@@ -28,6 +28,7 @@ jobs:
         env:
           # zackees/soldr#2148: cached Windows links still lose PDB line tables.
           ZCCACHE_DISABLE: ${{ runner.os == 'Windows' && '1' || '' }}
+          RUSTC_WRAPPER: ""
       - run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
@@ -128,6 +129,8 @@ jobs:
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
       - name: Test facade boundary lint
         env:
+          # Do not trust a partially restored global crates.io source tree.
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
           ZCCACHE_DISABLE: "1"
         run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr rustup run
@@ -135,6 +138,7 @@ jobs:
           --manifest-path dylints/kernal_api_boundary/Cargo.toml
       - name: Test platform boundary lint
         env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
           ZCCACHE_DISABLE: "1"
         run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr rustup run
@@ -142,6 +146,7 @@ jobs:
           --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml
       - name: Lint every client-style target
         env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
           ZCCACHE_DISABLE: "1"
         run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo dylint

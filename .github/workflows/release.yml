@@ -8,8 +8,7 @@ permissions:
   contents: write
 
 env:
-  SOLDR_SPEC: soldr==0.9.5
-  SOLDR_TOOLCHAIN_ORIGIN: https://raw.githubusercontent.com/zackees/soldr-toolchain/assets
+  SOLDR_SPEC: soldr
   SOURCE_DATE_EPOCH: "0"
 
 jobs:

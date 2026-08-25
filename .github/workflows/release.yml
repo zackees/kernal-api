@@ -1,0 +1,191 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  SOLDR_SPEC: soldr==0.9.5
+  SOLDR_TOOLCHAIN_ORIGIN: https://raw.githubusercontent.com/zackees/soldr-toolchain/assets
+  SOURCE_DATE_EPOCH: "0"
+
+jobs:
+  validate-and-package:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          lfs: true
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify exact release version
+        shell: bash
+        run: |
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+          test "v${manifest_version}" = "${{ github.event.release.tag_name }}"
+          test "${manifest_version}" != "0.0.0"
+          grep -q "version = \"${manifest_version}\"" pyproject.toml
+          grep -q "__version__ = \"${manifest_version}\"" python/kernal_api/__init__.py
+      - name: Regenerate and verify ConPTY sidecars
+        shell: bash
+        run: |
+          bash ci/build_conpty_assets.sh target/conpty-assets
+          cmp conpty-sidecar.sha256.toml target/conpty-assets/conpty-sidecar.sha256.toml
+      - name: Test every facility together
+        run: uv run --no-project --with "${SOLDR_SPEC}" soldr cargo test --locked --all-features
+      - name: Package exact Rust source
+        run: uv run --no-project --with "${SOLDR_SPEC}" soldr cargo package --locked
+      - name: Package exact Python companion
+        run: uv build --clear
+      - run: uv run --no-project --with twine twine check dist/*
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: registry-packages
+          path: |
+            target/package/kernal-api-*.crate
+            dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: conpty-sidecars
+          path: target/conpty-assets/conpty-sidecar-*.tar.zst
+          if-no-files-found: error
+
+  symbolizer-workers:
+    if: startsWith(github.event.release.tag_name, 'v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            extension: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            extension: ""
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            extension: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            extension: .exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Build isolated worker
+        run: >-
+          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr build
+          --release --target ${{ matrix.target }} --features symbolize-worker
+          --bin kernal-symbolize
+      - name: Stage worker asset
+        shell: bash
+        run: |
+          mkdir -p release-worker
+          cp "target/${{ matrix.target }}/release/kernal-symbolize${{ matrix.extension }}" \
+            "release-worker/kernal-symbolize-${{ matrix.target }}${{ matrix.extension }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: symbolizer-${{ matrix.target }}
+          path: release-worker/*
+          if-no-files-found: error
+
+  publish-crates:
+    needs: validate-and-package
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          lfs: true
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: registry-packages
+          path: release-packages
+      - name: Publish or verify identical crates.io artifact
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          version="${version#v}"
+          crate_file="$(find release-packages -name "kernal-api-${version}.crate" -print -quit)"
+          local_sha="$(sha256sum "${crate_file}" | awk '{print $1}')"
+          status="$(curl -sS -o crates.json -w '%{http_code}' \
+            -H 'User-Agent: kernal-api-release (https://github.com/zackees/kernal-api)' \
+            "https://crates.io/api/v1/crates/kernal-api/${version}")"
+          if [[ "${status}" == "404" ]]; then
+            uv run --no-project --with "${SOLDR_SPEC}" soldr cargo publish --locked --no-verify
+          elif [[ "${status}" == "200" ]]; then
+            remote_sha="$(jq -r '.version.checksum' crates.json)"
+            test "${local_sha}" = "${remote_sha}"
+          else
+            echo "crates.io returned HTTP ${status}" >&2
+            exit 1
+          fi
+
+  publish-pypi:
+    needs: validate-and-package
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: registry-packages
+          path: release-packages
+      - name: Publish or verify identical PyPI artifacts
+        shell: bash
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          version="${version#v}"
+          status="$(curl -sS -o pypi.json -w '%{http_code}' \
+            "https://pypi.org/pypi/kernal-api/${version}/json")"
+          if [[ "${status}" == "404" ]]; then
+            uv run --no-project --with twine twine upload --non-interactive "release-packages/kernal_api-${version}"*
+          elif [[ "${status}" == "200" ]]; then
+            for file in "release-packages/kernal_api-${version}"*; do
+              local_sha="$(sha256sum "${file}" | awk '{print $1}')"
+              jq -e --arg name "$(basename "${file}")" --arg sha "${local_sha}" \
+                '.urls[] | select(.filename == $name and .digests.sha256 == $sha)' \
+                pypi.json >/dev/null
+            done
+          else
+            echo "PyPI returned HTTP ${status}" >&2
+            exit 1
+          fi
+
+  release-assets:
+    needs: [validate-and-package, symbolizer-workers]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Attach verified sidecars and isolated workers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release upload "${{ github.event.release.tag_name }}"
+          release-assets/conpty-sidecar-*.tar.zst
+          release-assets/kernal-symbolize-*
+          --repo "${{ github.repository }}" --clobber

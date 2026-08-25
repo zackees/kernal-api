@@ -1,0 +1,12 @@
+Portions of the platform, crash-capture, profiling, and symbolization code were
+adapted from zackees/running-process under the BSD 3-Clause License.
+
+The checked-in pprof message definitions implement Google's
+`perftools.profiles` protobuf schema, originally published under the Apache
+License 2.0. Only the stable field names, types, and wire numbers are
+represented here; no generated build-time dependency is required.
+
+The optional Windows ConPTY sidecar contains binary artifacts from
+Microsoft.Windows.Console.ConPTY, distributed by Microsoft under the MIT
+License. Their package version and provenance are recorded under
+vendor/win32/conpty/.

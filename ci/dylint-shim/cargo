@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+toolchain="${RUSTUP_TOOLCHAIN:-nightly-2026-05-28}"
+exec uv run --no-project --with soldr==0.9.5 \
+  soldr rustup run "${toolchain}" cargo "$@"

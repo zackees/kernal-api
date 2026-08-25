@@ -1,0 +1,13 @@
+# Pinned Microsoft.Windows.Console.ConPTY NuGet version.
+#
+# The repository stores the reviewed per-architecture conpty.dll and
+# OpenConsole.exe bytes in Git LFS. Release CI deterministically packages
+# those checked-in inputs as zstd-compressed GitHub release assets named
+# `conpty-sidecar-<arch>.tar.zst` and verifies their committed hashes. The
+# runtime downloads the matching asset for its CARGO_PKG_VERSION on first
+# ConPTY use, verifies it, and caches it. Consumers do nothing.
+#
+# Refresh this pin on a cadence matching the WezTerm/upstream bundle
+# (https://github.com/wezterm/wezterm/issues/7774).
+
+Microsoft.Windows.Console.ConPTY 1.24.260512001

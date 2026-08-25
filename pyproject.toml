@@ -4,15 +4,17 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kernal-api"
-version = "0.0.0"
-description = "Reserved package name for the forthcoming kernal-api async systems HAL"
+version = "0.1.0"
+description = "Async OS HAL, profiling, symbolization, and allocator instrumentation"
 readme = "README.md"
-requires-python = "<0"
-license = "MIT OR Apache-2.0"
+requires-python = ">=3.10"
+license = "BSD-3-Clause"
 authors = [{ name = "Zackees" }]
 classifiers = [
-  "Development Status :: 1 - Planning",
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: BSD License",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
   "Typing :: Typed",
 ]
 
@@ -26,9 +28,9 @@ packages = ["python/kernal_api"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/COMPATIBILITY.md",
+  "/PROTOCOLS.md",
   "/python",
-  "/LICENSE-APACHE",
-  "/LICENSE-MIT",
+  "/LICENSE",
   "/README.md",
 ]
-

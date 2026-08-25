@@ -9,9 +9,6 @@ permissions:
   contents: read
   actions: write
 
-env:
-  SOLDR_SPEC: soldr
-
 jobs:
   rust-native:
     strategy:
@@ -23,16 +20,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - run: uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo test --locked --all-features
-        env:
-          # zackees/soldr#2148: cached Windows links still lose PDB line tables.
-          ZCCACHE_DISABLE: ${{ runner.os == 'Windows' && '1' || '' }}
-          RUSTC_WRAPPER: ""
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: runner.os != 'Windows'
+        run: soldr cargo test --locked --all-features
+      - if: runner.os == 'Windows'
+        # Temporary quarantine for source-line assertions: zackees/soldr#2148.
+        run: >-
+          soldr cargo test --locked --all-features --
+          --skip a_real_pdb_yields_file_and_line_for_this_crates_code
+          --skip real_addresses_resolve_to_files_and_lines_when_asked
       - run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo clippy
+          soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
-      - run: uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo fmt --all -- --check
+      - run: soldr cargo fmt --all -- --check
 
   each-feature:
     runs-on: ubuntu-latest
@@ -55,9 +55,9 @@ jobs:
           - tokio-console
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
       - run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo check
+          soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
 
   supported-targets:
@@ -88,27 +88,26 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo build
+          soldr cargo build
           --locked --target ${{ matrix.target }} --all-features
       # The managed GNU ARM bundle is intentionally x86_64-hosted. Until
       # Soldr distinguishes a native ARM host, validate this lane natively.
       - if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo build
+          soldr cargo build
           --locked --all-features
       - if: ${{ !matrix.legacy_cargo }}
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr build
+          soldr build
           --target ${{ matrix.target }} --all-features
 
   dylints:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
         with:
           toolchain: 1.95.0
@@ -122,7 +121,7 @@ jobs:
       - name: Select the pinned Dylint compiler
         shell: bash
         run: |
-          rustc_path="$(uv run --no-project --with "${SOLDR_SPEC}" soldr rustup which --toolchain nightly-2026-05-28 rustc)"
+          rustc_path="$(soldr rustup which --toolchain nightly-2026-05-28 rustc)"
           echo "RUSTC=${rustc_path}" >> "${GITHUB_ENV}"
           echo "RUSTUP_TOOLCHAIN=nightly-2026-05-28" >> "${GITHUB_ENV}"
           chmod +x ci/dylint-shim/cargo
@@ -131,25 +130,22 @@ jobs:
         env:
           # Do not trust a partially restored global crates.io source tree.
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-          ZCCACHE_DISABLE: "1"
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr rustup run
+          soldr rustup run
           nightly-2026-05-28 cargo test
           --manifest-path dylints/kernal_api_boundary/Cargo.toml
       - name: Test platform boundary lint
         env:
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-          ZCCACHE_DISABLE: "1"
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr rustup run
+          soldr rustup run
           nightly-2026-05-28 cargo test
           --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml
       - name: Lint every client-style target
         env:
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-          ZCCACHE_DISABLE: "1"
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo dylint
+          soldr cargo dylint
           --all --workspace -- --all-targets
 
   python:

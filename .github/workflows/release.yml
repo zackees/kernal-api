@@ -6,9 +6,9 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 env:
-  SOLDR_SPEC: soldr
   SOURCE_DATE_EPOCH: "0"
 
 jobs:
@@ -22,6 +22,7 @@ jobs:
           ref: ${{ github.event.release.tag_name }}
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
       - name: Verify exact release version
         shell: bash
         run: |
@@ -36,9 +37,9 @@ jobs:
           bash ci/build_conpty_assets.sh target/conpty-assets
           cmp conpty-sidecar.sha256.toml target/conpty-assets/conpty-sidecar.sha256.toml
       - name: Test every facility together
-        run: uv run --no-project --with "${SOLDR_SPEC}" soldr cargo test --locked --all-features
+        run: soldr cargo test --locked --all-features
       - name: Package exact Rust source
-        run: uv run --no-project --with "${SOLDR_SPEC}" soldr cargo package --locked
+        run: soldr cargo package --locked
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*
@@ -84,10 +85,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name }}
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
       - name: Build isolated worker
         run: >-
-          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr build
+          soldr build
           --release --target ${{ matrix.target }} --features symbolize-worker
           --bin kernal-symbolize
       - name: Stage worker asset
@@ -111,7 +112,7 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
           lfs: true
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: registry-packages
@@ -129,7 +130,7 @@ jobs:
             -H 'User-Agent: kernal-api-release (https://github.com/zackees/kernal-api)' \
             "https://crates.io/api/v1/crates/kernal-api/${version}")"
           if [[ "${status}" == "404" ]]; then
-            uv run --no-project --with "${SOLDR_SPEC}" soldr cargo publish --locked --no-verify
+            soldr cargo publish --locked --no-verify
           elif [[ "${status}" == "200" ]]; then
             remote_sha="$(jq -r '.version.checksum' crates.json)"
             test "${local_sha}" = "${remote_sha}"

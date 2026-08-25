@@ -1,5 +1,5 @@
 /dist/
 /target/
+/.extern-repos/
 *.egg-info/
 __pycache__/
-

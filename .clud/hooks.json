@@ -1,0 +1,10 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Shell|PowerShell|exec_command",
+        "command": "uv run --no-project python ci/hooks/tool_guard.py"
+      }
+    ]
+  }
+}

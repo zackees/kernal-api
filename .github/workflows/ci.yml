@@ -25,6 +25,9 @@ jobs:
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - run: uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo test --locked --all-features
+        env:
+          # zackees/soldr#2148: cached Windows links still lose PDB line tables.
+          ZCCACHE_DISABLE: ${{ runner.os == 'Windows' && '1' || '' }}
       - run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
@@ -85,10 +88,16 @@ jobs:
         with:
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - if: matrix.legacy_cargo
+      - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
         run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo build
           --locked --target ${{ matrix.target }} --all-features
+      # The managed GNU ARM bundle is intentionally x86_64-hosted. Until
+      # Soldr distinguishes a native ARM host, validate this lane natively.
+      - if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: >-
+          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo build
+          --locked --all-features
       - if: ${{ !matrix.legacy_cargo }}
         run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr build

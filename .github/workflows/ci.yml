@@ -101,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - uses: zackees/setup-soldr@031fe053b702e9d84b3b7464fddf8c1a07987a96
+      - uses: zackees/setup-soldr@882871241c9427b88686a8b1c358b4f3e8fdf2fb
         with:
           version: 0.9.5
           toolchain: 1.95.0

@@ -1,0 +1,27 @@
+[package]
+name = "kernal_api_boundary"
+version = "0.1.0"
+description = "Require client systems/runtime calls to pass through kernal-api facades"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "=6.0.3"
+toml = "=1.1.4"
+
+[dev-dependencies]
+dylint_testing = "=6.0.3"
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[workspace]
+
+[profile.release]
+opt-level = 0
+lto = false
+codegen-units = 16
+strip = "none"

@@ -1,0 +1,6 @@
+{
+  "rust": {
+    "use_soldr": true,
+    "install": true
+  }
+}

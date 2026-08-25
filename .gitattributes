@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+/vendor/win32/conpty/**/*.dll filter=lfs diff=lfs merge=lfs -text
+/vendor/win32/conpty/**/*.exe filter=lfs diff=lfs merge=lfs -text

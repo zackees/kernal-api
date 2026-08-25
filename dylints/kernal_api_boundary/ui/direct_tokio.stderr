@@ -1,0 +1,28 @@
+error: direct `tokio` use bypasses the kernal-api facade; use a kernal_api-owned type or operation
+  --> $DIR/direct_tokio.rs:7:1
+   |
+LL | use tokio::sync::Mutex;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(kernal_api_boundary)]` on by default
+
+error: direct `tokio` use bypasses the kernal-api facade; use a kernal_api-owned type or operation
+  --> $DIR/direct_tokio.rs:10:16
+   |
+LL |     let lock = Mutex::new(1_u8);
+   |                ^^^^^^^^^^
+
+error: direct `tokio` use bypasses the kernal-api facade; use a kernal_api-owned type or operation
+  --> $DIR/direct_tokio.rs:10:16
+   |
+LL |     let lock = Mutex::new(1_u8);
+   |                ^^^^^
+
+error: direct `tokio` use bypasses the kernal-api facade; use a kernal_api-owned type or operation
+  --> $DIR/direct_tokio.rs:11:5
+   |
+LL |     tokio::task::yield_now();
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 4 previous errors
+

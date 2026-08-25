@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+toolchain="${RUSTUP_TOOLCHAIN:-nightly-2026-05-28}"
+# The test harness launches this shim from inside an already soldr-wrapped
+# build. Re-entering soldr here is forbidden (and used to hide a stale pin).
+exec rustup run "${toolchain}" cargo "$@"

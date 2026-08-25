@@ -65,23 +65,34 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
+            legacy_cargo: true
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            legacy_cargo: true
           - os: macos-latest
             target: x86_64-apple-darwin
+            legacy_cargo: false
           - os: macos-latest
             target: aarch64-apple-darwin
+            legacy_cargo: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            legacy_cargo: false
           - os: windows-latest
             target: aarch64-pc-windows-msvc
+            legacy_cargo: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - run: >-
+      - if: matrix.legacy_cargo
+        run: >-
+          uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr cargo build
+          --locked --target ${{ matrix.target }} --all-features
+      - if: ${{ !matrix.legacy_cargo }}
+        run: >-
           uv run --no-project --with "${{ env.SOLDR_SPEC }}" soldr build
           --target ${{ matrix.target }} --all-features
 
@@ -90,7 +101,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - uses: zackees/setup-soldr@0a298edd911c3d863058d51c759beb6d76cf44ee
+      - uses: zackees/setup-soldr@031fe053b702e9d84b3b7464fddf8c1a07987a96
         with:
           version: 0.9.5
           toolchain: 1.95.0

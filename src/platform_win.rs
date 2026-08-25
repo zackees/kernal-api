@@ -478,20 +478,12 @@ pub fn configure_compat_tokio_command(
     Ok(())
 }
 
+#[cfg(test)]
 fn compat_tokio_creation_flags(show_console: bool) -> u32 {
     if show_console {
         0
     } else {
         0x0800_0000 // CREATE_NO_WINDOW
-    }
-}
-
-#[cfg(test)]
-pub fn after_compat_tokio_spawn(child: &Child, kill_when_owner_dies: bool) -> io::Result<()> {
-    if kill_when_owner_dies {
-        assign(child.raw_handle())
-    } else {
-        Ok(())
     }
 }
 
@@ -612,13 +604,17 @@ pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 
 #[cfg(test)]
 mod tests {
-    use super::compat_tokio_creation_flags;
+    use super::{compat_tokio_creation_flags, configure_compat_tokio_command};
     use std::ffi::OsStr;
 
     #[test]
     fn tokio_spawn_owns_console_creation_flags() {
         assert_eq!(compat_tokio_creation_flags(false), 0x0800_0000);
         assert_eq!(compat_tokio_creation_flags(true), 0);
+
+        let mut command = tokio::process::Command::new("cmd.exe");
+        configure_compat_tokio_command(&mut command, false, false)
+            .expect("command configuration must succeed");
     }
 
     #[test]

@@ -22,6 +22,8 @@ mod line_numbers;
 #[path = "../symbolize/object_symbols.rs"]
 mod object_symbols;
 #[cfg(target_os = "windows")]
+// The shared parser also carries Windows verification probes used by its unit tests.
+#[allow(dead_code)]
 #[path = "../symbolize/pdb_symbols.rs"]
 mod pdb_symbols;
 #[path = "../symbolize/render.rs"]

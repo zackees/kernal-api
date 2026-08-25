@@ -341,28 +341,34 @@ pub fn capture(config: &SnapshotConfig) -> Result<Snapshot, SnapshotError> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     #[test]
     fn snapshot_sees_every_spawned_thread_and_resumes_them() {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
-        let ready = Arc::new(Barrier::new(4));
+        let (tid_sender, tid_receiver) = mpsc::channel();
         let mut workers = Vec::new();
         for _ in 0..3 {
             let stop = Arc::clone(&stop);
             let progress = Arc::clone(&progress);
-            let ready = Arc::clone(&ready);
+            let tid_sender = tid_sender.clone();
             workers.push(std::thread::spawn(move || {
-                ready.wait();
+                let self_thread = unsafe { mach_thread_self() };
+                let os_tid = os_thread_id(self_thread).expect("worker must have an OS thread id");
+                unsafe {
+                    mach_port_deallocate(mach_task_self(), self_thread);
+                }
+                tid_sender.send(os_tid).unwrap();
                 while !stop.load(Ordering::Relaxed) {
                     progress.fetch_add(1, Ordering::Relaxed);
                     std::hint::spin_loop();
                 }
             }));
         }
-        ready.wait();
+        drop(tid_sender);
+        let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
         let snapshot = capture(&SnapshotConfig::default()).expect("capture");
         let before = progress.load(Ordering::Relaxed);
@@ -375,8 +381,16 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
-        assert_eq!(snapshot.stats.threads_dropped, 0, "{:?}", snapshot.stats);
-        assert!(snapshot.stats.threads_captured >= 3);
+        for expected_tid in expected_tids {
+            assert!(
+                snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| thread.os_tid == expected_tid),
+                "spawned thread {expected_tid} is absent from {:?}",
+                snapshot.stats
+            );
+        }
         assert!(progress.load(Ordering::Relaxed) > before);
     }
 

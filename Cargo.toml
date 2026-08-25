@@ -1,0 +1,21 @@
+[package]
+name = "kernal-api"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.95.0"
+description = "Reserved package name for the forthcoming kernal-api async systems HAL"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zackees/kernal-api"
+homepage = "https://github.com/zackees/kernal-api"
+readme = "README.md"
+keywords = ["async", "profiling", "process", "hal", "diagnostics"]
+categories = ["asynchronous", "development-tools::profiling", "os"]
+
+[lib]
+name = "kernal_api"
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+all-features = true
+
+[workspace]

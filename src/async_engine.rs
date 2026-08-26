@@ -632,6 +632,52 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_progress_after_its_idle_deadline_is_not_observed_progress() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            tokio::time::pause();
+            let reporter = ProgressReporter::new();
+            let watch = reporter.watch();
+            let release_progress = Arc::new(Notify::new());
+            let progress_task = launch({
+                let reporter = reporter.clone();
+                let release_progress = Arc::clone(&release_progress);
+                async move {
+                    release_progress.notified().await;
+                    reporter.report_progress();
+                }
+            });
+            let mut result = std::pin::pin!(progress_timeout(
+                Duration::from_millis(10),
+                &watch,
+                std::future::pending::<()>(),
+            ));
+
+            std::future::poll_fn(|context| {
+                assert!(matches!(
+                    result.as_mut().poll(context),
+                    std::task::Poll::Pending
+                ));
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            // Retained RED characterization of the removed test fixture:
+            // work that is merely scheduled is not progress. The separate
+            // task cannot report until after the idle deadline, so the typed
+            // idle error is the correct result and not a product regression.
+            tokio::time::advance(Duration::from_millis(10)).await;
+            assert_eq!(result.await, Err(ProgressIdleElapsed));
+
+            release_progress.notify_one();
+            progress_task.await.unwrap();
+        });
+    }
+
+    #[test]
     fn stalled_operation_expires_after_the_progress_idle_window() {
         let runtime = RuntimeBuilder::current_thread()
             .enable_all()

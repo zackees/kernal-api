@@ -31,6 +31,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use mimalloc_pprof",
         "pub use pdb_addr2line",
         "pub use portable_pty",
+        "pub use running_process",
         "pub use sysinfo",
         "pub use tokio",
     ];

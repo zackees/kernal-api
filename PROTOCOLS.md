@@ -12,6 +12,17 @@ Current protobuf boundaries include:
 - symbol manifest discovery; and
 - any future daemon, broker, profiling-control, or dump-control IPC.
 
+Once the compatibility facade is introduced, the existing `running-process`
+broker codec and daemon will remain its implementation during the first
+application migrations. Moving access behind `kernal-api` must preserve the
+established bytes, version negotiation, endpoint semantics, and round-trip
+count.
+
+The generic broker-daemon pattern is intended to become a `kernal-api`
+managed-service capability eventually, after zccache, Soldr, and fbuild have
+stabilized on the facade. That is a later ownership move, not permission to
+rewrite application payload schemas or a prerequisite for phase 1.
+
 JSON is not accepted as a control-plane or IPC fallback. It remains valid only
 where an external human-facing tool defines JSON as its import format, such as
 Firefox Profiler export.

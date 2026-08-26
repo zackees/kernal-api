@@ -27,3 +27,15 @@ is rejected before it can create a duplicate compile unit; method calls,
 function items, imports, and public type references are also resolved to the
 underlying crate and rejected. Client APIs must expose `kernal_api`-owned
 facade types instead.
+
+`running-process` is classified as an owned implementation dependency for the
+target architecture. It is allowed inside `kernal-api`; phase 1 will add the
+private adapter. It is denied in each first-party application once that
+application's required process and broker facade is available.
+`running-process` must never depend in the opposite direction.
+
+Adoption is a capability-by-capability ratchet, not a flag-day waiver. Land a
+facade with behavior and compatibility tests, migrate the client call sites,
+then enable the strict ban for that client workspace. Temporary migration
+branches may carry both dependencies, but released code has no alternate
+runtime, network stack, process layer, or broker path behind a fallback.

@@ -1,9 +1,15 @@
 # kernal-api
 
-`kernal-api` is the shared async systems foundation for Soldr, zccache,
-running-process, and fbuild. It provides one portable OS/process HAL together
-with allocator instrumentation, cooperative stack snapshots, CPU and async
-pprof capture, PDB/DWARF/Mach-O symbolization, and Tokio runtime diagnostics.
+`kernal-api` is the shared systems facade for Soldr, zccache, and fbuild. Its
+target architecture builds on `running-process`, the trusted low-level
+native/process substrate, and adds stable application contracts for async
+execution, hashing, diagnostics, profiling, symbolization, allocation,
+networking, storage, and other common capabilities. The private
+`running-process` integration is phase-1 work, not part of the current release.
+
+In the target architecture, applications use `kernal-api`; they do not use
+`running-process` or Tokio directly. The permanent dependency direction and
+staged migration are defined in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 The name is intentionally spelled **kernal-api**. The spelling is the stable
 package and repository identity on crates.io, PyPI, and GitHub.
@@ -27,8 +33,9 @@ direct use of implementation crates owned by this package.
 
 ## Rust features
 
-The base crate contains the async process/host HAL. Optional features keep
-consumers from linking tooling they do not use:
+The current base crate contains the async process/host facade. Its process
+implementation will be rebased onto `running-process` without exposing backend
+types. Optional features keep consumers from linking tooling they do not use:
 
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
 - `snapshot` for cooperative thread capture and deferred unwinding
@@ -63,8 +70,9 @@ full set of ordinary compiler children.
 
 That scheduler protection is separate from this crate's API boundary. The
 boundary Dylint prevents clients from adding their own copies of the runtime,
-allocator, profiler, symbolizer, and OS-HAL implementation dependencies; it
-does not rename or combine third-party source files.
+allocator, profiler, symbolizer, and OS-HAL implementation dependencies,
+including direct use of `running-process` after the relevant facade is ready.
+It does not rename or combine third-party source files.
 
 ## License
 

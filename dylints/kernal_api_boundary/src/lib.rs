@@ -33,6 +33,7 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "mimalloc_pprof",
     "pdb_addr2line",
     "portable_pty",
+    "running_process",
     "sysinfo",
     "tokio",
 ];
@@ -223,6 +224,7 @@ fn manifest_scan_finds_normal_aliased_target_and_test_dependencies() {
         [dependencies]
         tokio = "1"
         async_backend = { package = "console-subscriber", version = "0.5" }
+        process_backend = { package = "running-process", version = "4" }
 
         [target.'cfg(windows)'.dev-dependencies]
         portable-pty = "0.9"
@@ -231,7 +233,12 @@ fn manifest_scan_finds_normal_aliased_target_and_test_dependencies() {
         .expect("the client manifest fixture must be valid TOML");
     assert_eq!(
         direct_owned_dependencies_in(manifest),
-        ["console-subscriber", "portable-pty", "tokio"]
+        [
+            "console-subscriber",
+            "portable-pty",
+            "running-process",
+            "tokio"
+        ]
     );
 }
 

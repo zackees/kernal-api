@@ -114,6 +114,8 @@ static OWNER_PID: AtomicU32 = AtomicU32::new(0);
 static HANDLER_TRANSITION: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 static TEST_RESUME_PAUSE: Mutex<Option<TestResumePause>> = Mutex::new(None);
+#[cfg(test)]
+static TEST_SAMPLER_DISABLED: Mutex<bool> = Mutex::new(false);
 
 #[cfg(test)]
 struct TestResumePause {
@@ -153,6 +155,39 @@ impl Drop for TestResumePauseGuard {
             Err(poisoned) => poisoned.into_inner(),
         };
         slot.take();
+    }
+}
+
+#[cfg(test)]
+fn disable_test_sampler() -> TestSamplerDisabledGuard {
+    let mut disabled = match TEST_SAMPLER_DISABLED.lock() {
+        Ok(disabled) => disabled,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(!*disabled, "a test sampler disable guard is already active");
+    *disabled = true;
+    TestSamplerDisabledGuard
+}
+
+#[cfg(test)]
+fn test_sampler_disabled() -> bool {
+    match TEST_SAMPLER_DISABLED.lock() {
+        Ok(disabled) => *disabled,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+struct TestSamplerDisabledGuard;
+
+#[cfg(test)]
+impl Drop for TestSamplerDisabledGuard {
+    fn drop(&mut self) {
+        let mut disabled = match TEST_SAMPLER_DISABLED.lock() {
+            Ok(disabled) => disabled,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *disabled = false;
     }
 }
 
@@ -243,22 +278,26 @@ impl Runtime {
             }
         };
 
-        let sampler_state = Arc::clone(&shared);
-        let sampler = match std::thread::Builder::new()
-            .name("rp-crash-sampler".into())
-            .spawn(move || sampler_loop(sampler_state))
-        {
-            Ok(sampler) => sampler,
-            Err(error) => {
-                #[cfg(windows)]
-                uninstall_windows_abort_chain();
-                #[cfg(target_os = "macos")]
-                uninstall_macos_abort_chain();
-                drop(handler);
-                drop(shared);
-                let _ = std::fs::remove_file(&path);
-                return Err(InstallError::Sampler(error));
-            }
+        #[cfg(test)]
+        let sampler_disabled = test_sampler_disabled();
+        #[cfg(not(test))]
+        let sampler_disabled = false;
+        let sampler = if sampler_disabled {
+            None
+        } else {
+            Some(match start_sampler(&shared) {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    #[cfg(windows)]
+                    uninstall_windows_abort_chain();
+                    #[cfg(target_os = "macos")]
+                    uninstall_macos_abort_chain();
+                    drop(handler);
+                    drop(shared);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(InstallError::Sampler(error));
+                }
+            })
         };
 
         let registration_id = 1;
@@ -269,7 +308,7 @@ impl Runtime {
                 shared,
                 handler: Mutex::new(Some(handler)),
                 handler_armed: AtomicBool::new(true),
-                sampler: Some(sampler),
+                sampler,
                 path,
                 pid: std::process::id(),
                 registrations: Mutex::new(RegistrationState {
@@ -353,6 +392,13 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+fn start_sampler(shared: &Arc<Shared>) -> io::Result<JoinHandle<()>> {
+    let sampler_state = Arc::clone(shared);
+    std::thread::Builder::new()
+        .name("rp-crash-sampler".into())
+        .spawn(move || sampler_loop(sampler_state))
 }
 
 struct RegistrationState {
@@ -1303,6 +1349,11 @@ mod tests {
     #[test]
     fn failed_install_rearm_drops_last_runtime_after_transition_gate() {
         let _state = process_state();
+        // This regression exercises only the transition/handler teardown
+        // ordering. A live sampler can be resolving a process-wide capture
+        // while unrelated tests run, which would turn its normal join into a
+        // timing-dependent part of this lock-order assertion.
+        let _sampler = disable_test_sampler();
         let guard = install(CrashPolicy::On, metadata("last-guard")).unwrap();
         let foreign = Arc::new(Mutex::new(None));
         let foreign_slot = Arc::clone(&foreign);

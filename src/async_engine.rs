@@ -6,8 +6,12 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+
+use tokio::sync::Notify;
 
 /// Current engine implementation, retained for diagnostics and bug reports.
 pub const BACKEND_NAME: &str = "tokio";
@@ -198,12 +202,47 @@ pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// An absolute deadline that can be shared across composed async operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Deadline {
+    at: tokio::time::Instant,
+}
+
+impl Deadline {
+    /// Create a deadline `duration` from now.
+    pub fn after(duration: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + duration,
+        }
+    }
+
+    /// Return the remaining budget, clamped to zero after expiry.
+    pub fn remaining(self) -> Duration {
+        self.at
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// Whether this deadline has elapsed.
+    pub fn is_elapsed(self) -> bool {
+        self.remaining().is_zero()
+    }
+}
+
 /// Run `future` until it completes or the deadline expires.
 pub async fn timeout<F: Future>(
     duration: Duration,
     future: F,
 ) -> Result<F::Output, DeadlineElapsed> {
-    tokio::time::timeout(duration, future)
+    timeout_at(Deadline::after(duration), future).await
+}
+
+/// Run `future` until an already-composed deadline expires.
+pub async fn timeout_at<F: Future>(
+    deadline: Deadline,
+    future: F,
+) -> Result<F::Output, DeadlineElapsed> {
+    tokio::time::timeout_at(deadline.at, future)
         .await
         .map_err(|_| DeadlineElapsed)
 }
@@ -212,6 +251,253 @@ pub async fn timeout<F: Future>(
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("the kernal-api async operation exceeded its deadline")]
 pub struct DeadlineElapsed;
+
+/// Source that can request cancellation of operations sharing its token.
+#[derive(Clone, Debug)]
+pub struct CancellationSource {
+    state: Arc<CancellationState>,
+}
+
+#[derive(Debug)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+/// Cloneable cancellation capability for one or more async operations.
+///
+/// The token is an operation boundary, not a task handle: cancelling it never
+/// aborts unrelated work on the runtime. Operations opt in through
+/// [`cancellable`] or by awaiting [`CancellationToken::cancelled`].
+#[derive(Clone, Debug)]
+pub struct CancellationToken {
+    state: Arc<CancellationState>,
+}
+
+impl CancellationSource {
+    /// Create a new, initially active cancellation domain.
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(CancellationState {
+                cancelled: AtomicBool::new(false),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Return a token that can observe this source's cancellation request.
+    pub fn token(&self) -> CancellationToken {
+        CancellationToken {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Request cancellation for every operation using a token from this source.
+    ///
+    /// This is idempotent. The request is cooperative: an operation observes it
+    /// at an await point or when it explicitly checks its token.
+    pub fn cancel(&self) {
+        if !self.state.cancelled.swap(true, Ordering::AcqRel) {
+            self.state.notify.notify_waiters();
+        }
+    }
+
+    /// Whether this source has requested cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl Default for CancellationSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CancellationToken {
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.state.cancelled.load(Ordering::Acquire)
+    }
+
+    /// Wait until cancellation is requested.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            let notified = self.state.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Run an operation until it completes or `token` requests cancellation.
+pub async fn cancellable<F>(
+    token: &CancellationToken,
+    future: F,
+) -> Result<F::Output, Cancelled>
+where
+    F: Future,
+{
+    tokio::select! {
+        biased;
+        () = token.cancelled() => Err(Cancelled),
+        output = future => Ok(output),
+    }
+}
+
+/// An operation was cancelled through a kernal-api cancellation token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the kernal-api async operation was cancelled")]
+pub struct Cancelled;
+
+/// Run a connection-establishment operation until it completes or its
+/// connection deadline expires.
+///
+/// This deliberately differs from [`progress_timeout`]: it is for the period
+/// before a connection exists and therefore cannot report transfer progress.
+pub async fn connection_timeout<F>(
+    duration: Duration,
+    future: F,
+) -> Result<F::Output, ConnectionDeadlineElapsed>
+where
+    F: Future,
+{
+    connection_until(Deadline::after(duration), future).await
+}
+
+/// Run a connection-establishment operation within an already-composed
+/// deadline.
+pub async fn connection_until<F>(
+    deadline: Deadline,
+    future: F,
+) -> Result<F::Output, ConnectionDeadlineElapsed>
+where
+    F: Future,
+{
+    tokio::time::timeout_at(deadline.at, future)
+        .await
+        .map_err(|_| ConnectionDeadlineElapsed)
+}
+
+/// The configured connection-establishment deadline elapsed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the kernal-api connection deadline elapsed before the operation completed")]
+pub struct ConnectionDeadlineElapsed;
+
+/// Reports caller-observable progress for one transfer or streaming operation.
+#[derive(Clone, Debug)]
+pub struct ProgressReporter {
+    state: Arc<ProgressState>,
+}
+
+#[derive(Debug)]
+struct ProgressState {
+    last_progress: Mutex<tokio::time::Instant>,
+    notify: Notify,
+}
+
+/// Observes progress reported through a paired [`ProgressReporter`].
+#[derive(Clone, Debug)]
+pub struct ProgressWatch {
+    state: Arc<ProgressState>,
+}
+
+impl ProgressReporter {
+    /// Start a transfer-progress domain. Its initial idle window starts now.
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(ProgressState {
+                last_progress: Mutex::new(tokio::time::Instant::now()),
+                notify: Notify::new(),
+            }),
+        }
+    }
+
+    /// Obtain a watch capability for use with [`progress_timeout`].
+    pub fn watch(&self) -> ProgressWatch {
+        ProgressWatch {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Record that the caller observed forward progress.
+    ///
+    /// Call this only after a meaningful byte, frame, or other contractually
+    /// defined unit has been consumed or produced. Merely polling an idle
+    /// transport must not reset the progress deadline.
+    pub fn report_progress(&self) {
+        *self
+            .state
+            .last_progress
+            .lock()
+            .expect("progress state mutex must not be poisoned") = tokio::time::Instant::now();
+        self.state.notify.notify_waiters();
+    }
+}
+
+impl Default for ProgressReporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProgressWatch {
+    async fn wait_until_stalled(&self, idle: Duration) -> ProgressIdleElapsed {
+        loop {
+            // Register before observing the timestamp so a concurrent progress
+            // report cannot be missed between the observation and the await.
+            let notified = self.state.notify.notified();
+            let deadline = *self
+                .state
+                .last_progress
+                .lock()
+                .expect("progress state mutex must not be poisoned")
+                + idle;
+            let sleep = tokio::time::sleep_until(deadline);
+            tokio::pin!(sleep);
+
+            tokio::select! {
+                () = notified => continue,
+                () = &mut sleep => {
+                    let last_progress = *self
+                        .state
+                        .last_progress
+                        .lock()
+                        .expect("progress state mutex must not be poisoned");
+                    if last_progress + idle <= tokio::time::Instant::now() {
+                        return ProgressIdleElapsed;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Run an operation while caller-observable progress keeps resetting the idle
+/// budget. Unlike [`timeout`], this does not impose a total transfer duration.
+pub async fn progress_timeout<F>(
+    idle: Duration,
+    watch: &ProgressWatch,
+    future: F,
+) -> Result<F::Output, ProgressIdleElapsed>
+where
+    F: Future,
+{
+    tokio::select! {
+        output = future => Ok(output),
+        elapsed = watch.wait_until_stalled(idle) => Err(elapsed),
+    }
+}
+
+/// No caller-observable progress occurred before the configured idle deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the kernal-api async operation made no progress before its idle deadline")]
+pub struct ProgressIdleElapsed;
 
 #[cfg(feature = "tokio-console")]
 pub use crate::runtime::{DiagnosticsConfig, DiagnosticsInstallError};
@@ -238,5 +524,77 @@ mod tests {
             .unwrap();
         let result = runtime.run(timeout(Duration::ZERO, std::future::pending::<()>()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cancellation_source_unblocks_a_pending_operation() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let source = CancellationSource::new();
+            let token = source.token();
+            let trigger = launch(async move {
+                sleep(Duration::from_millis(1)).await;
+                source.cancel();
+            });
+
+            let result = cancellable(&token, std::future::pending::<()>()).await;
+            assert_eq!(result, Err(Cancelled));
+            trigger.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn connection_deadline_has_its_own_typed_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deadline = Deadline::after(Duration::ZERO);
+        assert!(deadline.is_elapsed());
+        let result = runtime.run(connection_until(deadline, std::future::pending::<()>()));
+        assert_eq!(result, Err(ConnectionDeadlineElapsed));
+    }
+
+    #[test]
+    fn progress_keeps_an_operation_alive_beyond_one_idle_window() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let reporter = ProgressReporter::new();
+            let watch = reporter.watch();
+            let operation = async move {
+                for _ in 0..3 {
+                    sleep(Duration::from_millis(20)).await;
+                    reporter.report_progress();
+                }
+                7_u8
+            };
+
+            let result = progress_timeout(Duration::from_millis(50), &watch, operation).await;
+            assert_eq!(result, Ok(7));
+        });
+    }
+
+    #[test]
+    fn stalled_operation_expires_after_the_progress_idle_window() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let reporter = ProgressReporter::new();
+            let result = progress_timeout(
+                Duration::from_millis(1),
+                &reporter.watch(),
+                std::future::pending::<()>(),
+            )
+            .await;
+            assert_eq!(result, Err(ProgressIdleElapsed));
+        });
     }
 }

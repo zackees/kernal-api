@@ -327,6 +327,12 @@ impl CancellationToken {
                 return;
             }
             let notified = self.state.notify.notified();
+            tokio::pin!(notified);
+            // Register before the second state observation. `notify_waiters`
+            // intentionally retains no permit, so without this a cancellation
+            // between constructing `Notified` and its first poll could strand
+            // this waiter forever.
+            notified.as_mut().enable();
             if self.is_cancelled() {
                 return;
             }
@@ -336,10 +342,7 @@ impl CancellationToken {
 }
 
 /// Run an operation until it completes or `token` requests cancellation.
-pub async fn cancellable<F>(
-    token: &CancellationToken,
-    future: F,
-) -> Result<F::Output, Cancelled>
+pub async fn cancellable<F>(token: &CancellationToken, future: F) -> Result<F::Output, Cancelled>
 where
     F: Future,
 {
@@ -575,7 +578,10 @@ mod tests {
                 7_u8
             };
 
-            let result = progress_timeout(Duration::from_millis(50), &watch, operation).await;
+            // Leave room for suite-wide CPU contention: the three reports take
+            // about 60 ms, while this verifies reset semantics rather than a
+            // scheduler-latency bound.
+            let result = progress_timeout(Duration::from_millis(200), &watch, operation).await;
             assert_eq!(result, Ok(7));
         });
     }

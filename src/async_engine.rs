@@ -648,7 +648,10 @@ mod tests {
             ));
 
             std::future::poll_fn(|context| {
-                assert!(matches!(result.as_mut().poll(context), std::task::Poll::Pending));
+                assert!(matches!(
+                    result.as_mut().poll(context),
+                    std::task::Poll::Pending
+                ));
                 std::task::Poll::Ready(())
             })
             .await;

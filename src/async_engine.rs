@@ -611,22 +611,23 @@ mod tests {
             tokio::time::pause();
             let reporter = ProgressReporter::new();
             let watch = reporter.watch();
-            let result = launch(async move {
-                let operation = async move {
-                    for _ in 0..3 {
-                        sleep(Duration::from_millis(10)).await;
-                        reporter.report_progress();
-                    }
-                    7_u8
-                };
-                progress_timeout(Duration::from_millis(15), &watch, operation).await
-            });
+            let operation = async move {
+                for _ in 0..3 {
+                    // Advancing from this same operation establishes the
+                    // contract sequence: report at 10/20/30 ms, each before
+                    // the 15 ms idle deadline. A spawned driver can advance
+                    // time before its sibling has reported and is not a
+                    // reliable policy test.
+                    tokio::time::advance(Duration::from_millis(10)).await;
+                    reporter.report_progress();
+                }
+                7_u8
+            };
 
-            for _ in 0..3 {
-                yield_now().await;
-                tokio::time::advance(Duration::from_millis(10)).await;
-            }
-            assert_eq!(result.await.unwrap(), Ok(7));
+            assert_eq!(
+                progress_timeout(Duration::from_millis(15), &watch, operation).await,
+                Ok(7)
+            );
         });
     }
 
@@ -640,17 +641,19 @@ mod tests {
             tokio::time::pause();
             let reporter = ProgressReporter::new();
             let watch = reporter.watch();
-            let result = launch(async move {
-                progress_timeout(
-                    Duration::from_millis(10),
-                    &watch,
-                    std::future::pending::<()>(),
-                )
-                .await
-            });
-            yield_now().await;
+            let mut result = std::pin::pin!(progress_timeout(
+                Duration::from_millis(10),
+                &watch,
+                std::future::pending::<()>(),
+            ));
+
+            std::future::poll_fn(|context| {
+                assert!(matches!(result.as_mut().poll(context), std::task::Poll::Pending));
+                std::task::Poll::Ready(())
+            })
+            .await;
             tokio::time::advance(Duration::from_millis(10)).await;
-            assert_eq!(result.await.unwrap(), Err(ProgressIdleElapsed));
+            assert_eq!(result.await, Err(ProgressIdleElapsed));
         });
     }
 }

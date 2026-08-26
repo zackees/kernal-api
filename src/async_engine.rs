@@ -641,8 +641,12 @@ mod tests {
             let reporter = ProgressReporter::new();
             let watch = reporter.watch();
             let result = launch(async move {
-                progress_timeout(Duration::from_millis(10), &watch, std::future::pending::<()>())
-                    .await
+                progress_timeout(
+                    Duration::from_millis(10),
+                    &watch,
+                    std::future::pending::<()>(),
+                )
+                .await
             });
             yield_now().await;
             tokio::time::advance(Duration::from_millis(10)).await;

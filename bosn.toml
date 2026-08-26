@@ -1,0 +1,33 @@
+[stack.linux]
+dockerfile = "docker/bosn.Dockerfile"
+family = "kernal-api-linux"
+default = true
+workdir = "/repo"
+
+[stack.linux.env]
+CARGO_TARGET_DIR = "/target"
+
+[stack.linux.mounts]
+repo = { source = ".", destination = "/repo", readonly = true }
+
+[stack.linux.volumes]
+target = { scope = "stack", destination = "/target" }
+cargo-home = { scope = "machine", destination = "/usr/local/cargo" }
+rustup-home = { scope = "machine", destination = "/usr/local/rustup" }
+soldr-home = { scope = "machine", destination = "/root/.soldr" }
+
+[task.fmt]
+stack = "linux"
+cmd = "soldr cargo fmt --all -- --check"
+
+[task.lint]
+stack = "linux"
+cmd = "soldr cargo clippy --locked --all-features --all-targets -- --deny warnings"
+
+[task.test]
+stack = "linux"
+cmd = "soldr cargo test --locked --all-features"
+
+[task.package]
+stack = "linux"
+cmd = "soldr cargo package --locked"

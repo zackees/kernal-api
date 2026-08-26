@@ -127,7 +127,10 @@ fn set_test_resume_pause(pause: TestResumePause) -> TestResumePauseGuard {
         Ok(slot) => slot,
         Err(poisoned) => poisoned.into_inner(),
     };
-    assert!(slot.replace(pause).is_none(), "a test resume pause is already active");
+    assert!(
+        slot.replace(pause).is_none(),
+        "a test resume pause is already active"
+    );
     TestResumePauseGuard
 }
 

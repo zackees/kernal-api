@@ -49,6 +49,9 @@ the same client operation and no runtime fallback to a second HAL.
   PDB/DWARF/Mach-O parser worker.
 - `allocator`: the facade-owned allocator plus sampled heap lifecycle/dumps.
 - `async_engine`: the facade-owned runtime/task surface and task diagnostics.
+  It also owns cancellation tokens, connection deadlines, and progress/idle
+  timeout policy; clients must not substitute a raw runtime or global transfer
+  timeout for these contracts.
 
 Client CI installs the two Dylints in [DYLINT.md](DYLINT.md). They deny direct
 implementation-crate use and host `cfg` selection outside this HAL, including

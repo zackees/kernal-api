@@ -22,6 +22,12 @@ package and repository identity on crates.io, PyPI, and GitHub.
 - x86-64 and ARM64
 - `kernal_api::async_engine`, backed by exactly Tokio 1.53.1 in this release
 
+The async facade also owns cooperative cancellation plus separate connection
+and transfer-progress timeout policies. A connection is bounded by a fixed
+deadline; a transfer is bounded by an idle budget that is reset only when the
+caller records meaningful progress. Clients therefore do not need to expose
+Tokio or choose an unsafe global download timeout.
+
 Consumers must pin the same exact `kernal-api` release while the API is below
 1.0. There is no compatibility fallback to the `0.0.0` namespace reservation:
 the crates.io copy is yanked and the PyPI copy has the impossible

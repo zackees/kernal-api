@@ -262,6 +262,10 @@ pub struct CancellationSource {
 struct CancellationState {
     cancelled: AtomicBool,
     notify: Notify,
+    // This is a deterministic regression seam for the Notify registration
+    // race. It is excluded from production artifacts.
+    #[cfg(test)]
+    cancel_after_waiter_check: AtomicBool,
 }
 
 /// Cloneable cancellation capability for one or more async operations.
@@ -281,6 +285,8 @@ impl CancellationSource {
             state: Arc::new(CancellationState {
                 cancelled: AtomicBool::new(false),
                 notify: Notify::new(),
+                #[cfg(test)]
+                cancel_after_waiter_check: AtomicBool::new(false),
             }),
         }
     }
@@ -335,6 +341,15 @@ impl CancellationToken {
             notified.as_mut().enable();
             if self.is_cancelled() {
                 return;
+            }
+            #[cfg(test)]
+            if self
+                .state
+                .cancel_after_waiter_check
+                .swap(false, Ordering::AcqRel)
+            {
+                self.state.cancelled.store(true, Ordering::Release);
+                self.state.notify.notify_waiters();
             }
             notified.await;
         }
@@ -393,6 +408,10 @@ where
 pub struct ConnectionDeadlineElapsed;
 
 /// Reports caller-observable progress for one transfer or streaming operation.
+///
+/// Clones of this reporter, and every [`ProgressWatch`] made from it, share one
+/// intentionally common progress domain. Use a new reporter for independent
+/// transfers so activity on one cannot extend another's idle budget.
 #[derive(Clone, Debug)]
 pub struct ProgressReporter {
     state: Arc<ProgressState>,
@@ -405,6 +424,9 @@ struct ProgressState {
 }
 
 /// Observes progress reported through a paired [`ProgressReporter`].
+///
+/// Clones observe the same intentionally shared progress domain as the
+/// reporter and its other watches.
 #[derive(Clone, Debug)]
 pub struct ProgressWatch {
     state: Arc<ProgressState>,
@@ -538,14 +560,32 @@ mod tests {
         runtime.run(async {
             let source = CancellationSource::new();
             let token = source.token();
-            let trigger = launch(async move {
-                sleep(Duration::from_millis(1)).await;
-                source.cancel();
+            let waiter = launch({
+                let token = token.clone();
+                async move { cancellable(&token, std::future::pending::<()>()).await }
             });
+            yield_now().await;
+            source.cancel();
+            assert_eq!(waiter.await.unwrap(), Err(Cancelled));
+        });
+    }
 
-            let result = cancellable(&token, std::future::pending::<()>()).await;
-            assert_eq!(result, Err(Cancelled));
-            trigger.await.unwrap();
+    #[test]
+    fn cancellation_between_state_check_and_waiter_poll_is_not_lost() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            let source = CancellationSource::new();
+            let token = source.token();
+            token
+                .state
+                .cancel_after_waiter_check
+                .store(true, Ordering::Release);
+
+            token.cancelled().await;
+            assert!(source.is_cancelled());
         });
     }
 
@@ -568,21 +608,25 @@ mod tests {
             .build()
             .unwrap();
         runtime.run(async {
+            tokio::time::pause();
             let reporter = ProgressReporter::new();
             let watch = reporter.watch();
-            let operation = async move {
-                for _ in 0..3 {
-                    sleep(Duration::from_millis(20)).await;
-                    reporter.report_progress();
-                }
-                7_u8
-            };
+            let result = launch(async move {
+                let operation = async move {
+                    for _ in 0..3 {
+                        sleep(Duration::from_millis(10)).await;
+                        reporter.report_progress();
+                    }
+                    7_u8
+                };
+                progress_timeout(Duration::from_millis(15), &watch, operation).await
+            });
 
-            // Leave room for suite-wide CPU contention: the three reports take
-            // about 60 ms, while this verifies reset semantics rather than a
-            // scheduler-latency bound.
-            let result = progress_timeout(Duration::from_millis(200), &watch, operation).await;
-            assert_eq!(result, Ok(7));
+            for _ in 0..3 {
+                yield_now().await;
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+            assert_eq!(result.await.unwrap(), Ok(7));
         });
     }
 
@@ -593,14 +637,16 @@ mod tests {
             .build()
             .unwrap();
         runtime.run(async {
+            tokio::time::pause();
             let reporter = ProgressReporter::new();
-            let result = progress_timeout(
-                Duration::from_millis(1),
-                &reporter.watch(),
-                std::future::pending::<()>(),
-            )
-            .await;
-            assert_eq!(result, Err(ProgressIdleElapsed));
+            let watch = reporter.watch();
+            let result = launch(async move {
+                progress_timeout(Duration::from_millis(10), &watch, std::future::pending::<()>())
+                    .await
+            });
+            yield_now().await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+            assert_eq!(result.await.unwrap(), Err(ProgressIdleElapsed));
         });
     }
 }

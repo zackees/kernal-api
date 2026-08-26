@@ -1332,7 +1332,7 @@ mod tests {
                 .unwrap();
         });
         entered_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(2))
             .expect("install never reached the forced reattach point");
 
         // The installer now owns the only other Runtime Arc and is paused
@@ -1340,7 +1340,7 @@ mod tests {
         drop(guard);
         release_tx.send(()).expect("release paused installer");
         let result = result_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(2))
             .expect("failed reattach deadlocked while dropping the final Runtime Arc");
         assert!(matches!(result, Err(InstallError::Handler(_))));
         installer.join().unwrap();

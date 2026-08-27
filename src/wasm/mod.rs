@@ -443,6 +443,7 @@ impl AdmittedSketch {
             ThreadStoreState {
                 controller: Arc::clone(&prepared.controller),
                 runtime: Some(runtime),
+                fuel_generation: root.fuel_generation,
             },
         );
         // Instantiation itself executes the module start section, so the
@@ -567,6 +568,7 @@ impl AdmittedSketch {
             ThreadStoreState {
                 controller: Arc::clone(&controller),
                 runtime: None,
+                fuel_generation: 0,
             },
         );
         linker
@@ -1005,9 +1007,11 @@ struct ThreadController {
 struct SessionState {
     active_roots: usize,
     closing: bool,
+    next_fuel_generation: u64,
     fuel: Option<FuelExecution>,
 }
 struct FuelExecution {
+    generation: u64,
     remaining_child_slices: usize,
     child_slice: u64,
 }
@@ -1068,7 +1072,10 @@ impl ThreadController {
         let permit = self.execution_ledger.acquire_root()?;
         session.active_roots += 1;
         let fuel = self.execution_ledger.limits.fuel_limits;
+        session.next_fuel_generation = session.next_fuel_generation.wrapping_add(1).max(1);
+        let generation = session.next_fuel_generation;
         session.fuel = Some(FuelExecution {
+            generation,
             remaining_child_slices: MAX_GUEST_THREADS_V1,
             child_slice: fuel.child_slice,
         });
@@ -1076,11 +1083,15 @@ impl ThreadController {
             controller: Arc::clone(self),
             _permit: permit,
             root_fuel: fuel.root_slice,
+            fuel_generation: generation,
         })
     }
-    fn reserve_child_fuel(&self) -> Option<u64> {
+    fn reserve_child_fuel(&self, generation: u64) -> Option<u64> {
         let mut session = self.session.lock().ok()?;
         let fuel = session.fuel.as_mut()?;
+        if fuel.generation != generation {
+            return None;
+        }
         if fuel.remaining_child_slices == 0 {
             return None;
         }
@@ -1185,6 +1196,7 @@ struct LogicalRootPermit {
     controller: Arc<ThreadController>,
     _permit: RootExecutionPermit,
     root_fuel: u64,
+    fuel_generation: u64,
 }
 impl Drop for LogicalRootPermit {
     fn drop(&mut self) {
@@ -1202,6 +1214,7 @@ impl Drop for LogicalRootPermit {
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
+    fuel_generation: u64,
 }
 
 #[cfg(test)]
@@ -1265,7 +1278,8 @@ fn define_closed_imports(
                 // thread, Store, or instance exists. A failed reservation is
                 // the same closed ABI sentinel as other rejected spawns, with
                 // a separate bounded semantic reason.
-                let Some(child_fuel) = controller.reserve_child_fuel() else {
+                let generation = caller.data().fuel_generation;
+                let Some(child_fuel) = controller.reserve_child_fuel(generation) else {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.fuel_rejections = workers.fuel_rejections.saturating_add(1);
                     }
@@ -1313,6 +1327,7 @@ fn define_closed_imports(
                             ThreadStoreState {
                                 controller: Arc::clone(&child),
                                 runtime,
+                                fuel_generation: generation,
                             },
                         );
                         if store.set_fuel(child_fuel).is_err() {

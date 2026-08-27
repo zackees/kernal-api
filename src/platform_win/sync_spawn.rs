@@ -1146,6 +1146,16 @@ fn daemon_creation_flags(base: DWORD, breakaway: bool) -> DWORD {
 mod daemon_flag_tests {
     use super::*;
 
+    static STRICT_WORKER_NATIVE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn strict_worker_native_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STRICT_WORKER_NATIVE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Breakaway is what lets a daemon outlive the job its spawner sits in.
     /// Without it, KILL_ON_JOB_CLOSE reaps the daemon when the job closes.
     #[test]
@@ -1313,6 +1323,7 @@ mod daemon_flag_tests {
     #[test]
     fn strict_worker_assigns_before_resume_and_job_close_reaps_tree() {
         const TEST_WAIT_MS: DWORD = 5_000;
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let _hook = strict_worker_test_hook::install(marker.path.clone());
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
@@ -1368,6 +1379,7 @@ mod daemon_flag_tests {
 
     #[test]
     fn strict_worker_timeout_retains_process_for_explicit_retry() {
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
@@ -1394,6 +1406,7 @@ mod daemon_flag_tests {
 
     #[test]
     fn injected_assign_denial_is_semantic_and_never_reaches_worker_entry() {
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
@@ -1420,6 +1433,7 @@ mod daemon_flag_tests {
 
     #[test]
     fn strict_job_rejects_breakaway_creation() {
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let breakaway = StrictWorkerTestMarker::new();
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
@@ -1448,6 +1462,7 @@ mod daemon_flag_tests {
 
     #[test]
     fn strict_active_process_limit_rejects_worker_descendant() {
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let mut command = Command::new(std::env::current_exe().expect("test executable"));
         command
@@ -1481,6 +1496,7 @@ mod daemon_flag_tests {
     #[allow(clippy::zombie_processes)] // explicit direct/descendant cleanup follows.
     fn ordinary_spawn_can_enter_before_post_spawn_job_assignment() {
         const TEST_WAIT_MS: DWORD = 5_000;
+        let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let mut helper = Command::new(std::env::current_exe().expect("test executable"));
         helper

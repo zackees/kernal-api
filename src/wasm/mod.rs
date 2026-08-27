@@ -4,6 +4,10 @@
 //! binary contract has succeeded. The threaded-root profile can then start in
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
+mod worker_protocol;
+
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::align_of;

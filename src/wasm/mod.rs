@@ -1853,8 +1853,8 @@ mod epoch_broker_tests {
     }
 
     #[test]
-    fn containment_required_host_block_is_killed_only_in_a_subprocess() {
-        const MODE: &str = "KERNAL_API_EPOCH_CONTAINMENT_CHILD";
+    fn containment_required_atomic_wait_is_killed_only_in_a_subprocess() {
+        const MODE: &str = "KERNAL_API_EPOCH_ATOMIC_WAIT_CHILD";
         const MARKER: &str = "KERNAL_API_EPOCH_ATOMIC_WAIT_MARKER";
         if std::env::var_os(MODE).is_some() {
             let bytes = super::threaded_root_observation_tests::atomic_wait_fixture();
@@ -1879,13 +1879,13 @@ mod epoch_broker_tests {
         }
         let executable = std::env::current_exe().expect("test executable");
         let marker = std::env::temp_dir().join(format!(
-            "kernal-api-epoch-host-block-{}",
-            std::process::id()
+            "kernal-api-epoch-atomic-wait-{}-{:?}",
+            std::process::id(), std::thread::current().id()
         ));
         let _ = std::fs::remove_file(&marker);
         let child = std::process::Command::new(executable)
             .arg("--exact")
-            .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
+            .arg("wasm::epoch_broker_tests::containment_required_atomic_wait_is_killed_only_in_a_subprocess")
             .arg("--nocapture")
             .env(MODE, "1")
             .env(MARKER, &marker)
@@ -1903,7 +1903,7 @@ mod epoch_broker_tests {
                     .try_wait()
                     .expect("child status")
                     .is_none(),
-                "containment child exited before reaching the host block"
+                "atomic-wait child exited before reaching the fixture"
             );
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1916,7 +1916,7 @@ mod epoch_broker_tests {
             "entered"
         );
         // Several clock cadence intervals must elapse without pretending the
-        // parked native host call became interruptible.
+        // guest atomic wait became interruptible.
         std::thread::sleep(Duration::from_millis(30));
         assert!(
             guard
@@ -1928,6 +1928,39 @@ mod epoch_broker_tests {
         );
         let classification = SketchExecutionError::ContainmentRequired;
         assert_eq!(classification.code(), "containment-required");
+        guard.reap_and_disarm();
+    }
+
+    #[test]
+    fn containment_required_host_block_is_killed_only_in_a_subprocess() {
+        const MODE: &str = "KERNAL_API_EPOCH_HOST_BLOCK_CHILD";
+        const MARKER: &str = "KERNAL_API_EPOCH_HOST_BLOCK_MARKER";
+        if std::env::var_os(MODE).is_some() {
+            let bytes = super::threaded_root_observation_tests::threaded_yield_fixture();
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let sketch = compiler.admit(&bytes, SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy")).expect("admission");
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+            // The actual Wasm import callback writes readiness and parks.
+            runtime.run(async { let _ = sketch.execute_threaded_root(runtime.handle()).await; });
+            return;
+        }
+        let marker = std::env::temp_dir().join(format!("kernal-api-epoch-host-block-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_file(&marker);
+        let child = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
+            .arg("--nocapture").env(MODE, "1").env(MARKER, &marker).spawn().expect("host-block child");
+        let mut guard = ContainmentChildGuard { child: Some(child), marker };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !guard.marker.exists() && Instant::now() < deadline {
+            assert!(guard.child_mut().try_wait().expect("child status").is_none(), "host-block child exited before callback readiness");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(guard.marker.exists(), "child must enter the real Wasm host callback");
+        assert_eq!(std::fs::read_to_string(&guard.marker).expect("read marker"), "entered");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(guard.child_mut().try_wait().expect("child status").is_none(), "host block must outlive epoch ticks");
+        assert_eq!(SketchExecutionError::ContainmentRequired.code(), "containment-required");
         guard.reap_and_disarm();
     }
 }

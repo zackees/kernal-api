@@ -101,12 +101,12 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
-    let outcome = runtime.run(async {
+    let error = runtime.run(async {
         sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
     });
     assert_eq!(
-        outcome.expect("negative thread-spawn rejection"),
-        ThreadedRootOutcome::Started
+        error.expect_err("the owned child proc_exit must reach the root join"),
+        SketchExecutionError::ChildNonzeroExit { code: 9 },
     );
 }
 
@@ -228,17 +228,27 @@ fn threaded_root_wasm(
     section(8, vec![12], &mut wasm);
     let mut code = Vec::new();
     leb(5, &mut code);
-    code.extend([
-        2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b,
-    ]);
+    // Root `_start`, `__main_void`, child `wasi_thread_start`, and the
+    // `kernal-api-run` export. The module start below remains a no-op: this
+    // proves the host enters the command only through `_start`, and that a
+    // positive thread-spawn result means a fresh child instance ran and was
+    // joined before execute_threaded_root returns.
+    if assert_thread_spawn_rejection {
+        code.extend([
+            7, 0, 0x41, 0, 0x10, 1, 0x1a, 0x0b, // root: spawn then drop TID
+            4, 0, 0x41, 0, 0x0b, 6, 0, 0x41, 9, 0x10, 6, 0x0b, // child: proc_exit(9)
+            4, 0, 0x41, 0, 0x0b,
+        ]);
+    } else {
+        code.extend([
+            2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b,
+        ]);
+    }
     if let Some(exit_code) = proc_exit {
         // Imported function index 6 is `wasi_snapshot_preview1::proc_exit`.
         code.extend([6, 0, 0x41, exit_code as u8, 0x10, 6, 0x0b]);
     } else if assert_thread_spawn_rejection {
-        // `thread-spawn` import index 1 accepts one child and returns its
-        // positive TID. Dropping it proves the root remains callable while
-        // the host owns child bootstrap and cooperative joining.
-        code.extend([7, 0, 0x41, 0, 0x10, 1, 0x1a, 0x0b]);
+        code.extend([2, 0, 0x0b]);
     } else if assert_fd_write_fault {
         // `fd_write` import index 5 must reject the negative iovec pointer.
         code.extend([

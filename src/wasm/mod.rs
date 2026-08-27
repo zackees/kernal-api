@@ -6,7 +6,8 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
@@ -32,6 +33,7 @@ const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
 const MAX_P1_IOVECS: usize = 1024;
+const MAX_GUEST_THREADS: usize = 16;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -210,10 +212,14 @@ impl AdmittedSketch {
                 runtime: Some(runtime),
             },
         );
-        match prepared.prelink.instantiate(&mut store) {
-            Ok(_) => Ok(ThreadedRootOutcome::Started),
-            Err(error) => map_root_error(&error),
-        }
+        let instance = match prepared.prelink.instantiate(&mut store) {
+            Ok(instance) => instance,
+            Err(error) => return map_root_error(&error),
+        };
+        let start = instance.get_typed_func::<(), ()>(&mut store, "_start").map_err(|_| SketchExecutionError::Trapped)?;
+        let outcome = start.call(&mut store, ()).map(|_| ThreadedRootOutcome::Started).or_else(|e| map_root_error(&e));
+        prepared.controller.join_completed();
+        outcome
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
@@ -232,8 +238,10 @@ impl AdmittedSketch {
         )
         .map_err(|_| SketchExecutionError::SharedMemoryUnavailable)?;
         let controller = Arc::new(ThreadController {
+            engine: Arc::clone(&self.engine),
             memory,
             prelink: OnceLock::new(),
+            workers: Mutex::new(Workers { next_tid: 1, live: 0, closing: false, handles: Vec::new() }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
         });
@@ -354,6 +362,7 @@ impl fmt::Display for SketchExecutionError {
 impl std::error::Error for SketchExecutionError {}
 
 struct ThreadController {
+    engine: Arc<Engine>,
     memory: SharedMemory,
     // Callbacks reach their controller through ThreadStoreState. Keeping the
     // prelink here breaks their otherwise cyclic construction without letting a
@@ -361,6 +370,14 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
+    workers: Mutex<Workers>,
+}
+struct Workers { next_tid: i32, live: usize, closing: bool, handles: Vec<JoinHandle<()>> }
+impl ThreadController {
+    fn join_completed(&self) {
+        let handles = self.workers.lock().map(|mut w| { w.closing = true; std::mem::take(&mut w.handles) }).unwrap_or_default();
+        for handle in handles { let _ = handle.join(); }
+    }
 }
 
 struct PreparedThreadedRoot {
@@ -412,10 +429,29 @@ fn define_closed_imports(
         .func_wrap(
             THREAD_MODULE,
             THREAD_SPAWN,
-            |_caller: Caller<'_, ThreadStoreState>, _arg: i32| -> i32 {
-                // #35 replaces this pure deterministic rejection with the owned
-                // child Store/Instance/native-thread bootstrap.
-                THREAD_SPAWN_REJECTED
+            |caller: Caller<'_, ThreadStoreState>, arg: i32| -> i32 {
+                let controller = Arc::clone(&caller.data().controller);
+                let runtime = caller.data().runtime.clone();
+                let tid = match controller.workers.lock() {
+                    Ok(mut w) if !w.closing && w.live < MAX_GUEST_THREADS && w.next_tid <= 0x1fff_ffff => { let tid=w.next_tid; w.next_tid += 1; w.live += 1; tid }
+                    _ => return THREAD_SPAWN_REJECTED,
+                };
+                let child = Arc::clone(&controller);
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let result = std::panic::catch_unwind(|| {
+                        let mut store = Store::new(&child.engine, ThreadStoreState { controller: Arc::clone(&child), runtime });
+                        let prelink = child.prelink.get().expect("prepared prelink");
+                        let instance = prelink.instantiate(&mut store).expect("child instance");
+                        let entry = instance.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start").expect("thread entry");
+                        let _ = entry.call(&mut store, (tid, arg));
+                    });
+                    let _ = result;
+                    if let Ok(mut w) = child.workers.lock() { w.live = w.live.saturating_sub(1); }
+                });
+                match spawned {
+                    Ok(handle) => { if let Ok(mut w) = controller.workers.lock() { w.handles.push(handle); tid } else { THREAD_SPAWN_REJECTED } }
+                    Err(_) => { if let Ok(mut w)=controller.workers.lock(){w.live=w.live.saturating_sub(1);} THREAD_SPAWN_REJECTED }
+                }
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;

@@ -22,6 +22,11 @@ name = "kernal-symbolize"
 path = "src/bin/kernal-symbolize.rs"
 required-features = ["symbolize-worker"]
 
+[[bin]]
+name = "kernal-wasm-worker"
+path = "src/bin/kernal-wasm-worker.rs"
+required-features = ["wasm-sketch-worker"]
+
 [features]
 default = []
 fs = ["dep:dirs"]
@@ -78,6 +83,12 @@ symbolize-worker = [
 # It uses core Wasm plus Cranelift; WASI, the Component Model, pooling, Winch,
 # and a second executor remain out of this first admission-only slice.
 wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser"]
+# Private one-request worker protocol; the executable/supervisor follows in
+# phase B. Keeping this separate preserves default-feature isolation.
+wasm-sketch-worker = ["wasm-sketch-host"]
+# Deliberately test-only: permits the private worker supervisor to publish an
+# exact native identity to an externally controlled containment harness.
+wasm-sketch-worker-test-support = ["wasm-sketch-worker"]
 full = [
   "allocator",
   "conpty-sidecar",

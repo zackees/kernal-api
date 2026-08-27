@@ -4,6 +4,17 @@
 //! binary contract has succeeded. The threaded-root profile can then start in
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
+#[cfg(feature = "wasm-sketch-worker")]
+mod worker;
+#[cfg(feature = "wasm-sketch-worker")]
+#[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
+mod worker_protocol;
+#[cfg(feature = "wasm-sketch-worker")]
+pub use worker::{
+    SketchWorkerConfig, SketchWorkerExecutionSnapshot, SketchWorkerFailure, SketchWorkerStopReason,
+    SketchWorkerTerminal,
+};
+
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::align_of;
@@ -334,6 +345,10 @@ pub struct SketchCompiler {
     compilations: Arc<AtomicU64>,
     execution_ledger: Arc<ExecutionLedger>,
     epoch_broker: Arc<EpochBroker>,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_config: SketchCompilerConfig,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_ledger: Arc<worker::WorkerExecutionLedger>,
 }
 impl SketchCompiler {
     /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
@@ -362,6 +377,10 @@ impl SketchCompiler {
             engine,
             compilations: Arc::new(AtomicU64::new(0)),
             execution_ledger: Arc::new(ExecutionLedger::new(config.execution_limits)),
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_config: config,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_ledger: Arc::new(worker::WorkerExecutionLedger::default()),
         })
     }
     /// Preflights and then compiles one module. Rejected input cannot compile.
@@ -393,6 +412,14 @@ impl SketchCompiler {
             max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
             validation: policy.validation,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_source: Arc::<[u8]>::from(bytes),
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_compiler_config: self.worker_config,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_policy: policy,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_ledger: Arc::clone(&self.worker_ledger),
             execution_ledger: Arc::clone(&self.execution_ledger),
             epoch_broker: Arc::clone(&self.epoch_broker),
             prepared_root: std::sync::Mutex::new(None),
@@ -507,6 +534,17 @@ pub struct AdmittedSketch {
     max_guest_threads: usize,
     profile: SketchAdmissionProfile,
     validation: bool,
+    #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
+    worker_source: Arc<[u8]>,
+    #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
+    worker_compiler_config: SketchCompilerConfig,
+    #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
+    worker_policy: SketchModulePolicy,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_ledger: Arc<worker::WorkerExecutionLedger>,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
     // controller: it must survive any future controller replacement to prove
@@ -876,6 +914,19 @@ pub struct ThreadSpawnRejectionSummary {
     epoch: u32,
 }
 impl ThreadSpawnRejectionSummary {
+    pub(crate) const fn from_worker_counts(
+        capacity: u32,
+        closing: u32,
+        fuel: u32,
+        epoch: u32,
+    ) -> Self {
+        Self {
+            capacity,
+            closing,
+            fuel,
+            epoch,
+        }
+    }
     pub fn capacity(self) -> u32 {
         self.capacity
     }
@@ -2854,22 +2905,29 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
-    fn epoch_deadline_reports_the_ordered_child_outcome_and_releases_every_store_slot() {
+    fn epoch_deadline_releases_every_store_slot_when_root_or_child_observes_it() {
         let compiler = epoch_compiler(Duration::from_millis(5), MAX_GUEST_THREADS_V1 + 1);
         let sketch = admit_epoch_fixture(&compiler, child_fuel_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
-            Err(SketchExecutionError::ChildOutcomes {
-                outcomes: vec![ThreadedChildOutcome {
+        // The epoch ticker can interrupt either the root while it is spawning the child or
+        // the child after it begins running.  Both are the documented deadline result; which
+        // store observes the tick is scheduler-dependent, so do not make the test depend on
+        // that race.  The cleanup assertions below are the contract under test.
+        let result = runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await });
+        match result {
+            Err(SketchExecutionError::DeadlineExceeded) => {}
+            Err(SketchExecutionError::ChildOutcomes { outcomes }) => assert_eq!(
+                outcomes,
+                vec![ThreadedChildOutcome {
                     tid: 1,
-                    kind: ThreadedChildOutcomeKind::DeadlineExceeded
+                    kind: ThreadedChildOutcomeKind::DeadlineExceeded,
                 }]
-            })
-        );
+            ),
+            other => panic!("expected a root or child deadline, got {other:?}"),
+        }
         sketch.close_threaded_root().expect("close");
         let snapshot = compiler.execution_limits_snapshot();
         assert_eq!(snapshot.active_epoch_registrations(), 0);

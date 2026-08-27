@@ -604,7 +604,7 @@ mod sync_spawn;
 pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 #[allow(unused_imports)] // strict-worker containment is consumed by the next worker-process phase.
 pub(crate) use sync_spawn::{
-    spawn_strict_contained_worker, StrictWorkerChild, StrictWorkerLimits, StrictWorkerSpawnError,
+    spawn_contained_worker, spawn_strict_contained_worker, StrictWorkerChild, StrictWorkerLimits, StrictWorkerSpawnError,
     StrictWorkerSpawnStage,
 };
 

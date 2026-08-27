@@ -188,6 +188,7 @@ impl RuntimeHandle {
             inner: self.inner.spawn_blocking(operation),
         }
     }
+    #[cfg(feature = "wasm-sketch-host")]
     pub(crate) fn same_runtime_for_wasm(&self, other: &Self) -> bool {
         // `tokio::runtime::Id` deliberately has no public numeric conversion.
         // Preserve it as opaque backend identity and compare only through

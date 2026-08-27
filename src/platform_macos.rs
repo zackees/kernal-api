@@ -136,6 +136,7 @@ pub fn ipc_broker_endpoint_name(bare_name: &str, path_scoped: bool) -> std::io::
 }
 
 /// macOS `sun_path` is 104 bytes including the NUL terminator.
+#[allow(dead_code)] // Used only when the optional IPC capability is enabled.
 const MACOS_SUN_PATH_MAX: usize = 104;
 
 #[cfg(feature = "ipc")]
@@ -570,9 +571,14 @@ pub fn configure_sync_daemon_command(command: &mut std::process::Command) -> io:
 
 pub fn configure_sync_contained_command(command: &mut std::process::Command) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
+    let owner_pid = unsafe { libc::getpid() };
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 { return Err(io::Error::last_os_error()); }
+            // macOS has no PDEATHSIG. The acknowledged supervisor is installed
+            // before exec, after this child becomes its own process-group
+            // leader, so owner death can kill ordinary worker descendants too.
+            install_owner_death_supervisor(owner_pid)?;
             unix_mark_extra_fds_close_on_exec();
             Ok(())
         });
@@ -791,14 +797,19 @@ fn owner_death_supervisor(
         let count = unsafe { libc::kevent(queue, std::ptr::null(), 0, events.as_mut_ptr(), 1, std::ptr::null()) };
         if count <= 0 {
             if count < 0 && last_errno() == libc::EINTR { continue; }
-            unsafe { libc::kill(target_pid, libc::SIGKILL); }
+            unsafe { libc::kill(supervisor_kill_target(target_pid), libc::SIGKILL); }
             break;
         }
-        if events[0].ident == owner_pid as libc::uintptr_t { unsafe { libc::kill(target_pid, libc::SIGKILL); } }
+        if events[0].ident == owner_pid as libc::uintptr_t { unsafe { libc::kill(supervisor_kill_target(target_pid), libc::SIGKILL); } }
         break;
     }
     unsafe { libc::close(queue); libc::_exit(0); }
 }
+
+/// The worker is made a process-group leader before its supervisor starts.
+/// A negative target is therefore the ordinary worker descendant tree, not
+/// the supervisor itself.
+fn supervisor_kill_target(target_pid: libc::pid_t) -> libc::pid_t { -target_pid }
 
 fn close_supervisor_fds(handshake_fd: libc::c_int) -> Result<(), libc::c_int> {
     const BATCH_SIZE: usize = 64;
@@ -890,6 +901,70 @@ mod tests;
 #[path = "sync_spawn_group.rs"]
 mod sync_spawn;
 pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
+
+/// Launch the private Wasm worker with protocol-only stdio and no inherited
+/// ambient environment. The contained pre-exec path installs the acknowledged
+/// kqueue owner-death supervisor before guest code can run.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+pub(crate) fn spawn_contained_worker(
+    command: &mut std::process::Command,
+    _limits: crate::platform::process::WorkerLimits,
+) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
+    use crate::platform::process::{SpawnStdio, StdioSource, SyncEnvironment, WorkerError, WorkerStage};
+    let child = spawn_sync(
+        command,
+        SpawnStdio {
+            stdin: StdioSource::Pipe,
+            stdout: StdioSource::Pipe,
+            stderr: StdioSource::Null,
+            drain_timeout: None,
+            show_console: false,
+        },
+        SyncEnvironment::Explicit(Vec::new()),
+    )
+    .map_err(|error| WorkerError::new(WorkerStage::Create, error))?;
+    let (stdin, stdout, pid, inner) = child.into_worker_parts();
+    Ok(crate::platform::process::WorkerChild::new(
+        stdin,
+        stdout,
+        pid,
+        Box::new(MacosWorkerControl { inner }),
+    ))
+}
+
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+struct MacosWorkerControl {
+    inner: Box<dyn crate::platform::process::SpawnedChildControl>,
+}
+
+impl crate::platform::process::WorkerChildControl for MacosWorkerControl {
+    fn try_wait(&mut self) -> io::Result<Option<i32>> { self.inner.try_wait() }
+
+    fn force_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), crate::platform::process::WorkerError> {
+        use crate::platform::process::{WorkerError, WorkerStage};
+        self.inner.kill().map_err(|error| WorkerError::new(WorkerStage::Terminate, error))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.inner.try_wait().map_err(|error| WorkerError::new(WorkerStage::Reap, error))?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkerError::new(WorkerStage::Reap, io::Error::new(io::ErrorKind::TimedOut, "contained worker did not exit")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn shutdown(&mut self) { self.inner.shutdown(); }
+}
+
+#[cfg(test)]
+mod contained_worker_tests {
+    #[test]
+    fn supervisor_kills_the_worker_group() {
+        assert_eq!(super::supervisor_kill_target(42), -42);
+    }
+}
 
 #[cfg(all(test, feature = "ipc"))]
 mod endpoint_naming_tests {

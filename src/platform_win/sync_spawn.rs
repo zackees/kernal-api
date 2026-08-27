@@ -836,6 +836,81 @@ pub(crate) fn spawn_strict_contained_worker(
     })
 }
 
+/// Adapt the strict Job launcher to the private cross-platform worker facade.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+pub(crate) fn spawn_contained_worker(
+    command: &mut Command,
+    limits: crate::platform::process::WorkerLimits,
+) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
+    let mut strict = spawn_strict_contained_worker(
+        command,
+        crate::platform::process::SpawnStdio {
+            stdin: crate::platform::process::StdioSource::Pipe,
+            stdout: crate::platform::process::StdioSource::Pipe,
+            stderr: crate::platform::process::StdioSource::Null,
+            drain_timeout: None,
+            show_console: false,
+        },
+        crate::platform::process::SyncEnvironment::Explicit(Vec::new()),
+        StrictWorkerLimits {
+            active_processes: limits.active_processes,
+            process_memory_bytes: limits.process_memory_bytes,
+            job_memory_bytes: limits.job_memory_bytes,
+        },
+    )
+    .map_err(map_strict_worker_spawn_error)?;
+    let stdin = strict.stdin.take();
+    let stdout = strict.stdout.take();
+    let pid = strict.pid();
+    Ok(crate::platform::process::WorkerChild::new(
+        stdin,
+        stdout,
+        pid,
+        Box::new(StrictWorkerControl { child: Some(strict) }),
+    ))
+}
+
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+struct StrictWorkerControl { child: Option<StrictWorkerChild> }
+
+impl crate::platform::process::WorkerChildControl for StrictWorkerControl {
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        self.child.as_ref().map_or(Ok(None), StrictWorkerChild::try_wait)
+    }
+
+    fn force_and_reap(&mut self, _timeout: std::time::Duration) -> Result<(), crate::platform::process::WorkerError> {
+        let Some(child) = self.child.as_mut() else { return Ok(()); };
+        if let Some(error) = child.terminate_and_reap() {
+            return Err(crate::platform::process::WorkerError::new(map_strict_stage(error.stage()), io::Error::other(error.to_string())));
+        }
+        self.child = None;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(mut child) = self.child.take() { let _ = child.terminate_and_reap(); }
+    }
+}
+
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+fn map_strict_worker_spawn_error(error: StrictWorkerSpawnError) -> crate::platform::process::WorkerError {
+    crate::platform::process::WorkerError::new(map_strict_stage(error.stage()), io::Error::other(error.to_string()))
+}
+
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
+fn map_strict_stage(stage: StrictWorkerSpawnStage) -> crate::platform::process::WorkerStage {
+    use crate::platform::process::WorkerStage;
+    match stage {
+        StrictWorkerSpawnStage::Pipe => WorkerStage::Pipe,
+        StrictWorkerSpawnStage::CreateSuspended => WorkerStage::Create,
+        StrictWorkerSpawnStage::CreateJob | StrictWorkerSpawnStage::ConfigureJob => WorkerStage::ConfigureContainment,
+        StrictWorkerSpawnStage::AssignJob => WorkerStage::AssignContainment,
+        StrictWorkerSpawnStage::Resume => WorkerStage::Resume,
+        StrictWorkerSpawnStage::Terminate => WorkerStage::Terminate,
+        StrictWorkerSpawnStage::Reap => WorkerStage::Reap,
+    }
+}
+
 #[allow(dead_code)]
 fn strict_resume_count_is_valid(previous: u32) -> bool { previous == 1 }
 

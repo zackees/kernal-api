@@ -150,3 +150,63 @@ pub(crate) fn threaded_root_wasm(
 pub(crate) fn looping_root_wasm() -> Vec<u8> {
     threaded_root_wasm(None, false, false, true)
 }
+
+/// A true root-level `unreachable` trap.  Keep this body shape aligned with
+/// the core-Wasm host fixtures: only the exported root is replaced.
+pub(crate) fn unreachable_root_wasm() -> Vec<u8> {
+    threaded_code_fixture([
+        vec![0, 0x0b],
+        vec![0, 0x41, 0, 0x0b],
+        vec![0, 0x0b],
+        vec![0, 0x00, 0x0b],
+        vec![0, 0x0b],
+    ])
+}
+
+/// The exact shared-memory `memory.atomic.wait32(0, 0, -1)` blocker used by
+/// the private core-Wasm fixture.  It deliberately has no wake-up path.
+pub(crate) fn atomic_wait32_wasm() -> Vec<u8> {
+    threaded_code_fixture([
+        vec![
+            0, 0x10, 0, 0x41, 0, 0x41, 0, 0x42, 0x7f, 0xfe, 0x01, 0x02, 0, 0x1a, 0x0b,
+        ],
+        vec![0, 0x41, 0, 0x0b],
+        vec![0, 0x0b],
+        vec![0, 0x41, 0, 0x0b],
+        vec![0, 0x0b],
+    ])
+}
+
+fn threaded_code_fixture(bodies: [Vec<u8>; 5]) -> Vec<u8> {
+    let bytes = threaded_root_wasm(None, false, false, false);
+    let mut section_offset = 8;
+    loop {
+        let id = bytes[section_offset];
+        let mut body_at = section_offset + 1;
+        let mut length = 0_usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[body_at];
+            body_at += 1;
+            length |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let end = body_at + length;
+        if id == 10 {
+            let mut code = Vec::new();
+            leb(bodies.len() as u32, &mut code);
+            for body in bodies {
+                leb(body.len() as u32, &mut code);
+                code.extend(body);
+            }
+            let mut output = bytes[..section_offset].to_vec();
+            section(10, code, &mut output);
+            output.extend_from_slice(&bytes[end..]);
+            return output;
+        }
+        section_offset = end;
+    }
+}

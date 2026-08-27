@@ -23,7 +23,7 @@ pub struct SketchWorkerConfig {
 impl SketchWorkerConfig {
     pub fn new(executable: PathBuf, cooperative_cancel_grace: Duration) -> Result<Self, SketchWorkerFailure> {
         if executable.as_os_str().is_empty() || !executable.is_absolute() || cooperative_cancel_grace.is_zero() || cooperative_cancel_grace > MAX_COOPERATIVE_CANCEL_GRACE {
-            return Err(SketchWorkerFailure::Launch);
+            return Err(SketchWorkerFailure::InvalidConfiguration);
         }
         Ok(Self { executable, cooperative_cancel_grace })
     }
@@ -32,10 +32,10 @@ impl SketchWorkerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SketchWorkerStopReason { Cancelled, DeadlineExceeded, ForcedContainment }
+pub enum SketchWorkerStopReason { Cancelled, DeadlineExceeded }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SketchWorkerFailure { Launch, Protocol, UnexpectedExit, ContainmentCleanup }
-impl SketchWorkerFailure { pub fn code(self) -> &'static str { match self { Self::Launch => "worker-launch", Self::Protocol => "worker-protocol", Self::UnexpectedExit => "worker-unexpected-exit", Self::ContainmentCleanup => "worker-containment-cleanup" } } }
+pub enum SketchWorkerFailure { InvalidConfiguration, Launch, Protocol, UnexpectedExit, ContainmentCleanup }
+impl SketchWorkerFailure { pub fn code(self) -> &'static str { match self { Self::InvalidConfiguration => "worker-invalid-configuration", Self::Launch => "worker-launch", Self::Protocol => "worker-protocol", Self::UnexpectedExit => "worker-unexpected-exit", Self::ContainmentCleanup => "worker-containment-cleanup" } } }
 impl fmt::Display for SketchWorkerFailure { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.code()) } }
 impl std::error::Error for SketchWorkerFailure {}
 
@@ -44,11 +44,12 @@ impl std::error::Error for SketchWorkerFailure {}
 pub enum SketchWorkerTerminal {
     Completed(ThreadedRootOutcome),
     Stopped(SketchWorkerStopReason),
+    ForcedContainment { trigger: SketchWorkerStopReason },
     Execution(SketchExecutionError),
     Failure(SketchWorkerFailure),
 }
 impl SketchWorkerTerminal {
-    pub fn code(&self) -> &'static str { match self { Self::Completed(_) => "worker-completed", Self::Stopped(SketchWorkerStopReason::Cancelled) => "cancelled", Self::Stopped(SketchWorkerStopReason::DeadlineExceeded) => "deadline-exceeded", Self::Stopped(SketchWorkerStopReason::ForcedContainment) => "forced-containment", Self::Execution(error) => error.code(), Self::Failure(error) => error.code() } }
+    pub fn code(&self) -> &'static str { match self { Self::Completed(_) => "worker-completed", Self::Stopped(SketchWorkerStopReason::Cancelled) => "cancelled", Self::Stopped(SketchWorkerStopReason::DeadlineExceeded) => "deadline-exceeded", Self::ForcedContainment { trigger: SketchWorkerStopReason::Cancelled } => "forced-containment-cancelled", Self::ForcedContainment { trigger: SketchWorkerStopReason::DeadlineExceeded } => "forced-containment-deadline-exceeded", Self::Execution(error) => error.code(), Self::Failure(error) => error.code() } }
 }
 impl fmt::Display for SketchWorkerTerminal { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.code()) } }
 
@@ -82,23 +83,58 @@ impl AdmittedSketch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::{SketchCompiler, SketchExecutionSnapshot, THREADED_RUST_MAX_PAGES};
     #[test]
     fn worker_config_requires_absolute_path_and_bounded_nonzero_grace() {
-        assert_eq!(SketchWorkerConfig::new(PathBuf::from("worker"), Duration::from_secs(1)), Err(SketchWorkerFailure::Launch));
+        assert_eq!(SketchWorkerConfig::new(PathBuf::from("worker"), Duration::from_secs(1)), Err(SketchWorkerFailure::InvalidConfiguration));
         let absolute = std::env::current_dir().expect("current directory").join("worker");
-        assert_eq!(SketchWorkerConfig::new(absolute.clone(), Duration::ZERO), Err(SketchWorkerFailure::Launch));
+        assert_eq!(SketchWorkerConfig::new(absolute.clone(), Duration::ZERO), Err(SketchWorkerFailure::InvalidConfiguration));
         assert!(SketchWorkerConfig::new(absolute, Duration::from_millis(1)).is_ok());
     }
     #[test]
     fn terminal_codes_preserve_semantic_categories() {
         assert_eq!(SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled).code(), "cancelled");
-        assert_eq!(SketchWorkerTerminal::Stopped(SketchWorkerStopReason::ForcedContainment).code(), "forced-containment");
+        assert_eq!(SketchWorkerTerminal::ForcedContainment { trigger: SketchWorkerStopReason::Cancelled }.code(), "forced-containment-cancelled");
+        assert_eq!(SketchWorkerTerminal::ForcedContainment { trigger: SketchWorkerStopReason::DeadlineExceeded }.code(), "forced-containment-deadline-exceeded");
         assert_eq!(SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol).code(), "worker-protocol");
+        assert_eq!(SketchWorkerFailure::InvalidConfiguration.code(), "worker-invalid-configuration");
     }
     #[test]
     fn parent_lifecycle_ledger_is_separate_and_bounded() {
         let ledger = WorkerExecutionLedger::default();
         ledger.record_spawned(); ledger.record_cancel_sent(); ledger.record_grace_expired(); ledger.record_forced(); ledger.record_reaped(); ledger.record_protocol_failure();
         assert_eq!(ledger.snapshot(), WorkerExecutionSnapshot { spawned: 1, cancel_sent: 1, grace_expired: 1, forced: 1, reaped: 1, protocol_failures: 1 });
+    }
+    #[test]
+    fn admitted_worker_retains_one_shared_source_allocation() {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let bytes = super::super::epoch_broker_tests::threaded_yield_fixture();
+        let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy");
+        let sketch = compiler.admit(&bytes, policy).expect("admission");
+        let first = sketch.worker_source();
+        let second = sketch.worker_source();
+        assert_eq!(&*first, bytes.as_slice());
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::strong_count(&first) >= 3);
+        assert_eq!(sketch.worker_compiler_config(), SketchCompilerConfig::default());
+        assert_eq!(sketch.worker_policy(), policy);
+    }
+    #[test]
+    fn parent_root_lease_never_prepares_guest_state() {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let bytes = super::super::epoch_broker_tests::threaded_yield_fixture();
+        let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy");
+        let sketch = compiler.admit(&bytes, policy).expect("admission");
+        assert_eq!(compiler.execution_limits_snapshot(), SketchExecutionSnapshot::default());
+        let lease = sketch.acquire_worker_parent_root_lease().expect("parent lease");
+        let during = compiler.execution_limits_snapshot();
+        assert_eq!(during.active_root_executions(), 1);
+        assert_eq!(during.reserved_shared_memory_bytes(), 0);
+        assert_eq!(during.live_stores(), 0);
+        assert_eq!(during.live_instances(), 0);
+        assert_eq!(during.live_guest_threads(), 0);
+        assert_eq!(during.active_epoch_registrations(), 0);
+        drop(lease);
+        assert_eq!(compiler.execution_limits_snapshot(), SketchExecutionSnapshot::default());
     }
 }

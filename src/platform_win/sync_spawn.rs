@@ -11,6 +11,10 @@ use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
 use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
 use winapi::um::handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE};
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
+#[cfg(test)]
+use windows_sys::Win32::Foundation::HANDLE as WindowsHandle;
+#[cfg(test)]
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::namedpipeapi::CreateNamedPipeW;
 use winapi::um::processenv::GetStdHandle;
@@ -19,6 +23,8 @@ use winapi::um::processthreadsapi::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
     UpdateProcThreadAttribute, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
 };
+#[cfg(test)]
+use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
@@ -31,13 +37,30 @@ use winapi::um::winbase::{
 use winapi::um::winnt::{
     JobObjectExtendedLimitInformation, DUPLICATE_SAME_ACCESS, FILE_SHARE_READ, FILE_SHARE_WRITE,
     GENERIC_READ, GENERIC_WRITE, HANDLE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
+#[cfg(test)]
+use winapi::um::winnt::SYNCHRONIZE;
 
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE,
 // TRUE, FALSE) = 0x00020002.
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x00020002;
 const STILL_ACTIVE: u32 = 259;
+/// A containment cleanup must not wedge the host if Windows fails to honor a
+/// Job close or process termination. Worker-process escalation owns any later
+/// retry/reaping policy.
+#[allow(dead_code)] // exercised by the native containment regression; worker wiring follows in #28.
+const STRICT_WORKER_REAP_TIMEOUT_MS: DWORD = 5_000;
+#[allow(dead_code)]
+const WAIT_TIMEOUT_RESULT: DWORD = 0x0000_0102;
+#[cfg(test)]
+static STRICT_WORKER_FORCE_REAP_TIMEOUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static STRICT_WORKER_FORCE_ASSIGN_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub struct OwnedHandle(HANDLE);
 
@@ -535,6 +558,335 @@ pub fn spawn_sync(
     })
 }
 
+/// Private containment stages for the hostile Wasm worker.  This is separate
+/// from generic `spawn_sync`: that path deliberately supports daemon/breakaway
+/// compatibility and must not silently acquire stricter semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum StrictWorkerSpawnStage {
+    Pipe,
+    CreateSuspended,
+    CreateJob,
+    ConfigureJob,
+    AssignJob,
+    Resume,
+    Terminate,
+    Reap,
+}
+
+/// Facade-owned bounds for a hostile Wasm worker Job Object. `None` leaves a
+/// particular Job limit unset; the default still enables KILL_ON_JOB_CLOSE.
+/// Memory values are bytes and must be nonzero and representable as a Windows
+/// `SIZE_T` on the target process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct StrictWorkerLimits {
+    pub(crate) active_processes: Option<u32>,
+    pub(crate) process_memory_bytes: Option<u64>,
+    pub(crate) job_memory_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+enum StrictWorkerLimitError {
+    ZeroActiveProcesses,
+    ZeroProcessMemory,
+    ZeroJobMemory,
+    ProcessMemoryTooLarge,
+    JobMemoryTooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+struct StrictWorkerJobConfiguration {
+    limit_flags: DWORD,
+    active_processes: Option<u32>,
+    process_memory_bytes: Option<usize>,
+    job_memory_bytes: Option<usize>,
+}
+
+impl StrictWorkerLimits {
+    fn job_configuration(self) -> Result<StrictWorkerJobConfiguration, StrictWorkerLimitError> {
+        let active_processes = match self.active_processes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroActiveProcesses),
+            value => value,
+        };
+        let process_memory_bytes = match self.process_memory_bytes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroProcessMemory),
+            Some(value) => Some(
+                usize::try_from(value).map_err(|_| StrictWorkerLimitError::ProcessMemoryTooLarge)?,
+            ),
+            None => None,
+        };
+        let job_memory_bytes = match self.job_memory_bytes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroJobMemory),
+            Some(value) => Some(
+                usize::try_from(value).map_err(|_| StrictWorkerLimitError::JobMemoryTooLarge)?,
+            ),
+            None => None,
+        };
+
+        let mut limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if active_processes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        }
+        if process_memory_bytes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
+        if job_memory_bytes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        }
+        Ok(StrictWorkerJobConfiguration {
+            limit_flags,
+            active_processes,
+            process_memory_bytes,
+            job_memory_bytes,
+        })
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct StrictWorkerSpawnError {
+    stage: StrictWorkerSpawnStage,
+    source: io::Error,
+    cleanup: Option<StrictWorkerCleanupError>,
+}
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct StrictWorkerCleanupError {
+    stage: StrictWorkerSpawnStage,
+    source: io::Error,
+}
+#[allow(dead_code)]
+impl StrictWorkerSpawnError {
+    pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
+    pub(crate) fn cleanup(&self) -> Option<&StrictWorkerCleanupError> { self.cleanup.as_ref() }
+}
+#[allow(dead_code)]
+impl StrictWorkerCleanupError {
+    pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
+    pub(crate) fn message(&self) -> String { self.source.to_string() }
+    pub(crate) fn raw_os_error(&self) -> Option<i32> { self.source.raw_os_error() }
+}
+impl std::fmt::Display for StrictWorkerSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "strict worker spawn failed at {:?}: {}", self.stage, self.source) }
+}
+impl std::error::Error for StrictWorkerSpawnError {}
+impl std::fmt::Display for StrictWorkerCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "strict worker cleanup failed at {:?}: {}", self.stage, self.source)
+    }
+}
+impl std::error::Error for StrictWorkerCleanupError {}
+
+/// Opaque crate-private worker child. Unlike generic `SpawnedChild`, Drop is
+/// a containment operation: it closes the strict Job and waits/reaps the
+/// direct worker. This covers ordinary CreateProcess descendants; processes
+/// created by nonstandard escape mechanisms remain a platform-policy gap.
+#[allow(dead_code)]
+pub(crate) struct StrictWorkerChild {
+    pub(crate) stdin: Option<ChildStdin>,
+    pub(crate) stdout: Option<ChildStdout>,
+    pub(crate) stderr: Option<ChildStderr>,
+    pub(crate) pid: u32,
+    inner: StrictWorkerInner,
+}
+#[allow(dead_code)]
+struct StrictWorkerInner { process: Option<OwnedHandle>, job: Option<OwnedHandle> }
+#[allow(dead_code)]
+impl StrictWorkerChild {
+    pub(crate) fn pid(&self) -> u32 { self.pid }
+    pub(crate) fn try_wait(&self) -> io::Result<Option<i32>> { self.inner.process.as_ref().map_or(Ok(None), try_wait_inner) }
+    pub(crate) fn wait(&self) -> io::Result<i32> { self.inner.process.as_ref().ok_or_else(|| io::Error::other("worker handle absent")).and_then(wait_inner) }
+    /// Idempotent strict shutdown. Closing the Job is the tree termination
+    /// action; `OwnedHandle::Drop` cannot report CloseHandle failure. Reaping
+    /// is bounded, so Drop remains best-effort rather than wedging the host.
+    pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> {
+        self.shutdown(true)
+    }
+    fn shutdown(&mut self, retry_termination: bool) -> Option<StrictWorkerCleanupError> {
+        // KILL_ON_JOB_CLOSE must happen before waiting: it terminates the
+        // worker and ordinary CreateProcess descendants as one containment
+        // action. A failed/timed-out reap deliberately retains the process
+        // handle so an explicit later call can retry it.
+        let job = self.inner.job.take();
+        let closed_job = job.is_some();
+        // Closing the strict Job is the normal tree termination action.
+        drop(job);
+        let cleanup = self.inner.process.as_ref().and_then(|process| {
+            if retry_termination && !closed_job {
+                terminate_and_reap(process)
+            } else {
+                reap_only(process)
+            }
+        });
+        if cleanup.is_none() {
+            drop(self.inner.process.take());
+        }
+        cleanup
+    }
+}
+impl Drop for StrictWorkerChild { fn drop(&mut self) { let _ = self.shutdown(false); } }
+
+#[cfg(test)]
+mod strict_worker_test_hook {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = fn(HANDLE, HANDLE);
+
+    static HOOK: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+    static MARKER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    static OBSERVED: AtomicBool = AtomicBool::new(false);
+
+    fn hook_slot() -> &'static Mutex<Option<Hook>> { HOOK.get_or_init(|| Mutex::new(None)) }
+    fn marker_slot() -> &'static Mutex<Option<PathBuf>> { MARKER.get_or_init(|| Mutex::new(None)) }
+
+    pub(super) struct Guard;
+
+    pub(super) fn install(marker: PathBuf) -> Guard {
+        OBSERVED.store(false, Ordering::SeqCst);
+        *marker_slot().lock().unwrap() = Some(marker);
+        *hook_slot().lock().unwrap() = Some(assert_assigned_while_suspended);
+        Guard
+    }
+
+    pub(super) fn was_observed() -> bool { OBSERVED.load(Ordering::SeqCst) }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *hook_slot().lock().unwrap() = None;
+            *marker_slot().lock().unwrap() = None;
+        }
+    }
+
+    pub(super) fn run(process: HANDLE, job: HANDLE) {
+        if let Some(hook) = *hook_slot().lock().unwrap() {
+            hook(process, job);
+        }
+    }
+
+    fn assert_assigned_while_suspended(process: HANDLE, job: HANDLE) {
+        let marker = marker_slot().lock().unwrap().clone().expect("test marker installed");
+        assert!(
+            !marker.exists(),
+            "worker reached its entry marker before strict spawn resumed it"
+        );
+        let mut contained = FALSE;
+        assert_ne!(
+            unsafe {
+                IsProcessInJob(process as WindowsHandle, job as WindowsHandle, &mut contained)
+            },
+            FALSE,
+            "IsProcessInJob failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_ne!(contained, FALSE, "suspended worker was not assigned to strict Job");
+        OBSERVED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Spawn a worker suspended, attach it to a strict kill-on-close Job Object
+/// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
+/// (including hostile nested-job policy) is an AssignJob failure, never a
+/// successful "already contained" fallback.
+#[allow(dead_code)]
+pub(crate) fn spawn_strict_contained_worker(
+    command: &mut Command,
+    stdio: crate::platform::process::SpawnStdio<'_>,
+    environment: crate::platform::process::SyncEnvironment,
+    limits: StrictWorkerLimits,
+) -> Result<StrictWorkerChild, StrictWorkerSpawnError> {
+    let stdin = resolve_slot(&stdio.stdin, SlotDir::Stdin).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    let stdout = resolve_slot(&stdio.stdout, SlotDir::Stdout).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    let stderr = resolve_slot(&stdio.stderr, SlotDir::Stderr).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    // Job setup is intentionally before CreateProcessW: failure here leaves
+    // no suspended hostile child to clean up.
+    let job = create_strict_worker_job(limits)
+        .map_err(|(stage, source)| StrictWorkerSpawnError { stage, source, cleanup: None })?;
+    let (process, thread, pid) = create_process_inner(command, &stdin.child_handle, &stdout.child_handle, &stderr.child_handle, CreateMode::Contained { show_console: false }, environment)
+        .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source, cleanup: None })?;
+    let process = OwnedHandle(process);
+    let thread = OwnedHandle(thread);
+    if let Err(source) = assign_strict_worker_to_job(job.as_raw(), process.as_raw()) {
+        let cleanup = terminate_and_reap(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source, cleanup });
+    }
+    #[cfg(test)]
+    strict_worker_test_hook::run(process.as_raw(), job.as_raw());
+    let resumed = unsafe { ResumeThread(thread.as_raw()) };
+    if !strict_resume_count_is_valid(resumed) {
+        let source = if resumed == u32::MAX { io::Error::last_os_error() } else { io::Error::other("strict worker suspend count was not one") };
+        // Assignment succeeded, so Job close kills the complete contained
+        // tree before direct-worker reaping.
+        drop(job);
+        let cleanup = reap_only(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Resume, source, cleanup });
+    }
+    drop(thread);
+    Ok(StrictWorkerChild {
+        stdin: stdin.parent_end.map(OverlappedHandle::into_child_stdin),
+        stdout: stdout.parent_end.map(OverlappedHandle::into_child_stdout),
+        stderr: stderr.parent_end.map(OverlappedHandle::into_child_stderr),
+        pid,
+        inner: StrictWorkerInner { process: Some(process), job: Some(job) },
+    })
+}
+
+#[allow(dead_code)]
+fn strict_resume_count_is_valid(previous: u32) -> bool { previous == 1 }
+
+fn assign_strict_worker_to_job(job: HANDLE, process: HANDLE) -> io::Result<()> {
+    #[cfg(test)]
+    if STRICT_WORKER_FORCE_ASSIGN_DENIED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected AssignProcessToJobObject access denied",
+        ));
+    }
+    if unsafe { AssignProcessToJobObject(job, process) } == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
+    let terminate = if unsafe { TerminateProcess(process.as_raw(), 1) } == FALSE {
+        Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
+    } else { None };
+    let reap = reap_only(process);
+    // A process that already exited between Job close and this retry can
+    // reject TerminateProcess; successful reaping is still success.
+    reap.as_ref()?;
+    terminate.or(reap)
+}
+
+#[allow(dead_code)]
+fn reap_only(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
+    #[cfg(test)]
+    if STRICT_WORKER_FORCE_REAP_TIMEOUT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::new(io::ErrorKind::TimedOut, "injected strict worker reap timeout"),
+        });
+    }
+    match unsafe { WaitForSingleObject(process.as_raw(), STRICT_WORKER_REAP_TIMEOUT_MS) } {
+        WAIT_OBJECT_0 => None,
+        WAIT_TIMEOUT_RESULT => Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::new(io::ErrorKind::TimedOut, "strict worker did not exit after containment cleanup"),
+        }),
+        _ => Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::last_os_error(),
+        }),
+    }
+}
+
 fn drain_watcher(process_handle: OwnedHandle, timeout: Duration, keep: Arc<()>) {
     // `WAIT_TIMEOUT` (0x102): a single wait slice elapsed without the child
     // exiting. Declared inline to avoid pinning an extra winapi import.
@@ -792,6 +1144,16 @@ fn daemon_creation_flags(base: DWORD, breakaway: bool) -> DWORD {
 mod daemon_flag_tests {
     use super::*;
 
+    static STRICT_WORKER_NATIVE_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn strict_worker_native_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        STRICT_WORKER_NATIVE_TEST_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Breakaway is what lets a daemon outlive the job its spawner sits in.
     /// Without it, KILL_ON_JOB_CLOSE reaps the daemon when the job closes.
     #[test]
@@ -843,6 +1205,393 @@ mod daemon_flag_tests {
             "fallback must equal the non-breakaway flag set"
         );
     }
+
+    #[test]
+    fn strict_worker_limits_default_to_kill_on_close_without_breakaway() {
+        let configuration = StrictWorkerLimits::default().job_configuration().unwrap();
+        let flags = configuration.limit_flags;
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_JOB_MEMORY, 0);
+    }
+
+    #[test]
+    fn strict_worker_limits_map_every_requested_job_limit() {
+        let configuration = StrictWorkerLimits {
+            active_processes: Some(3),
+            process_memory_bytes: Some(4096),
+            job_memory_bytes: Some(8192),
+        }
+        .job_configuration()
+        .unwrap();
+        assert_eq!(configuration.active_processes, Some(3));
+        assert_eq!(configuration.process_memory_bytes, Some(4096));
+        assert_eq!(configuration.job_memory_bytes, Some(8192));
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS, 0);
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY, 0);
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY, 0);
+        assert_eq!(configuration.limit_flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+    }
+
+    #[test]
+    fn strict_worker_limits_reject_zero_values_before_process_creation() {
+        assert_eq!(
+            StrictWorkerLimits { active_processes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroActiveProcesses)
+        );
+        assert_eq!(
+            StrictWorkerLimits { process_memory_bytes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroProcessMemory)
+        );
+        assert_eq!(
+            StrictWorkerLimits { job_memory_bytes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroJobMemory)
+        );
+    }
+
+    #[test]
+    fn strict_worker_accepts_exactly_one_suspension() {
+        assert!(strict_resume_count_is_valid(1));
+        assert!(!strict_resume_count_is_valid(0));
+        assert!(!strict_resume_count_is_valid(2));
+        assert!(!strict_resume_count_is_valid(u32::MAX));
+    }
+
+    /// This is invoked only by the native containment test below. It is an
+    /// ignored test so normal test discovery can never park a helper process.
+    #[test]
+    #[ignore]
+    fn strict_worker_native_descendant_helper() {
+        if std::env::var_os("KERNAL_API_STRICT_WORKER_DESCENDANT").is_some() {
+            std::thread::park();
+        }
+    }
+
+    /// The direct helper spawns an ordinary CreateProcess descendant, reports
+    /// its PID through a marker file, and stays alive until Job close kills it.
+    #[test]
+    #[ignore]
+    #[allow(clippy::zombie_processes)] // closing the strict Job, not Child::wait, proves tree reaping.
+    fn strict_worker_native_helper() {
+        let Some(marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_MARKER") else {
+            return;
+        };
+        if let Some(breakaway_marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_BREAKAWAY") {
+            use std::os::windows::process::CommandExt;
+
+            let mut breakaway = Command::new(std::env::current_exe().expect("test executable"));
+            breakaway
+                .args([
+                    "--exact",
+                    "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_descendant_helper",
+                    "--ignored",
+                ])
+                .env("KERNAL_API_STRICT_WORKER_DESCENDANT", "1")
+                .creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+            let outcome = match breakaway.spawn() {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    format!("unexpected-success:{}", child.id())
+                }
+                Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
+            };
+            std::fs::write(breakaway_marker, outcome).expect("publish breakaway result");
+        }
+        let mut descendant = Command::new(std::env::current_exe().expect("test executable"));
+        descendant
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_descendant_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_DESCENDANT", "1");
+        let outcome = match descendant.spawn() {
+            Ok(descendant) => format!("ready:{}", descendant.id()),
+            Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
+        };
+        std::fs::write(marker, outcome).expect("publish descendant result");
+        std::thread::park();
+    }
+
+    /// Deliberately uncontained RED helper. Unlike the strict fixture it has
+    /// no descendant: its sole purpose is proving user entry after an ordinary
+    /// CreateProcess return and before any later Job assignment could occur.
+    #[test]
+    #[ignore]
+    fn ordinary_post_spawn_red_helper() {
+        if let Some(marker) = std::env::var_os("KERNAL_API_ORDINARY_SPAWN_MARKER") {
+            std::fs::write(marker, "ready").expect("publish ordinary entry marker");
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn strict_worker_assigns_before_resume_and_job_close_reaps_tree() {
+        const TEST_WAIT_MS: DWORD = 5_000;
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let _hook = strict_worker_test_hook::install(marker.path.clone());
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        assert!(
+            strict_worker_test_hook::was_observed(),
+            "the strict pre-resume membership hook was not reached"
+        );
+        let direct = dup_inheritable(
+            worker
+                .inner
+                .process
+                .as_ref()
+                .expect("live worker process")
+                .as_raw(),
+        )
+        .expect("duplicate direct worker handle");
+        let descendant_pid = marker.wait_for_pid();
+        let descendant = unsafe { OpenProcess(SYNCHRONIZE, FALSE, descendant_pid) };
+        assert!(
+            !descendant.is_null(),
+            "open descendant for bounded wait: {}",
+            io::Error::last_os_error()
+        );
+        let descendant = OwnedHandle(descendant);
+
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+        assert_eq!(
+            unsafe { WaitForSingleObject(direct.as_raw(), TEST_WAIT_MS) },
+            WAIT_OBJECT_0,
+            "direct worker did not exit after Job close"
+        );
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw(), TEST_WAIT_MS) },
+            WAIT_OBJECT_0,
+            "ordinary CreateProcess descendant escaped Job close"
+        );
+        assert!(worker.terminate_and_reap().is_none(), "second shutdown was not harmless");
+    }
+
+    #[test]
+    fn strict_worker_timeout_retains_process_for_explicit_retry() {
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        STRICT_WORKER_FORCE_REAP_TIMEOUT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let timeout = worker.terminate_and_reap().expect("injected timeout");
+        assert_eq!(timeout.stage(), StrictWorkerSpawnStage::Reap);
+        assert!(worker.inner.process.is_some(), "timeout must retain retryable process handle");
+        assert!(worker.terminate_and_reap().is_none(), "explicit retry must reap worker");
+        assert!(worker.inner.process.is_none(), "successful reap consumes process handle");
+    }
+
+    #[test]
+    fn injected_assign_denial_is_semantic_and_never_reaches_worker_entry() {
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        STRICT_WORKER_FORCE_ASSIGN_DENIED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = match spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("injected assignment denial unexpectedly spawned a worker"),
+        };
+        assert_eq!(error.stage(), StrictWorkerSpawnStage::AssignJob);
+        assert!(
+            !marker.path.exists(),
+            "suspended worker entered despite failed Job assignment"
+        );
+    }
+
+    #[test]
+    fn strict_job_rejects_breakaway_creation() {
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let breakaway = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path)
+            .env("KERNAL_API_STRICT_WORKER_BREAKAWAY", &breakaway.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        assert!(
+            breakaway.wait_for_text().starts_with("denied:"),
+            "strict Job unexpectedly permitted breakaway creation"
+        );
+        let _ = marker.wait_for_pid();
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+    }
+
+    #[test]
+    fn strict_active_process_limit_rejects_worker_descendant() {
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits {
+                active_processes: Some(1),
+                ..StrictWorkerLimits::default()
+            },
+        )
+        .expect("strict limited worker launch");
+        assert!(
+            marker.wait_for_text().starts_with("denied:"),
+            "active-process Job limit admitted a worker descendant"
+        );
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+    }
+
+    /// RED contrast for the strict launch sequence: a normal CreateProcess
+    /// child can publish its entry marker before its parent has any
+    /// post-spawn opportunity to assign it to a Job Object.
+    #[test]
+    fn ordinary_spawn_can_enter_before_post_spawn_job_assignment() {
+        let _native_test_guard = strict_worker_native_test_guard();
+        let marker = StrictWorkerTestMarker::new();
+        let mut helper = Command::new(std::env::current_exe().expect("test executable"));
+        helper
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::ordinary_post_spawn_red_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_ORDINARY_SPAWN_MARKER", &marker.path);
+        let mut helper = TestChildGuard::new(helper.spawn().expect("ordinary helper spawn"));
+        assert_eq!(marker.wait_for_text(), "ready");
+        assert!(
+            helper.child_mut().try_wait().expect("observe helper").is_none(),
+            "ordinary helper exited before publishing its entry marker"
+        );
+        helper.terminate_and_reap();
+    }
+
+    /// Narrow panic-safe owner for an intentionally uncontained native test
+    /// helper. StrictWorkerChild itself already owns strict-Job cleanup.
+    struct TestChildGuard(Option<std::process::Child>);
+
+    impl TestChildGuard {
+        fn new(child: std::process::Child) -> Self { Self(Some(child)) }
+
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("live test helper")
+        }
+
+        fn terminate_and_reap(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for TestChildGuard {
+        fn drop(&mut self) { self.terminate_and_reap(); }
+    }
+
+    struct StrictWorkerTestMarker {
+        path: std::path::PathBuf,
+    }
+
+    impl StrictWorkerTestMarker {
+        fn new() -> Self {
+            let unique = format!(
+                "kernal-api-strict-worker-{}-{}.marker",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+            );
+            Self { path: std::env::temp_dir().join(unique) }
+        }
+
+        fn wait_for_pid(&self) -> u32 {
+            let text = self.wait_for_text();
+            let pid = text.strip_prefix("ready:").expect("ready descendant marker");
+            pid.parse().expect("descendant pid marker")
+        }
+
+        fn wait_for_text(&self) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&self.path) {
+                    return text;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "strict worker did not publish descendant readiness"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for StrictWorkerTestMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 fn create_job_object() -> io::Result<OwnedHandle> {
@@ -867,6 +1616,47 @@ fn create_job_object() -> io::Result<OwnedHandle> {
         return Err(err);
     }
     Ok(OwnedHandle(job))
+}
+
+#[allow(dead_code)]
+fn create_strict_worker_job(
+    limits: StrictWorkerLimits,
+) -> Result<OwnedHandle, (StrictWorkerSpawnStage, io::Error)> {
+    let configuration = limits.job_configuration().map_err(|error| {
+        (
+            StrictWorkerSpawnStage::ConfigureJob,
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid strict worker limit: {error:?}")),
+        )
+    })?;
+    let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
+        return Err((StrictWorkerSpawnStage::CreateJob, io::Error::last_os_error()));
+    }
+    let job = OwnedHandle(job);
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    // Deliberately no JOB_OBJECT_LIMIT_BREAKAWAY_OK: this worker executes
+    // hostile threaded Wasm and every descendant must remain killable.
+    info.BasicLimitInformation.LimitFlags = configuration.limit_flags;
+    if let Some(active_processes) = configuration.active_processes {
+        info.BasicLimitInformation.ActiveProcessLimit = active_processes;
+    }
+    if let Some(process_memory_bytes) = configuration.process_memory_bytes {
+        info.ProcessMemoryLimit = process_memory_bytes;
+    }
+    if let Some(job_memory_bytes) = configuration.job_memory_bytes {
+        info.JobMemoryLimit = job_memory_bytes;
+    }
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw(),
+            JobObjectExtendedLimitInformation,
+            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == FALSE {
+        return Err((StrictWorkerSpawnStage::ConfigureJob, io::Error::last_os_error()));
+    }
+    Ok(job)
 }
 
 pub fn terminate(handle: &OwnedHandle) -> io::Result<()> {

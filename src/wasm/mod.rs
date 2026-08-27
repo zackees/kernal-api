@@ -856,12 +856,19 @@ mod threaded_root_observation_tests {
         };
         for (metadata, expected) in [
             (
-                vec![VALIDATION_PROFILE_METADATA_VALUE, VALIDATION_PROFILE_METADATA_VALUE],
-                SketchModuleError::DuplicateMetadata { name: PROFILE_METADATA },
+                vec![
+                    VALIDATION_PROFILE_METADATA_VALUE,
+                    VALIDATION_PROFILE_METADATA_VALUE,
+                ],
+                SketchModuleError::DuplicateMetadata {
+                    name: PROFILE_METADATA,
+                },
             ),
             (
                 vec![b"wrong-profile"],
-                SketchModuleError::MetadataMismatch { name: PROFILE_METADATA },
+                SketchModuleError::MetadataMismatch {
+                    name: PROFILE_METADATA,
+                },
             ),
         ] {
             let mut bytes = threaded_yield_fixture();
@@ -878,7 +885,11 @@ mod threaded_root_observation_tests {
         }
 
         let mut bytes = threaded_yield_fixture();
-        custom(PROFILE_METADATA, VALIDATION_PROFILE_METADATA_VALUE, &mut bytes);
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut bytes,
+        );
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
         let error = match compiler.admit(&bytes, policy(bytes.len())) {
             Ok(_) => panic!("report export is required"),
@@ -886,6 +897,79 @@ mod threaded_root_observation_tests {
         };
         assert!(matches!(error, SketchModuleError::ExportNotAllowed { .. }));
         assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
+    fn validation_export_mutation(name: &str, kind: u8, index: u32) -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section = 8;
+        loop {
+            if bytes[section] == 7 {
+                break;
+            }
+            let mut at = section + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[at];
+                at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            section = at + length;
+        }
+        let mut at = section + 1;
+        let mut length = 0_usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[at];
+            at += 1;
+            length |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let body = &bytes[at..at + length];
+        let mut replacement = vec![6];
+        replacement.extend_from_slice(&body[1..]);
+        text(name, &mut replacement);
+        replacement.push(kind);
+        leb(index, &mut replacement);
+        let mut output = bytes[..section].to_vec();
+        output.push(7);
+        leb(replacement.len() as u32, &mut output);
+        output.extend(replacement);
+        output.extend_from_slice(&bytes[at + length..]);
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut output,
+        );
+        output
+    }
+
+    #[test]
+    fn validation_report_export_mutations_reject_precompile() {
+        let cases = [
+            ("wrong-name", 0, 9),
+            (VALIDATION_REPORT, 2, 0),
+            (VALIDATION_REPORT, 0, 8),
+            ("extra", 0, 9),
+        ];
+        for (name, kind, index) in cases {
+            let bytes = validation_export_mutation(name, kind, index);
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                bytes.len() + 1,
+                THREADED_RUST_MAX_PAGES,
+            )
+            .expect("policy");
+            assert!(compiler.admit(&bytes, policy).is_err());
+            assert_eq!(compiler.compiled_module_count(), 0);
+        }
     }
 
     fn leb(mut value: u32, output: &mut Vec<u8>) {
@@ -1797,7 +1881,9 @@ fn preflight_threaded_rust(
                 PROFILE_METADATA if validation => {
                     validation_metadata += 1;
                     if validation_metadata > 1 {
-                        return Err(SketchModuleError::DuplicateMetadata { name: PROFILE_METADATA });
+                        return Err(SketchModuleError::DuplicateMetadata {
+                            name: PROFILE_METADATA,
+                        });
                     }
                     if section.data() != VALIDATION_PROFILE_METADATA_VALUE {
                         return Err(SketchModuleError::MetadataMismatch {

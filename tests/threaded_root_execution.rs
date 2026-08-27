@@ -192,6 +192,7 @@ fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) {
 // Minimal structurally valid ThreadedRustV1 artifact. The start function is
 // intentionally unexported: Wasmtime runs it during instantiate, not by
 // calling exported `_start` or `kernal-api-run` separately.
+#[allow(dead_code)]
 fn legacy_threaded_root_wasm(
     proc_exit: Option<i32>,
     assert_thread_spawn_rejection: bool,
@@ -277,8 +278,8 @@ fn legacy_threaded_root_wasm(
     } else if loop_root {
         // `_start`: plain compute loop; it has epoch checks but no atomic wait.
         code.extend([
-            10, 0, 0x02, 0x40, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b,
-            4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b,
+            10, 0, 0x02, 0x40, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4,
+            0, 0x41, 0, 0x0b,
         ]);
     } else {
         code.extend([

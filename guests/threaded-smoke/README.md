@@ -1,8 +1,8 @@
 # Threaded Rust smoke guest
 
 This is a standalone, source-only Rust 1.95 fixture for
-`wasm32-wasip1-threads`. It is intentionally not a workspace member and has
-no checked-in lockfile, Wasm binary, or build output.
+`wasm32-wasip1-threads`. It is intentionally not a workspace member and has a
+checked-in lockfile, but no Wasm binary or build output.
 
 It imports `kernal-api:v1::kernel-yield`, creates and joins one standard
 thread using `Arc<AtomicU32>`, and exports `kernal-api-run` with a numeric

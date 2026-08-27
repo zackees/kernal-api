@@ -32,6 +32,10 @@ cmd = "soldr cargo clippy --locked --all-features --all-targets -- --deny warnin
 stack = "linux"
 cmd = "soldr cargo test --locked --all-features"
 
+[task.threaded-smoke-red]
+stack = "linux"
+cmd = "bash scripts/build-threaded-smoke.sh"
+
 [task.package]
 stack = "linux"
 cmd = "soldr cargo package --locked"

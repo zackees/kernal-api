@@ -16,7 +16,13 @@ $previous = $env:KERNAL_API_THREADED_SMOKE_WASM
 try {
     if (-not $ArtifactPath) {
         soldr rustup target add $target
-        soldr $subcommand build --manifest-path $guestManifest --target $target --release --target-dir $targetDirectory
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+        soldr $subcommand build --locked --manifest-path $guestManifest --target $target --release --target-dir $targetDirectory
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
         $built = Join-Path $targetDirectory "$target/release/kernal-api-threaded-smoke.wasm"
         Copy-Item -LiteralPath $built -Destination $artifact
     }

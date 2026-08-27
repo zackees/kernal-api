@@ -10,7 +10,7 @@ artifact="${1:-$temporary_root/threaded-smoke.wasm}"
 
 if [[ $# -eq 0 ]]; then
   soldr rustup target add "$target"
-  soldr "$subcommand" build --manifest-path "$guest_manifest" --target "$target" --release --target-dir "$temporary_root/target"
+  soldr "$subcommand" build --locked --manifest-path "$guest_manifest" --target "$target" --release --target-dir "$temporary_root/target"
   cp "$temporary_root/target/$target/release/kernal-api-threaded-smoke.wasm" "$artifact"
 fi
 

@@ -10,10 +10,12 @@ use std::mem::align_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
     Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store, Strategy,
+    UpdateDeadline,
 };
 
 const PAGE_BYTES: u64 = 64 * 1024;
@@ -42,6 +44,8 @@ const MAX_P1_IOVECS: usize = 1024;
 /// child-outcome vector independently of a caller's requested quota.
 const MAX_GUEST_THREADS_V1: usize = 16;
 const DEFAULT_MAX_GUEST_THREADS: usize = MAX_GUEST_THREADS_V1;
+const EPOCH_PENDING: u8 = 0;
+const EPOCH_INTERRUPTED: u8 = 1;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -100,6 +104,7 @@ pub struct SketchExecutionLimits {
     maximum_reserved_shared_memory_bytes: u64,
     maximum_active_root_executions: usize,
     fuel_limits: SketchFuelLimits,
+    epoch_limits: SketchEpochLimits,
 }
 impl SketchExecutionLimits {
     pub fn new(
@@ -110,6 +115,7 @@ impl SketchExecutionLimits {
             maximum_reserved_shared_memory_bytes,
             maximum_active_root_executions,
             fuel_limits: SketchFuelLimits::default(),
+            epoch_limits: SketchEpochLimits::default(),
         };
         limits
             .is_valid()
@@ -136,10 +142,25 @@ impl SketchExecutionLimits {
     pub fn fuel_limits(self) -> SketchFuelLimits {
         self.fuel_limits
     }
+    /// Sets bounded epoch polling for cancellation and wall-clock deadlines.
+    pub fn with_epoch_limits(
+        mut self,
+        epoch_limits: SketchEpochLimits,
+    ) -> Result<Self, SketchCompilerError> {
+        if !epoch_limits.is_valid() {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.epoch_limits = epoch_limits;
+        Ok(self)
+    }
+    pub fn epoch_limits(self) -> SketchEpochLimits {
+        self.epoch_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
             && self.fuel_limits.is_valid()
+            && self.epoch_limits.is_valid()
     }
 }
 impl Default for SketchExecutionLimits {
@@ -150,6 +171,45 @@ impl Default for SketchExecutionLimits {
             maximum_reserved_shared_memory_bytes: THREADED_RUST_RESERVATION_BYTES,
             maximum_active_root_executions: 1,
             fuel_limits: SketchFuelLimits::default(),
+            epoch_limits: SketchEpochLimits::default(),
+        }
+    }
+}
+
+/// Facade-owned epoch polling policy for a logical sketch execution.
+///
+/// The Wasmtime engine clock is compiler-global; these limits bound only the
+/// logical registrations consulted by Store callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchEpochLimits {
+    wall_clock_deadline: Duration,
+    tick_interval: Duration,
+    maximum_active_registrations: usize,
+}
+impl SketchEpochLimits {
+    pub fn new(
+        wall_clock_deadline: Duration,
+        tick_interval: Duration,
+        maximum_active_registrations: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let limits = Self { wall_clock_deadline, tick_interval, maximum_active_registrations };
+        limits.is_valid().then_some(limits).ok_or(SketchCompilerError::InvalidExecutionLimits)
+    }
+    pub fn wall_clock_deadline(self) -> Duration { self.wall_clock_deadline }
+    pub fn tick_interval(self) -> Duration { self.tick_interval }
+    pub fn maximum_active_registrations(self) -> usize { self.maximum_active_registrations }
+    fn is_valid(self) -> bool {
+        !self.wall_clock_deadline.is_zero()
+            && !self.tick_interval.is_zero()
+            && self.maximum_active_registrations != 0
+    }
+}
+impl Default for SketchEpochLimits {
+    fn default() -> Self {
+        Self {
+            wall_clock_deadline: Duration::from_secs(30),
+            tick_interval: Duration::from_millis(10),
+            maximum_active_registrations: MAX_GUEST_THREADS_V1 + 1,
         }
     }
 }
@@ -256,6 +316,10 @@ impl SketchCompiler {
         cfg.wasm_multi_memory(false);
         cfg.wasm_shared_everything_threads(false);
         cfg.consume_fuel(true);
+        // Epoch is Engine-global. Stores install per-generation callbacks so
+        // an increment only interrupts the logical execution whose terminal
+        // state has already been chosen by its ticker.
+        cfg.epoch_interruption(true);
         cfg.max_wasm_stack(config.max_wasm_stack_bytes);
         let engine = Engine::new(&cfg).map_err(|_| SketchCompilerError::Unavailable)?;
         Ok(Self {
@@ -474,8 +538,10 @@ impl AdmittedSketch {
                 controller: Arc::clone(&prepared.controller),
                 runtime: Some(runtime),
                 fuel_generation: root.fuel_generation,
+                epoch_state: Arc::new(AtomicU8::new(EPOCH_PENDING)),
             },
         );
+        install_epoch_deadline(&mut store)?;
         // Instantiation itself executes the module start section, so the
         // finite root slice must be installed before `instantiate` as well as
         // before the explicit command `_start` call below.
@@ -601,6 +667,7 @@ impl AdmittedSketch {
                 controller: Arc::clone(&controller),
                 runtime: None,
                 fuel_generation: 0,
+                epoch_state: Arc::new(AtomicU8::new(EPOCH_PENDING)),
             },
         );
         linker
@@ -1266,6 +1333,23 @@ struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
     fuel_generation: u64,
+    // Store-owned, generation-scoped callback state. The engine clock never
+    // retains a Store or guest reference; a future logical registration only
+    // changes this semantic terminal byte before incrementing the Engine.
+    epoch_state: Arc<AtomicU8>,
+}
+
+fn install_epoch_deadline(store: &mut Store<ThreadStoreState>) -> Result<(), SketchExecutionError> {
+    store.set_epoch_deadline(1);
+    store
+        .epoch_deadline_callback(|state| {
+            if state.epoch_state.load(Ordering::Acquire) == EPOCH_PENDING {
+                Ok(UpdateDeadline::Continue(1))
+            } else {
+                Ok(UpdateDeadline::Interrupt)
+            }
+        })
+        .map_err(|_| SketchExecutionError::PrelinkFailed)
 }
 
 #[cfg(test)]
@@ -1332,6 +1416,7 @@ fn define_closed_imports(
                 // the same closed ABI sentinel as other rejected spawns, with
                 // a separate bounded semantic reason.
                 let generation = caller.data().fuel_generation;
+                let epoch_state = Arc::clone(&caller.data().epoch_state);
                 let Some(child_fuel) = controller.reserve_child_fuel(generation) else {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.fuel_rejections = workers.fuel_rejections.saturating_add(1);
@@ -1381,8 +1466,12 @@ fn define_closed_imports(
                                 controller: Arc::clone(&child),
                                 runtime,
                                 fuel_generation: generation,
+                                epoch_state,
                             },
                         );
+                        if install_epoch_deadline(&mut store).is_err() {
+                            return ChildOutcome::Trapped;
+                        }
                         let outcome = (|| {
                             if store.set_fuel(child_fuel).is_err() {
                                 return ChildOutcome::Trapped;

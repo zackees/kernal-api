@@ -335,13 +335,21 @@ impl std::ops::Deref for ActiveOwnership {
     type Target = crate::platform::process::WorkerControl;
 
     fn deref(&self) -> &Self::Target {
-        &self.ownership.as_ref().expect("active worker ownership").control
+        &self
+            .ownership
+            .as_ref()
+            .expect("active worker ownership")
+            .control
     }
 }
 
 impl std::ops::DerefMut for ActiveOwnership {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.ownership.as_mut().expect("active worker ownership").control
+        &mut self
+            .ownership
+            .as_mut()
+            .expect("active worker ownership")
+            .control
     }
 }
 
@@ -372,7 +380,12 @@ impl CleanupDispatcher {
                     // A failed force leaves the contained process and both
                     // pipe owners alive. Retry until containment completes;
                     // only then can joining the helpers be bounded.
-                    while job.ownership.control.force_and_reap(Duration::from_secs(5)).is_err() {
+                    while job
+                        .ownership
+                        .control
+                        .force_and_reap(Duration::from_secs(5))
+                        .is_err()
+                    {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                     ledger.record_forced();
@@ -380,8 +393,12 @@ impl CleanupDispatcher {
                     if let Some(writer_tx) = job.writer_tx.take() {
                         let _ = writer_tx.send(WriterCommand::Close);
                     }
-                    if let Some(writer) = job.writer.take() { let _ = writer.join(); }
-                    if let Some(reader) = job.reader.take() { let _ = reader.join(); }
+                    if let Some(writer) = job.writer.take() {
+                        let _ = writer.join();
+                    }
+                    if let Some(reader) = job.reader.take() {
+                        let _ = reader.join();
+                    }
                     // `job` drops here, releasing the root lease and gauges.
                 }
             })
@@ -870,7 +887,11 @@ fn force_join_terminal(
     reader: std::thread::JoinHandle<()>,
     trigger: SketchWorkerStopReason,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(&sketch.worker_ledger, &mut *control, SketchWorkerFailure::UnexpectedExit);
+    let (result, forced) = force_result(
+        &sketch.worker_ledger,
+        &mut *control,
+        SketchWorkerFailure::UnexpectedExit,
+    );
     if !forced {
         control.cleanup.hand_off(CleanupJob {
             ownership: control.take(),
@@ -1031,7 +1052,12 @@ mod tests {
         fn force_and_reap(&mut self, _timeout: Duration) -> Result<(), WorkerError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
-                if let Some(first_failure) = self.first_failure.lock().expect("first failure lock").take() {
+                if let Some(first_failure) = self
+                    .first_failure
+                    .lock()
+                    .expect("first failure lock")
+                    .take()
+                {
                     let _ = first_failure.send(());
                 }
                 return Err(WorkerError::new(
@@ -1120,7 +1146,10 @@ mod tests {
             None,
         );
         let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
-        let mut active = ActiveOwnership { ownership: Some(ownership), cleanup };
+        let mut active = ActiveOwnership {
+            ownership: Some(ownership),
+            cleanup,
+        };
         let caller = std::thread::current().id();
         let (writer_tx, writer_rx) = mpsc::channel();
         let (writer_closed_tx, writer_closed_rx) = mpsc::channel();
@@ -1138,11 +1167,22 @@ mod tests {
             reader,
             SketchWorkerFailure::Protocol,
         );
-        assert_eq!(terminal, SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup));
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup)
+        );
         assert!(active.ownership.is_none());
         assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
-        assert!(shutdown_threads.lock().expect("shutdown threads lock").iter().all(|id| *id != caller));
-        assert!(drop_threads.lock().expect("drop threads lock").iter().all(|id| *id != caller));
+        assert!(shutdown_threads
+            .lock()
+            .expect("shutdown threads lock")
+            .iter()
+            .all(|id| *id != caller));
+        assert!(drop_threads
+            .lock()
+            .expect("drop threads lock")
+            .iter()
+            .all(|id| *id != caller));
         release_retry(&retry_gate);
         assert!(writer_closed_rx.recv_timeout(TEST_WAIT).is_ok());
     }
@@ -1204,8 +1244,16 @@ mod tests {
         let cleanup = CleanupDispatcher { sender };
         let caller = std::thread::current().id();
         cleanup.hand_off_pre_protocol(ownership);
-        assert!(shutdown_threads.lock().expect("shutdown threads lock").iter().all(|id| *id != caller));
-        assert!(drop_threads.lock().expect("drop threads lock").iter().all(|id| *id != caller));
+        assert!(shutdown_threads
+            .lock()
+            .expect("shutdown threads lock")
+            .iter()
+            .all(|id| *id != caller));
+        assert!(drop_threads
+            .lock()
+            .expect("drop threads lock")
+            .iter()
+            .all(|id| *id != caller));
         assert_eq!(ledger.snapshot().live_workers, 1);
         assert_eq!(ledger.snapshot().pending_root_leases, 1);
     }
@@ -1228,13 +1276,16 @@ mod tests {
             None,
         );
         let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
-        let mut active = ActiveOwnership { ownership: Some(ownership), cleanup };
-        let terminal = force_pre_protocol_with_ledger(
-            &ledger,
-            &mut active,
-            SketchWorkerFailure::Protocol,
+        let mut active = ActiveOwnership {
+            ownership: Some(ownership),
+            cleanup,
+        };
+        let terminal =
+            force_pre_protocol_with_ledger(&ledger, &mut active, SketchWorkerFailure::Protocol);
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup)
         );
-        assert_eq!(terminal, SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup));
         assert!(active.ownership.is_none());
         assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
         release_retry(&retry_gate);

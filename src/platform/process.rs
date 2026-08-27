@@ -485,7 +485,11 @@ mod worker_child_tests {
     impl WorkerChildControl for FakeControl {
         fn try_wait(&mut self) -> io::Result<Option<i32>> {
             self.counts.waits.fetch_add(1, Ordering::Relaxed);
-            Ok(self.counts.observed_exit.load(Ordering::Relaxed).then_some(0))
+            Ok(self
+                .counts
+                .observed_exit
+                .load(Ordering::Relaxed)
+                .then_some(0))
         }
 
         fn force_and_reap(&mut self, _timeout: Duration) -> Result<(), WorkerError> {

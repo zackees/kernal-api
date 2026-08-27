@@ -286,16 +286,16 @@ impl AdmittedSketch {
         // Finalization always drains children, but the root call is the
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
-        let outcome = outcome?;
-        children?;
-        if self.validation {
+        let report = if self.validation && outcome.is_ok() && children.is_ok() {
             let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
             let offset = getter
                 .call(&mut store, ())
                 .map_err(|_| SketchExecutionError::ValidationReportInvalid)?;
-            validate_report(&prepared.controller.memory, offset)?;
-        }
-        Ok(outcome)
+            validate_report(&prepared.controller.memory, offset)
+        } else {
+            Ok(())
+        };
+        resolve_threaded_result(outcome, children, report)
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
@@ -980,7 +980,9 @@ mod threaded_root_observation_tests {
         let mut section = 8;
         while bytes[section] != 2 {
             let mut at = section + 1;
-            while bytes[at] & 0x80 != 0 { at += 1; }
+            while bytes[at] & 0x80 != 0 {
+                at += 1;
+            }
             let length = usize::from(bytes[at] & 0x7f);
             section = at + 1 + length;
         }
@@ -993,7 +995,11 @@ mod threaded_root_observation_tests {
         extra.extend([0, 0]);
         bytes.splice(end..end, extra.iter().copied());
         bytes[section + 1] = bytes[section + 1].saturating_add(extra.len() as u8);
-        custom(PROFILE_METADATA, VALIDATION_PROFILE_METADATA_VALUE, &mut bytes);
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut bytes,
+        );
         bytes
     }
 
@@ -1002,9 +1008,14 @@ mod threaded_root_observation_tests {
         let bytes = validation_fixture_with_extra_import();
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
         let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
-            bytes.len() + 1, THREADED_RUST_MAX_PAGES,
-        ).expect("policy");
-        assert!(matches!(compiler.admit(&bytes, policy), Err(SketchModuleError::ForbiddenImport { .. })));
+            bytes.len() + 1,
+            THREADED_RUST_MAX_PAGES,
+        )
+        .expect("policy");
+        assert!(matches!(
+            compiler.admit(&bytes, policy),
+            Err(SketchModuleError::ForbiddenImport { .. })
+        ));
         assert_eq!(compiler.compiled_module_count(), 0);
     }
 
@@ -1321,6 +1332,68 @@ fn map_child_error(error: &wasmtime::Error) -> ChildOutcome {
         };
     }
     ChildOutcome::Trapped
+}
+
+fn resolve_threaded_result(
+    root: Result<ThreadedRootOutcome, SketchExecutionError>,
+    children: Result<(), SketchExecutionError>,
+    report: Result<(), SketchExecutionError>,
+) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    // All callers already drained children before this pure precedence step.
+    // Root remains primary; ordered child aggregation is next; report schema
+    // failures are only meaningful after successful guest execution.
+    let outcome = root?;
+    children?;
+    report?;
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod result_precedence_tests {
+    use super::*;
+
+    fn child_error() -> SketchExecutionError {
+        SketchExecutionError::ChildOutcomes {
+            outcomes: vec![
+                ThreadedChildOutcome {
+                    tid: 1,
+                    kind: ThreadedChildOutcomeKind::Trapped,
+                },
+                ThreadedChildOutcome {
+                    tid: 2,
+                    kind: ThreadedChildOutcomeKind::NonzeroExit { code: 9 },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn root_child_and_report_precedence_is_semantic() {
+        assert_eq!(
+            resolve_threaded_result(
+                Err(SketchExecutionError::NonzeroExit { code: 7 }),
+                Err(child_error()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+            ),
+            Err(SketchExecutionError::NonzeroExit { code: 7 }),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Ok(ThreadedRootOutcome::Started),
+                Err(child_error()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+            ),
+            Err(child_error()),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Ok(ThreadedRootOutcome::Started),
+                Ok(()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+            ),
+            Err(SketchExecutionError::ValidationReportInvalid),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

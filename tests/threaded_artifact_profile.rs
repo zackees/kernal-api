@@ -44,7 +44,7 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
 
     let threaded = SketchModulePolicy::threaded_rust_v1(bytes.len().saturating_add(1), 16_384)
         .expect("threaded Rust policy");
-    compiler
+    let sketch = compiler
         .admit(&bytes, threaded)
         .expect("threaded-rust-v1 must admit the exact artifact");
     assert_eq!(compiler.compiled_module_count(), 1);
@@ -52,13 +52,6 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
     // #34 starts the supplied, direct Rust artifact through Wasmtime start;
     // #35 owns its thread-spawn path. Until then the guest's std::thread call
     // reaches the deterministic rejection and is contained as a semantic trap.
-    let sketch = compiler
-        .admit(
-            &bytes,
-            SketchModulePolicy::threaded_rust_v1(bytes.len().saturating_add(1), 16_384)
-                .expect("threaded Rust policy"),
-        )
-        .expect("second supplied artifact admission");
     let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
@@ -69,6 +62,11 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
         )
     });
     assert_eq!(outcome, Err(SketchExecutionError::Trapped));
+    assert_eq!(
+        compiler.compiled_module_count(),
+        1,
+        "execution never recompiles"
+    );
 }
 
 // This deliberately has no WAT or parser test dependency. It is the smallest

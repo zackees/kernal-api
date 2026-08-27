@@ -227,6 +227,9 @@ impl AdmittedSketch {
         let controller = Arc::new(ThreadController {
             memory,
             prelink: OnceLock::new(),
+            preparation_count: AtomicU64::new(1),
+            kernel_yield_count: AtomicU64::new(0),
+            runtime_handle_count: AtomicU64::new(0),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -257,6 +260,7 @@ impl AdmittedSketch {
             .prelink
             .set(Arc::clone(&prelink))
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        debug_assert_eq!(controller.preparation_count.load(Ordering::Relaxed), 1);
         let prelink = Arc::clone(
             controller
                 .prelink
@@ -270,6 +274,16 @@ impl AdmittedSketch {
         });
         *prepared = Some(Arc::clone(&prepared_root));
         Ok(prepared_root)
+    }
+    #[cfg(test)]
+    fn root_execution_observation_for_test(&self) -> Option<RootExecutionObservation> {
+        let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
+        let controller = &prepared.controller;
+        Some(RootExecutionObservation {
+            preparations: controller.preparation_count.load(Ordering::Relaxed),
+            kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
+            supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
+        })
     }
     #[allow(dead_code)]
     pub(crate) fn compiled_module(&self) -> &Module {
@@ -338,6 +352,12 @@ struct ThreadController {
     // prelink here breaks their otherwise cyclic construction without letting a
     // Store or Instance escape to another thread.
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
+    // This remains entirely host-private.  Besides guarding the cached setup,
+    // it gives unit tests a narrow way to prove that repeated root stores do
+    // not quietly create a second prelink or shared memory.
+    preparation_count: AtomicU64,
+    kernel_yield_count: AtomicU64,
+    runtime_handle_count: AtomicU64,
 }
 
 struct PreparedThreadedRoot {
@@ -348,6 +368,14 @@ struct PreparedThreadedRoot {
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootExecutionObservation {
+    preparations: u64,
+    kernel_yields: u64,
+    supplied_runtime_handles: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -364,8 +392,16 @@ fn define_closed_imports(
             |caller: Caller<'_, ThreadStoreState>| {
                 // The facade handle is deliberately supplied by the caller. This
                 // slice has no scheduler yet, but must never construct a runtime.
-                let _ = caller.data().runtime.as_ref();
-                let _ = caller.data().controller.prelink.get();
+                let controller = &caller.data().controller;
+                controller
+                    .kernel_yield_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if caller.data().runtime.is_some() {
+                    controller
+                        .runtime_handle_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = controller.prelink.get();
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -461,6 +497,167 @@ fn define_closed_imports(
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod threaded_root_observation_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_roots_reuse_one_preparation_and_receive_the_supplied_runtime() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.run(async {
+            assert_eq!(
+                sketch.execute_threaded_root(handle.clone()),
+                Ok(ThreadedRootOutcome::Started)
+            );
+            assert_eq!(
+                sketch.execute_threaded_root(handle),
+                Ok(ThreadedRootOutcome::Started)
+            );
+        });
+        assert_eq!(compiler.compiled_module_count(), 1);
+        assert_eq!(
+            sketch.root_execution_observation_for_test(),
+            Some(RootExecutionObservation {
+                preparations: 1,
+                kernel_yields: 2,
+                supplied_runtime_handles: 2,
+            })
+        );
+    }
+
+    fn leb(mut value: u32, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+    fn text(value: &str, output: &mut Vec<u8>) {
+        leb(value.len() as u32, output);
+        output.extend(value.as_bytes());
+    }
+    fn section(id: u8, body: Vec<u8>, output: &mut Vec<u8>) {
+        output.push(id);
+        leb(body.len() as u32, output);
+        output.extend(body);
+    }
+    fn custom(name: &str, value: &[u8], output: &mut Vec<u8>) {
+        let mut body = Vec::new();
+        text(name, &mut body);
+        body.extend(value);
+        section(0, body, output);
+    }
+
+    // Minimal exact ThreadedRustV1 profile whose start calls kernel-yield.
+    // Keeping it in this private unit module prevents test instrumentation
+    // from becoming a public sketch-host API.
+    fn threaded_yield_fixture() -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        let mut types = Vec::new();
+        leb(9, &mut types);
+        types.extend([
+            0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 3, 0x7f, 0x7e, 0x7f, 1, 0x7f, 0x60, 2, 0x7f,
+            0x7f, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 0, 0x60, 0, 1,
+            0x7f, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 0,
+        ]);
+        section(1, types, &mut wasm);
+        let mut imports = Vec::new();
+        leb(9, &mut imports);
+        text("env", &mut imports);
+        text("memory", &mut imports);
+        imports.extend([2, 3]);
+        leb(17, &mut imports);
+        leb(16_384, &mut imports);
+        text(ABI_MODULE, &mut imports);
+        text(ABI_YIELD, &mut imports);
+        imports.extend([0, 0]);
+        text(THREAD_MODULE, &mut imports);
+        text(THREAD_SPAWN, &mut imports);
+        imports.extend([0, 1]);
+        for (name, ty) in [
+            ("clock_time_get", 2),
+            ("environ_get", 3),
+            ("environ_sizes_get", 3),
+            ("fd_write", 4),
+            ("proc_exit", 5),
+            ("sched_yield", 6),
+        ] {
+            text("wasi_snapshot_preview1", &mut imports);
+            text(name, &mut imports);
+            imports.push(0);
+            leb(ty, &mut imports);
+        }
+        section(2, imports, &mut wasm);
+        let mut functions = Vec::new();
+        leb(5, &mut functions);
+        for ty in [0, 7, 8, 7, 0] {
+            leb(ty, &mut functions);
+        }
+        section(3, functions, &mut wasm);
+        let mut exports = Vec::new();
+        leb(5, &mut exports);
+        text("memory", &mut exports);
+        exports.push(2);
+        leb(0, &mut exports);
+        for (name, index) in [
+            ("_start", 8),
+            ("__main_void", 9),
+            ("wasi_thread_start", 10),
+            (ENTRY, 11),
+        ] {
+            text(name, &mut exports);
+            exports.push(0);
+            leb(index, &mut exports);
+        }
+        section(7, exports, &mut wasm);
+        section(8, vec![12], &mut wasm);
+        let mut code = Vec::new();
+        leb(5, &mut code);
+        code.extend([
+            2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 4, 0, 0x10, 0, 0x0b,
+        ]);
+        section(10, code, &mut wasm);
+        let mut features = Vec::new();
+        let names = [
+            "atomics",
+            "bulk-memory",
+            "bulk-memory-opt",
+            "call-indirect-overlong",
+            "extended-const",
+            "multivalue",
+            "mutable-globals",
+            "nontrapping-fptoint",
+            "reference-types",
+            "sign-ext",
+        ];
+        leb(names.len() as u32, &mut features);
+        for name in names {
+            features.push(b'+');
+            text(name, &mut features);
+        }
+        custom("target_features", &features, &mut wasm);
+        wasm
+    }
 }
 
 fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {

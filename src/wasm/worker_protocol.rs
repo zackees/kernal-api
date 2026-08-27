@@ -9,7 +9,9 @@ const MAGIC: [u8; 4] = *b"KWW1";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
-pub(super) const MAX_MODULE_BYTES: u64 = 512 * 1024 * 1024;
+/// One-request worker protocol ceiling.  This is intentionally distinct from
+/// admission policy: only the process transport is bounded by this contract.
+pub(super) const WORKER_PROTOCOL_MAX_MODULE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
 const NO_STATUS_CODE: i32 = i32::MIN;
 
@@ -371,7 +373,7 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         Kind::ExecuteStart => {
             let module_len = take_u64(&mut input)?;
             let metadata = take_metadata(&mut input)?;
-            if module_len > MAX_MODULE_BYTES || module_len > metadata.max_module_bytes {
+            if module_len > WORKER_PROTOCOL_MAX_MODULE_BYTES || module_len > metadata.max_module_bytes {
                 return Err(ProtocolError::ModuleTooLarge);
             }
             Message::ExecuteStart {
@@ -487,7 +489,7 @@ impl ModuleAssembler {
         if request_id == 0 {
             return Err(ProtocolError::InvalidRequestId);
         }
-        if module_len > MAX_MODULE_BYTES || module_len > caller_max {
+        if module_len > WORKER_PROTOCOL_MAX_MODULE_BYTES || module_len > caller_max {
             return Err(ProtocolError::ModuleTooLarge);
         }
         let declared = usize::try_from(module_len).map_err(|_| ProtocolError::LengthOverflow)?;
@@ -718,7 +720,7 @@ mod tests {
     #[test]
     fn multi_chunk_module_is_ordered_and_exact() {
         let chunk = vec![7; MAX_FRAME_PAYLOAD - 12];
-        let mut a = ModuleAssembler::start(1, (chunk.len() * 2) as u64, MAX_MODULE_BYTES).unwrap();
+        let mut a = ModuleAssembler::start(1, (chunk.len() * 2) as u64, WORKER_PROTOCOL_MAX_MODULE_BYTES).unwrap();
         assert_eq!(
             a.accept(Message::ModuleChunk {
                 request_id: 1,
@@ -763,7 +765,7 @@ mod tests {
     #[test]
     fn rejects_oversize_and_invalid_module_lengths() {
         assert!(matches!(
-            ModuleAssembler::start(1, MAX_MODULE_BYTES + 1, MAX_MODULE_BYTES + 1),
+            ModuleAssembler::start(1, WORKER_PROTOCOL_MAX_MODULE_BYTES + 1, WORKER_PROTOCOL_MAX_MODULE_BYTES + 1),
             Err(ProtocolError::ModuleTooLarge)
         ));
         assert!(matches!(

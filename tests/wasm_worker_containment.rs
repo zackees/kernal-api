@@ -324,17 +324,42 @@ mod failure_proof {
         }
         panic!("worker identity marker was not published")
     }
-    fn launch(inner: &str, files: &Artifacts) -> std::process::Child {
+    struct InnerChild(Option<std::process::Child>);
+    impl InnerChild {
+        fn wait_success(&mut self) {
+            let deadline = Instant::now() + OUTER_BOUND;
+            let child = self.0.as_mut().expect("inner child");
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("inner exit") { break status; }
+                assert!(Instant::now() < deadline, "inner child exceeded bound");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success());
+            self.0 = None;
+        }
+    }
+    impl Drop for InnerChild {
+        fn drop(&mut self) {
+            let Some(child) = self.0.as_mut() else { return; };
+            let _ = child.kill();
+            let deadline = Instant::now() + OUTER_BOUND;
+            while Instant::now() < deadline {
+                if child.try_wait().ok().flatten().is_some() { break; }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    fn launch(inner: &str, files: &Artifacts) -> InnerChild {
         let worker = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
         assert!(worker.is_absolute(), "real worker path must be absolute");
-        Command::new(std::env::current_exe().expect("test executable"))
+        InnerChild(Some(Command::new(std::env::current_exe().expect("test executable"))
             .args(["--exact", inner, "--ignored", "--nocapture"])
             .env(MARKER, &files.marker)
             .env(RESULT, &files.result)
             .env(RELEASE, &files.release)
             .env("KERNAL_API_D4_REAL_WORKER", worker)
             .spawn()
-            .expect("inner harness")
+            .expect("inner harness")))
     }
     fn inner_crash() {
         let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel());
@@ -424,29 +449,36 @@ mod failure_proof {
         })
     }
     #[cfg(target_os = "linux")]
-    fn pidfd_open(identity: Identity) -> i32 {
+    struct PidFd(Option<i32>);
+    #[cfg(target_os = "linux")]
+    impl PidFd {
+        fn wait_gone(&mut self) {
+            let fd = self.0.expect("pidfd");
+            let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            assert!(unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) } > 0, "exact worker survived bound");
+            unsafe { libc::close(fd); }
+            self.0 = None;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl Drop for PidFd {
+        fn drop(&mut self) {
+            let Some(fd) = self.0.take() else { return; };
+            let _ = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) };
+            let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let _ = unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) };
+            unsafe { libc::close(fd); }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    fn pidfd_open(identity: Identity) -> PidFd {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) as i32 };
         assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
         assert!(
             matches!(linux_identity(identity.pid), Some(now) if now.a == identity.a && now.b == identity.b),
             "PID was reused"
         );
-        fd
-    }
-    #[cfg(target_os = "linux")]
-    fn wait_pidfd_gone(fd: i32) {
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert!(
-            unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) } > 0,
-            "exact worker survived bound"
-        );
-        unsafe {
-            libc::close(fd);
-        }
+        PidFd(Some(fd))
     }
 
     #[cfg(target_os = "linux")]
@@ -455,12 +487,12 @@ mod failure_proof {
         let files = Artifacts::new();
         let mut inner = launch("failure_proof::d4_inner_crash_exact_identity", &files);
         let identity = wait_for_marker(&files.marker);
-        let fd = pidfd_open(identity);
+        let mut fd = pidfd_open(identity);
         assert_eq!(
             unsafe {
                 libc::syscall(
                     libc::SYS_pidfd_send_signal,
-                    fd,
+                    fd.0.expect("pidfd"),
                     libc::SIGKILL,
                     std::ptr::null::<libc::siginfo_t>(),
                     0,
@@ -469,8 +501,8 @@ mod failure_proof {
             0,
             "pidfd signal"
         );
-        wait_pidfd_gone(fd);
-        assert!(inner.wait().expect("inner exit").success());
+        fd.wait_gone();
+        inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
             "unexpected-exit"
@@ -487,10 +519,10 @@ mod failure_proof {
             &files,
         );
         let identity = wait_for_marker(&files.marker);
-        let fd = pidfd_open(identity);
+        let mut fd = pidfd_open(identity);
         fs::write(&files.release, "go").expect("release");
-        assert!(inner.wait().expect("inner exit").success());
-        wait_pidfd_gone(fd);
+        inner.wait_success();
+        fd.wait_gone();
         assert!(linux_identity(identity.pid)
             .is_none_or(|now| now.a != identity.a || now.b != identity.b));
     }

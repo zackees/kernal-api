@@ -443,6 +443,9 @@ fn supervise(
     if cancellation.is_cancelled() {
         return SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled);
     }
+    if validate_worker_module_len(sketch.module_bytes()).is_err() {
+        return SketchWorkerTerminal::Failure(SketchWorkerFailure::InvalidConfiguration);
+    }
     let _lease = match sketch.acquire_worker_parent_root_lease() {
         Ok(lease) => lease,
         Err(error) => return SketchWorkerTerminal::Execution(error),
@@ -549,6 +552,10 @@ fn supervise(
     let mut cancel_written = false;
     let mut cancel_queued = false;
     let mut hello_acked = false;
+    // A malicious worker may write Terminal immediately after HelloAck. Keep
+    // exactly one bounded pending frame, but never accept it until the parent
+    // observed a successful complete upload.
+    let mut early_terminal = None;
     let mut selected = None;
     let mut grace_deadline = None;
     loop {
@@ -591,7 +598,8 @@ fn supervise(
                 }
             }
         }
-        if let Ok(result) = read_rx.try_recv() {
+        let received = early_terminal.take().map(Ok).or_else(|| read_rx.try_recv().ok());
+        if let Some(result) = received {
             let message = match result {
                 Ok(message) => message,
                 Err(()) => match control.try_wait() {
@@ -629,6 +637,9 @@ fn supervise(
                         );
                     }
                     upload_sent = true;
+                }
+                message @ Message::Terminal { .. } if hello_acked && !upload_complete => {
+                    early_terminal = Some(message);
                 }
                 Message::Terminal { .. } if hello_acked => {
                     let mapped = map_terminal(message, id);
@@ -751,6 +762,14 @@ fn supervise(
         }
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// Validate the private process-transport limit without constraining direct
+/// in-process admission/execution policy.
+fn validate_worker_module_len(module_bytes: usize) -> Result<(), SketchWorkerFailure> {
+    (u64::try_from(module_bytes).ok().filter(|bytes| *bytes <= worker_protocol::WORKER_PROTOCOL_MAX_MODULE_BYTES).is_some())
+        .then_some(())
+        .ok_or(SketchWorkerFailure::InvalidConfiguration)
 }
 
 fn selected_stop(
@@ -1345,6 +1364,17 @@ mod tests {
         assert_eq!(
             SketchWorkerFailure::InvalidConfiguration.code(),
             "worker-invalid-configuration"
+        );
+    }
+    #[test]
+    fn worker_protocol_module_ceiling_is_checked_without_allocating_a_fixture() {
+        let cap: usize = worker_protocol::WORKER_PROTOCOL_MAX_MODULE_BYTES
+            .try_into()
+            .expect("host usize");
+        assert_eq!(validate_worker_module_len(cap), Ok(()));
+        assert_eq!(
+            validate_worker_module_len(cap + 1),
+            Err(SketchWorkerFailure::InvalidConfiguration)
         );
     }
     #[test]

@@ -535,6 +535,76 @@ pub fn spawn_sync(
     })
 }
 
+/// Private containment stages for the hostile Wasm worker.  This is separate
+/// from generic `spawn_sync`: that path deliberately supports daemon/breakaway
+/// compatibility and must not silently acquire stricter semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StrictWorkerSpawnStage {
+    Pipe,
+    CreateSuspended,
+    CreateJob,
+    ConfigureJob,
+    AssignJob,
+    Resume,
+}
+
+#[derive(Debug)]
+pub(crate) struct StrictWorkerSpawnError {
+    stage: StrictWorkerSpawnStage,
+    source: io::Error,
+}
+impl StrictWorkerSpawnError {
+    pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
+}
+impl std::fmt::Display for StrictWorkerSpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "strict worker spawn failed at {:?}: {}", self.stage, self.source) }
+}
+impl std::error::Error for StrictWorkerSpawnError {}
+
+/// Spawn a worker suspended, attach it to a strict kill-on-close Job Object
+/// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
+/// (including hostile nested-job policy) is an AssignJob failure, never a
+/// successful "already contained" fallback.
+pub(crate) fn spawn_strict_contained_worker(
+    command: &mut Command,
+    stdio: crate::platform::process::SpawnStdio<'_>,
+    environment: crate::platform::process::SyncEnvironment,
+) -> Result<crate::platform::process::SpawnedChild, StrictWorkerSpawnError> {
+    let stdin = resolve_slot(&stdio.stdin, SlotDir::Stdin).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
+    let stdout = resolve_slot(&stdio.stdout, SlotDir::Stdout).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
+    let stderr = resolve_slot(&stdio.stderr, SlotDir::Stderr).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
+    let (process, thread, pid) = create_process_inner(command, &stdin.child_handle, &stdout.child_handle, &stderr.child_handle, CreateMode::Contained { show_console: false }, environment)
+        .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source })?;
+    let process = OwnedHandle(process);
+    let thread = OwnedHandle(thread);
+    let job = match create_strict_worker_job() {
+        Ok(job) => job,
+        Err((stage, source)) => { terminate_and_reap(&process); return Err(StrictWorkerSpawnError { stage, source }); }
+    };
+    if unsafe { AssignProcessToJobObject(job.as_raw(), process.as_raw()) } == FALSE {
+        let source = io::Error::last_os_error();
+        terminate_and_reap(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source });
+    }
+    if unsafe { ResumeThread(thread.as_raw()) } == u32::MAX {
+        let source = io::Error::last_os_error();
+        terminate_and_reap(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Resume, source });
+    }
+    drop(thread);
+    Ok(crate::platform::process::SpawnedChild {
+        stdin: stdin.parent_end.map(OverlappedHandle::into_child_stdin),
+        stdout: stdout.parent_end.map(OverlappedHandle::into_child_stdout),
+        stderr: stderr.parent_end.map(OverlappedHandle::into_child_stderr),
+        pid,
+        inner: Box::new(SpawnedInner { process: Some(process), job: Some(job), _drain_keepalive: None }),
+    })
+}
+
+fn terminate_and_reap(process: &OwnedHandle) {
+    unsafe { let _ = TerminateProcess(process.as_raw(), 1); let _ = WaitForSingleObject(process.as_raw(), INFINITE); }
+}
+
 fn drain_watcher(process_handle: OwnedHandle, timeout: Duration, keep: Arc<()>) {
     // `WAIT_TIMEOUT` (0x102): a single wait slice elapsed without the child
     // exiting. Declared inline to avoid pinning an extra winapi import.
@@ -843,6 +913,19 @@ mod daemon_flag_tests {
             "fallback must equal the non-breakaway flag set"
         );
     }
+
+    #[test]
+    fn strict_worker_job_never_permits_breakaway() {
+        let flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+    }
+
+    #[test]
+    fn strict_worker_stage_keeps_nested_job_denial_semantic() {
+        assert_eq!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::AssignJob);
+        assert_ne!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::Resume);
+    }
 }
 
 fn create_job_object() -> io::Result<OwnedHandle> {
@@ -867,6 +950,29 @@ fn create_job_object() -> io::Result<OwnedHandle> {
         return Err(err);
     }
     Ok(OwnedHandle(job))
+}
+
+fn create_strict_worker_job() -> Result<OwnedHandle, (StrictWorkerSpawnStage, io::Error)> {
+    let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+    if job.is_null() || job == INVALID_HANDLE_VALUE {
+        return Err((StrictWorkerSpawnStage::CreateJob, io::Error::last_os_error()));
+    }
+    let job = OwnedHandle(job);
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    // Deliberately no JOB_OBJECT_LIMIT_BREAKAWAY_OK: this worker executes
+    // hostile threaded Wasm and every descendant must remain killable.
+    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job.as_raw(),
+            JobObjectExtendedLimitInformation,
+            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == FALSE {
+        return Err((StrictWorkerSpawnStage::ConfigureJob, io::Error::last_os_error()));
+    }
+    Ok(job)
 }
 
 pub fn terminate(handle: &OwnedHandle) -> io::Result<()> {

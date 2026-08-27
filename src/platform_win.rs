@@ -134,6 +134,7 @@ pub fn ipc_broker_endpoint_name(bare_name: &str, _path_scoped: bool) -> std::io:
 
 /// Windows named-pipe names are capped by `MAX_PATH` while the long-path
 /// prefix is not in use.
+#[cfg(feature = "ipc")]
 const WINDOWS_MAX_PATH: usize = 260;
 
 #[cfg(feature = "ipc")]
@@ -603,6 +604,7 @@ mod sync_spawn;
 pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{compat_tokio_creation_flags, configure_compat_tokio_command};
     use std::ffi::OsStr;

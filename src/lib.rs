@@ -19,6 +19,14 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 
+/// Admission policy for opt-in Rust WebAssembly sketches.
+///
+/// This module deliberately compiles and validates a module only. It does not
+/// instantiate or execute guest code; thread scheduling, generated async ABI,
+/// resources, and worker-process containment land in later sketch-host slices.
+#[cfg(feature = "wasm-sketch-host")]
+pub mod wasm;
+
 /// Cooperative all-thread stack capture and deferred unwinding.
 #[cfg(feature = "snapshot")]
 pub mod snapshot;

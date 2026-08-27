@@ -74,6 +74,10 @@ symbolize-worker = [
   "dep:url",
   "dep:ureq",
 ]
+# The sketch host is intentionally isolated from ordinary async/process users.
+# It uses core Wasm plus Cranelift; WASI, the Component Model, pooling, Winch,
+# and a second executor remain out of this first admission-only slice.
+wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser"]
 full = [
   "allocator",
   "conpty-sidecar",
@@ -128,6 +132,13 @@ tracing = { version = "=0.1.44", optional = true }
 tracing-subscriber = { version = "=0.3.23", optional = true }
 ureq = { version = "=2.12.1", default-features = false, features = ["tls"], optional = true }
 url = { version = "=2.5.8", optional = true }
+wasmtime = { version = "=45.0.0", default-features = false, features = [
+  "async",
+  "cranelift",
+  "runtime",
+  "threads",
+], optional = true }
+wasmparser = { version = "=0.248.0", default-features = false, optional = true }
 zstd = { version = "=0.13.3", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]

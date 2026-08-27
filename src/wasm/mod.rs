@@ -1468,7 +1468,7 @@ struct LogicalEpoch {
     winner: AtomicU8,
 }
 struct EpochEntry { logical: Arc<LogicalEpoch> }
-struct EpochRegistration { broker: Arc<EpochBroker>, entry: Arc<EpochEntry> }
+struct EpochRegistration { broker: Arc<EpochBroker>, entry: Option<Arc<EpochEntry>> }
 impl EpochBroker {
     fn new(engine: Arc<Engine>, limits: SketchEpochLimits) -> Self {
         Self { engine, limits, state: Mutex::new(EpochBrokerState { runtime: None, registrations: Vec::with_capacity(limits.maximum_active_registrations), generation: 0, ticker: None }) }
@@ -1485,6 +1485,10 @@ impl EpochBroker {
         let entry = Arc::new(EpochEntry { logical });
         let mut state = self.state.lock().map_err(|_| SketchExecutionError::PrelinkFailed)?;
         state.registrations.retain(|entry| entry.strong_count() != 0);
+        // Registration and terminal-state publication are serialized by this
+        // mutex. A child can therefore never acquire a Store slot after its
+        // logical execution has committed cancellation/deadline/completion.
+        if logical.winner.load(Ordering::Acquire) != EPOCH_PENDING { return Err(SketchExecutionError::EpochRegistrationLimitExceeded); }
         if state.registrations.len() >= self.limits.maximum_active_registrations { return Err(SketchExecutionError::EpochRegistrationLimitExceeded); }
         if let Some(expected) = state.runtime.as_ref() { if !runtime.same_runtime_for_wasm(expected) { return Err(SketchExecutionError::ForeignRuntime); } } else { state.runtime = Some(runtime.clone()); }
         state.registrations.push(Arc::downgrade(&entry));
@@ -1494,7 +1498,7 @@ impl EpochBroker {
             let broker = Arc::clone(self);
             state.ticker = Some((generation, runtime.launch(async move { broker.tick(generation).await; })));
         }
-        Ok(EpochRegistration { broker: Arc::clone(self), entry })
+        Ok(EpochRegistration { broker: Arc::clone(self), entry: Some(entry) })
     }
     async fn tick(self: Arc<Self>, generation: u64) {
         loop {
@@ -1503,24 +1507,27 @@ impl EpochBroker {
                 Ok(mut state) => {
                     if state.generation != generation { return; }
                     state.registrations.retain(|entry| entry.strong_count() != 0);
-                    state.registrations.iter().filter_map(Weak::upgrade).collect::<Vec<_>>() }
+                    let entries = state.registrations.iter().filter_map(Weak::upgrade).collect::<Vec<_>>();
+                    for entry in &entries {
+                        let logical = &entry.logical;
+                        // Cancellation wins the same tick as deadline. The
+                        // winner is published while registration is locked.
+                        let terminal = if logical.cancellation.is_cancelled() { EPOCH_CANCELLED } else if Instant::now() >= logical.deadline { EPOCH_DEADLINE_EXCEEDED } else { EPOCH_PENDING };
+                        if terminal != EPOCH_PENDING { let _ = logical.winner.compare_exchange(EPOCH_PENDING, terminal, Ordering::AcqRel, Ordering::Acquire); }
+                    }
+                    entries }
                 Err(_) => Vec::new(),
             };
             if entries.is_empty() { return; }
-            for entry in entries {
-                let logical = &entry.logical;
-                // Cancellation wins the same tick as deadline by design.
-                let terminal = if logical.cancellation.is_cancelled() { EPOCH_CANCELLED } else if Instant::now() >= logical.deadline { EPOCH_DEADLINE_EXCEEDED } else { EPOCH_PENDING };
-                if terminal != EPOCH_PENDING { let _ = logical.winner.compare_exchange(EPOCH_PENDING, terminal, Ordering::AcqRel, Ordering::Acquire); }
-            }
             self.engine.increment_epoch();
         }
     }
     fn active_registrations(&self) -> usize {
         self.state.lock().map(|state| state.registrations.iter().filter(|entry| entry.strong_count() != 0).count()).unwrap_or(0)
     }
-    fn unregister(&self, entry: &Arc<EpochEntry>) -> Option<crate::async_engine::Task<()>> {
+    fn finish_registration(&self, entry: &Arc<EpochEntry>) -> Option<crate::async_engine::Task<()>> {
         let mut state = self.state.lock().ok()?;
+        let _ = entry.logical.winner.compare_exchange(EPOCH_PENDING, EPOCH_COMPLETED, Ordering::AcqRel, Ordering::Acquire);
         state.registrations.retain(|candidate| candidate.upgrade().is_some_and(|live| !Arc::ptr_eq(&live, entry)));
         if state.registrations.is_empty() {
             state.generation = state.generation.wrapping_add(1);
@@ -1530,10 +1537,10 @@ impl EpochBroker {
     }
 }
 impl EpochRegistration {
-    fn logical(&self) -> Arc<LogicalEpoch> { Arc::clone(&self.entry.logical) }
-    fn finish(self) -> Option<crate::async_engine::Task<()>> { let _ = self.entry.logical.winner.compare_exchange(EPOCH_PENDING, EPOCH_COMPLETED, Ordering::AcqRel, Ordering::Acquire); self.broker.unregister(&self.entry) }
+    fn logical(&self) -> Arc<LogicalEpoch> { Arc::clone(&self.entry.as_ref().expect("active epoch registration").logical) }
+    fn finish(mut self) -> Option<crate::async_engine::Task<()>> { self.entry.take().and_then(|entry| self.broker.finish_registration(&entry)) }
 }
-impl Drop for EpochRegistration { fn drop(&mut self) { let _ = self.entry.logical.winner.compare_exchange(EPOCH_PENDING, EPOCH_COMPLETED, Ordering::AcqRel, Ordering::Acquire); let _ = self.broker.unregister(&self.entry); } }
+impl Drop for EpochRegistration { fn drop(&mut self) { if let Some(entry) = self.entry.take() { let _ = self.broker.finish_registration(&entry); } } }
 
 #[cfg(test)]
 mod epoch_broker_tests {
@@ -1557,6 +1564,9 @@ mod epoch_broker_tests {
             drop(child);
             if let Some(ticker) = root.finish() { let _ = ticker.await; }
             assert_eq!(compiler.execution_limits_snapshot().active_epoch_registrations(), 0);
+            let state = compiler.epoch_broker.state.lock().expect("broker state");
+            assert_eq!(state.generation, 2, "one start and one exact-once final removal");
+            assert!(state.ticker.is_none());
         });
     }
 
@@ -2178,6 +2188,8 @@ mod threaded_root_observation_tests {
         let observation = sketch
             .root_execution_observation_for_test()
             .expect("prepared observation after terminal result");
+        sketch.close_threaded_root().expect("terminal execution releases cache");
+        assert_eq!(compiler.execution_limits_snapshot(), SketchExecutionSnapshot::default());
         (outcome, observation)
     }
 
@@ -2338,6 +2350,16 @@ mod threaded_root_observation_tests {
         SketchCompiler::new(SketchCompilerConfig::default().with_execution_limits(limits).expect("config")).expect("compiler")
     }
 
+    fn concurrent_epoch_compiler(deadline: Duration, registrations: usize) -> SketchCompiler {
+        let fuel = SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000).expect("high fuel partition");
+        let reserved = THREADED_RUST_RESERVATION_BYTES.checked_mul(2).expect("two exact reservations");
+        let limits = SketchExecutionLimits::new(reserved, 2).expect("two roots")
+            .with_fuel_limits(fuel).expect("fuel")
+            .with_epoch_limits(SketchEpochLimits::new(deadline, Duration::from_millis(1), registrations).expect("epoch"))
+            .expect("epoch limits");
+        SketchCompiler::new(SketchCompilerConfig::default().with_execution_limits(limits).expect("config")).expect("compiler")
+    }
+
     fn admit_epoch_fixture(compiler: &SketchCompiler, bytes: Vec<u8>) -> Arc<AdmittedSketch> {
         compiler.admit(&bytes, SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy")).expect("admission")
     }
@@ -2370,7 +2392,7 @@ mod threaded_root_observation_tests {
 
     #[test]
     fn cancellation_wins_deadline_and_current_thread_drives_the_blocking_lane() {
-        let compiler = epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+        let compiler = concurrent_epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
         let sketch = admit_epoch_fixture(&compiler, root_fuel_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
         runtime.run(async {

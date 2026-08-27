@@ -1,7 +1,8 @@
 #![cfg(feature = "wasm-sketch-worker")]
 
-//! Real-worker containment coverage for #28.  Crash and parent-death cases
-//! remain TODO(#28): they need a separately controlled process harness.
+//! Real-worker containment coverage for #28, including ignored inner helpers
+//! and externally controlled crash/parent-death proofs on native Windows and
+//! Linux targets.
 
 use std::path::PathBuf;
 use std::sync::Arc;

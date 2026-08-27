@@ -41,8 +41,8 @@ not selected by ordinary async/process users.
 
 | Target | Native evidence for this boundary |
 |---|---|
-| Linux x86-64 | Bosn/native evidence: not run in this change |
-| Windows x86-64 | native evidence: not run in this change |
+| Linux x86-64 | Managed Bosn 0.1.3 (`uname -m` = `x86_64`): current-tip fmt, warnings-denied all-feature lint, and locked all-feature suite passed (jobs `j1-2957e646`, `j2-20e8e2d9`, `j3-c11d96c9`); both exact containment subprocess tests also passed (`j6-c8de8973`, `j7-943bab55`). |
+| Windows x86-64 | Native Soldr current-tip CI-equivalent all-feature suite passed: 369 library tests, all integration/doc tests, with only the two established PDB line-resolution quarantines skipped. |
 | macOS x86-64 / ARM64 | pending/not run |
 | Linux ARM64 | pending/not run |
 | Windows ARM64 | pending/not run |

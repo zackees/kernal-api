@@ -790,11 +790,13 @@ fn validate_worker_module_len(module_bytes: usize) -> Result<(), SketchWorkerFai
 
 /// Bounded acceptance rule exercised by the supervisor ordering regression:
 /// one terminal may wait for upload success, never for upload failure.
+#[cfg(test)]
 #[derive(Default)]
 struct UploadTerminalGate {
     upload_complete: bool,
     deferred: bool,
 }
+#[cfg(test)]
 impl UploadTerminalGate {
     fn terminal(&mut self) -> Result<bool, SketchWorkerFailure> {
         if self.upload_complete {

@@ -643,7 +643,7 @@ impl AdmittedSketch {
                     .or_else(|error| map_root_error(&error, &logical_epoch))
             })(),
         };
-        let outcome = if matches!(outcome, Err(SketchExecutionError::OutOfFuel)) {
+        let outcome = if matches!(&outcome, Err(SketchExecutionError::OutOfFuel)) {
             outcome
         } else {
             epoch_error(&logical_epoch).map_or(outcome, Err)

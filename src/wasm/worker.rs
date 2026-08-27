@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use super::{
     AdmittedSketch, RootExecutionPermit, SketchCompilerConfig, SketchExecutionError,
-    SketchModulePolicy, ThreadedRootOutcome,
+    SketchModulePolicy, ThreadedRootOutcome, ThreadSpawnRejectionSummary,
 };
 use super::worker_protocol::{self, ExecuteMetadata, FinalCounters, Message, ModuleAssembler, RootOutcome, TerminalKind};
 
@@ -207,61 +207,147 @@ impl AdmittedSketch {
     }
 }
 
+enum WriterCommand { Upload { request_id: u64, source: Arc<[u8]>, metadata: ExecuteMetadata }, Cancel { request_id: u64 }, Close }
+enum WriterEvent { Upload(Result<(), ()>), Cancel(Result<(), ()>) }
+
 fn supervise(sketch: &AdmittedSketch, config: SketchWorkerConfig, cancellation: crate::async_engine::CancellationToken) -> SketchWorkerTerminal {
-    let _lease = match sketch.acquire_worker_parent_root_lease() { Ok(value) => value, Err(error) => return SketchWorkerTerminal::Execution(error) };
-    let _lease_gauge = sketch.worker_ledger.live_lease();
-    if cancellation.is_cancelled() { return SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled); }
+    // This authority begins before admission, spawning, and the handshake.
     let deadline = std::time::Instant::now() + sketch.worker_compiler_config().execution_limits().epoch_limits().wall_clock_deadline();
+    if cancellation.is_cancelled() { return SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled); }
+    let _lease = match sketch.acquire_worker_parent_root_lease() { Ok(lease) => lease, Err(error) => return SketchWorkerTerminal::Execution(error) };
+    let _lease_gauge = sketch.worker_ledger.live_lease();
+    if let Some(trigger) = selected_stop(&cancellation, deadline) { return SketchWorkerTerminal::Stopped(trigger); }
     let mut command = std::process::Command::new(config.executable());
-    let child = spawn_worker(&mut command);
-    let child = match child { Ok(value) => value, Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch) };
-    sketch.worker_ledger.record_spawned(); let _worker_gauge = sketch.worker_ledger.live_worker();
-    let (mut control, mut stdin, mut stdout) = child.into_parts();
-    let _protocol_gauge = sketch.worker_ledger.live_protocol();
-    let id = next_request_id().ok_or(SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol));
-    let id = match id { Ok(value) => value, Err(value) => return value };
-    let terminal = (|| -> Result<SketchWorkerTerminal, SketchWorkerFailure> {
-        let input = stdin.as_mut().ok_or(SketchWorkerFailure::Protocol)?; let output = stdout.as_mut().ok_or(SketchWorkerFailure::Protocol)?;
-        worker_protocol::write_message(input, &Message::Hello { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?;
-        match worker_protocol::read_message(output).map_err(|_| SketchWorkerFailure::Protocol)? { Message::HelloAck { request_id } if request_id == id => {}, _ => return Err(SketchWorkerFailure::Protocol) }
-        let metadata = metadata(sketch, deadline); let source = sketch.worker_source();
-        worker_protocol::write_message(input, &Message::ExecuteStart { request_id: id, module_len: source.len() as u64, metadata }).map_err(|_| SketchWorkerFailure::Protocol)?;
-        for (sequence, bytes) in source.chunks(worker_protocol::MAX_FRAME_PAYLOAD - 12).enumerate() { if cancellation.is_cancelled() || std::time::Instant::now() >= deadline { return Ok(SketchWorkerTerminal::Stopped(winner(&cancellation, deadline))); } worker_protocol::write_message(input, &Message::ModuleChunk { request_id: id, sequence: u32::try_from(sequence).map_err(|_| SketchWorkerFailure::Protocol)?, bytes: bytes.to_vec() }).map_err(|_| SketchWorkerFailure::Protocol)?; }
-        worker_protocol::write_message(input, &Message::ExecuteEnd { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?;
-        let reader = stdout.take().ok_or(SketchWorkerFailure::Protocol)?;
-        let (terminal_tx, terminal_rx) = std::sync::mpsc::sync_channel(1);
-        let reader_thread = std::thread::spawn(move || { let mut reader = reader; let _ = terminal_tx.send(worker_protocol::read_message(&mut reader)); });
-        let mut selected = None;
-        let mut grace_deadline = None;
-        loop {
-            if let Ok(message) = terminal_rx.try_recv() {
-                let _ = reader_thread.join();
-                let mapped = map_terminal(message.map_err(|_| SketchWorkerFailure::Protocol)?, id)?;
-                return Ok(selected.map_or(mapped, SketchWorkerTerminal::Stopped));
-            }
-            if selected.is_none() && cancellation.is_cancelled() { selected = Some(SketchWorkerStopReason::Cancelled); }
-            if selected.is_none() && std::time::Instant::now() >= deadline { selected = Some(SketchWorkerStopReason::DeadlineExceeded); }
-            if let Some(trigger) = selected {
-                if grace_deadline.is_none() {
-                    sketch.worker_ledger.record_cancel_sent();
-                    worker_protocol::write_message(input, &Message::Cancel { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?;
-                    grace_deadline = Some(std::time::Instant::now() + config.cooperative_cancel_grace());
+    let child = match spawn_worker(&mut command) { Ok(child) => child, Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch) };
+    sketch.worker_ledger.record_spawned();
+    let _worker_gauge = sketch.worker_ledger.live_worker();
+    let (mut control, stdin, stdout) = child.into_parts();
+    let (Some(stdin), Some(stdout)) = (stdin, stdout) else { return force_result(sketch, &mut control, SketchWorkerFailure::Protocol); };
+    let Some(id) = next_request_id() else {
+        drop(stdin);
+        drop(stdout);
+        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol);
+    };
+    let (write_tx, write_rx) = std::sync::mpsc::channel();
+    let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
+    let writer_ledger = Arc::clone(&sketch.worker_ledger);
+    let writer = std::thread::spawn(move || {
+        let _gauge = writer_ledger.live_protocol();
+        let mut input = stdin;
+        while let Ok(command) = write_rx.recv() {
+            let event = match command {
+                WriterCommand::Upload { request_id, source, metadata } => {
+                    let result = write_upload(&mut input, request_id, source, metadata);
+                    WriterEvent::Upload(result)
                 }
-                if std::time::Instant::now() >= grace_deadline.expect("grace") {
-                    sketch.worker_ledger.record_grace_expired();
-                    return Ok(SketchWorkerTerminal::ForcedContainment { trigger });
-                }
-            }
-            std::thread::sleep(Duration::from_millis(1));
+                WriterCommand::Cancel { request_id } => WriterEvent::Cancel(worker_protocol::write_message(&mut input, &Message::Cancel { request_id }).map_err(|_| ())),
+                WriterCommand::Close => break,
+            };
+            if write_done_tx.send(event).is_err() { break; }
         }
-    })();
-    match terminal { Ok(value) => { if control.force_and_reap(Duration::from_secs(5)).is_ok() { sketch.worker_ledger.record_reaped(); value } else { SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup) } }, Err(error) => { sketch.worker_ledger.record_protocol_failure(); let _ = control.force_and_reap(Duration::from_secs(5)); sketch.worker_ledger.record_forced(); SketchWorkerTerminal::Failure(error) } }
+    });
+    let (read_tx, read_rx) = std::sync::mpsc::channel();
+    let reader_ledger = Arc::clone(&sketch.worker_ledger);
+    let reader = std::thread::spawn(move || {
+        let _gauge = reader_ledger.live_protocol();
+        let mut output = stdout;
+        loop {
+            let message = worker_protocol::read_message(&mut output).map_err(|_| ());
+            let finished = message.is_err() || matches!(message, Ok(Message::Terminal { .. }));
+            if read_tx.send(message).is_err() || finished { break; }
+        }
+    });
+    if write_tx.send(WriterCommand::Upload { request_id: id, source: sketch.worker_source(), metadata: metadata(sketch, deadline) }).is_err() { return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol); }
+    let mut upload_complete = false;
+    let mut cancel_written = false;
+    let mut cancel_queued = false;
+    let mut hello_acked = false;
+    let mut selected = None;
+    let mut grace_deadline = None;
+    loop {
+        if selected.is_none() { selected = selected_stop(&cancellation, deadline); }
+        if let Some(trigger) = selected && !upload_complete {
+            return force_join_terminal(sketch, &mut control, write_tx, writer, reader, trigger);
+        }
+        if let Ok(event) = write_done_rx.try_recv() { match event { WriterEvent::Upload(Ok(())) => upload_complete = true, WriterEvent::Cancel(Ok(())) => { cancel_written = true; sketch.worker_ledger.record_cancel_sent(); grace_deadline = Some(std::time::Instant::now() + config.cooperative_cancel_grace()); }, WriterEvent::Upload(Err(())) | WriterEvent::Cancel(Err(())) => return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol) } }
+        if let Ok(result) = read_rx.try_recv() {
+            let message = match result {
+                Ok(message) => message,
+                Err(()) => match control.try_wait() {
+                    Ok(Some(_)) => return exited_join_result(sketch, write_tx, writer, reader),
+                    Ok(None) | Err(_) => return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol),
+                },
+            };
+            match message {
+                Message::HelloAck { request_id } if request_id == id && !hello_acked => hello_acked = true,
+                Message::Terminal { .. } => {
+                    let mapped = map_terminal(message, id);
+                    let mapped = match mapped { Ok(value) => value, Err(error) => return force_join_result(sketch, &mut control, write_tx, writer, reader, error) };
+                    if matches!(mapped, SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol)) { sketch.worker_ledger.record_protocol_failure(); }
+                    match control.reap_clean(Duration::from_secs(5)) {
+                        Ok(crate::platform::process::WorkerNormalReap::Clean) => { let _ = write_tx.send(WriterCommand::Close); let _ = writer.join(); let _ = reader.join(); sketch.worker_ledger.record_reaped(); return Ok(selected.map_or(mapped, SketchWorkerTerminal::Stopped)); }
+                        Ok(crate::platform::process::WorkerNormalReap::Nonzero) => { let _ = write_tx.send(WriterCommand::Close); let _ = writer.join(); let _ = reader.join(); sketch.worker_ledger.record_reaped(); return SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit); }
+                        Err(_) => return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::ContainmentCleanup),
+                    }
+                }
+                _ => return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol),
+            }
+        }
+        match control.try_wait() {
+            Ok(Some(_)) => return exited_join_result(sketch, write_tx, writer, reader),
+            Ok(None) => {}
+            Err(_) => return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::UnexpectedExit),
+        }
+        if let Some(trigger) = selected {
+            if !upload_complete { return force_join_terminal(sketch, &mut control, write_tx, writer, reader, trigger); }
+            if !cancel_written && !cancel_queued { if write_tx.send(WriterCommand::Cancel { request_id: id }).is_err() { return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol); } cancel_queued = true; grace_deadline = Some(std::time::Instant::now() + config.cooperative_cancel_grace()); }
+            if let Some(grace_deadline) = grace_deadline && std::time::Instant::now() >= grace_deadline { sketch.worker_ledger.record_grace_expired(); return force_join_terminal(sketch, &mut control, write_tx, writer, reader, trigger); }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
-fn spawn_worker(command: &mut std::process::Command) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> { #[cfg(target_os = "windows")] { crate::platform_win::spawn_contained_worker(command, crate::platform::process::WorkerLimits { active_processes: Some(1), ..Default::default() }) } #[cfg(target_os = "linux")] { crate::platform_linux::spawn_contained_worker(command, crate::platform::process::WorkerLimits { active_processes: Some(1), ..Default::default() }) } #[cfg(target_os = "macos")] { crate::platform_macos::spawn_contained_worker(command, crate::platform::process::WorkerLimits { active_processes: Some(1), ..Default::default() }) } }
-fn winner(c: &crate::async_engine::CancellationToken, deadline: std::time::Instant) -> SketchWorkerStopReason { if c.is_cancelled() { SketchWorkerStopReason::Cancelled } else { let _ = deadline; SketchWorkerStopReason::DeadlineExceeded } }
+fn selected_stop(cancellation: &crate::async_engine::CancellationToken, deadline: std::time::Instant) -> Option<SketchWorkerStopReason> { select_stop(cancellation.is_cancelled(), std::time::Instant::now() >= deadline) }
+fn select_stop(cancelled: bool, deadline_elapsed: bool) -> Option<SketchWorkerStopReason> { if cancelled { Some(SketchWorkerStopReason::Cancelled) } else if deadline_elapsed { Some(SketchWorkerStopReason::DeadlineExceeded) } else { None } }
+fn write_upload(input: &mut std::process::ChildStdin, request_id: u64, source: Arc<[u8]>, metadata: ExecuteMetadata) -> Result<(), ()> {
+    worker_protocol::write_message(input, &Message::Hello { request_id }).map_err(|_| ())?;
+    worker_protocol::write_message(input, &Message::ExecuteStart { request_id, module_len: source.len() as u64, metadata }).map_err(|_| ())?;
+    for (sequence, bytes) in source.chunks(worker_protocol::MAX_FRAME_PAYLOAD - 12).enumerate() {
+        let sequence = u32::try_from(sequence).map_err(|_| ())?;
+        worker_protocol::write_message(input, &Message::ModuleChunk { request_id, sequence, bytes: bytes.to_vec() }).map_err(|_| ())?;
+    }
+    worker_protocol::write_message(input, &Message::ExecuteEnd { request_id }).map_err(|_| ())
+}
+fn force_result(sketch: &AdmittedSketch, control: &mut crate::platform::process::WorkerControl, failure: SketchWorkerFailure) -> SketchWorkerTerminal { if failure == SketchWorkerFailure::Protocol { sketch.worker_ledger.record_protocol_failure(); } match control.force_and_reap(Duration::from_secs(5)) { Ok(()) => { sketch.worker_ledger.record_forced(); sketch.worker_ledger.record_reaped(); SketchWorkerTerminal::Failure(failure) }, Err(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup) } }
+fn force_join_result(sketch: &AdmittedSketch, control: &mut crate::platform::process::WorkerControl, tx: std::sync::mpsc::Sender<WriterCommand>, writer: std::thread::JoinHandle<()>, reader: std::thread::JoinHandle<()>, failure: SketchWorkerFailure) -> SketchWorkerTerminal { let result = force_result(sketch, control, failure); let _ = tx.send(WriterCommand::Close); let _ = writer.join(); let _ = reader.join(); result }
+fn exited_join_result(sketch: &AdmittedSketch, tx: std::sync::mpsc::Sender<WriterCommand>, writer: std::thread::JoinHandle<()>, reader: std::thread::JoinHandle<()>) -> SketchWorkerTerminal { let _ = tx.send(WriterCommand::Close); let _ = writer.join(); let _ = reader.join(); sketch.worker_ledger.record_reaped(); SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit) }
+fn force_join_terminal(sketch: &AdmittedSketch, control: &mut crate::platform::process::WorkerControl, tx: std::sync::mpsc::Sender<WriterCommand>, writer: std::thread::JoinHandle<()>, reader: std::thread::JoinHandle<()>, trigger: SketchWorkerStopReason) -> SketchWorkerTerminal { let result = force_result(sketch, control, SketchWorkerFailure::UnexpectedExit); let _ = tx.send(WriterCommand::Close); let _ = writer.join(); let _ = reader.join(); match result { SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup) => result, _ => SketchWorkerTerminal::ForcedContainment { trigger } } }
+
+fn spawn_worker(command: &mut std::process::Command) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> { crate::platform_imp::spawn_contained_worker(command, crate::platform::process::WorkerLimits { active_processes: Some(1), ..Default::default() }) }
 fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMetadata { let config = sketch.worker_compiler_config(); let limits = config.execution_limits(); let fuel = limits.fuel_limits(); let epoch = limits.epoch_limits(); let remaining = deadline.saturating_duration_since(std::time::Instant::now()).max(Duration::from_millis(1)); let policy = sketch.worker_policy(); ExecuteMetadata { max_wasm_stack_bytes: config.max_wasm_stack_bytes() as u64, reserved_memory_bytes: limits.maximum_reserved_shared_memory_bytes(), maximum_active_roots: limits.maximum_active_root_executions() as u64, total_fuel: fuel.total(), root_fuel: fuel.root_slice(), child_fuel: fuel.child_slice(), epoch_deadline_millis: remaining.as_millis().try_into().unwrap_or(u64::MAX), epoch_tick_millis: epoch.tick_interval().as_millis().try_into().unwrap_or(u64::MAX), maximum_epoch_registrations: epoch.maximum_active_registrations() as u64, max_module_bytes: policy.max_module_bytes() as u64, max_shared_memory_pages: policy.max_shared_memory_pages(), max_guest_threads: policy.max_guest_threads() as u64 } }
-fn map_terminal(message: Message, id: u64) -> Result<SketchWorkerTerminal, SketchWorkerFailure> { match message { Message::Terminal { request_id, kind: TerminalKind::Completed, detail, counters, .. } if request_id == id && zero(counters) => match detail.root_outcome { RootOutcome::Started => Ok(SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started)), RootOutcome::Exited => Ok(SketchWorkerTerminal::Completed(ThreadedRootOutcome::Exited)), _ => Err(SketchWorkerFailure::Protocol) }, Message::Terminal { request_id, kind: TerminalKind::Cancelled, counters, .. } if request_id == id && zero(counters) => Ok(SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled)), Message::Terminal { request_id, kind: TerminalKind::DeadlineExceeded, counters, .. } if request_id == id && zero(counters) => Ok(SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded)), _ => Err(SketchWorkerFailure::Protocol) } }
+fn map_terminal(message: Message, id: u64) -> Result<SketchWorkerTerminal, SketchWorkerFailure> {
+    let Message::Terminal { request_id, kind, detail, counters, .. } = message else { return Err(SketchWorkerFailure::Protocol); };
+    if request_id != id || !zero(counters) { return Err(SketchWorkerFailure::Protocol); }
+    let rejected = ThreadSpawnRejectionSummary::from_worker_counts(detail.capacity_rejections, detail.closing_rejections, detail.fuel_rejections, detail.epoch_rejections);
+    let terminal = match kind {
+        TerminalKind::Completed => match detail.root_outcome {
+            RootOutcome::Started => SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+            RootOutcome::Exited => SketchWorkerTerminal::Completed(ThreadedRootOutcome::Exited),
+            RootOutcome::StartedWithThreadRejections => SketchWorkerTerminal::Completed(ThreadedRootOutcome::StartedWithThreadRejections(rejected)),
+            RootOutcome::ExitedWithThreadRejections => SketchWorkerTerminal::Completed(ThreadedRootOutcome::ExitedWithThreadRejections(rejected)),
+            RootOutcome::None => return Err(SketchWorkerFailure::Protocol),
+        },
+        TerminalKind::Cancelled => SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled),
+        TerminalKind::DeadlineExceeded => SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded),
+        TerminalKind::OutOfFuel => SketchWorkerTerminal::Execution(SketchExecutionError::OutOfFuel),
+        TerminalKind::Trapped => SketchWorkerTerminal::Execution(SketchExecutionError::Trapped),
+        TerminalKind::NonzeroExit => SketchWorkerTerminal::Execution(SketchExecutionError::NonzeroExit { code: detail.status_code.ok_or(SketchWorkerFailure::Protocol)? }),
+        TerminalKind::ChildFailure | TerminalKind::WorkerFailure => SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit),
+        TerminalKind::ProtocolFailure => SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol),
+        TerminalKind::ForcedContainment => return Err(SketchWorkerFailure::Protocol),
+    };
+    Ok(terminal)
+}
 fn zero(c: FinalCounters) -> bool { c.active_roots == 0 && c.live_stores == 0 && c.live_instances == 0 && c.active_epoch_registrations == 0 && c.live_threads == 0 }
 static REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 fn next_request_id() -> Option<u64> { let value = REQUEST_ID.fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1)).ok()?; (value != 0).then_some(value) }
@@ -315,6 +401,12 @@ mod tests {
         );
     }
     #[test]
+    fn cancellation_wins_a_same_tick_deadline() {
+        assert_eq!(select_stop(true, true), Some(SketchWorkerStopReason::Cancelled));
+        assert_eq!(select_stop(false, true), Some(SketchWorkerStopReason::DeadlineExceeded));
+        assert_eq!(select_stop(false, false), None);
+    }
+    #[test]
     fn parent_lifecycle_ledger_is_separate_and_bounded() {
         let ledger = WorkerExecutionLedger::default();
         ledger.record_spawned();
@@ -331,7 +423,10 @@ mod tests {
                 grace_expired: 1,
                 forced: 1,
                 reaped: 1,
-                protocol_failures: 1
+                protocol_failures: 1,
+                live_workers: 0,
+                live_protocol_tasks: 0,
+                pending_root_leases: 0,
             }
         );
     }

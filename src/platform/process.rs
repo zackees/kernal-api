@@ -289,6 +289,12 @@ pub(crate) struct WorkerControl {
     contained: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerNormalReap {
+    Clean,
+    Nonzero,
+}
+
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 impl WorkerChild {
     pub(crate) fn new(
@@ -316,9 +322,13 @@ impl WorkerChild {
         self.stdout.take()
     }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner
+        let exit = self.inner
             .as_mut()
-            .map_or(Ok(None), |inner| inner.try_wait())
+            .map_or(Ok(None), |inner| inner.try_wait())?;
+        if exit.is_some() {
+            self.contained = true;
+        }
+        Ok(exit)
     }
 
     /// Close the control writer before hard containment, then reap within the
@@ -378,9 +388,43 @@ impl WorkerControl {
     }
 
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner
+        let exit = self.inner
             .as_mut()
-            .map_or(Ok(None), |inner| inner.try_wait())
+            .map_or(Ok(None), |inner| inner.try_wait())?;
+        if exit.is_some() {
+            self.contained = true;
+        }
+        Ok(exit)
+    }
+
+    /// Reap a child which is expected to exit normally.  This never sends a
+    /// termination signal: callers decide separately whether containment is
+    /// required after a timeout or an abnormal exit.
+    pub(crate) fn reap_clean(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<WorkerNormalReap, WorkerError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.try_wait().map_err(|source| WorkerError::new(WorkerStage::Reap, source))? {
+                Some(0) => {
+                    self.contained = true;
+                    return Ok(WorkerNormalReap::Clean);
+                }
+                Some(code) => {
+                    let _ = code;
+                    self.contained = true;
+                    return Ok(WorkerNormalReap::Nonzero);
+                }
+                None if std::time::Instant::now() >= deadline => {
+                    return Err(WorkerError::new(
+                        WorkerStage::Reap,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, "worker clean reap timed out"),
+                    ));
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
     }
 
     /// Force containment and reap on a caller-selected blocking lane.  A

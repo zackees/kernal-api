@@ -914,6 +914,14 @@ pub struct ThreadSpawnRejectionSummary {
     epoch: u32,
 }
 impl ThreadSpawnRejectionSummary {
+    pub(crate) const fn from_worker_counts(
+        capacity: u32,
+        closing: u32,
+        fuel: u32,
+        epoch: u32,
+    ) -> Self {
+        Self { capacity, closing, fuel, epoch }
+    }
     pub fn capacity(self) -> u32 {
         self.capacity
     }

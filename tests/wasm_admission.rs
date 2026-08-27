@@ -61,6 +61,8 @@ struct F {
     initial: u32,
     wrong_thread_signature: bool,
     wrong_yield_signature: bool,
+    non_function_yield: bool,
+    non_function_entry: bool,
 }
 impl Default for F {
     fn default() -> Self {
@@ -84,16 +86,26 @@ impl Default for F {
             initial: 1,
             wrong_thread_signature: false,
             wrong_yield_signature: false,
+            non_function_yield: false,
+            non_function_entry: false,
         }
     }
 }
 fn wasm(f: F) -> Vec<u8> {
     let mut w = b"\0asm\x01\0\0\0".to_vec();
     let mut t = Vec::new();
-    leb(if f.entry_param { 3 } else { 2 }, &mut t);
+    let has_non_function = f.non_function_yield || f.non_function_entry;
+    leb(
+        2 + u64::from(f.entry_param) + u64::from(has_non_function),
+        &mut t,
+    );
     t.extend([0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f]);
     if f.entry_param {
         t.extend([0x60, 1, 0x7f, 0]);
+    }
+    if has_non_function {
+        // GC struct with no fields. It is deliberately not a function type.
+        t.extend([0x5f, 0]);
     }
     section(1, t, &mut w);
     let mut i = Vec::new();
@@ -158,12 +170,32 @@ fn wasm(f: F) -> Vec<u8> {
         text("kernal-api:v1", &mut i);
         text("kernel-yield", &mut i);
         i.push(0);
-        leb(if f.wrong_yield_signature { 1 } else { 0 }, &mut i)
+        let non_function_index = 2 + u32::from(f.entry_param);
+        leb(
+            if f.non_function_yield {
+                non_function_index
+            } else if f.wrong_yield_signature {
+                1
+            } else {
+                0
+            },
+            &mut i,
+        )
     };
     section(2, i, &mut w);
     let mut fun = Vec::new();
     leb(1, &mut fun);
-    leb(if f.entry_param { 2 } else { 0 }, &mut fun);
+    let non_function_index = 2 + u32::from(f.entry_param);
+    leb(
+        if f.non_function_entry {
+            non_function_index
+        } else if f.entry_param {
+            2
+        } else {
+            0
+        },
+        &mut fun,
+    );
     section(3, fun, &mut w);
     if f.defined_memory {
         let mut m = Vec::new();
@@ -352,6 +384,20 @@ fn malformed_oversized_and_abi_mismatches_have_stable_errors() {
     assert!(matches!(
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::ImportTypeMismatch { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+    let mut f = F::default();
+    f.non_function_yield = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ImportTypeMismatch { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+    let mut f = F::default();
+    f.non_function_entry = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::EntrypointMismatch)
     ));
     assert_eq!(c.compiled_module_count(), 0);
     let p = SketchModulePolicy::new(4, 16).unwrap();

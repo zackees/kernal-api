@@ -281,11 +281,22 @@ struct Signature {
 const EMPTY: &[ValType] = &[];
 const I32: &[ValType] = &[ValType::I32];
 
+/// The type section may contain GC composite types. They are not empty
+/// function signatures: keeping that distinction makes ABI type references
+/// fail at preflight instead of being mistaken for `() -> ()`.
+enum TypeEntry {
+    Function {
+        params: Vec<ValType>,
+        results: Vec<ValType>,
+    },
+    NonFunction,
+}
+
 fn preflight(
     bytes: &[u8],
     policy: SketchModulePolicy,
 ) -> Result<SketchSharedMemory, SketchModuleError> {
-    let mut types = Vec::<(Vec<ValType>, Vec<ValType>)>::new();
+    let mut types = Vec::<TypeEntry>::new();
     let mut functions = Vec::<u32>::new();
     let mut imported_functions = 0_u32;
     let mut memory = None;
@@ -301,9 +312,12 @@ fn preflight(
                     let group = group.map_err(|_| SketchModuleError::InvalidBinary)?;
                     for ty in group.types() {
                         if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
-                            types.push((function.params().to_vec(), function.results().to_vec()));
+                            types.push(TypeEntry::Function {
+                                params: function.params().to_vec(),
+                                results: function.results().to_vec(),
+                            });
                         } else {
-                            types.push((Vec::new(), Vec::new()));
+                            types.push(TypeEntry::NonFunction);
                         }
                     }
                 }
@@ -433,16 +447,7 @@ fn preflight(
     let ty = *functions
         .get(index)
         .ok_or(SketchModuleError::EntrypointMismatch)?;
-    check_signature(
-        &types,
-        ty,
-        Signature {
-            params: EMPTY,
-            results: EMPTY,
-        },
-        ABI_MODULE,
-        ENTRY,
-    )?;
+    check_entrypoint_signature(&types, ty)?;
     Ok(memory)
 }
 fn check_memory(
@@ -484,13 +489,13 @@ fn check_memory(
     })
 }
 fn check_signature(
-    types: &[(Vec<ValType>, Vec<ValType>)],
+    types: &[TypeEntry],
     index: u32,
     expected: Signature,
     module: &str,
     name: &str,
 ) -> Result<(), SketchModuleError> {
-    let Some((params, results)) = types.get(index as usize) else {
+    let Some(TypeEntry::Function { params, results }) = types.get(index as usize) else {
         return Err(SketchModuleError::ImportTypeMismatch {
             module: bounded(module),
             name: bounded(name),
@@ -500,6 +505,25 @@ fn check_signature(
         return Err(SketchModuleError::ImportTypeMismatch {
             module: bounded(module),
             name: bounded(name),
+        });
+    }
+    Ok(())
+}
+
+fn check_entrypoint_signature(
+    types: &[TypeEntry],
+    index: u32,
+) -> Result<(), SketchModuleError> {
+    let Some(TypeEntry::Function { params, results }) = types.get(index as usize) else {
+        return Err(SketchModuleError::EntrypointMismatch);
+    };
+    if params.as_slice() != EMPTY || results.as_slice() != EMPTY {
+        // Preserve the existing stable error for a function-valued entrypoint
+        // whose ABI is wrong; only a non-function type gets the distinct
+        // entrypoint-type diagnostic above.
+        return Err(SketchModuleError::ImportTypeMismatch {
+            module: ABI_MODULE.to_owned(),
+            name: ENTRY.to_owned(),
         });
     }
     Ok(())

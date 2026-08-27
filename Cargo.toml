@@ -211,7 +211,6 @@ windows-sys = { version = "=0.61.2", features = [
 [dev-dependencies]
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "test-util", "time"] }
-wat = "=1.248.0"
 
 [build-dependencies]
 toml = "=0.8.23"

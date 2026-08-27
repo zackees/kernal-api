@@ -6,7 +6,7 @@ fn wasm_engine_is_opt_in_and_not_part_of_full() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("Cargo.toml");
 
     assert!(
-        manifest.contains("wasm-sketch-host = [\"dep:wasmtime\"]"),
+        manifest.contains("wasm-sketch-host = [\"dep:wasmtime\", \"dep:wasmparser\"]"),
         "the Wasm engine must remain behind its explicit feature"
     );
     let full_start = manifest.find("full = [").expect("full feature");

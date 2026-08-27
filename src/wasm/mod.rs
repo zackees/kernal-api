@@ -1,498 +1,154 @@
-//! Versioned admission of untrusted Rust sketch modules.
+//! Bounded admission of versioned core-Wasm sketches.
 //!
-//! Wasmtime and all of its types remain implementation details. Admission is
-//! intentionally stricter than successful Wasm validation: a module must use
-//! the selected versioned kernel namespace and the two owned compatibility
-//! imports needed by Rust's threaded WASI target. In particular, linking broad
-//! WASI is never an admission shortcut.
+//! This module does not instantiate or execute Wasm. Its only effect is one
+//! private Cranelift compilation after the complete binary admission contract
+//! has succeeded. No Wasmtime handle appears in the public API.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use wasmparser::{ExternalKind, Parser, Payload, TypeRef};
-use wasmtime::{Config, Engine, ExternType, Module, Strategy, ValType};
+use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
+use wasmtime::{Config, Engine, Module, Strategy};
 
 const PAGE_BYTES: u64 = 64 * 1024;
-const KERNEL_ABI_V1_NAMESPACE: &str = "kernal-api:v1";
-const KERNEL_YIELD: &str = "kernel-yield";
-const THREAD_NAMESPACE: &str = "wasi";
+const ABI_MODULE: &str = "kernal-api:v1";
+const ABI_YIELD: &str = "kernel-yield";
+const THREAD_MODULE: &str = "wasi";
 const THREAD_SPAWN: &str = "thread-spawn";
-const MEMORY_NAMESPACE: &str = "env";
+const MEMORY_MODULE: &str = "env";
 const MEMORY_NAME: &str = "memory";
-const ENTRYPOINT_NAME: &str = "kernal-api-run";
+const ENTRY: &str = "kernal-api-run";
+const ABI_METADATA: &str = "kernal-api.abi";
+const ABI_METADATA_VALUE: &[u8] = b"v1";
+const PROFILE_METADATA: &str = "kernal-api.profile";
+const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
+const MAX_METADATA_BYTES: usize = 128;
 
-/// Process-shareable compilation configuration for the selected sketch engine.
-///
-/// The configuration controls only compilation. Runtime resource accounting is
-/// deliberately separate: Wasmtime documents that shared memories are not
-/// integrated with ordinary store resource limiters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SketchEngineConfig {
-    max_wasm_stack_bytes: usize,
-}
-
-impl SketchEngineConfig {
-    /// Construct a compilation configuration with an explicit Wasm stack cap.
-    pub fn new(max_wasm_stack_bytes: usize) -> Result<Self, SketchEngineError> {
-        if max_wasm_stack_bytes == 0 {
-            return Err(SketchEngineError::InvalidStackLimit);
-        }
-        Ok(Self {
-            max_wasm_stack_bytes,
-        })
+pub struct SketchCompilerConfig { max_wasm_stack_bytes: usize }
+impl SketchCompilerConfig {
+    pub fn new(max_wasm_stack_bytes: usize) -> Result<Self, SketchCompilerError> {
+        if max_wasm_stack_bytes == 0 { return Err(SketchCompilerError::InvalidStackLimit); }
+        Ok(Self { max_wasm_stack_bytes })
     }
-
-    /// Maximum stack consumed by Wasm frames on one guest thread.
-    pub fn max_wasm_stack_bytes(self) -> usize {
-        self.max_wasm_stack_bytes
-    }
+    pub fn max_wasm_stack_bytes(self) -> usize { self.max_wasm_stack_bytes }
 }
+impl Default for SketchCompilerConfig { fn default() -> Self { Self { max_wasm_stack_bytes: 2 * 1024 * 1024 } } }
 
-impl Default for SketchEngineConfig {
-    fn default() -> Self {
-        // This is a Wasm-frame limit, not a guarantee about the native thread
-        // stack. Later thread creation chooses a larger native stack as needed.
-        Self {
-            max_wasm_stack_bytes: 2 * 1024 * 1024,
-        }
-    }
-}
-
-/// A private Wasmtime/Cranelift engine wrapped in facade-owned semantics.
+/// Facade-owned compiler for the selected core-Wasm profile.
 #[derive(Clone)]
-pub struct SketchEngine {
-    inner: Arc<Engine>,
+pub struct SketchCompiler { engine: Arc<Engine>, compilations: Arc<AtomicU64> }
+impl SketchCompiler {
+    /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
+    /// Component Model, Winch, WASI linking, and an executor are absent.
+    pub fn new(config: SketchCompilerConfig) -> Result<Self, SketchCompilerError> {
+        let mut cfg = Config::new();
+        cfg.strategy(Strategy::Cranelift).map_err(|_| SketchCompilerError::Unavailable)?;
+        cfg.wasm_threads(true);
+        cfg.shared_memory(true);
+        cfg.wasm_memory64(false);
+        cfg.wasm_multi_memory(false);
+        cfg.wasm_shared_everything_threads(false);
+        cfg.max_wasm_stack(config.max_wasm_stack_bytes);
+        let engine = Engine::new(&cfg).map_err(|_| SketchCompilerError::Unavailable)?;
+        Ok(Self { engine: Arc::new(engine), compilations: Arc::new(AtomicU64::new(0)) })
+    }
+    /// Preflights and then compiles one module. Rejected input cannot compile.
+    pub fn admit(&self, bytes: &[u8], policy: SketchModulePolicy) -> Result<AdmittedSketch, SketchModuleError> {
+        if bytes.len() > policy.max_module_bytes { return Err(SketchModuleError::ModuleTooLarge { actual_bytes: bytes.len(), maximum_bytes: policy.max_module_bytes }); }
+        let memory = preflight(bytes, policy)?;
+        let module = Module::new(&self.engine, bytes).map_err(|_| SketchModuleError::InvalidBinary)?;
+        self.compilations.fetch_add(1, Ordering::Relaxed);
+        Ok(AdmittedSketch { module, module_bytes: bytes.len(), shared_memory: memory })
+    }
+    /// Number of modules whose complete preflight reached private compilation.
+    pub fn compiled_module_count(&self) -> u64 { self.compilations.load(Ordering::Relaxed) }
 }
 
-impl SketchEngine {
-    /// Construct the sole core-Wasm/Cranelift engine profile for sketches.
-    ///
-    /// This intentionally excludes WASI linking, the Component Model, the
-    /// pooling allocator, Winch, and any engine-managed task runtime.
-    pub fn new(config: SketchEngineConfig) -> Result<Self, SketchEngineError> {
-        let mut wasmtime = Config::new();
-        wasmtime.strategy(Strategy::Cranelift);
-        wasmtime.wasm_threads(true);
-        // Shared memories are off by default in Wasmtime even when threads are
-        // enabled, so make this policy choice explicit.
-        wasmtime.shared_memory(true);
-        wasmtime.wasm_memory64(false);
-        wasmtime.wasm_multi_memory(false);
-        wasmtime.wasm_shared_everything_threads(false);
-        wasmtime.max_wasm_stack(config.max_wasm_stack_bytes);
-
-        let engine = Engine::new(&wasmtime)
-            .map_err(|error| SketchEngineError::Initialization(error.to_string()))?;
-        Ok(Self {
-            inner: Arc::new(engine),
-        })
-    }
-
-    /// Compile and admit one module exactly once.
-    ///
-    /// The returned value retains the compiled module privately for a later
-    /// instantiation slice. No store or instance is created here.
-    pub fn admit(
-        &self,
-        bytes: &[u8],
-        policy: SketchAdmissionPolicy,
-    ) -> Result<SketchModule, SketchAdmissionError> {
-        if bytes.len() > policy.max_module_bytes {
-            return Err(SketchAdmissionError::ModuleTooLarge {
-                actual_bytes: bytes.len(),
-                maximum_bytes: policy.max_module_bytes,
-            });
-        }
-
-        preflight(bytes, policy)?;
-        let module = Module::new(&self.inner, bytes)
-            .map_err(|error| SketchAdmissionError::InvalidModule(error.to_string()))?;
-        let shared_memory = validate_imports(&module, policy)?;
-        validate_entrypoint(&module)?;
-
-        Ok(SketchModule {
-            module,
-            module_bytes: bytes.len(),
-            shared_memory,
-        })
-    }
-}
-
-fn preflight(bytes: &[u8], policy: SketchAdmissionPolicy) -> Result<(), SketchAdmissionError> {
-    let mut memory = false;
-    let mut thread_spawn = false;
-    let mut kernel_yield = false;
-    let mut entrypoint = false;
-    for payload in Parser::new(0).parse_all(bytes) {
-        match payload.map_err(|_| SketchAdmissionError::InvalidModule("malformed module".into()))? {
-            Payload::ImportSection(reader) => {
-                for group in reader {
-                    let group = group.map_err(|_| {
-                        SketchAdmissionError::InvalidModule("malformed import".into())
-                    })?;
-                    for import in group.into_iter() {
-                        let (_, import) = import.map_err(|_| {
-                            SketchAdmissionError::InvalidModule("malformed import".into())
-                        })?;
-                        match (import.module, import.name, import.ty) {
-                            (MEMORY_NAMESPACE, MEMORY_NAME, TypeRef::Memory(memory_type)) => {
-                                if memory {
-                                    return Err(SketchAdmissionError::MultipleMemoryImports);
-                                }
-                                memory = true;
-                                if !memory_type.shared {
-                                    return Err(SketchAdmissionError::UnsharedMemory);
-                                }
-                                if memory_type.memory64 {
-                                    return Err(SketchAdmissionError::Memory64);
-                                }
-                                let Some(maximum) = memory_type.maximum else {
-                                    return Err(SketchAdmissionError::SharedMemoryWithoutMaximum);
-                                };
-                                if memory_type.initial > u64::from(policy.max_shared_memory_pages)
-                                    || maximum > u64::from(policy.max_shared_memory_pages)
-                                {
-                                    return Err(SketchAdmissionError::SharedMemoryExceedsPolicy {
-                                        minimum_pages: memory_type.initial,
-                                        maximum_pages: maximum,
-                                        policy_pages: policy.max_shared_memory_pages,
-                                    });
-                                }
-                            }
-                            (
-                                THREAD_NAMESPACE,
-                                THREAD_SPAWN,
-                                TypeRef::Func(_) | TypeRef::FuncExact(_),
-                            ) => thread_spawn = true,
-                            (
-                                KERNEL_ABI_V1_NAMESPACE,
-                                KERNEL_YIELD,
-                                TypeRef::Func(_) | TypeRef::FuncExact(_),
-                            ) => kernel_yield = true,
-                            _ => {
-                                return Err(SketchAdmissionError::ForbiddenImport {
-                                    module: import.module.into(),
-                                    name: import.name.into(),
-                                })
-                            }
-                        }
-                    }
-                }
-            }
-            Payload::ExportSection(reader) => {
-                for export in reader {
-                    let export = export.map_err(|_| {
-                        SketchAdmissionError::InvalidModule("malformed export".into())
-                    })?;
-                    if export.name != ENTRYPOINT_NAME || export.kind != ExternalKind::Func {
-                        return Err(SketchAdmissionError::EntrypointMismatch);
-                    }
-                    entrypoint = true;
-                }
-            }
-            Payload::StartSection { .. } => return Err(SketchAdmissionError::EntrypointMismatch),
-            _ => {}
-        }
-    }
-    if !memory {
-        return Err(SketchAdmissionError::MissingSharedMemory);
-    }
-    if !thread_spawn || !kernel_yield || !entrypoint {
-        return Err(SketchAdmissionError::EntrypointMismatch);
-    }
-    Ok(())
-}
-
-/// Limits applied before a sketch module may be instantiated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SketchAdmissionPolicy {
-    max_module_bytes: usize,
-    max_shared_memory_pages: u32,
+pub struct SketchModulePolicy { max_module_bytes: usize, max_shared_memory_pages: u32 }
+impl SketchModulePolicy {
+    pub fn new(max_module_bytes: usize, max_shared_memory_pages: u32) -> Result<Self, SketchModuleError> {
+        if max_module_bytes == 0 { return Err(SketchModuleError::InvalidModuleLimit); }
+        if max_shared_memory_pages == 0 { return Err(SketchModuleError::InvalidSharedMemoryLimit); }
+        Ok(Self { max_module_bytes, max_shared_memory_pages })
+    }
+    pub fn max_module_bytes(self) -> usize { self.max_module_bytes }
+    pub fn max_shared_memory_pages(self) -> u32 { self.max_shared_memory_pages }
 }
 
-impl SketchAdmissionPolicy {
-    /// Construct the v1 admission policy.
-    pub fn new(
-        max_module_bytes: usize,
-        max_shared_memory_pages: u32,
-    ) -> Result<Self, SketchAdmissionError> {
-        if max_module_bytes == 0 {
-            return Err(SketchAdmissionError::InvalidModuleLimit);
-        }
-        if max_shared_memory_pages == 0 {
-            return Err(SketchAdmissionError::InvalidSharedMemoryLimit);
-        }
-        Ok(Self {
-            max_module_bytes,
-            max_shared_memory_pages,
-        })
-    }
-
-    /// Maximum accepted input bytes before compilation.
-    pub fn max_module_bytes(self) -> usize {
-        self.max_module_bytes
-    }
-
-    /// Maximum declared shared-memory pages (64 KiB each).
-    pub fn max_shared_memory_pages(self) -> u32 {
-        self.max_shared_memory_pages
-    }
+/// An admitted module. The backend object is private to the crate.
+pub struct AdmittedSketch { module: Module, module_bytes: usize, shared_memory: SketchSharedMemory }
+impl AdmittedSketch {
+    pub fn module_bytes(&self) -> usize { self.module_bytes }
+    pub fn shared_memory(&self) -> SketchSharedMemory { self.shared_memory }
+    #[allow(dead_code)] pub(crate) fn compiled_module(&self) -> &Module { &self.module }
 }
-
-/// Metadata for a module admitted by [`SketchEngine`].
-///
-/// The compiled backend object remains private. Later internal runtime code can
-/// use it for instantiation without leaking Wasmtime into the facade.
-pub struct SketchModule {
-    module: Module,
-    module_bytes: usize,
-    shared_memory: SketchSharedMemory,
-}
-
-impl SketchModule {
-    /// Input byte length that was compiled exactly once for this admission.
-    pub fn module_bytes(&self) -> usize {
-        self.module_bytes
-    }
-
-    /// Validated shared-memory declaration for the future logical sketch.
-    pub fn shared_memory(&self) -> SketchSharedMemory {
-        self.shared_memory
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn compiled_module(&self) -> &Module {
-        &self.module
-    }
-}
-
-/// Shared-memory bounds validated at sketch admission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SketchSharedMemory {
-    minimum_pages: u32,
-    maximum_pages: u32,
-}
-
+pub struct SketchSharedMemory { minimum_pages: u32, maximum_pages: u32 }
 impl SketchSharedMemory {
-    /// Minimum initially available memory in 64 KiB Wasm pages.
-    pub fn minimum_pages(self) -> u32 {
-        self.minimum_pages
-    }
-
-    /// Maximum memory in 64 KiB Wasm pages, bounded by kernel policy.
-    pub fn maximum_pages(self) -> u32 {
-        self.maximum_pages
-    }
-
-    /// Maximum memory as bytes, checked from the page bound.
-    pub fn maximum_bytes(self) -> u64 {
-        u64::from(self.maximum_pages) * PAGE_BYTES
-    }
+    pub fn minimum_pages(self) -> u32 { self.minimum_pages }
+    pub fn maximum_pages(self) -> u32 { self.maximum_pages }
+    pub fn maximum_bytes(self) -> u64 { u64::from(self.maximum_pages) * PAGE_BYTES }
 }
 
-/// Failure while configuring the private sketch compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchCompilerError { InvalidStackLimit, Unavailable }
+impl fmt::Display for SketchCompilerError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(match self { Self::InvalidStackLimit => "the Wasm stack limit must be nonzero", Self::Unavailable => "the sketch compiler is unavailable" }) } }
+impl std::error::Error for SketchCompilerError {}
+
+/// Stable bounded diagnostics; no parser or engine message crosses this facade.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SketchEngineError {
-    /// A zero Wasm stack cap cannot execute any module safely.
-    InvalidStackLimit,
-    /// The selected engine could not be initialized on this host.
-    Initialization(String),
+pub enum SketchModuleError {
+    ModuleTooLarge { actual_bytes: usize, maximum_bytes: usize }, InvalidBinary, InvalidModuleLimit, InvalidSharedMemoryLimit,
+    ForbiddenImport { module: String, name: String }, ImportTypeMismatch { module: String, name: String }, MissingRequiredImport { module: &'static str, name: &'static str },
+    MissingSharedMemory, MultipleMemoryImports, UnsharedMemory, Memory64, UnsupportedMemoryPageSize, SharedMemoryWithoutMaximum,
+    SharedMemoryExceedsPolicy { minimum_pages: u64, maximum_pages: u64, policy_pages: u32 },
+    MissingMetadata { name: &'static str }, DuplicateMetadata { name: &'static str }, MetadataMismatch { name: &'static str }, MetadataTooLarge { name: &'static str },
+    StartFunctionForbidden, ExportNotAllowed { name: String }, EntrypointMismatch,
 }
+impl SketchModuleError { pub fn code(&self) -> &'static str { match self {
+    Self::ModuleTooLarge {..} => "module-too-large", Self::InvalidBinary => "invalid-binary", Self::InvalidModuleLimit => "invalid-module-limit", Self::InvalidSharedMemoryLimit => "invalid-shared-memory-limit", Self::ForbiddenImport {..} => "forbidden-import", Self::ImportTypeMismatch {..} => "import-type-mismatch", Self::MissingRequiredImport {..} => "missing-required-import", Self::MissingSharedMemory => "missing-shared-memory", Self::MultipleMemoryImports => "multiple-memory-imports", Self::UnsharedMemory => "unshared-memory", Self::Memory64 => "memory64", Self::UnsupportedMemoryPageSize => "unsupported-memory-page-size", Self::SharedMemoryWithoutMaximum => "shared-memory-without-maximum", Self::SharedMemoryExceedsPolicy {..} => "shared-memory-exceeds-policy", Self::MissingMetadata {..} => "missing-metadata", Self::DuplicateMetadata {..} => "duplicate-metadata", Self::MetadataMismatch {..} => "metadata-mismatch", Self::MetadataTooLarge {..} => "metadata-too-large", Self::StartFunctionForbidden => "start-function-forbidden", Self::ExportNotAllowed {..} => "export-not-allowed", Self::EntrypointMismatch => "entrypoint-mismatch" } } }
+impl fmt::Display for SketchModuleError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "sketch admission failed ({})", self.code()) } }
+impl std::error::Error for SketchModuleError {}
 
-impl fmt::Display for SketchEngineError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidStackLimit => formatter.write_str("the Wasm stack limit must be nonzero"),
-            Self::Initialization(detail) => {
-                write!(formatter, "could not initialize sketch engine: {detail}")
-            }
-        }
-    }
+#[derive(Clone, Copy)] struct Signature { params: &'static [ValType], results: &'static [ValType] }
+const EMPTY: &[ValType] = &[]; const I32: &[ValType] = &[ValType::I32];
+
+fn preflight(bytes: &[u8], policy: SketchModulePolicy) -> Result<SketchSharedMemory, SketchModuleError> {
+    let mut types = Vec::<(Vec<ValType>, Vec<ValType>)>::new(); let mut functions = Vec::<u32>::new(); let mut imported_functions = 0_u32;
+    let mut memory = None; let mut saw_thread = false; let mut saw_yield = false; let mut exports = Vec::<(String, ExternalKind, u32)>::new(); let mut abi = 0; let mut profile = 0;
+    for item in Parser::new(0).parse_all(bytes) { match item.map_err(|_| SketchModuleError::InvalidBinary)? {
+        Payload::TypeSection(reader) => for group in reader { let group = group.map_err(|_| SketchModuleError::InvalidBinary)?; for ty in group.types() { if let CompositeInnerType::Func(function) = &ty.composite_type.inner { types.push((function.params().to_vec(), function.results().to_vec())); } else { types.push((Vec::new(), Vec::new())); } } },
+        Payload::ImportSection(reader) => for import in reader.into_imports() { let (_, import) = import.map_err(|_| SketchModuleError::InvalidBinary)?; match (import.module, import.name, import.ty) {
+            (MEMORY_MODULE, MEMORY_NAME, TypeRef::Memory(ty)) => { if memory.is_some() { return Err(SketchModuleError::MultipleMemoryImports); } memory = Some(check_memory(ty.initial, ty.maximum, ty.shared, ty.memory64, ty.page_size_log2, policy)?); },
+            (THREAD_MODULE, THREAD_SPAWN, TypeRef::Func(i) | TypeRef::FuncExact(i)) => { check_signature(&types, i, Signature { params: I32, results: I32 }, THREAD_MODULE, THREAD_SPAWN)?; saw_thread = true; imported_functions += 1; },
+            (ABI_MODULE, ABI_YIELD, TypeRef::Func(i) | TypeRef::FuncExact(i)) => { check_signature(&types, i, Signature { params: EMPTY, results: EMPTY }, ABI_MODULE, ABI_YIELD)?; saw_yield = true; imported_functions += 1; },
+            (module, name, _) => return Err(SketchModuleError::ForbiddenImport { module: bounded(module), name: bounded(name) }),
+        } },
+        Payload::FunctionSection(reader) => for index in reader { functions.push(index.map_err(|_| SketchModuleError::InvalidBinary)?); },
+        Payload::ExportSection(reader) => for export in reader { let e = export.map_err(|_| SketchModuleError::InvalidBinary)?; exports.push((bounded(e.name), e.kind, e.index)); },
+        Payload::StartSection { .. } => return Err(SketchModuleError::StartFunctionForbidden),
+        Payload::CustomSection(section) => { let (count, expected, name) = if section.name() == ABI_METADATA { (&mut abi, ABI_METADATA_VALUE, ABI_METADATA) } else if section.name() == PROFILE_METADATA { (&mut profile, PROFILE_METADATA_VALUE, PROFILE_METADATA) } else { continue }; *count += 1; if *count > 1 { return Err(SketchModuleError::DuplicateMetadata { name }); } if section.data().len() > MAX_METADATA_BYTES { return Err(SketchModuleError::MetadataTooLarge { name }); } if section.data() != expected { return Err(SketchModuleError::MetadataMismatch { name }); } },
+        _ => {}
+    }}
+    let memory = memory.ok_or(SketchModuleError::MissingSharedMemory)?;
+    if !saw_thread { return Err(SketchModuleError::MissingRequiredImport { module: THREAD_MODULE, name: THREAD_SPAWN }); }
+    if !saw_yield { return Err(SketchModuleError::MissingRequiredImport { module: ABI_MODULE, name: ABI_YIELD }); }
+    if abi == 0 { return Err(SketchModuleError::MissingMetadata { name: ABI_METADATA }); }
+    if profile == 0 { return Err(SketchModuleError::MissingMetadata { name: PROFILE_METADATA }); }
+    if exports.len() != 1 || exports[0].0 != ENTRY || exports[0].1 != ExternalKind::Func { return Err(SketchModuleError::ExportNotAllowed { name: exports.first().map(|e| e.0.clone()).unwrap_or_default() }); }
+    let index = exports[0].2.checked_sub(imported_functions).ok_or(SketchModuleError::EntrypointMismatch)? as usize;
+    let ty = *functions.get(index).ok_or(SketchModuleError::EntrypointMismatch)?;
+    check_signature(&types, ty, Signature { params: EMPTY, results: EMPTY }, ABI_MODULE, ENTRY)?;
+    Ok(memory)
 }
-
-impl std::error::Error for SketchEngineError {}
-
-/// Failure while validating a module before any instance is created.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SketchAdmissionError {
-    /// The caller exceeded its bounded module input budget.
-    ModuleTooLarge {
-        actual_bytes: usize,
-        maximum_bytes: usize,
-    },
-    /// The module could not be parsed or compiled by the selected engine.
-    InvalidModule(String),
-    /// A policy with no module budget is invalid.
-    InvalidModuleLimit,
-    /// A policy with no shared-memory budget is invalid.
-    InvalidSharedMemoryLimit,
-    /// An import did not belong to the explicit kernel/compatibility allowlist.
-    ForbiddenImport { module: String, name: String },
-    /// An explicitly named import had the wrong external kind or ABI shape.
-    ImportTypeMismatch { module: String, name: String },
-    /// Exactly one owned shared-memory import is required.
-    MissingSharedMemory,
-    /// More than one memory import was requested.
-    MultipleMemoryImports,
-    /// The memory compatibility import must be a shared memory.
-    UnsharedMemory,
-    /// memory64 is prohibited in the v1 sketch ABI.
-    Memory64,
-    /// A shared memory must have an explicit finite maximum.
-    SharedMemoryWithoutMaximum,
-    /// The module's shared-memory declaration exceeds the kernel policy.
-    SharedMemoryExceedsPolicy {
-        minimum_pages: u64,
-        maximum_pages: u64,
-        policy_pages: u32,
-    },
-    /// The required versioned guest entrypoint is absent or has the wrong ABI.
-    EntrypointMismatch,
+fn check_memory(initial: u64, maximum: Option<u64>, shared: bool, memory64: bool, page_size_log2: Option<u32>, policy: SketchModulePolicy) -> Result<SketchSharedMemory, SketchModuleError> {
+    if memory64 { return Err(SketchModuleError::Memory64); } if !shared { return Err(SketchModuleError::UnsharedMemory); } if page_size_log2.is_some() { return Err(SketchModuleError::UnsupportedMemoryPageSize); }
+    let maximum = maximum.ok_or(SketchModuleError::SharedMemoryWithoutMaximum)?;
+    if initial > u64::from(policy.max_shared_memory_pages) || maximum > u64::from(policy.max_shared_memory_pages) { return Err(SketchModuleError::SharedMemoryExceedsPolicy { minimum_pages: initial, maximum_pages: maximum, policy_pages: policy.max_shared_memory_pages }); }
+    Ok(SketchSharedMemory { minimum_pages: initial as u32, maximum_pages: maximum as u32 })
 }
-
-impl fmt::Display for SketchAdmissionError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ModuleTooLarge {
-                actual_bytes,
-                maximum_bytes,
-            } => write!(formatter, "sketch module is {actual_bytes} bytes; maximum is {maximum_bytes}"),
-            Self::InvalidModule(detail) => write!(formatter, "invalid sketch module: {detail}"),
-            Self::InvalidModuleLimit => formatter.write_str("the module input limit must be nonzero"),
-            Self::InvalidSharedMemoryLimit => formatter.write_str("the shared-memory page limit must be nonzero"),
-            Self::ForbiddenImport { module, name } => write!(formatter, "forbidden sketch import {module}::{name}"),
-            Self::ImportTypeMismatch { module, name } => write!(formatter, "sketch import {module}::{name} has an unsupported ABI"),
-            Self::MissingSharedMemory => formatter.write_str("sketch must import owned shared memory"),
-            Self::MultipleMemoryImports => formatter.write_str("sketch may import exactly one shared memory"),
-            Self::UnsharedMemory => formatter.write_str("sketch memory import must be shared"),
-            Self::Memory64 => formatter.write_str("memory64 is not admitted for v1 sketches"),
-            Self::SharedMemoryWithoutMaximum => formatter.write_str("sketch shared memory must declare a maximum"),
-            Self::SharedMemoryExceedsPolicy {
-                minimum_pages,
-                maximum_pages,
-                policy_pages,
-            } => write!(formatter, "sketch shared memory {minimum_pages}..={maximum_pages} pages exceeds policy maximum {policy_pages}"),
-            Self::EntrypointMismatch => formatter.write_str("sketch must export kernal-api-run with signature () -> ()"),
-        }
-    }
-}
-
-impl std::error::Error for SketchAdmissionError {}
-
-fn validate_imports(
-    module: &Module,
-    policy: SketchAdmissionPolicy,
-) -> Result<SketchSharedMemory, SketchAdmissionError> {
-    let mut shared_memory = None;
-
-    for import in module.imports() {
-        let module_name = import.module();
-        let name = import.name();
-        let external_type = import.ty();
-
-        if module_name == MEMORY_NAMESPACE && name == MEMORY_NAME {
-            if shared_memory.is_some() {
-                return Err(SketchAdmissionError::MultipleMemoryImports);
-            }
-            let memory =
-                external_type
-                    .memory()
-                    .ok_or_else(|| SketchAdmissionError::ImportTypeMismatch {
-                        module: module_name.to_owned(),
-                        name: name.to_owned(),
-                    })?;
-            shared_memory = Some(validate_shared_memory(memory, policy)?);
-            continue;
-        }
-
-        if module_name == THREAD_NAMESPACE && name == THREAD_SPAWN {
-            if !matches_thread_spawn(&external_type) {
-                return Err(SketchAdmissionError::ImportTypeMismatch {
-                    module: module_name.to_owned(),
-                    name: name.to_owned(),
-                });
-            }
-            continue;
-        }
-
-        if module_name == KERNEL_ABI_V1_NAMESPACE && name == KERNEL_YIELD {
-            // This is the one deliberately tiny v1 kernel import admitted by
-            // the engine slice. #16 replaces this fixed contract with the
-            // generated ABI manifest; an arbitrary name in this namespace is
-            // no more trusted than an arbitrary WASI import.
-            if !matches_empty_function(&external_type) {
-                return Err(SketchAdmissionError::ImportTypeMismatch {
-                    module: module_name.to_owned(),
-                    name: name.to_owned(),
-                });
-            }
-            continue;
-        }
-
-        return Err(SketchAdmissionError::ForbiddenImport {
-            module: module_name.to_owned(),
-            name: name.to_owned(),
-        });
-    }
-
-    shared_memory.ok_or(SketchAdmissionError::MissingSharedMemory)
-}
-
-fn validate_shared_memory(
-    memory: &wasmtime::MemoryType,
-    policy: SketchAdmissionPolicy,
-) -> Result<SketchSharedMemory, SketchAdmissionError> {
-    if memory.is_64() {
-        return Err(SketchAdmissionError::Memory64);
-    }
-    if !memory.is_shared() {
-        return Err(SketchAdmissionError::UnsharedMemory);
-    }
-    let maximum_pages = memory
-        .maximum()
-        .ok_or(SketchAdmissionError::SharedMemoryWithoutMaximum)?;
-    let minimum_pages = memory.minimum();
-    if minimum_pages > u64::from(policy.max_shared_memory_pages)
-        || maximum_pages > u64::from(policy.max_shared_memory_pages)
-    {
-        return Err(SketchAdmissionError::SharedMemoryExceedsPolicy {
-            minimum_pages,
-            maximum_pages,
-            policy_pages: policy.max_shared_memory_pages,
-        });
-    }
-
-    Ok(SketchSharedMemory {
-        minimum_pages: minimum_pages as u32,
-        maximum_pages: maximum_pages as u32,
-    })
-}
-
-fn matches_thread_spawn(external_type: &ExternType) -> bool {
-    let Some(function) = external_type.func() else {
-        return false;
-    };
-    let params: Vec<_> = function.params().collect();
-    let results: Vec<_> = function.results().collect();
-    matches!(params.as_slice(), [ValType::I32]) && matches!(results.as_slice(), [ValType::I32])
-}
-
-fn matches_empty_function(external_type: &ExternType) -> bool {
-    let Some(function) = external_type.func() else {
-        return false;
-    };
-    function.params().next().is_none() && function.results().next().is_none()
-}
-
-fn validate_entrypoint(module: &Module) -> Result<(), SketchAdmissionError> {
-    let Some(export) = module.get_export(ENTRYPOINT_NAME) else {
-        return Err(SketchAdmissionError::EntrypointMismatch);
-    };
-    let Some(function) = export.func() else {
-        return Err(SketchAdmissionError::EntrypointMismatch);
-    };
-    if function.params().next().is_some() || function.results().next().is_some() {
-        return Err(SketchAdmissionError::EntrypointMismatch);
-    }
-    Ok(())
-}
+fn check_signature(types: &[(Vec<ValType>, Vec<ValType>)], index: u32, expected: Signature, module: &str, name: &str) -> Result<(), SketchModuleError> { let Some((params, results)) = types.get(index as usize) else { return Err(SketchModuleError::ImportTypeMismatch { module: bounded(module), name: bounded(name) }); }; if params.as_slice() != expected.params || results.as_slice() != expected.results { return Err(SketchModuleError::ImportTypeMismatch { module: bounded(module), name: bounded(name) }); } Ok(()) }
+fn bounded(value: &str) -> String { value.chars().take(96).collect() }

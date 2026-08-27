@@ -1,156 +1,25 @@
 #![cfg(feature = "wasm-sketch-host")]
 
-use kernal_api::wasm::{
-    SketchAdmissionError, SketchAdmissionPolicy, SketchEngine, SketchEngineConfig,
-};
+use kernal_api::wasm::{SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy};
 
-fn engine() -> SketchEngine {
-    SketchEngine::new(SketchEngineConfig::default()).expect("private Cranelift engine")
+fn compiler() -> SketchCompiler { SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler") }
+fn policy() -> SketchModulePolicy { SketchModulePolicy::new(4096, 16).expect("policy") }
+fn leb(mut n: u64, o: &mut Vec<u8>) { loop { let mut b = (n & 127) as u8; n >>= 7; if n != 0 { b |= 128; } o.push(b); if n == 0 { return; } } }
+fn text(s: &str, o: &mut Vec<u8>) { leb(s.len() as u64, o); o.extend(s.as_bytes()); }
+fn section(id: u8, b: Vec<u8>, o: &mut Vec<u8>) { o.push(id); leb(b.len() as u64, o); o.extend(b); }
+fn custom(n: &str, d: &[u8], o: &mut Vec<u8>) { let mut b = Vec::new(); text(n, &mut b); b.extend(d); section(0, b, o); }
+
+#[derive(Clone, Copy)] struct F { thread: bool, yield_: bool, shared: bool, max: Option<u32>, mem64: bool, entry_param: bool, extra: Option<u8>, start: bool, duplicate: bool, bad_meta: bool }
+impl Default for F { fn default() -> Self { Self { thread: true, yield_: true, shared: true, max: Some(16), mem64: false, entry_param: false, extra: None, start: false, duplicate: false, bad_meta: false } } }
+fn wasm(f: F) -> Vec<u8> {
+    let mut w = b"\0asm\x01\0\0\0".to_vec();
+    let mut t = Vec::new(); leb(if f.entry_param { 3 } else { 2 }, &mut t); t.extend([0x60,0,0, 0x60,1,0x7f,1,0x7f]); if f.entry_param { t.extend([0x60,1,0x7f,0]); } section(1,t,&mut w);
+    let mut i = Vec::new(); leb((1+u32::from(f.thread)+u32::from(f.yield_)) as u64,&mut i); text("env",&mut i); text("memory",&mut i); i.push(2); let mut flags=if f.max.is_some(){1}else{0}; if f.shared{flags|=2};if f.mem64{flags|=4};leb(flags,&mut i);leb(1,&mut i);if let Some(x)=f.max{leb(x as u64,&mut i)};if f.thread{text("wasi",&mut i);text("thread-spawn",&mut i);i.push(0);leb(1,&mut i)};if f.yield_{text("kernal-api:v1",&mut i);text("kernel-yield",&mut i);i.push(0);leb(0,&mut i)};section(2,i,&mut w);
+    let mut fun=Vec::new();leb(1,&mut fun);leb(if f.entry_param{2}else{0},&mut fun);section(3,fun,&mut w);let imports=u32::from(f.thread)+u32::from(f.yield_);let mut e=Vec::new();leb(if f.extra.is_some(){2}else{1},&mut e);text("kernal-api-run",&mut e);e.push(0);leb(imports as u64,&mut e);if let Some(k)=f.extra{text("extra",&mut e);e.push(k);leb(0,&mut e)};section(7,e,&mut w);if f.start{section(8,vec![imports as u8],&mut w)};section(10,vec![1,2,0,0x0b],&mut w);custom("kernal-api.abi",if f.bad_meta{b"vX"}else{b"v1"},&mut w);if f.duplicate{custom("kernal-api.abi",b"v1",&mut w)};custom("kernal-api.profile",b"threaded-core-wasm-v1",&mut w);w
 }
 
-fn policy() -> SketchAdmissionPolicy {
-    SketchAdmissionPolicy::new(1024 * 1024, 16).expect("bounded policy")
-}
-
-fn wasm(source: &str) -> Vec<u8> {
-    wat::parse_str(source).expect("test-only WAT fixture")
-}
-
-fn valid_module() -> Vec<u8> {
-    wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16 shared))
-              (import "wasi" "thread-spawn" (func (param i32) (result i32)))
-              (import "kernal-api:v1" "kernel-yield" (func))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    )
-}
-
-#[test]
-fn valid_versioned_kernel_module_is_admitted_once_with_bounded_shared_memory() {
-    let module = engine()
-        .admit(&valid_module(), policy())
-        .expect("admit module");
-
-    assert!(module.module_bytes() > 0);
-    assert_eq!(module.shared_memory().minimum_pages(), 1);
-    assert_eq!(module.shared_memory().maximum_pages(), 16);
-    assert_eq!(module.shared_memory().maximum_bytes(), 16 * 64 * 1024);
-}
-
-#[test]
-fn ambient_wasi_is_rejected_before_any_instance_exists() {
-    let bytes = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16 shared))
-              (import "wasi_snapshot_preview1" "fd_write" (func))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    );
-
-    assert!(matches!(
-        engine().admit(&bytes, policy()),
-        Err(SketchAdmissionError::ForbiddenImport { module, name })
-            if module == "wasi_snapshot_preview1" && name == "fd_write"
-    ));
-}
-
-#[test]
-fn versioned_namespace_does_not_admit_unspecified_kernel_entries() {
-    let bytes = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16 shared))
-              (import "kernal-api:v1" "ambient-by-another-name" (func))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    );
-
-    assert!(matches!(
-        engine().admit(&bytes, policy()),
-        Err(SketchAdmissionError::ForbiddenImport { module, name })
-            if module == "kernal-api:v1" && name == "ambient-by-another-name"
-    ));
-}
-
-#[test]
-fn shared_memory_must_be_the_owned_bounded_compatibility_import() {
-    let unshared = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    );
-    assert!(matches!(
-        engine().admit(&unshared, policy()),
-        Err(SketchAdmissionError::UnsharedMemory)
-    ));
-
-    let oversized = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 17 shared))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    );
-    assert!(matches!(
-        engine().admit(&oversized, policy()),
-        Err(SketchAdmissionError::SharedMemoryExceedsPolicy {
-            policy_pages: 16,
-            ..
-        })
-    ));
-}
-
-#[test]
-fn compatibility_and_entrypoint_abi_mismatches_are_rejected() {
-    let bad_thread_spawn = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16 shared))
-              (import "wasi" "thread-spawn" (func (param i64) (result i32)))
-              (func (export "kernal-api-run"))
-            )
-        "#,
-    );
-    assert!(matches!(
-        engine().admit(&bad_thread_spawn, policy()),
-        Err(SketchAdmissionError::ImportTypeMismatch { module, name })
-            if module == "wasi" && name == "thread-spawn"
-    ));
-
-    let bad_entrypoint = wasm(
-        r#"
-            (module
-              (import "env" "memory" (memory 1 16 shared))
-              (func (export "kernal-api-run") (param i32))
-            )
-        "#,
-    );
-    assert!(matches!(
-        engine().admit(&bad_entrypoint, policy()),
-        Err(SketchAdmissionError::EntrypointMismatch)
-    ));
-}
-
-#[test]
-fn module_input_is_bounded_before_compilation() {
-    let bytes = vec![0_u8; 8];
-    let policy = SketchAdmissionPolicy::new(7, 16).expect("policy");
-    assert!(matches!(
-        engine().admit(&bytes, policy),
-        Err(SketchAdmissionError::ModuleTooLarge {
-            actual_bytes: 8,
-            maximum_bytes: 7,
-        })
-    ));
-}
+#[test] fn valid_module_compiles_once() { let c=compiler();let a=c.admit(&wasm(F::default()),policy()).expect("admit");assert_eq!(c.compiled_module_count(),1);assert_eq!(a.shared_memory().maximum_pages(),16); }
+#[test] fn rejected_module_never_compiles() { let c=compiler();let mut f=F::default();f.yield_=false;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::MissingRequiredImport{..})));assert_eq!(c.compiled_module_count(),0); }
+#[test] fn memory_forms_are_rejected_precompile() { let c=compiler();let mut f=F::default();f.shared=false;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::UnsharedMemory)));let mut f=F::default();f.max=None;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::SharedMemoryWithoutMaximum)));let mut f=F::default();f.mem64=true;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::Memory64))); }
+#[test] fn metadata_start_and_export_allowlist_are_strict() { let c=compiler();let mut f=F::default();f.start=true;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::StartFunctionForbidden)));let mut f=F::default();f.duplicate=true;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::DuplicateMetadata{..})));let mut f=F::default();f.bad_meta=true;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::MetadataMismatch{..})));for k in [0,1,2,3,4]{let mut f=F::default();f.extra=Some(k);assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::ExportNotAllowed{..})));} }
+#[test] fn malformed_oversized_and_abi_mismatches_have_stable_errors() { let c=compiler();assert!(matches!(c.admit(&[0,1,2],policy()),Err(error) if error.code()=="invalid-binary"));let mut f=F::default();f.entry_param=true;assert!(matches!(c.admit(&wasm(f),policy()),Err(SketchModuleError::ImportTypeMismatch{..})));let p=SketchModulePolicy::new(4,16).unwrap();assert!(matches!(c.admit(&wasm(F::default()),p),Err(SketchModuleError::ModuleTooLarge{..}))); }

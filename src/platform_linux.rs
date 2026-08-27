@@ -791,6 +791,66 @@ mod coverage_tests;
 mod sync_spawn;
 pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 
+/// Launch the private Wasm worker with no inherited ambient stdio and an
+/// explicit empty environment. Guest capabilities travel over the worker
+/// protocol, never through inherited descriptors or environment variables.
+pub(crate) fn spawn_contained_worker(
+    command: &mut std::process::Command,
+    _limits: crate::platform::process::WorkerLimits,
+) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
+    use crate::platform::process::{SpawnStdio, StdioSource, SyncEnvironment, WorkerError, WorkerStage};
+    let child = spawn_sync(
+        command,
+        SpawnStdio {
+            stdin: StdioSource::Pipe,
+            stdout: StdioSource::Pipe,
+            stderr: StdioSource::Null,
+            drain_timeout: None,
+            show_console: false,
+        },
+        SyncEnvironment::Explicit(Vec::new()),
+    )
+    .map_err(|error| WorkerError::new(WorkerStage::Create, error))?;
+    worker_from_spawned_child(child)
+}
+
+fn worker_from_spawned_child(
+    child: crate::platform::process::SpawnedChild,
+) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
+    let crate::platform::process::SpawnedChild { stdin, stdout, stderr: _, pid, inner } = child;
+    Ok(crate::platform::process::WorkerChild::new(
+        stdin,
+        stdout,
+        pid,
+        Box::new(UnixWorkerControl { inner }),
+    ))
+}
+
+struct UnixWorkerControl {
+    inner: Box<dyn crate::platform::process::SpawnedChildControl>,
+}
+
+impl crate::platform::process::WorkerChildControl for UnixWorkerControl {
+    fn try_wait(&mut self) -> io::Result<Option<i32>> { self.inner.try_wait() }
+
+    fn force_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), crate::platform::process::WorkerError> {
+        use crate::platform::process::{WorkerError, WorkerStage};
+        self.inner.kill().map_err(|error| WorkerError::new(WorkerStage::Terminate, error))?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.inner.try_wait().map_err(|error| WorkerError::new(WorkerStage::Reap, error))?.is_some() {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(WorkerError::new(WorkerStage::Reap, io::Error::new(io::ErrorKind::TimedOut, "contained worker did not exit")));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn shutdown(&mut self) { self.inner.shutdown(); }
+}
+
 #[cfg(all(test, feature = "ipc"))]
 mod endpoint_naming_tests {
     use super::{ipc_broker_v1_endpoint_path, ipc_endpoint_name_limit, LINUX_SUN_PATH_MAX};

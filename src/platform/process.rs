@@ -14,7 +14,6 @@ pub use crate::{
 };
 
 /// Host-neutral command options selected by the caller before spawning.
-#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessCommandConfig {
     pub creation_flags: Option<u32>,
@@ -33,7 +32,6 @@ pub struct ExactTraceCapability {
     pub non_invasive_grade: NonInvasiveObservationGrade,
 }
 
-#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NonInvasiveObservationGrade {
     KernelNotification,
@@ -200,6 +198,7 @@ pub enum SyncEnvironment {
 ///
 /// The protocol layer selects these values; platform implementations translate
 /// only the bounds their native containment primitive can enforce.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct WorkerLimits {
     pub(crate) active_processes: Option<u32>,
@@ -208,6 +207,7 @@ pub(crate) struct WorkerLimits {
 }
 
 /// Semantic stage at which a contained-worker launch or cleanup failed.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WorkerStage {
     Pipe,
@@ -453,6 +453,29 @@ pub(crate) trait SpawnedChildControl:
 }
 
 impl SpawnedChild {
+    /// Transfer the private process owner and the parent protocol pipes to a
+    /// more specialized contained-child facade without running this wrapper's
+    /// shutdown-on-drop path.
+    #[allow(dead_code)] // Used only by Unix platform worker adapters.
+    pub(crate) fn into_worker_parts(
+        self,
+    ) -> (
+        Option<std::process::ChildStdin>,
+        Option<std::process::ChildStdout>,
+        u32,
+        Box<dyn SpawnedChildControl>,
+    ) {
+        let mut child = std::mem::ManuallyDrop::new(self);
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        drop(child.stderr.take());
+        let pid = child.pid;
+        // SAFETY: `child` is ManuallyDrop so its Drop implementation cannot
+        // shut down `inner`; this is the one ownership transfer of `inner`.
+        let inner = unsafe { std::ptr::read(&child.inner) };
+        (stdin, stdout, pid, inner)
+    }
+
     /// Return the operating-system process identifier.
     pub fn id(&self) -> u32 {
         self.pid

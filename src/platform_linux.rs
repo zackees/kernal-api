@@ -819,7 +819,7 @@ pub(crate) fn spawn_contained_worker(
 fn worker_from_spawned_child(
     child: crate::platform::process::SpawnedChild,
 ) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
-    let crate::platform::process::SpawnedChild { stdin, stdout, stderr: _, pid, inner } = child;
+    let (stdin, stdout, pid, inner) = child.into_worker_parts();
     Ok(crate::platform::process::WorkerChild::new(
         stdin,
         stdout,

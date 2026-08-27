@@ -136,6 +136,7 @@ pub fn ipc_broker_endpoint_name(bare_name: &str, path_scoped: bool) -> std::io::
 }
 
 /// macOS `sun_path` is 104 bytes including the NUL terminator.
+#[allow(dead_code)] // Used only when the optional IPC capability is enabled.
 const MACOS_SUN_PATH_MAX: usize = 104;
 
 #[cfg(feature = "ipc")]
@@ -922,7 +923,7 @@ pub(crate) fn spawn_contained_worker(
         SyncEnvironment::Explicit(Vec::new()),
     )
     .map_err(|error| WorkerError::new(WorkerStage::Create, error))?;
-    let crate::platform::process::SpawnedChild { stdin, stdout, stderr: _, pid, inner } = child;
+    let (stdin, stdout, pid, inner) = child.into_worker_parts();
     Ok(crate::platform::process::WorkerChild::new(
         stdin,
         stdout,

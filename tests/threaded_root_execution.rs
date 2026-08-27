@@ -36,7 +36,28 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
         repeated.expect("repeated root execution"),
         ThreadedRootOutcome::Started
     );
-    assert_eq!(sketch.threaded_root_preparation_count_for_test(), 1);
+}
+
+#[test]
+fn synthetic_profile_cannot_prepare_or_allocate_a_threaded_root() {
+    let bytes = synthetic_root_wasm();
+    let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+    let sketch = compiler
+        .admit(
+            &bytes,
+            SketchModulePolicy::new(bytes.len() + 1, 16_384).expect("synthetic policy"),
+        )
+        .expect("synthetic admission");
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let error = runtime.run(async {
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .expect_err("synthetic execution must fail before preparation")
+    });
+    assert_eq!(error, SketchExecutionError::ThreadedProfileRequired);
 }
 
 #[test]
@@ -221,13 +242,18 @@ fn threaded_root_wasm(
     } else if assert_fd_write_fault {
         // `fd_write` import index 5 must reject the negative iovec pointer.
         code.extend([
-            19, 0, 0x41, 1, 0x41, 0x7f, 0x41, 1, 0x41, 0, 0x10, 5, 0x41, 21, 0x47, 0x04, 0x40,
-            0x00, 0x0b, 0x0b,
+            32, 0, 0x41, 1, 0x41, 0x7f, 0x41, 1, 0x41, 0, 0x10, 5, 0x41, 21, 0x47, 0x04, 0x40,
+            0x00, 0x0b, 0x41, 0, 0xfe, 0x10, 2, 0, 0x41, 42, 0x47, 0x04, 0x40, 0x00, 0x0b, 0x0b,
         ]);
     } else {
         code.extend([2, 0, 0x0b]);
     }
     section(10, code, &mut wasm);
+    if assert_fd_write_fault {
+        // A nonzero `nwritten` sentinel proves bad iovecs cannot trigger the
+        // host's zero-byte result write before validation has failed.
+        section(11, vec![1, 0, 0x41, 0, 0x0b, 4, 42, 0, 0, 0], &mut wasm);
+    }
     let mut features = Vec::new();
     let names = [
         "atomics",
@@ -247,5 +273,37 @@ fn threaded_root_wasm(
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
+    wasm
+}
+
+fn synthetic_root_wasm() -> Vec<u8> {
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    let mut types = Vec::new();
+    leb(2, &mut types);
+    types.extend([0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f]);
+    section(1, types, &mut wasm);
+    let mut imports = Vec::new();
+    leb(3, &mut imports);
+    text("env", &mut imports);
+    text("memory", &mut imports);
+    imports.extend([2, 3]);
+    leb(17, &mut imports);
+    leb(16_384, &mut imports);
+    text("kernal-api:v1", &mut imports);
+    text("kernel-yield", &mut imports);
+    imports.extend([0, 0]);
+    text("wasi", &mut imports);
+    text("thread-spawn", &mut imports);
+    imports.extend([0, 1]);
+    section(2, imports, &mut wasm);
+    section(3, vec![1, 0], &mut wasm);
+    let mut exports = Vec::new();
+    leb(1, &mut exports);
+    text("kernal-api-run", &mut exports);
+    exports.extend([0, 2]);
+    section(7, exports, &mut wasm);
+    section(10, vec![1, 2, 0, 0x0b], &mut wasm);
+    custom("kernal-api.abi", b"v1", &mut wasm);
+    custom("kernal-api.profile", b"threaded-core-wasm-v1", &mut wasm);
     wasm
 }

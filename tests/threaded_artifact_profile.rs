@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use kernal_api::wasm::{
-    threaded_artifact_manifest_for_test, SketchCompiler, SketchCompilerConfig, SketchModuleError,
-    SketchModulePolicy,
+    threaded_artifact_manifest_for_test, SketchCompiler, SketchCompilerConfig,
+    SketchExecutionError, SketchModuleError, SketchModulePolicy,
 };
 
 const ARTIFACT_ENV: &str = "KERNAL_API_THREADED_SMOKE_WASM";
@@ -48,6 +48,27 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
         .admit(&bytes, threaded)
         .expect("threaded-rust-v1 must admit the exact artifact");
     assert_eq!(compiler.compiled_module_count(), 1);
+
+    // #34 starts the supplied, direct Rust artifact through Wasmtime start;
+    // #35 owns its thread-spawn path. Until then the guest's std::thread call
+    // reaches the deterministic rejection and is contained as a semantic trap.
+    let sketch = compiler
+        .admit(
+            &bytes,
+            SketchModulePolicy::threaded_rust_v1(bytes.len().saturating_add(1), 16_384)
+                .expect("threaded Rust policy"),
+        )
+        .expect("second supplied artifact admission");
+    let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let outcome = runtime.run(async {
+        sketch.execute_threaded_root(
+            kernal_api::async_engine::RuntimeHandle::current().expect("runtime handle"),
+        )
+    });
+    assert_eq!(outcome, Err(SketchExecutionError::Trapped));
 }
 
 // This deliberately has no WAT or parser test dependency. It is the smallest

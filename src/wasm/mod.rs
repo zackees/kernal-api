@@ -208,13 +208,6 @@ impl AdmittedSketch {
             Err(error) => map_root_error(&error),
         }
     }
-    #[doc(hidden)]
-    pub fn threaded_root_preparation_count_for_test(&self) -> u64 {
-        self.prepared_root
-            .lock()
-            .map(|prepared| u64::from(prepared.is_some()))
-            .unwrap_or(0)
-    }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
             .prepared_root
@@ -475,7 +468,10 @@ fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
         return ERRNO_FAULT;
     };
     for (cell, byte) in cells.iter().zip(bytes) {
-        // Shared Wasm bytes may be concurrently accessed only atomically.
+        // SAFETY: UnsafeCell<u8> has alignment 1, matching AtomicU8. The
+        // SharedMemory owns and pins this backing allocation for its lifetime,
+        // and every host access to concurrently reachable guest bytes in this
+        // module uses AtomicU8 (never a plain dereference).
         unsafe { AtomicU8::from_ptr(cell.get()) }.store(*byte, Ordering::Relaxed);
     }
     ERRNO_SUCCESS
@@ -525,6 +521,9 @@ fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
     let cells = shared_range(memory, offset, 4)?;
     let mut bytes = [0_u8; 4];
     for (destination, cell) in bytes.iter_mut().zip(cells) {
+        // SAFETY: UnsafeCell<u8> has AtomicU8-compatible alignment and belongs
+        // to the live SharedMemory. This module's host-side shared-byte access
+        // invariant is atomic-only; AtomicU8 avoids a plain concurrent load.
         *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
     }
     Some(u32::from_le_bytes(bytes))

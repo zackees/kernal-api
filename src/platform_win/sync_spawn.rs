@@ -1296,6 +1296,7 @@ mod daemon_flag_tests {
             let outcome = match breakaway.spawn() {
                 Ok(mut child) => {
                     let _ = child.kill();
+                    let _ = child.wait();
                     format!("unexpected-success:{}", child.id())
                 }
                 Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
@@ -1316,6 +1317,18 @@ mod daemon_flag_tests {
         };
         std::fs::write(marker, outcome).expect("publish descendant result");
         std::thread::park();
+    }
+
+    /// Deliberately uncontained RED helper. Unlike the strict fixture it has
+    /// no descendant: its sole purpose is proving user entry after an ordinary
+    /// CreateProcess return and before any later Job assignment could occur.
+    #[test]
+    #[ignore]
+    fn ordinary_post_spawn_red_helper() {
+        if let Some(marker) = std::env::var_os("KERNAL_API_ORDINARY_SPAWN_MARKER") {
+            std::fs::write(marker, "ready").expect("publish ordinary entry marker");
+            std::thread::park();
+        }
     }
 
     #[test]
@@ -1493,40 +1506,47 @@ mod daemon_flag_tests {
     /// child can publish its entry marker before its parent has any
     /// post-spawn opportunity to assign it to a Job Object.
     #[test]
-    #[allow(clippy::zombie_processes)] // explicit direct/descendant cleanup follows.
     fn ordinary_spawn_can_enter_before_post_spawn_job_assignment() {
-        const TEST_WAIT_MS: DWORD = 5_000;
         let _native_test_guard = strict_worker_native_test_guard();
         let marker = StrictWorkerTestMarker::new();
         let mut helper = Command::new(std::env::current_exe().expect("test executable"));
         helper
             .args([
                 "--exact",
-                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "platform_win::sync_spawn::daemon_flag_tests::ordinary_post_spawn_red_helper",
                 "--ignored",
             ])
-            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
-        let mut helper = helper.spawn().expect("ordinary helper spawn");
-        let descendant_pid = marker.wait_for_pid();
+            .env("KERNAL_API_ORDINARY_SPAWN_MARKER", &marker.path);
+        let mut helper = TestChildGuard::new(helper.spawn().expect("ordinary helper spawn"));
+        assert_eq!(marker.wait_for_text(), "ready");
         assert!(
-            helper.try_wait().expect("observe helper").is_none(),
+            helper.child_mut().try_wait().expect("observe helper").is_none(),
             "ordinary helper exited before publishing its entry marker"
         );
-        let descendant = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, descendant_pid) };
-        assert!(!descendant.is_null(), "open ordinary descendant");
-        let descendant = OwnedHandle(descendant);
-        helper.kill().expect("terminate ordinary helper");
-        helper.wait().expect("reap ordinary helper");
-        assert_ne!(
-            unsafe { TerminateProcess(descendant.as_raw(), 1) },
-            FALSE,
-            "terminate ordinary descendant"
-        );
-        assert_eq!(
-            unsafe { WaitForSingleObject(descendant.as_raw(), TEST_WAIT_MS) },
-            WAIT_OBJECT_0,
-            "reap ordinary descendant"
-        );
+        helper.terminate_and_reap();
+    }
+
+    /// Narrow panic-safe owner for an intentionally uncontained native test
+    /// helper. StrictWorkerChild itself already owns strict-Job cleanup.
+    struct TestChildGuard(Option<std::process::Child>);
+
+    impl TestChildGuard {
+        fn new(child: std::process::Child) -> Self { Self(Some(child)) }
+
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.0.as_mut().expect("live test helper")
+        }
+
+        fn terminate_and_reap(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for TestChildGuard {
+        fn drop(&mut self) { self.terminate_and_reap(); }
     }
 
     struct StrictWorkerTestMarker {

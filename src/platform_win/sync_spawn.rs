@@ -55,6 +55,12 @@ const STILL_ACTIVE: u32 = 259;
 const STRICT_WORKER_REAP_TIMEOUT_MS: DWORD = 5_000;
 #[allow(dead_code)]
 const WAIT_TIMEOUT_RESULT: DWORD = 0x0000_0102;
+#[cfg(test)]
+static STRICT_WORKER_FORCE_REAP_TIMEOUT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static STRICT_WORKER_FORCE_ASSIGN_DENIED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub struct OwnedHandle(HANDLE);
 
@@ -697,19 +703,31 @@ impl StrictWorkerChild {
     /// action; `OwnedHandle::Drop` cannot report CloseHandle failure. Reaping
     /// is bounded, so Drop remains best-effort rather than wedging the host.
     pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> {
-        self.shutdown()
+        self.shutdown(true)
     }
-    fn shutdown(&mut self) -> Option<StrictWorkerCleanupError> {
+    fn shutdown(&mut self, retry_termination: bool) -> Option<StrictWorkerCleanupError> {
         // KILL_ON_JOB_CLOSE must happen before waiting: it terminates the
         // worker and ordinary CreateProcess descendants as one containment
-        // action. Repeated calls observe taken handles and are harmless.
-        drop(self.inner.job.take());
-        let cleanup = self.inner.process.as_ref().and_then(reap_only);
-        drop(self.inner.process.take());
+        // action. A failed/timed-out reap deliberately retains the process
+        // handle so an explicit later call can retry it.
+        let job = self.inner.job.take();
+        let closed_job = job.is_some();
+        // Closing the strict Job is the normal tree termination action.
+        drop(job);
+        let cleanup = self.inner.process.as_ref().and_then(|process| {
+            if retry_termination && !closed_job {
+                terminate_and_reap(process)
+            } else {
+                reap_only(process)
+            }
+        });
+        if cleanup.is_none() {
+            drop(self.inner.process.take());
+        }
         cleanup
     }
 }
-impl Drop for StrictWorkerChild { fn drop(&mut self) { let _ = self.shutdown(); } }
+impl Drop for StrictWorkerChild { fn drop(&mut self) { let _ = self.shutdown(false); } }
 
 #[cfg(test)]
 mod strict_worker_test_hook {
@@ -793,8 +811,7 @@ pub(crate) fn spawn_strict_contained_worker(
         .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source, cleanup: None })?;
     let process = OwnedHandle(process);
     let thread = OwnedHandle(thread);
-    if unsafe { AssignProcessToJobObject(job.as_raw(), process.as_raw()) } == FALSE {
-        let source = io::Error::last_os_error();
+    if let Err(source) = assign_strict_worker_to_job(job.as_raw(), process.as_raw()) {
         let cleanup = terminate_and_reap(&process);
         return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source, cleanup });
     }
@@ -822,21 +839,43 @@ pub(crate) fn spawn_strict_contained_worker(
 #[allow(dead_code)]
 fn strict_resume_count_is_valid(previous: u32) -> bool { previous == 1 }
 
+fn assign_strict_worker_to_job(job: HANDLE, process: HANDLE) -> io::Result<()> {
+    #[cfg(test)]
+    if STRICT_WORKER_FORCE_ASSIGN_DENIED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "injected AssignProcessToJobObject access denied",
+        ));
+    }
+    if unsafe { AssignProcessToJobObject(job, process) } == FALSE {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[allow(dead_code)]
 fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
     let terminate = if unsafe { TerminateProcess(process.as_raw(), 1) } == FALSE {
         Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
     } else { None };
     let reap = reap_only(process);
-    if let Some(error) = terminate { return Some(error); }
-    if let Some(error) = reap {
-        return Some(error);
+    if reap.is_none() {
+        // A process that already exited between Job close and this retry can
+        // reject TerminateProcess; successful reaping is still success.
+        return None;
     }
-    None
+    terminate.or(reap)
 }
 
 #[allow(dead_code)]
 fn reap_only(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
+    #[cfg(test)]
+    if STRICT_WORKER_FORCE_REAP_TIMEOUT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        return Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::new(io::ErrorKind::TimedOut, "injected strict worker reap timeout"),
+        });
+    }
     match unsafe { WaitForSingleObject(process.as_raw(), STRICT_WORKER_REAP_TIMEOUT_MS) } {
         WAIT_OBJECT_0 => None,
         WAIT_TIMEOUT_RESULT => Some(StrictWorkerCleanupError {
@@ -1234,6 +1273,27 @@ mod daemon_flag_tests {
         let Some(marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_MARKER") else {
             return;
         };
+        if let Some(breakaway_marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_BREAKAWAY") {
+            use std::os::windows::process::CommandExt;
+
+            let mut breakaway = Command::new(std::env::current_exe().expect("test executable"));
+            breakaway
+                .args([
+                    "--exact",
+                    "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_descendant_helper",
+                    "--ignored",
+                ])
+                .env("KERNAL_API_STRICT_WORKER_DESCENDANT", "1")
+                .creation_flags(CREATE_BREAKAWAY_FROM_JOB);
+            let outcome = match breakaway.spawn() {
+                Ok(mut child) => {
+                    let _ = child.kill();
+                    format!("unexpected-success:{}", child.id())
+                }
+                Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
+            };
+            std::fs::write(breakaway_marker, outcome).expect("publish breakaway result");
+        }
         let mut descendant = Command::new(std::env::current_exe().expect("test executable"));
         descendant
             .args([
@@ -1242,8 +1302,11 @@ mod daemon_flag_tests {
                 "--ignored",
             ])
             .env("KERNAL_API_STRICT_WORKER_DESCENDANT", "1");
-        let descendant = descendant.spawn().expect("spawn ordinary descendant");
-        std::fs::write(marker, descendant.id().to_string()).expect("publish descendant pid");
+        let outcome = match descendant.spawn() {
+            Ok(descendant) => format!("ready:{}", descendant.id()),
+            Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
+        };
+        std::fs::write(marker, outcome).expect("publish descendant result");
         std::thread::park();
     }
 
@@ -1303,6 +1366,153 @@ mod daemon_flag_tests {
         assert!(worker.terminate_and_reap().is_none(), "second shutdown was not harmless");
     }
 
+    #[test]
+    fn strict_worker_timeout_retains_process_for_explicit_retry() {
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        STRICT_WORKER_FORCE_REAP_TIMEOUT.store(true, std::sync::atomic::Ordering::SeqCst);
+        let timeout = worker.terminate_and_reap().expect("injected timeout");
+        assert_eq!(timeout.stage(), StrictWorkerSpawnStage::Reap);
+        assert!(worker.inner.process.is_some(), "timeout must retain retryable process handle");
+        assert!(worker.terminate_and_reap().is_none(), "explicit retry must reap worker");
+        assert!(worker.inner.process.is_none(), "successful reap consumes process handle");
+    }
+
+    #[test]
+    fn injected_assign_denial_is_semantic_and_never_reaches_worker_entry() {
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        STRICT_WORKER_FORCE_ASSIGN_DENIED.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect_err("injected assignment denial");
+        assert_eq!(error.stage(), StrictWorkerSpawnStage::AssignJob);
+        assert!(
+            !marker.path.exists(),
+            "suspended worker entered despite failed Job assignment"
+        );
+    }
+
+    #[test]
+    fn strict_job_rejects_breakaway_creation() {
+        let marker = StrictWorkerTestMarker::new();
+        let breakaway = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path)
+            .env("KERNAL_API_STRICT_WORKER_BREAKAWAY", &breakaway.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        assert!(
+            breakaway.wait_for_text().starts_with("denied:"),
+            "strict Job unexpectedly permitted breakaway creation"
+        );
+        let _ = marker.wait_for_pid();
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+    }
+
+    #[test]
+    fn strict_active_process_limit_rejects_worker_descendant() {
+        let marker = StrictWorkerTestMarker::new();
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits {
+                active_processes: Some(1),
+                ..StrictWorkerLimits::default()
+            },
+        )
+        .expect("strict limited worker launch");
+        assert!(
+            marker.wait_for_text().starts_with("denied:"),
+            "active-process Job limit admitted a worker descendant"
+        );
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+    }
+
+    /// RED contrast for the strict launch sequence: a normal CreateProcess
+    /// child can publish its entry marker before its parent has any
+    /// post-spawn opportunity to assign it to a Job Object.
+    #[test]
+    #[allow(clippy::zombie_processes)] // explicit direct/descendant cleanup follows.
+    fn ordinary_spawn_can_enter_before_post_spawn_job_assignment() {
+        const TEST_WAIT_MS: DWORD = 5_000;
+        let marker = StrictWorkerTestMarker::new();
+        let mut helper = Command::new(std::env::current_exe().expect("test executable"));
+        helper
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut helper = helper.spawn().expect("ordinary helper spawn");
+        let descendant_pid = marker.wait_for_pid();
+        assert!(
+            helper.try_wait().expect("observe helper").is_none(),
+            "ordinary helper exited before publishing its entry marker"
+        );
+        let descendant = unsafe { OpenProcess(SYNCHRONIZE, FALSE, descendant_pid) };
+        assert!(!descendant.is_null(), "open ordinary descendant");
+        let descendant = OwnedHandle(descendant);
+        helper.kill().expect("terminate ordinary helper");
+        helper.wait().expect("reap ordinary helper");
+        assert_ne!(
+            unsafe { TerminateProcess(descendant.as_raw(), 1) },
+            FALSE,
+            "terminate ordinary descendant"
+        );
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw(), TEST_WAIT_MS) },
+            WAIT_OBJECT_0,
+            "reap ordinary descendant"
+        );
+    }
+
     struct StrictWorkerTestMarker {
         path: std::path::PathBuf,
     }
@@ -1321,10 +1531,16 @@ mod daemon_flag_tests {
         }
 
         fn wait_for_pid(&self) -> u32 {
+            let text = self.wait_for_text();
+            let pid = text.strip_prefix("ready:").expect("ready descendant marker");
+            pid.parse().expect("descendant pid marker")
+        }
+
+        fn wait_for_text(&self) -> String {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
-                if let Ok(pid) = std::fs::read_to_string(&self.path) {
-                    return pid.trim().parse().expect("descendant pid marker");
+                if let Ok(text) = std::fs::read_to_string(&self.path) {
+                    return text;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,

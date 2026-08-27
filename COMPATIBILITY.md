@@ -51,6 +51,36 @@ This is an evidence matrix, not a statement of test execution. Supported
 targets remain those in the package policy above; unlisted native runs must be
 recorded before being claimed as evidence.
 
+## Wasm worker containment (#28)
+
+`wasm-sketch-worker` places one request in a private contained process
+boundary. The facade reports typed worker diagnostics and maintains its parent
+lease/gauge accounting through normal completion, cooperative cancellation,
+deadline handling, unexpected exit, and bounded forced cleanup; it does not
+expose child handles, Job Objects, pidfds, or backend worker types. Windows
+uses kill-on-close Job containment and Linux uses parent-death signaling, so a
+supervisor's abrupt death also contains the worker. The optional
+`wasm-sketch-worker-test-support` hook is test-only and not a public API: its
+external proof marker records a PID together with an opaque native creation
+key, never a PID alone. The broader universal identity API remains follow-up
+#51.
+
+`default = []` remains isolated from the Wasm host, worker, and test-support
+feature. The process boundary is therefore opt-in rather than a new default
+process/runtime dependency.
+
+| Target | Focused #28 evidence |
+|---|---|
+| Windows x86-64 | Native local Soldr passthrough with `ZCCACHE_DISABLE=1`: the four core D4 containment tests plus crash and parent-death proofs passed (6 passed); the two exact, ignored inner helpers were intentionally not part of the normal run. Prior current-tip checks, lint, and regression evidence also passed. |
+| Linux x86-64 | Core/full evidence predates this focused record, but D4 crash and parent-death native proof is pending: the foreign managed Bosn lease is protected and was not disturbed. |
+| Windows ARM64 | Compile-only; native focused evidence pending. |
+| macOS x86-64 / ARM64 | Compile-only; native focused evidence pending. |
+| Linux ARM64 | Pending. |
+
+This matrix records platform evidence rather than expanding the supported API
+surface. Native crash/parent-death claims require exact PID-plus-creation-key
+observation and bounded disappearance/exit evidence on the listed target.
+
 ## Client rule
 
 Until 1.0, the four first-party clients use an exact Cargo requirement:

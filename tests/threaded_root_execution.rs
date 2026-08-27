@@ -7,7 +7,7 @@ use kernal_api::wasm::{
 
 #[test]
 fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handle() {
-    let bytes = threaded_root_wasm();
+    let bytes = threaded_root_wasm(false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
@@ -18,6 +18,20 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
     });
     assert_eq!(outcome.expect("root execution"), ThreadedRootOutcome::Started);
     assert_eq!(compiler.compiled_module_count(), 1, "root execution must not compile again");
+}
+
+#[test]
+fn proc_exit_zero_is_a_controlled_root_completion() {
+    let bytes = threaded_root_wasm(true);
+    let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+    let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
+    let sketch = compiler.admit(&bytes, policy).expect("admission");
+    let runtime = RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+
+    let outcome = runtime.run(async {
+        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+    });
+    assert_eq!(outcome.expect("normal proc_exit"), ThreadedRootOutcome::Exited);
 }
 
 fn leb(mut value: u32, output: &mut Vec<u8>) {
@@ -36,7 +50,7 @@ fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) { let mut body = Ve
 // Minimal structurally valid ThreadedRustV1 artifact. The start function is
 // intentionally unexported: Wasmtime runs it during instantiate, not by
 // calling exported `_start` or `kernal-api-run` separately.
-fn threaded_root_wasm() -> Vec<u8> {
+fn threaded_root_wasm(proc_exit: bool) -> Vec<u8> {
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
     let mut types = Vec::new();
     leb(9, &mut types);
@@ -65,7 +79,13 @@ fn threaded_root_wasm() -> Vec<u8> {
     section(7, exports, &mut wasm);
     section(8, vec![12], &mut wasm);
     let mut code = Vec::new(); leb(5, &mut code);
-    code.extend([2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b]);
+    code.extend([2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b]);
+    if proc_exit {
+        // Imported function index 6 is `wasi_snapshot_preview1::proc_exit`.
+        code.extend([6, 0, 0x41, 0, 0x10, 6, 0x0b]);
+    } else {
+        code.extend([2, 0, 0x0b]);
+    }
     section(10, code, &mut wasm);
     let mut features = Vec::new();
     let names = ["atomics", "bulk-memory", "bulk-memory-opt", "call-indirect-overlong", "extended-const", "multivalue", "mutable-globals", "nontrapping-fptoint", "reference-types", "sign-ext"];

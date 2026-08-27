@@ -11,6 +11,8 @@ use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
 use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
 use winapi::um::handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE};
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
+#[cfg(test)]
+use winapi::um::jobapi2::IsProcessInJob;
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::namedpipeapi::CreateNamedPipeW;
 use winapi::um::processenv::GetStdHandle;
@@ -19,6 +21,8 @@ use winapi::um::processthreadsapi::{
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
     UpdateProcThreadAttribute, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
 };
+#[cfg(test)]
+use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
@@ -35,6 +39,8 @@ use winapi::um::winnt::{
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
+#[cfg(test)]
+use winapi::um::winnt::SYNCHRONIZE;
 
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE,
 // TRUE, FALSE) = 0x00020002.
@@ -690,6 +696,64 @@ impl StrictWorkerChild {
 }
 impl Drop for StrictWorkerChild { fn drop(&mut self) { let _ = self.shutdown(); } }
 
+#[cfg(test)]
+mod strict_worker_test_hook {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    type Hook = fn(HANDLE, HANDLE);
+
+    static HOOK: OnceLock<Mutex<Option<Hook>>> = OnceLock::new();
+    static MARKER: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    static OBSERVED: AtomicBool = AtomicBool::new(false);
+
+    fn hook_slot() -> &'static Mutex<Option<Hook>> { HOOK.get_or_init(|| Mutex::new(None)) }
+    fn marker_slot() -> &'static Mutex<Option<PathBuf>> { MARKER.get_or_init(|| Mutex::new(None)) }
+
+    pub(super) struct Guard;
+
+    pub(super) fn install(marker: PathBuf) -> Guard {
+        OBSERVED.store(false, Ordering::SeqCst);
+        *marker_slot().lock().unwrap() = Some(marker);
+        *hook_slot().lock().unwrap() = Some(assert_assigned_while_suspended);
+        Guard
+    }
+
+    pub(super) fn was_observed() -> bool { OBSERVED.load(Ordering::SeqCst) }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *hook_slot().lock().unwrap() = None;
+            *marker_slot().lock().unwrap() = None;
+        }
+    }
+
+    pub(super) fn run(process: HANDLE, job: HANDLE) {
+        if let Some(hook) = *hook_slot().lock().unwrap() {
+            hook(process, job);
+        }
+    }
+
+    fn assert_assigned_while_suspended(process: HANDLE, job: HANDLE) {
+        let marker = marker_slot().lock().unwrap().clone().expect("test marker installed");
+        assert!(
+            !marker.exists(),
+            "worker reached its entry marker before strict spawn resumed it"
+        );
+        let mut contained = FALSE;
+        assert_ne!(
+            unsafe { IsProcessInJob(process, job, &mut contained) },
+            FALSE,
+            "IsProcessInJob failed: {}",
+            io::Error::last_os_error()
+        );
+        assert_ne!(contained, FALSE, "suspended worker was not assigned to strict Job");
+        OBSERVED.store(true, Ordering::SeqCst);
+    }
+}
+
 /// Spawn a worker suspended, attach it to a strict kill-on-close Job Object
 /// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
 /// (including hostile nested-job policy) is an AssignJob failure, never a
@@ -716,6 +780,8 @@ pub(crate) fn spawn_strict_contained_worker(
         let cleanup = terminate_and_reap(&process);
         return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source, cleanup });
     }
+    #[cfg(test)]
+    strict_worker_test_hook::run(process.as_raw(), job.as_raw());
     let resumed = unsafe { ResumeThread(thread.as_raw()) };
     if !strict_resume_count_is_valid(resumed) {
         let source = if resumed == u32::MAX { io::Error::last_os_error() } else { io::Error::other("strict worker suspend count was not one") };
@@ -1126,6 +1192,131 @@ mod daemon_flag_tests {
         assert!(!strict_resume_count_is_valid(0));
         assert!(!strict_resume_count_is_valid(2));
         assert!(!strict_resume_count_is_valid(u32::MAX));
+    }
+
+    /// This is invoked only by the native containment test below. It is an
+    /// ignored test so normal test discovery can never park a helper process.
+    #[test]
+    #[ignore]
+    fn strict_worker_native_descendant_helper() {
+        if std::env::var_os("KERNAL_API_STRICT_WORKER_DESCENDANT").is_some() {
+            std::thread::park();
+        }
+    }
+
+    /// The direct helper spawns an ordinary CreateProcess descendant, reports
+    /// its PID through a marker file, and stays alive until Job close kills it.
+    #[test]
+    #[ignore]
+    fn strict_worker_native_helper() {
+        let Some(marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_MARKER") else {
+            return;
+        };
+        let mut descendant = Command::new(std::env::current_exe().expect("test executable"));
+        descendant
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_descendant_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_DESCENDANT", "1");
+        let descendant = descendant.spawn().expect("spawn ordinary descendant");
+        std::fs::write(marker, descendant.id().to_string()).expect("publish descendant pid");
+        std::thread::park();
+    }
+
+    #[test]
+    fn strict_worker_assigns_before_resume_and_job_close_reaps_tree() {
+        const TEST_WAIT_MS: DWORD = 5_000;
+        let marker = StrictWorkerTestMarker::new();
+        let _hook = strict_worker_test_hook::install(marker.path.clone());
+        let mut command = Command::new(std::env::current_exe().expect("test executable"));
+        command
+            .args([
+                "--exact",
+                "platform_win::sync_spawn::daemon_flag_tests::strict_worker_native_helper",
+                "--ignored",
+            ])
+            .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
+        let mut worker = spawn_strict_contained_worker(
+            &mut command,
+            crate::platform::process::SpawnStdio::default(),
+            crate::platform::process::SyncEnvironment::Inherit,
+            StrictWorkerLimits::default(),
+        )
+        .expect("strict worker launch");
+        assert!(
+            strict_worker_test_hook::was_observed(),
+            "the strict pre-resume membership hook was not reached"
+        );
+        let direct = dup_inheritable(
+            worker
+                .inner
+                .process
+                .as_ref()
+                .expect("live worker process")
+                .as_raw(),
+        )
+        .expect("duplicate direct worker handle");
+        let descendant_pid = marker.wait_for_pid();
+        let descendant = unsafe { OpenProcess(SYNCHRONIZE, FALSE, descendant_pid) };
+        assert!(
+            !descendant.is_null(),
+            "open descendant for bounded wait: {}",
+            io::Error::last_os_error()
+        );
+        let descendant = OwnedHandle(descendant);
+
+        assert!(worker.terminate_and_reap().is_none(), "strict shutdown failed");
+        assert_eq!(
+            unsafe { WaitForSingleObject(direct.as_raw(), TEST_WAIT_MS) },
+            WAIT_OBJECT_0,
+            "direct worker did not exit after Job close"
+        );
+        assert_eq!(
+            unsafe { WaitForSingleObject(descendant.as_raw(), TEST_WAIT_MS) },
+            WAIT_OBJECT_0,
+            "ordinary CreateProcess descendant escaped Job close"
+        );
+        assert!(worker.terminate_and_reap().is_none(), "second shutdown was not harmless");
+    }
+
+    struct StrictWorkerTestMarker {
+        path: std::path::PathBuf,
+    }
+
+    impl StrictWorkerTestMarker {
+        fn new() -> Self {
+            let unique = format!(
+                "kernal-api-strict-worker-{}-{}.marker",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("system clock")
+                    .as_nanos(),
+            );
+            Self { path: std::env::temp_dir().join(unique) }
+        }
+
+        fn wait_for_pid(&self) -> u32 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&self.path) {
+                    return pid.trim().parse().expect("descendant pid marker");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "strict worker did not publish descendant readiness"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    impl Drop for StrictWorkerTestMarker {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

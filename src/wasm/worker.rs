@@ -639,6 +639,9 @@ fn supervise(
                     upload_sent = true;
                 }
                 message @ Message::Terminal { .. } if hello_acked && !upload_complete => {
+                    if early_terminal.is_some() {
+                        return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol);
+                    }
                     early_terminal = Some(message);
                 }
                 Message::Terminal { .. } if hello_acked => {
@@ -770,6 +773,24 @@ fn validate_worker_module_len(module_bytes: usize) -> Result<(), SketchWorkerFai
     (u64::try_from(module_bytes).ok().filter(|bytes| *bytes <= worker_protocol::WORKER_PROTOCOL_MAX_MODULE_BYTES).is_some())
         .then_some(())
         .ok_or(SketchWorkerFailure::InvalidConfiguration)
+}
+
+/// Bounded acceptance rule exercised by the supervisor ordering regression:
+/// one terminal may wait for upload success, never for upload failure.
+#[derive(Default)]
+struct UploadTerminalGate { upload_complete: bool, deferred: bool }
+impl UploadTerminalGate {
+    fn terminal(&mut self) -> Result<bool, SketchWorkerFailure> {
+        if self.upload_complete { return Ok(true); }
+        if self.deferred { return Err(SketchWorkerFailure::Protocol); }
+        self.deferred = true;
+        Ok(false)
+    }
+    fn upload(&mut self, success: bool) -> Result<bool, SketchWorkerFailure> {
+        if !success { return Err(SketchWorkerFailure::Protocol); }
+        self.upload_complete = true;
+        Ok(std::mem::take(&mut self.deferred))
+    }
 }
 
 fn selected_stop(
@@ -1376,6 +1397,19 @@ mod tests {
             validate_worker_module_len(cap + 1),
             Err(SketchWorkerFailure::InvalidConfiguration)
         );
+    }
+    #[test]
+    fn early_terminal_gate_requires_upload_success_and_is_bounded() {
+        let mut gate = UploadTerminalGate::default();
+        assert_eq!(gate.terminal(), Ok(false));
+        assert_eq!(gate.upload(false), Err(SketchWorkerFailure::Protocol));
+        let mut gate = UploadTerminalGate::default();
+        assert_eq!(gate.terminal(), Ok(false));
+        assert_eq!(gate.upload(true), Ok(true));
+        assert_eq!(gate.terminal(), Ok(true));
+        let mut gate = UploadTerminalGate::default();
+        assert_eq!(gate.terminal(), Ok(false));
+        assert_eq!(gate.terminal(), Err(SketchWorkerFailure::Protocol));
     }
     #[test]
     fn cancellation_wins_a_same_tick_deadline() {

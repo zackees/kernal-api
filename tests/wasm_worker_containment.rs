@@ -527,11 +527,41 @@ mod failure_proof {
             .is_none_or(|now| now.a != identity.a || now.b != identity.b));
     }
     #[cfg(target_os = "windows")]
-    fn windows_handle(identity: Identity, access: u32) -> windows_sys::Win32::Foundation::HANDLE {
-        use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
-        let process = unsafe { OpenProcess(access, 0, identity.pid) };
+    #[cfg(target_os = "windows")]
+    struct WindowsProcess(Option<windows_sys::Win32::Foundation::HANDLE>);
+    #[cfg(target_os = "windows")]
+    impl WindowsProcess {
+        fn acquire(pid: u32, access: u32) -> Self {
+            use windows_sys::Win32::System::Threading::OpenProcess;
+            let process = unsafe { OpenProcess(access, 0, pid) };
+            Self(Some(process))
+        }
+        fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE { self.0.expect("process handle") }
+        fn wait_gone(&mut self) {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+            use windows_sys::Win32::System::Threading::WaitForSingleObject;
+            assert_eq!(unsafe { WaitForSingleObject(self.handle(), OUTER_BOUND.as_millis() as u32) }, WAIT_OBJECT_0, "exact worker survived bound");
+            unsafe { CloseHandle(self.handle()); }
+            self.0 = None;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    impl Drop for WindowsProcess {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+            let Some(process) = self.0.take() else { return; };
+            let _ = unsafe { TerminateProcess(process, 1) };
+            let _ = unsafe { WaitForSingleObject(process, OUTER_BOUND.as_millis() as u32) };
+            unsafe { CloseHandle(process); }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    fn windows_handle(identity: Identity, access: u32) -> WindowsProcess {
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let process = WindowsProcess::acquire(identity.pid, access);
         assert!(
-            !process.is_null(),
+            !process.handle().is_null(),
             "OpenProcess: {}",
             std::io::Error::last_os_error()
         );
@@ -540,7 +570,7 @@ mod failure_proof {
         let mut kernel = unsafe { std::mem::zeroed() };
         let mut user = unsafe { std::mem::zeroed() };
         assert_ne!(
-            unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) },
+            unsafe { GetProcessTimes(process.handle(), &mut creation, &mut exit, &mut kernel, &mut user) },
             0,
             "GetProcessTimes"
         );
@@ -549,22 +579,8 @@ mod failure_proof {
         process
     }
     #[cfg(target_os = "windows")]
-    fn wait_windows_gone(process: windows_sys::Win32::Foundation::HANDLE) {
-        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
-        use windows_sys::Win32::System::Threading::WaitForSingleObject;
-        assert_eq!(
-            unsafe { WaitForSingleObject(process, OUTER_BOUND.as_millis() as u32) },
-            WAIT_OBJECT_0,
-            "exact worker survived bound"
-        );
-        unsafe {
-            CloseHandle(process);
-        }
-    }
-    #[cfg(target_os = "windows")]
     #[test]
     fn d4_crash_reaps_exact_worker() {
-        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
             TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
         };
@@ -572,33 +588,21 @@ mod failure_proof {
         let files = Artifacts::new();
         let mut inner = launch("failure_proof::d4_inner_crash_exact_identity", &files);
         let identity = wait_for_marker(&files.marker);
-        let process = windows_handle(
+        let mut process = windows_handle(
             identity,
             PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
         );
         assert_ne!(
-            unsafe { TerminateProcess(process, 1) },
+            unsafe { TerminateProcess(process.handle(), 1) },
             0,
             "TerminateProcess"
         );
-        wait_windows_gone(process);
-        assert!(inner.wait().expect("inner exit").success());
+        process.wait_gone();
+        inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
             "unexpected-exit"
         );
-        let stale = unsafe {
-            windows_sys::Win32::System::Threading::OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                0,
-                identity.pid,
-            )
-        };
-        if !stale.is_null() {
-            unsafe {
-                CloseHandle(stale);
-            }
-        }
     }
     #[cfg(target_os = "windows")]
     #[test]
@@ -611,10 +615,10 @@ mod failure_proof {
             &files,
         );
         let identity = wait_for_marker(&files.marker);
-        let process = windows_handle(identity, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
+        let mut process = windows_handle(identity, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
         fs::write(&files.release, "go").expect("release");
-        assert!(inner.wait().expect("inner exit").success());
-        wait_windows_gone(process);
+        inner.wait_success();
+        process.wait_gone();
     }
     #[cfg(target_os = "macos")]
     #[test]

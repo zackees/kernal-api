@@ -33,6 +33,8 @@ const VALIDATION_REPORT: &str = "kernal-api-threaded-validation-report-v1";
 const MAX_METADATA_BYTES: usize = 128;
 const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
+const THREADED_RUST_RESERVATION_BYTES: u64 =
+    u64::from(THREADED_RUST_MAX_PAGES) * PAGE_BYTES;
 const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
@@ -53,6 +55,7 @@ pub enum SketchAdmissionProfile {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SketchCompilerConfig {
     max_wasm_stack_bytes: usize,
+    execution_limits: SketchExecutionLimits,
 }
 impl SketchCompilerConfig {
     pub fn new(max_wasm_stack_bytes: usize) -> Result<Self, SketchCompilerError> {
@@ -61,18 +64,91 @@ impl SketchCompilerConfig {
         }
         Ok(Self {
             max_wasm_stack_bytes,
+            execution_limits: SketchExecutionLimits::default(),
         })
     }
     pub fn max_wasm_stack_bytes(self) -> usize {
         self.max_wasm_stack_bytes
+    }
+    /// Sets facade-owned aggregate limits for logical sketch sessions.
+    pub fn with_execution_limits(
+        mut self,
+        limits: SketchExecutionLimits,
+    ) -> Result<Self, SketchCompilerError> {
+        if !limits.is_valid() {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.execution_limits = limits;
+        Ok(self)
+    }
+    pub fn execution_limits(self) -> SketchExecutionLimits {
+        self.execution_limits
     }
 }
 impl Default for SketchCompilerConfig {
     fn default() -> Self {
         Self {
             max_wasm_stack_bytes: 2 * 1024 * 1024,
+            execution_limits: SketchExecutionLimits::default(),
         }
     }
+}
+
+/// Facade-owned aggregate bounds for one compiler's logical sketch sessions.
+/// These are reservations, not Wasmtime Store or pooling limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchExecutionLimits {
+    maximum_reserved_shared_memory_bytes: u64,
+    maximum_active_root_executions: usize,
+}
+impl SketchExecutionLimits {
+    pub fn new(
+        maximum_reserved_shared_memory_bytes: u64,
+        maximum_active_root_executions: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let limits = Self {
+            maximum_reserved_shared_memory_bytes,
+            maximum_active_root_executions,
+        };
+        limits.is_valid().then_some(limits).ok_or(SketchCompilerError::InvalidExecutionLimits)
+    }
+    pub fn maximum_reserved_shared_memory_bytes(self) -> u64 {
+        self.maximum_reserved_shared_memory_bytes
+    }
+    pub fn maximum_active_root_executions(self) -> usize {
+        self.maximum_active_root_executions
+    }
+    fn is_valid(self) -> bool {
+        self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
+            && self.maximum_active_root_executions != 0
+    }
+}
+impl Default for SketchExecutionLimits {
+    fn default() -> Self {
+        Self {
+            // One exact Rust 1.95 threaded profile. Callers that want more
+            // concurrent logical sketches must explicitly reserve more.
+            maximum_reserved_shared_memory_bytes: THREADED_RUST_RESERVATION_BYTES,
+            maximum_active_root_executions: 1,
+        }
+    }
+}
+
+/// Bounded semantic observations for compiler-owned logical sketch sessions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SketchExecutionSnapshot {
+    reserved_shared_memory_bytes: u64,
+    active_root_executions: usize,
+    live_guest_threads: usize,
+    live_stores: usize,
+    live_instances: usize,
+}
+impl SketchExecutionSnapshot {
+    pub fn reserved_shared_memory_bytes(self) -> u64 { self.reserved_shared_memory_bytes }
+    pub fn active_root_executions(self) -> usize { self.active_root_executions }
+    pub fn live_guest_threads(self) -> usize { self.live_guest_threads }
+    pub fn live_stores(self) -> usize { self.live_stores }
+    pub fn live_instances(self) -> usize { self.live_instances }
 }
 
 /// Facade-owned compiler for the selected core-Wasm profile.
@@ -80,6 +156,7 @@ impl Default for SketchCompilerConfig {
 pub struct SketchCompiler {
     engine: Arc<Engine>,
     compilations: Arc<AtomicU64>,
+    execution_ledger: Arc<ExecutionLedger>,
 }
 impl SketchCompiler {
     /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
@@ -97,6 +174,7 @@ impl SketchCompiler {
         Ok(Self {
             engine: Arc::new(engine),
             compilations: Arc::new(AtomicU64::new(0)),
+            execution_ledger: Arc::new(ExecutionLedger::new(config.execution_limits)),
         })
     }
     /// Preflights and then compiles one module. Rejected input cannot compile.
@@ -128,6 +206,7 @@ impl SketchCompiler {
             max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
             validation: policy.validation,
+            execution_ledger: Arc::clone(&self.execution_ledger),
             prepared_root: std::sync::Mutex::new(None),
             #[cfg(test)]
             preparation_count: AtomicU64::new(0),
@@ -136,6 +215,10 @@ impl SketchCompiler {
     /// Number of modules whose complete preflight reached private compilation.
     pub fn compiled_module_count(&self) -> u64 {
         self.compilations.load(Ordering::Relaxed)
+    }
+    /// Snapshot of aggregate logical resources owned by this compiler.
+    pub fn execution_limits_snapshot(&self) -> SketchExecutionSnapshot {
+        self.execution_ledger.snapshot()
     }
 }
 
@@ -223,6 +306,7 @@ impl SketchModulePolicy {
 /// An admitted module. The backend object is private to the crate.
 pub struct AdmittedSketch {
     engine: Arc<Engine>,
+    execution_ledger: Arc<ExecutionLedger>,
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
@@ -243,6 +327,29 @@ impl AdmittedSketch {
     pub fn shared_memory(&self) -> SketchSharedMemory {
         self.shared_memory
     }
+    /// Aggregate accounting owned by the compiler that admitted this sketch.
+    pub fn execution_limits_snapshot(&self) -> SketchExecutionSnapshot {
+        self.execution_ledger.snapshot()
+    }
+    /// Explicitly releases the cached logical session. Calling this while a
+    /// root is executing is rejected; dropping an admitted sketch also
+    /// releases its cached session once the last execution reference ends.
+    pub fn close_threaded_root(&self) -> Result<(), SketchExecutionError> {
+        let prepared = self
+            .prepared_root
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?
+            .take();
+        if let Some(prepared) = prepared {
+            if prepared.controller.active_roots.load(Ordering::Acquire) != 0 {
+                let mut slot = self.prepared_root.lock().map_err(|_| SketchExecutionError::PrelinkFailed)?;
+                *slot = Some(prepared);
+                return Err(SketchExecutionError::SessionBusy);
+            }
+            drop(prepared);
+        }
+        Ok(())
+    }
     /// Instantiates the admitted module in one fresh root store, then invokes
     /// the admitted command ABI's exported `_start` exactly once. The Wasm
     /// start section runs during instantiation; Rust command artifacts use it
@@ -256,10 +363,12 @@ impl AdmittedSketch {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let prepared = self.prepare_threaded_root()?;
+        let _root = prepared.controller.acquire_root()?;
         prepared
             .controller
             .runtime_identity
             .store(runtime.identity_for_wasm(), Ordering::Release);
+        let _store_observation = CounterObservation::new(&prepared.controller.execution_ledger.live_stores);
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -272,11 +381,15 @@ impl AdmittedSketch {
         // progress, and lookup/call failures after that must still close and
         // drain every accepted native child.
         let mut validation_getter = None;
+        let mut _instance_observation = None;
         let outcome = (|| {
             let instance = match prepared.prelink.instantiate(&mut store) {
                 Ok(instance) => instance,
                 Err(error) => return map_root_error(&error),
             };
+            _instance_observation = Some(CounterObservation::new(
+                &prepared.controller.execution_ledger.live_instances,
+            ));
             let start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
                 .map_err(|_| SketchExecutionError::Trapped)?;
@@ -319,6 +432,12 @@ impl AdmittedSketch {
         if let Some(prepared) = prepared.as_ref() {
             return Ok(Arc::clone(prepared));
         }
+        // The Rust threaded link profile has a fixed maximum. Reserve its
+        // complete address-space contract before asking Wasmtime to create the
+        // engine-owned shared memory; committed pages are telemetry only.
+        let reservation = self.execution_ledger.reserve_shared_memory(
+            THREADED_RUST_RESERVATION_BYTES,
+        )?;
         let memory = SharedMemory::new(
             &self.engine,
             MemoryType::shared(
@@ -348,6 +467,8 @@ impl AdmittedSketch {
             runtime_handle_count: AtomicU64::new(0),
             runtime_identity: AtomicUsize::new(0),
             runtime_identity_mismatches: AtomicU64::new(0),
+            execution_ledger: Arc::clone(&self.execution_ledger),
+            active_roots: AtomicUsize::new(0),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -388,6 +509,7 @@ impl AdmittedSketch {
         let prepared_root = Arc::new(PreparedThreadedRoot {
             controller,
             prelink,
+            _reservation: reservation,
         });
         #[cfg(test)]
         self.preparation_count.fetch_add(1, Ordering::Relaxed);
@@ -473,6 +595,9 @@ impl ThreadSpawnRejectionSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SketchExecutionError {
     ThreadedProfileRequired,
+    SharedMemoryLimitExceeded,
+    RootExecutionLimitExceeded,
+    SessionBusy,
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
@@ -487,6 +612,9 @@ impl SketchExecutionError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::ThreadedProfileRequired => "threaded-profile-required",
+            Self::SharedMemoryLimitExceeded => "shared-memory-limit-exceeded",
+            Self::RootExecutionLimitExceeded => "root-execution-limit-exceeded",
+            Self::SessionBusy => "session-busy",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -506,6 +634,106 @@ impl fmt::Display for SketchExecutionError {
 }
 impl std::error::Error for SketchExecutionError {}
 
+/// Private compiler-owned accounting. It deliberately has no relationship to
+/// a Store limiter: shared memory belongs to the Engine and is visible to all
+/// per-thread stores in a logical sketch session.
+struct ExecutionLedger {
+    limits: SketchExecutionLimits,
+    reserved_shared_memory_bytes: AtomicU64,
+    active_root_executions: AtomicUsize,
+    live_guest_threads: AtomicUsize,
+    live_stores: AtomicUsize,
+    live_instances: AtomicUsize,
+}
+impl ExecutionLedger {
+    fn new(limits: SketchExecutionLimits) -> Self {
+        Self {
+            limits,
+            reserved_shared_memory_bytes: AtomicU64::new(0),
+            active_root_executions: AtomicUsize::new(0),
+            live_guest_threads: AtomicUsize::new(0),
+            live_stores: AtomicUsize::new(0),
+            live_instances: AtomicUsize::new(0),
+        }
+    }
+    fn snapshot(&self) -> SketchExecutionSnapshot {
+        SketchExecutionSnapshot {
+            reserved_shared_memory_bytes: self.reserved_shared_memory_bytes.load(Ordering::Acquire),
+            active_root_executions: self.active_root_executions.load(Ordering::Acquire),
+            live_guest_threads: self.live_guest_threads.load(Ordering::Acquire),
+            live_stores: self.live_stores.load(Ordering::Acquire),
+            live_instances: self.live_instances.load(Ordering::Acquire),
+        }
+    }
+    fn reserve_shared_memory(self: &Arc<Self>, bytes: u64) -> Result<SharedMemoryReservation, SketchExecutionError> {
+        let mut current = self.reserved_shared_memory_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return Err(SketchExecutionError::SharedMemoryLimitExceeded);
+            };
+            if next > self.limits.maximum_reserved_shared_memory_bytes {
+                return Err(SketchExecutionError::SharedMemoryLimitExceeded);
+            }
+            match self.reserved_shared_memory_bytes.compare_exchange_weak(
+                current, next, Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(SharedMemoryReservation { ledger: Arc::clone(self), bytes }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+    fn acquire_root(self: &Arc<Self>) -> Result<RootExecutionPermit, SketchExecutionError> {
+        let mut current = self.active_root_executions.load(Ordering::Acquire);
+        loop {
+            if current >= self.limits.maximum_active_root_executions {
+                return Err(SketchExecutionError::RootExecutionLimitExceeded);
+            }
+            match self.active_root_executions.compare_exchange_weak(
+                current, current + 1, Ordering::AcqRel, Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(RootExecutionPermit { ledger: Arc::clone(self) }),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+struct SharedMemoryReservation {
+    ledger: Arc<ExecutionLedger>,
+    bytes: u64,
+}
+impl Drop for SharedMemoryReservation {
+    fn drop(&mut self) {
+        self.ledger
+            .reserved_shared_memory_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct RootExecutionPermit {
+    ledger: Arc<ExecutionLedger>,
+}
+
+struct CounterObservation<'a> {
+    counter: &'a AtomicUsize,
+}
+impl<'a> CounterObservation<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+impl Drop for CounterObservation<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl Drop for RootExecutionPermit {
+    fn drop(&mut self) {
+        self.ledger.active_root_executions.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ThreadController {
     engine: Arc<Engine>,
     memory: SharedMemory,
@@ -517,6 +745,8 @@ struct ThreadController {
     runtime_handle_count: AtomicU64,
     runtime_identity: AtomicUsize,
     runtime_identity_mismatches: AtomicU64,
+    execution_ledger: Arc<ExecutionLedger>,
+    active_roots: AtomicUsize,
     workers: Mutex<Workers>,
 }
 struct Workers {
@@ -562,6 +792,11 @@ pub enum ThreadedChildOutcomeKind {
     Panicked,
 }
 impl ThreadController {
+    fn acquire_root(&self) -> Result<LogicalRootPermit, SketchExecutionError> {
+        let permit = self.execution_ledger.acquire_root()?;
+        self.active_roots.fetch_add(1, Ordering::AcqRel);
+        Ok(LogicalRootPermit { controller: self, _permit: permit })
+    }
     fn join_completed(&self) -> Result<(), SketchExecutionError> {
         // Mark closing before taking the queue. This prevents a child that is
         // still running from registering another native worker after the final
@@ -642,6 +877,17 @@ impl ThreadController {
 struct PreparedThreadedRoot {
     controller: Arc<ThreadController>,
     prelink: Arc<InstancePre<ThreadStoreState>>,
+    _reservation: SharedMemoryReservation,
+}
+
+struct LogicalRootPermit<'a> {
+    controller: &'a ThreadController,
+    _permit: RootExecutionPermit,
+}
+impl Drop for LogicalRootPermit<'_> {
+    fn drop(&mut self) {
+        self.controller.active_roots.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct ThreadStoreState {
@@ -729,7 +975,13 @@ fn define_closed_imports(
                 };
                 let child = Arc::clone(&controller);
                 let spawned = std::thread::Builder::new().spawn(move || {
+                    let _thread_observation = CounterObservation::new(
+                        &child.execution_ledger.live_guest_threads,
+                    );
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _store_observation = CounterObservation::new(
+                            &child.execution_ledger.live_stores,
+                        );
                         let mut store = Store::new(
                             &child.engine,
                             ThreadStoreState {
@@ -744,6 +996,9 @@ fn define_closed_imports(
                             Ok(instance) => instance,
                             Err(error) => return map_child_error(&error),
                         };
+                        let _instance_observation = CounterObservation::new(
+                            &child.execution_ledger.live_instances,
+                        );
                         let entry = instance
                             .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
                             .map_err(|_| ())
@@ -877,6 +1132,67 @@ fn define_closed_imports(
 #[cfg(test)]
 mod threaded_root_observation_tests {
     use super::*;
+
+    #[test]
+    fn compiler_owned_ledger_reserves_the_exact_threaded_contract_and_releases_once() {
+        let limits = SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES, 1)
+            .expect("exact one-session limit");
+        let compiler = SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(limits)
+                .expect("limits"),
+        )
+        .expect("compiler");
+        let bytes = threaded_yield_fixture();
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async {
+            assert_eq!(
+                sketch.execute_threaded_root(runtime.handle()),
+                Ok(ThreadedRootOutcome::Started)
+            );
+        });
+        assert_eq!(
+            compiler.execution_limits_snapshot().reserved_shared_memory_bytes(),
+            THREADED_RUST_RESERVATION_BYTES,
+        );
+        sketch.close_threaded_root().expect("explicit close");
+        assert_eq!(compiler.execution_limits_snapshot(), SketchExecutionSnapshot::default());
+    }
+
+    #[test]
+    fn compiler_ledger_rejects_a_second_preparation_before_shared_memory_allocation() {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let bytes = threaded_yield_fixture();
+        let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+            .expect("policy");
+        let first = compiler.admit(&bytes, policy).expect("first admission");
+        let second = compiler.admit(&bytes, policy).expect("second admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async {
+            first.execute_threaded_root(runtime.handle()).expect("first preparation");
+            assert_eq!(
+                second.execute_threaded_root(runtime.handle()),
+                Err(SketchExecutionError::SharedMemoryLimitExceeded),
+            );
+        });
+        first.close_threaded_root().expect("close first");
+        runtime.run(async {
+            second.execute_threaded_root(runtime.handle()).expect("released reservation admits second");
+        });
+    }
 
     #[test]
     fn thread_policy_rejects_requests_above_the_v1_absolute_cap() {
@@ -1699,12 +2015,16 @@ mod result_precedence_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchCompilerError {
     InvalidStackLimit,
+    InvalidExecutionLimits,
     Unavailable,
 }
 impl fmt::Display for SketchCompilerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidStackLimit => "the Wasm stack limit must be nonzero",
+            Self::InvalidExecutionLimits => {
+                "execution limits must admit one 1 GiB threaded Rust session and one root"
+            }
             Self::Unavailable => "the sketch compiler is unavailable",
         })
     }

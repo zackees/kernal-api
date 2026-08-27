@@ -15,5 +15,5 @@ if [[ $# -eq 0 ]]; then
   soldr "$subcommand" build --locked --manifest-path "$guest_manifest" --target "$target" --release --target-dir "$target_directory"
 fi
 
-KERNAL_API_THREADED_SMOKE_WASM="$artifact" \
-  soldr "$subcommand" test --locked --features wasm-sketch-host --test threaded_artifact_profile
+KERNAL_API_THREADED_VALIDATION_WASM="$artifact" \
+  soldr "$subcommand" test --locked --features wasm-sketch-host --lib supplied_validation_artifact_executes_the_private_validation_lane

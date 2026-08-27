@@ -4,7 +4,9 @@
 //! binary contract has succeeded. The threaded-root profile can then start in
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
+use std::cell::UnsafeCell;
 use std::fmt;
+use std::mem::align_of;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -35,7 +37,10 @@ const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
 const MAX_P1_IOVECS: usize = 1024;
-const DEFAULT_MAX_GUEST_THREADS: usize = 16;
+/// Absolute v1 ceiling. This bounds native JoinHandles and the facade-owned
+/// child-outcome vector independently of a caller's requested quota.
+const MAX_GUEST_THREADS_V1: usize = 16;
+const DEFAULT_MAX_GUEST_THREADS: usize = MAX_GUEST_THREADS_V1;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -192,9 +197,17 @@ impl SketchModulePolicy {
     }
     /// Bounds live guest-owned native threads for one admitted sketch. The
     /// limit is a semantic controller quota, not a Wasmtime pooling setting.
+    /// V1 accepts at most 16 threads so the native
+    /// registrations and bounded semantic child report cannot grow unbounded.
     pub fn with_max_guest_threads(mut self, maximum: usize) -> Result<Self, SketchModuleError> {
         if maximum == 0 {
             return Err(SketchModuleError::InvalidThreadLimit);
+        }
+        if maximum > MAX_GUEST_THREADS_V1 {
+            return Err(SketchModuleError::ThreadLimitExceedsV1Maximum {
+                requested: maximum,
+                maximum: MAX_GUEST_THREADS_V1,
+            });
         }
         self.max_guest_threads = maximum;
         Ok(self)
@@ -319,11 +332,14 @@ impl AdmittedSketch {
             prelink: OnceLock::new(),
             workers: Mutex::new(Workers {
                 next_tid: 1,
+                accepted: 0,
                 live: 0,
                 closing: false,
                 maximum: self.max_guest_threads,
                 handles: Vec::new(),
-                outcomes: Vec::new(),
+                // At most `maximum` spawns are accepted before the controller
+                // closes, so this facade report remains absolutely bounded.
+                outcomes: Vec::with_capacity(self.max_guest_threads),
             }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
@@ -384,6 +400,10 @@ impl AdmittedSketch {
             preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
             supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
+            runtime_identity_mismatches: controller
+                .runtime_identity_mismatches
+                .load(Ordering::Relaxed),
+            accepted_child_registrations: workers.accepted,
             live_threads: workers.live,
             queued_join_handles: workers.handles.len(),
         })
@@ -474,6 +494,10 @@ struct ThreadController {
 }
 struct Workers {
     next_tid: i32,
+    // Total child registrations in the current root execution. Unlike `live`,
+    // this never decreases until drain, so a fast-completing guest cannot grow
+    // the bounded facade outcome vector by repeatedly spawning replacements.
+    accepted: usize,
     live: usize,
     closing: bool,
     maximum: usize,
@@ -531,7 +555,9 @@ impl ThreadController {
                         .workers
                         .lock()
                         .map_err(|_| SketchExecutionError::ChildPanicked)?;
-                    workers.outcomes.push((i32::MAX, ChildOutcome::Panicked));
+                    if workers.outcomes.len() < workers.maximum {
+                        workers.outcomes.push((i32::MAX, ChildOutcome::Panicked));
+                    }
                 }
             }
         }
@@ -540,6 +566,7 @@ impl ThreadController {
             .lock()
             .map_err(|_| SketchExecutionError::ChildPanicked)?;
         let mut outcomes: Vec<_> = workers.outcomes.drain(..).collect();
+        workers.accepted = 0;
         outcomes.sort_by_key(|(tid, _)| *tid);
         let report: Vec<_> = outcomes
             .into_iter()
@@ -586,6 +613,8 @@ struct RootExecutionObservation {
     preparations: u64,
     kernel_yields: u64,
     supplied_runtime_handles: u64,
+    runtime_identity_mismatches: u64,
+    accepted_child_registrations: usize,
     live_threads: usize,
     queued_join_handles: usize,
 }
@@ -636,9 +665,15 @@ fn define_closed_imports(
                 let controller = Arc::clone(&caller.data().controller);
                 let runtime = caller.data().runtime.clone();
                 let tid = match controller.workers.lock() {
-                    Ok(mut w) if !w.closing && w.live < w.maximum && w.next_tid <= 0x1fff_ffff => {
+                    Ok(mut w)
+                        if !w.closing
+                            && w.live < w.maximum
+                            && w.accepted < w.maximum
+                            && w.next_tid <= 0x1fff_ffff =>
+                    {
                         let tid = w.next_tid;
                         w.next_tid += 1;
+                        w.accepted += 1;
                         w.live += 1;
                         tid
                     }
@@ -698,6 +733,7 @@ fn define_closed_imports(
                     Err(_) => {
                         if let Ok(mut w) = controller.workers.lock() {
                             w.live = w.live.saturating_sub(1);
+                            w.accepted = w.accepted.saturating_sub(1);
                         }
                         THREAD_SPAWN_REJECTED
                     }
@@ -793,6 +829,19 @@ mod threaded_root_observation_tests {
     use super::*;
 
     #[test]
+    fn thread_policy_rejects_requests_above_the_v1_absolute_cap() {
+        let policy =
+            SketchModulePolicy::threaded_rust_v1(1, THREADED_RUST_MAX_PAGES).expect("policy");
+        assert_eq!(
+            policy.with_max_guest_threads(MAX_GUEST_THREADS_V1 + 1),
+            Err(SketchModuleError::ThreadLimitExceedsV1Maximum {
+                requested: MAX_GUEST_THREADS_V1 + 1,
+                maximum: MAX_GUEST_THREADS_V1,
+            })
+        );
+    }
+
+    #[test]
     fn repeated_roots_reuse_one_preparation_and_receive_the_supplied_runtime() {
         let bytes = threaded_yield_fixture();
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
@@ -824,6 +873,8 @@ mod threaded_root_observation_tests {
                 preparations: 1,
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
+                runtime_identity_mismatches: 0,
+                accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
             })
@@ -889,6 +940,8 @@ mod threaded_root_observation_tests {
                 // each invoke the closed kernel-yield import.
                 kernel_yields: 3,
                 supplied_runtime_handles: 3,
+                runtime_identity_mismatches: 0,
+                accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
             })
@@ -1276,20 +1329,30 @@ fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+fn load_shared_atomic_u32(cells: &[UnsafeCell<u8>], ordering: Ordering) -> Option<u32> {
+    if cells.len() != 4 {
+        return None;
+    }
+    let pointer = cells.as_ptr().cast::<AtomicU32>();
+    if pointer.addr() % align_of::<AtomicU32>() != 0 {
+        return None;
+    }
+    // SAFETY: callers provide exactly four live SharedMemory cells and the
+    // computed backing address is checked for AtomicU32 alignment. The shared
+    // report protocol permits only atomic accesses; this reference is used for
+    // one load and never escapes the function.
+    Some(unsafe { (&*pointer).load(ordering) })
+}
+
 // Validation reports are intentionally private: the guest returns only a
 // bounded offset and the facade consumes the fixed 64-byte schema itself.
 fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecutionError> {
     if offset < 0 || offset % 4 != 0 || shared_range(memory, offset, 64).is_none() {
         return Err(SketchExecutionError::ValidationReportInvalid);
     }
-    // SAFETY: the checked offset is four-byte aligned, every 4-byte word lies
-    // in the live SharedMemory range, and host access to this concurrent guest
-    // record is atomic-only. AtomicU32 has the required alignment and no view
-    // or reference escapes this function.
     let load = |word: i32, ordering| -> Option<u32> {
         let cells = shared_range(memory, offset.checked_add(word.checked_mul(4)?)?, 4)?;
-        let pointer = cells.as_ptr().cast::<AtomicU32>();
-        Some(unsafe { (&*pointer).load(ordering) })
+        load_shared_atomic_u32(cells, ordering)
     };
     // The guest stores ready with Release after all record fields; acquire it
     // before copying the remaining words.
@@ -1369,6 +1432,19 @@ mod validation_report_tests {
                 Err(SketchExecutionError::ValidationReportInvalid)
             );
         }
+    }
+
+    #[test]
+    fn atomic_report_load_rejects_a_misaligned_computed_address() {
+        let bytes: [UnsafeCell<u8>; 8] = std::array::from_fn(|_| UnsafeCell::new(0));
+        let base = bytes.as_ptr().addr();
+        let misaligned = (0..4)
+            .find(|offset| !(base + offset).is_multiple_of(align_of::<AtomicU32>()))
+            .expect("one of four adjacent byte addresses is misaligned");
+        assert_eq!(
+            load_shared_atomic_u32(&bytes[misaligned..misaligned + 4], Ordering::Relaxed),
+            None
+        );
     }
 }
 
@@ -1492,6 +1568,10 @@ pub enum SketchModuleError {
     InvalidModuleLimit,
     InvalidSharedMemoryLimit,
     InvalidThreadLimit,
+    ThreadLimitExceedsV1Maximum {
+        requested: usize,
+        maximum: usize,
+    },
     ForbiddenImport {
         module: String,
         name: String,
@@ -1557,6 +1637,7 @@ impl SketchModuleError {
             Self::InvalidModuleLimit => "invalid-module-limit",
             Self::InvalidSharedMemoryLimit => "invalid-shared-memory-limit",
             Self::InvalidThreadLimit => "invalid-thread-limit",
+            Self::ThreadLimitExceedsV1Maximum { .. } => "thread-limit-exceeds-v1-maximum",
             Self::ForbiddenImport { .. } => "forbidden-import",
             Self::ImportTypeMismatch { .. } => "import-type-mismatch",
             Self::MissingRequiredImport { .. } => "missing-required-import",

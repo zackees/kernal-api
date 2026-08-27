@@ -112,7 +112,9 @@ from the host process.
 The host enforces a maximum guest-thread count and an explicit shared-memory
 maximum. Shared memory is accounted by `kernal-api` rather than relying solely
 on an engine Store limiter, and the threaded profile does not depend on the
-pooling allocator. Until all blocked atomic waits can be interrupted reliably,
+pooling allocator. Issue #43's in-process epoch clock is cooperative: it
+cannot terminate an `atomic.wait` or host-blocked call. Until all blocked
+atomic waits can be interrupted reliably,
 untrusted threaded sketches run behind a killable worker-process boundary so a
 timeout, trap, or teardown can contain every thread and release every resource.
 

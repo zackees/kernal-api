@@ -675,6 +675,15 @@ fn take_counters(input: &mut &[u8]) -> Result<FinalCounters, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execute_ack_round_trips_and_rejects_trailing_bytes() {
+        let frame = encode(&Message::ExecuteAck { request_id: 41 }).expect("encode ack");
+        assert_eq!(decode(&frame), Ok(Message::ExecuteAck { request_id: 41 }));
+        let mut trailing = frame;
+        trailing.push(0);
+        assert_eq!(decode(&trailing), Err(ProtocolError::TrailingBytes));
+    }
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
             max_wasm_stack_bytes: 1,

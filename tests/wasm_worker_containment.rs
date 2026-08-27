@@ -457,9 +457,15 @@ mod failure_proof {
         })
     }
     #[cfg(target_os = "linux")]
-    struct PidFd(Option<i32>);
+    struct CloseOnlyPidFd(Option<i32>);
     #[cfg(target_os = "linux")]
-    impl PidFd {
+    impl Drop for CloseOnlyPidFd { fn drop(&mut self) { if let Some(fd) = self.0.take() { unsafe { libc::close(fd); } } } }
+    #[cfg(target_os = "linux")]
+    impl CloseOnlyPidFd { fn promote(mut self) -> ArmedPidFd { ArmedPidFd(self.0.take()) } }
+    #[cfg(target_os = "linux")]
+    struct ArmedPidFd(Option<i32>);
+    #[cfg(target_os = "linux")]
+    impl ArmedPidFd {
         fn wait_gone(&mut self) {
             let fd = self.0.expect("pidfd");
             let mut poll = libc::pollfd {
@@ -478,7 +484,7 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "linux")]
-    impl Drop for PidFd {
+    impl Drop for ArmedPidFd {
         fn drop(&mut self) {
             let Some(fd) = self.0.take() else {
                 return;
@@ -504,14 +510,15 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "linux")]
-    fn pidfd_open(identity: Identity) -> PidFd {
+    fn pidfd_open(identity: Identity) -> ArmedPidFd {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) as i32 };
-        assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        let close_only = CloseOnlyPidFd((fd >= 0).then_some(fd));
+        assert!(close_only.0.is_some(), "pidfd_open: {}", std::io::Error::last_os_error());
         assert!(
             matches!(linux_identity(identity.pid), Some(now) if now.a == identity.a && now.b == identity.b),
             "PID was reused"
         );
-        PidFd(Some(fd))
+        close_only.promote()
     }
 
     #[cfg(target_os = "linux")]
@@ -561,9 +568,15 @@ mod failure_proof {
     }
     #[cfg(target_os = "windows")]
     #[cfg(target_os = "windows")]
-    struct WindowsProcess(Option<windows_sys::Win32::Foundation::HANDLE>);
+    struct CloseOnlyWindowsHandle(Option<windows_sys::Win32::Foundation::HANDLE>);
     #[cfg(target_os = "windows")]
-    impl WindowsProcess {
+    impl Drop for CloseOnlyWindowsHandle { fn drop(&mut self) { if let Some(handle) = self.0.take() { unsafe { windows_sys::Win32::Foundation::CloseHandle(handle); } } } }
+    #[cfg(target_os = "windows")]
+    impl CloseOnlyWindowsHandle { fn promote(mut self) -> ArmedWindowsProcess { ArmedWindowsProcess(self.0.take()) } }
+    #[cfg(target_os = "windows")]
+    struct ArmedWindowsProcess(Option<windows_sys::Win32::Foundation::HANDLE>);
+    #[cfg(target_os = "windows")]
+    impl ArmedWindowsProcess {
         fn acquire(pid: u32, access: u32) -> Self {
             use windows_sys::Win32::System::Threading::OpenProcess;
             let process = unsafe { OpenProcess(access, 0, pid) };
@@ -587,7 +600,7 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "windows")]
-    impl Drop for WindowsProcess {
+    impl Drop for ArmedWindowsProcess {
         fn drop(&mut self) {
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
@@ -602,11 +615,11 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "windows")]
-    fn windows_handle(identity: Identity, access: u32) -> WindowsProcess {
-        use windows_sys::Win32::System::Threading::GetProcessTimes;
-        let process = WindowsProcess::acquire(identity.pid, access);
+    fn windows_handle(identity: Identity, access: u32) -> ArmedWindowsProcess {
+        use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
+        let close_only = CloseOnlyWindowsHandle(Some(unsafe { OpenProcess(access, 0, identity.pid) }));
         assert!(
-            !process.handle().is_null(),
+            !close_only.0.expect("owned handle").is_null(),
             "OpenProcess: {}",
             std::io::Error::last_os_error()
         );
@@ -617,7 +630,7 @@ mod failure_proof {
         assert_ne!(
             unsafe {
                 GetProcessTimes(
-                    process.handle(),
+                    close_only.0.expect("owned handle"),
                     &mut creation,
                     &mut exit,
                     &mut kernel,
@@ -629,7 +642,7 @@ mod failure_proof {
         );
         let created = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
         assert_eq!((created, 0), (identity.a, identity.b), "PID was reused");
-        process
+        close_only.promote()
     }
     #[cfg(target_os = "windows")]
     #[test]

@@ -13,9 +13,8 @@ pub use crate::{
     WindowsJobHandle,
 };
 
-pub(crate) use crate::spawn_contained_worker;
-
 /// Host-neutral command options selected by the caller before spawning.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ProcessCommandConfig {
     pub creation_flags: Option<u32>,
@@ -34,6 +33,7 @@ pub struct ExactTraceCapability {
     pub non_invasive_grade: NonInvasiveObservationGrade,
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NonInvasiveObservationGrade {
     KernelNotification,
@@ -220,31 +220,42 @@ pub(crate) enum WorkerStage {
 }
 
 /// Private worker failure without exposing an OS handle or backend type.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Debug)]
 pub(crate) struct WorkerError {
     stage: WorkerStage,
     source: std::io::Error,
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 impl WorkerError {
     pub(crate) fn new(stage: WorkerStage, source: std::io::Error) -> Self {
         Self { stage, source }
     }
 
-    pub(crate) fn stage(&self) -> WorkerStage { self.stage }
+    pub(crate) fn stage(&self) -> WorkerStage {
+        self.stage
+    }
 }
 
 impl std::fmt::Display for WorkerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "contained worker failed at {:?}: {}", self.stage, self.source)
+        write!(
+            f,
+            "contained worker failed at {:?}: {}",
+            self.stage, self.source
+        )
     }
 }
 
 impl std::error::Error for WorkerError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.source) }
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 /// Platform-private lifecycle implementation for [`WorkerChild`].
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 pub(crate) trait WorkerChildControl: Send {
     fn try_wait(&mut self) -> std::io::Result<Option<i32>>;
     fn force_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), WorkerError>;
@@ -255,6 +266,7 @@ pub(crate) trait WorkerChildControl: Send {
 ///
 /// This is deliberately crate-private: callers receive protocol semantic
 /// outcomes, never native child, Job, process-group, or descriptor handles.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 pub(crate) struct WorkerChild {
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<std::process::ChildStdout>,
@@ -262,6 +274,7 @@ pub(crate) struct WorkerChild {
     inner: Box<dyn WorkerChildControl>,
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 impl WorkerChild {
     pub(crate) fn new(
         stdin: Option<std::process::ChildStdin>,
@@ -269,18 +282,34 @@ impl WorkerChild {
         pid: u32,
         inner: Box<dyn WorkerChildControl>,
     ) -> Self {
-        Self { stdin, stdout, pid, inner }
+        Self {
+            stdin,
+            stdout,
+            pid,
+            inner,
+        }
     }
 
-    pub(crate) fn id(&self) -> u32 { self.pid }
-    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> { self.stdin.take() }
-    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> { self.stdout.take() }
-    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> { self.inner.try_wait() }
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
+    }
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.stdin.take()
+    }
+    pub(crate) fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.stdout.take()
+    }
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+        self.inner.try_wait()
+    }
 
     /// Close the control writer before hard containment, then reap within the
     /// caller-selected bound. Repeated calls are delegated to the platform
     /// owner and remain idempotent.
-    pub(crate) fn force_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), WorkerError> {
+    pub(crate) fn force_and_reap(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), WorkerError> {
         drop(self.stdin.take());
         self.inner.force_and_reap(timeout)
     }

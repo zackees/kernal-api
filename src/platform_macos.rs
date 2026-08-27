@@ -904,6 +904,7 @@ pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 /// Launch the private Wasm worker with protocol-only stdio and no inherited
 /// ambient environment. The contained pre-exec path installs the acknowledged
 /// kqueue owner-death supervisor before guest code can run.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 pub(crate) fn spawn_contained_worker(
     command: &mut std::process::Command,
     _limits: crate::platform::process::WorkerLimits,
@@ -930,6 +931,7 @@ pub(crate) fn spawn_contained_worker(
     ))
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 struct MacosWorkerControl {
     inner: Box<dyn crate::platform::process::SpawnedChildControl>,
 }

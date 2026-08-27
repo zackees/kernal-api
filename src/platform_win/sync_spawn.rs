@@ -837,6 +837,7 @@ pub(crate) fn spawn_strict_contained_worker(
 }
 
 /// Adapt the strict Job launcher to the private cross-platform worker facade.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 pub(crate) fn spawn_contained_worker(
     command: &mut Command,
     limits: crate::platform::process::WorkerLimits,
@@ -869,6 +870,7 @@ pub(crate) fn spawn_contained_worker(
     ))
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 struct StrictWorkerControl { child: Option<StrictWorkerChild> }
 
 impl crate::platform::process::WorkerChildControl for StrictWorkerControl {
@@ -890,10 +892,12 @@ impl crate::platform::process::WorkerChildControl for StrictWorkerControl {
     }
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 fn map_strict_worker_spawn_error(error: StrictWorkerSpawnError) -> crate::platform::process::WorkerError {
     crate::platform::process::WorkerError::new(map_strict_stage(error.stage()), io::Error::other(error.to_string()))
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 fn map_strict_stage(stage: StrictWorkerSpawnStage) -> crate::platform::process::WorkerStage {
     use crate::platform::process::WorkerStage;
     match stage {

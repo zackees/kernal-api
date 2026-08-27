@@ -794,6 +794,7 @@ pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 /// Launch the private Wasm worker with no inherited ambient stdio and an
 /// explicit empty environment. Guest capabilities travel over the worker
 /// protocol, never through inherited descriptors or environment variables.
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 pub(crate) fn spawn_contained_worker(
     command: &mut std::process::Command,
     _limits: crate::platform::process::WorkerLimits,
@@ -814,6 +815,7 @@ pub(crate) fn spawn_contained_worker(
     worker_from_spawned_child(child)
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 fn worker_from_spawned_child(
     child: crate::platform::process::SpawnedChild,
 ) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
@@ -826,6 +828,7 @@ fn worker_from_spawned_child(
     ))
 }
 
+#[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 struct UnixWorkerControl {
     inner: Box<dyn crate::platform::process::SpawnedChildControl>,
 }

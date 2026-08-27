@@ -95,11 +95,6 @@ pub use platform_imp::{
     TracedChild, WindowsJobHandle,
 };
 
-// The worker-process protocol is an internal consumer of this selected
-// platform primitive; unlike the public process facade it exposes no backend
-// handles or native containment vocabulary.
-pub(crate) use platform_imp::spawn_contained_worker;
-
 pub use platform_imp::{autostart_register, autostart_render_registration, autostart_unregister};
 
 pub use platform_imp::{process_install_owner_death_cleanup, process_owner_death_cleanup_target};

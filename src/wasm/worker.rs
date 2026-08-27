@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "wasm-sketch-worker-test-support")]
+mod test_support;
+
 use super::worker_protocol::{
     self, ExecuteMetadata, FinalCounters, Message, RootOutcome, TerminalKind,
 };
@@ -469,6 +472,13 @@ fn supervise(
         }),
         cleanup,
     };
+    #[cfg(feature = "wasm-sketch-worker-test-support")]
+    if let Err(()) = test_support::publish_worker_identity(control.id()) {
+        // The marker is an all-or-nothing test observation point.  Do not
+        // start protocol work when its observer cannot identify this exact
+        // worker; the existing pre-protocol path contains and reaps it.
+        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::UnexpectedExit);
+    }
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
         return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
     };

@@ -246,3 +246,144 @@ fn real_worker_sequential_stress_leaves_no_parent_state() {
         );
     }
 }
+
+// These are deliberately a second, externally controlled process layer.  The
+// worker's environment is explicit-empty; only this parent harness receives
+// the marker paths.  Do not remove `--ignored` from the outer invocations.
+#[cfg(feature = "wasm-sketch-worker-test-support")]
+mod failure_proof {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    const MARKER: &str = "KERNAL_API_WASM_WORKER_IDENTITY_MARKER";
+    const RESULT: &str = "KERNAL_API_WASM_WORKER_FAILURE_RESULT";
+    const RELEASE: &str = "KERNAL_API_WASM_WORKER_FAILURE_RELEASE";
+
+    struct Artifacts { root: std::path::PathBuf, marker: std::path::PathBuf, result: std::path::PathBuf, release: std::path::PathBuf }
+    impl Artifacts {
+        fn new() -> Self {
+            let unique = format!("kernal-api-d4-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos());
+            let root = std::env::temp_dir().join(unique); fs::create_dir(&root).expect("artifact directory");
+            Self { marker: root.join("identity"), result: root.join("result"), release: root.join("release"), root }
+        }
+    }
+    impl Drop for Artifacts { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.root); } }
+
+    #[derive(Clone, Copy)] struct Identity { pid: u32, a: u64, b: u64 }
+    fn decode_marker() -> Option<Identity> {
+        let text = fs::read_to_string(std::env::var_os(MARKER)?).ok()?;
+        let mut lines = text.lines();
+        (lines.next()? == "kernal-api-worker-identity-v1").then_some(())?;
+        let mut number = |key| -> Option<u64> { lines.next()?.strip_prefix(key)?.parse().ok() };
+        let value = Identity { pid: number("pid=")?.try_into().ok()?, a: number("creation-a=")?, b: number("creation-b=")? };
+        lines.next().is_none().then_some(value)
+    }
+    fn wait_for_marker(path: &std::path::Path) -> Identity {
+        let deadline = Instant::now() + OUTER_BOUND;
+        while Instant::now() < deadline {
+            if path.exists() { if let Some(value) = decode_marker() { return value; } }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("worker identity marker was not published")
+    }
+    fn launch(inner: &str, files: &Artifacts) -> std::process::Child {
+        let worker = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
+        assert!(worker.is_absolute(), "real worker path must be absolute");
+        Command::new(std::env::current_exe().expect("test executable"))
+            .args(["--exact", inner, "--ignored", "--nocapture"])
+            .env(MARKER, &files.marker).env(RESULT, &files.result).env(RELEASE, &files.release)
+            .env("KERNAL_API_D4_REAL_WORKER", worker).spawn().expect("inner harness")
+    }
+    fn inner_crash() {
+        let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel()); let sketch = admit(&compiler, threaded_fixture::atomic_wait32_wasm());
+        let config = SketchWorkerConfig::new(PathBuf::from(std::env::var_os("KERNAL_API_D4_REAL_WORKER").expect("worker")), GRACE).expect("config");
+        let runtime = RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+        let actual = runtime.run(async { contained(&sketch, runtime.handle(), &config, None).await });
+        fs::write(std::env::var_os(RESULT).expect("result"), if actual == SketchWorkerTerminal::Failure(kernal_api::wasm::SketchWorkerFailure::UnexpectedExit) { "unexpected-exit" } else { "wrong-terminal" }).expect("result");
+        runtime.run(async { assert_clean(&compiler, &sketch).await });
+    }
+    fn inner_parent_death() {
+        let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel()); let sketch = admit(&compiler, threaded_fixture::atomic_wait32_wasm());
+        let config = SketchWorkerConfig::new(PathBuf::from(std::env::var_os("KERNAL_API_D4_REAL_WORKER").expect("worker")), GRACE).expect("config");
+        let runtime = RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+        let handle = runtime.handle();
+        let _task = runtime.handle().launch(async move { let _ = sketch.execute_threaded_root_contained_cancellable(handle, &config, CancellationSource::new().token()).await; });
+        let release = std::path::PathBuf::from(std::env::var_os(RELEASE).expect("release"));
+        runtime.run(async {
+            let deadline = Instant::now() + OUTER_BOUND;
+            while !release.exists() && Instant::now() < deadline {
+                async_engine::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(release.exists(), "outer harness did not release parent-death inner process");
+        });
+        std::process::exit(0);
+    }
+
+    #[test] #[ignore] fn d4_inner_crash_exact_identity() { inner_crash(); }
+    #[test] #[ignore] fn d4_inner_parent_death_exact_identity() { inner_parent_death(); }
+
+    #[cfg(target_os = "linux")]
+    fn linux_identity(pid: u32) -> Option<Identity> {
+        let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?; let close = text.rfind(')')?;
+        let fields: Vec<_> = text[close + 1..].split_whitespace().collect();
+        Some(Identity { pid, a: fields.get(19)?.parse().ok()?, b: 0 })
+    }
+    #[cfg(target_os = "linux")]
+    fn pidfd_open(identity: Identity) -> i32 {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid, 0) as i32 }; assert!(fd >= 0, "pidfd_open: {}", std::io::Error::last_os_error());
+        assert!(matches!(linux_identity(identity.pid), Some(now) if now.a == identity.a && now.b == identity.b), "PID was reused"); fd
+    }
+    #[cfg(target_os = "linux")]
+    fn wait_pidfd_gone(fd: i32) { let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 }; assert!(unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) } > 0, "exact worker survived bound"); unsafe { libc::close(fd); } }
+
+    #[cfg(target_os = "linux")]
+    #[test] fn d4_crash_reaps_exact_worker() {
+        let files = Artifacts::new(); let mut inner = launch("failure_proof::d4_inner_crash_exact_identity", &files); let identity = wait_for_marker(&files.marker); let fd = pidfd_open(identity);
+        assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) }, 0, "pidfd signal"); wait_pidfd_gone(fd);
+        assert!(inner.wait().expect("inner exit").success()); assert_eq!(fs::read_to_string(&files.result).expect("result"), "unexpected-exit"); assert!(linux_identity(identity.pid).is_none_or(|now| now.a != identity.a || now.b != identity.b));
+    }
+    #[cfg(target_os = "linux")]
+    #[test] fn d4_parent_death_kills_exact_worker() {
+        let files = Artifacts::new(); let mut inner = launch("failure_proof::d4_inner_parent_death_exact_identity", &files); let identity = wait_for_marker(&files.marker); let fd = pidfd_open(identity); fs::write(&files.release, "go").expect("release"); assert!(inner.wait().expect("inner exit").success()); wait_pidfd_gone(fd);
+        assert!(linux_identity(identity.pid).is_none_or(|now| now.a != identity.a || now.b != identity.b));
+    }
+    #[cfg(target_os = "windows")]
+    fn windows_handle(identity: Identity, access: u32) -> windows_sys::Win32::Foundation::HANDLE {
+        use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
+        let process = unsafe { OpenProcess(access, 0, identity.pid) };
+        assert!(!process.is_null(), "OpenProcess: {}", std::io::Error::last_os_error());
+        let mut creation = unsafe { std::mem::zeroed() }; let mut exit = unsafe { std::mem::zeroed() }; let mut kernel = unsafe { std::mem::zeroed() }; let mut user = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) }, 0, "GetProcessTimes");
+        let created = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        assert_eq!((created, 0), (identity.a, identity.b), "PID was reused"); process
+    }
+    #[cfg(target_os = "windows")]
+    fn wait_windows_gone(process: windows_sys::Win32::Foundation::HANDLE) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{WaitForSingleObject, WAIT_OBJECT_0};
+        assert_eq!(unsafe { WaitForSingleObject(process, OUTER_BOUND.as_millis() as u32) }, WAIT_OBJECT_0, "exact worker survived bound"); unsafe { CloseHandle(process); }
+    }
+    #[cfg(target_os = "windows")]
+    #[test] fn d4_crash_reaps_exact_worker() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let files = Artifacts::new(); let mut inner = launch("failure_proof::d4_inner_crash_exact_identity", &files); let identity = wait_for_marker(&files.marker);
+        let process = windows_handle(identity, PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
+        assert_ne!(unsafe { TerminateProcess(process, 1) }, 0, "TerminateProcess"); wait_windows_gone(process);
+        assert!(inner.wait().expect("inner exit").success()); assert_eq!(fs::read_to_string(&files.result).expect("result"), "unexpected-exit");
+        let stale = unsafe { windows_sys::Win32::System::Threading::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, identity.pid) };
+        if !stale.is_null() { unsafe { CloseHandle(stale); } }
+    }
+    #[cfg(target_os = "windows")]
+    #[test] fn d4_parent_death_kills_exact_worker() {
+        use windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        let files = Artifacts::new(); let mut inner = launch("failure_proof::d4_inner_parent_death_exact_identity", &files); let identity = wait_for_marker(&files.marker);
+        let process = windows_handle(identity, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION); fs::write(&files.release, "go").expect("release"); assert!(inner.wait().expect("inner exit").success()); wait_windows_gone(process);
+    }
+    #[cfg(target_os = "macos")]
+    #[test] #[ignore = "macOS owner-death evidence requires a native supervisor trace"] fn d4_macos_native_evidence() {}
+}

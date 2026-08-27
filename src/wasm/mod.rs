@@ -823,6 +823,28 @@ mod threaded_root_observation_tests {
         );
     }
 
+    #[test]
+    fn validation_profile_requires_its_metadata_and_rejects_precompile() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+            bytes.len() + 1,
+            THREADED_RUST_MAX_PAGES,
+        )
+        .expect("policy");
+        let error = match compiler.admit(&bytes, policy) {
+            Ok(_) => panic!("metadata is required"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            SketchModuleError::MissingMetadata {
+                name: PROFILE_METADATA
+            }
+        );
+        assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
     fn leb(mut value: u32, output: &mut Vec<u8>) {
         loop {
             let mut byte = (value & 0x7f) as u8;

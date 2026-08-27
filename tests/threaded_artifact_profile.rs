@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use kernal_api::wasm::{
-    threaded_artifact_manifest_for_test, SketchCompiler, SketchCompilerConfig,
-    SketchExecutionError, SketchModuleError, SketchModulePolicy,
+    threaded_artifact_manifest_for_test, SketchCompiler, SketchCompilerConfig, SketchModuleError,
+    SketchModulePolicy,
 };
 
 const ARTIFACT_ENV: &str = "KERNAL_API_THREADED_SMOKE_WASM";

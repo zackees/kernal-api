@@ -194,9 +194,11 @@ impl AdmittedSketch {
     pub fn shared_memory(&self) -> SketchSharedMemory {
         self.shared_memory
     }
-    /// Instantiates the admitted module in one fresh root store. Instantiation
-    /// is the sole entry operation: Wasmtime invokes the module start itself.
-    /// Child guest threads are deliberately unavailable until the next slice.
+    /// Instantiates the admitted module in one fresh root store, then invokes
+    /// the admitted command ABI's exported `_start` exactly once. The Wasm
+    /// start section runs during instantiation; Rust command artifacts use it
+    /// only for memory initialization, while `_start` performs constructors,
+    /// user entry, and the P1 exit path.
     pub fn execute_threaded_root(
         &self,
         runtime: crate::async_engine::RuntimeHandle,
@@ -216,9 +218,17 @@ impl AdmittedSketch {
             Ok(instance) => instance,
             Err(error) => return map_root_error(&error),
         };
-        let start = instance.get_typed_func::<(), ()>(&mut store, "_start").map_err(|_| SketchExecutionError::Trapped)?;
-        let outcome = start.call(&mut store, ()).map(|_| ThreadedRootOutcome::Started).or_else(|e| map_root_error(&e));
-        prepared.controller.join_completed();
+        let start = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .map_err(|_| SketchExecutionError::Trapped)?;
+        let outcome = start
+            .call(&mut store, ())
+            .map(|_| ThreadedRootOutcome::Started)
+            .or_else(|e| map_root_error(&e));
+        // Joining happens after the root Store has returned from Wasm and the
+        // workers mutex is not held. A child failure is part of the semantic
+        // execution result rather than a detached native-thread panic.
+        prepared.controller.join_completed()?;
         outcome
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
@@ -241,7 +251,13 @@ impl AdmittedSketch {
             engine: Arc::clone(&self.engine),
             memory,
             prelink: OnceLock::new(),
-            workers: Mutex::new(Workers { next_tid: 1, live: 0, closing: false, handles: Vec::new() }),
+            workers: Mutex::new(Workers {
+                next_tid: 1,
+                live: 0,
+                closing: false,
+                handles: Vec::new(),
+                outcomes: Vec::new(),
+            }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
         });
@@ -341,6 +357,9 @@ pub enum SketchExecutionError {
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
+    ChildNonzeroExit { code: i32 },
+    ChildTrapped,
+    ChildPanicked,
     Trapped,
 }
 impl SketchExecutionError {
@@ -350,6 +369,9 @@ impl SketchExecutionError {
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
+            Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
+            Self::ChildTrapped => "child-trapped",
+            Self::ChildPanicked => "child-panicked",
             Self::Trapped => "trapped",
         }
     }
@@ -372,11 +394,66 @@ struct ThreadController {
     runtime_handle_count: AtomicU64,
     workers: Mutex<Workers>,
 }
-struct Workers { next_tid: i32, live: usize, closing: bool, handles: Vec<JoinHandle<()>> }
+struct Workers {
+    next_tid: i32,
+    live: usize,
+    closing: bool,
+    handles: Vec<JoinHandle<()>>,
+    outcomes: Vec<ChildOutcome>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildOutcome {
+    Completed,
+    Exited,
+    NonzeroExit(i32),
+    Trapped,
+    Panicked,
+}
 impl ThreadController {
-    fn join_completed(&self) {
-        let handles = self.workers.lock().map(|mut w| { w.closing = true; std::mem::take(&mut w.handles) }).unwrap_or_default();
-        for handle in handles { let _ = handle.join(); }
+    fn join_completed(&self) -> Result<(), SketchExecutionError> {
+        // Mark closing before taking the queue. This prevents a child that is
+        // still running from registering another native worker after the final
+        // drain begins; no mutex remains held across `join` or guest Wasm.
+        loop {
+            let handles = self
+                .workers
+                .lock()
+                .map_err(|_| SketchExecutionError::ChildPanicked)
+                .map(|mut w| {
+                    w.closing = true;
+                    std::mem::take(&mut w.handles)
+                })?;
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    let mut workers = self
+                        .workers
+                        .lock()
+                        .map_err(|_| SketchExecutionError::ChildPanicked)?;
+                    workers.outcomes.push(ChildOutcome::Panicked);
+                }
+            }
+        }
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| SketchExecutionError::ChildPanicked)?;
+        let outcome = workers
+            .outcomes
+            .drain(..)
+            .find(|outcome| !matches!(outcome, ChildOutcome::Completed | ChildOutcome::Exited));
+        workers.closing = false;
+        match outcome {
+            None | Some(ChildOutcome::Completed | ChildOutcome::Exited) => Ok(()),
+            Some(ChildOutcome::NonzeroExit(code)) => {
+                Err(SketchExecutionError::ChildNonzeroExit { code })
+            }
+            Some(ChildOutcome::Trapped) => Err(SketchExecutionError::ChildTrapped),
+            Some(ChildOutcome::Panicked) => Err(SketchExecutionError::ChildPanicked),
+        }
     }
 }
 
@@ -433,24 +510,75 @@ fn define_closed_imports(
                 let controller = Arc::clone(&caller.data().controller);
                 let runtime = caller.data().runtime.clone();
                 let tid = match controller.workers.lock() {
-                    Ok(mut w) if !w.closing && w.live < MAX_GUEST_THREADS && w.next_tid <= 0x1fff_ffff => { let tid=w.next_tid; w.next_tid += 1; w.live += 1; tid }
+                    Ok(mut w)
+                        if !w.closing
+                            && w.live < MAX_GUEST_THREADS
+                            && w.next_tid <= 0x1fff_ffff =>
+                    {
+                        let tid = w.next_tid;
+                        w.next_tid += 1;
+                        w.live += 1;
+                        tid
+                    }
                     _ => return THREAD_SPAWN_REJECTED,
                 };
                 let child = Arc::clone(&controller);
                 let spawned = std::thread::Builder::new().spawn(move || {
-                    let result = std::panic::catch_unwind(|| {
-                        let mut store = Store::new(&child.engine, ThreadStoreState { controller: Arc::clone(&child), runtime });
-                        let prelink = child.prelink.get().expect("prepared prelink");
-                        let instance = prelink.instantiate(&mut store).expect("child instance");
-                        let entry = instance.get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start").expect("thread entry");
-                        let _ = entry.call(&mut store, (tid, arg));
-                    });
-                    let _ = result;
-                    if let Ok(mut w) = child.workers.lock() { w.live = w.live.saturating_sub(1); }
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut store = Store::new(
+                            &child.engine,
+                            ThreadStoreState {
+                                controller: Arc::clone(&child),
+                                runtime,
+                            },
+                        );
+                        let Some(prelink) = child.prelink.get() else {
+                            return ChildOutcome::Trapped;
+                        };
+                        let instance = match prelink.instantiate(&mut store) {
+                            Ok(instance) => instance,
+                            Err(error) => return map_child_error(&error),
+                        };
+                        let entry = instance
+                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
+                            .map_err(|_| ())
+                            .ok();
+                        let Some(entry) = entry else {
+                            return ChildOutcome::Trapped;
+                        };
+                        match entry.call(&mut store, (tid, arg)) {
+                            Ok(()) => ChildOutcome::Completed,
+                            Err(error) => map_child_error(&error),
+                        }
+                    }));
+                    let outcome = match result {
+                        Ok(outcome) => outcome,
+                        Err(_) => ChildOutcome::Panicked,
+                    };
+                    if let Ok(mut w) = child.workers.lock() {
+                        w.live = w.live.saturating_sub(1);
+                        w.outcomes.push(outcome);
+                    }
                 });
                 match spawned {
-                    Ok(handle) => { if let Ok(mut w) = controller.workers.lock() { w.handles.push(handle); tid } else { THREAD_SPAWN_REJECTED } }
-                    Err(_) => { if let Ok(mut w)=controller.workers.lock(){w.live=w.live.saturating_sub(1);} THREAD_SPAWN_REJECTED }
+                    Ok(handle) => {
+                        if let Ok(mut w) = controller.workers.lock() {
+                            w.handles.push(handle);
+                            tid
+                        } else {
+                            // Do not detach a worker if bookkeeping became
+                            // poisoned after reservation. We cannot safely
+                            // expose its positive TID, so wait before failing.
+                            let _ = handle.join();
+                            THREAD_SPAWN_REJECTED
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut w) = controller.workers.lock() {
+                            w.live = w.live.saturating_sub(1);
+                        }
+                        THREAD_SPAWN_REJECTED
+                    }
                 }
             },
         )
@@ -784,6 +912,17 @@ fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, Sketch
         };
     }
     Err(SketchExecutionError::Trapped)
+}
+
+fn map_child_error(error: &wasmtime::Error) -> ChildOutcome {
+    if let Some(exit) = error.downcast_ref::<ProcExitSentinel>() {
+        return if exit.0 == 0 {
+            ChildOutcome::Exited
+        } else {
+            ChildOutcome::NonzeroExit(exit.0)
+        };
+    }
+    ChildOutcome::Trapped
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

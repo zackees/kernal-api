@@ -235,10 +235,10 @@ fn threaded_root_wasm(
         // Imported function index 6 is `wasi_snapshot_preview1::proc_exit`.
         code.extend([6, 0, 0x41, exit_code as u8, 0x10, 6, 0x0b]);
     } else if assert_thread_spawn_rejection {
-        // `thread-spawn` import index 1 must return the negative v1 sentinel.
-        code.extend([
-            13, 0, 0x41, 0, 0x10, 1, 0x41, 0x7f, 0x47, 0x04, 0x40, 0x00, 0x0b, 0x0b,
-        ]);
+        // `thread-spawn` import index 1 accepts one child and returns its
+        // positive TID. Dropping it proves the root remains callable while
+        // the host owns child bootstrap and cooperative joining.
+        code.extend([7, 0, 0x41, 0, 0x10, 1, 0x1a, 0x0b]);
     } else if assert_fd_write_fault {
         // `fd_write` import index 5 must reject the negative iovec pointer.
         code.extend([

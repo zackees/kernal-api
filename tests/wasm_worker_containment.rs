@@ -637,14 +637,24 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "windows")]
-    fn windows_handle(identity: Identity, access: u32) -> ArmedWindowsProcess {
+    fn windows_handle(identity: Identity, access: u32) -> Option<ArmedWindowsProcess> {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
         use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
         let close_only =
             CloseOnlyWindowsHandle(Some(unsafe { OpenProcess(access, 0, identity.pid) }));
+        if close_only.0.expect("owned handle").is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                // The marker was validated before this open. A missing PID is
+                // already the required reap outcome; a reused PID opens and
+                // fails the creation-time identity check below.
+                return None;
+            }
+            panic!("OpenProcess: {error}");
+        }
         assert!(
             !close_only.0.expect("owned handle").is_null(),
-            "OpenProcess: {}",
-            std::io::Error::last_os_error()
+            "OpenProcess unexpectedly returned a null handle"
         );
         let mut creation = unsafe { std::mem::zeroed() };
         let mut exit = unsafe { std::mem::zeroed() };
@@ -665,7 +675,7 @@ mod failure_proof {
         );
         let created = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
         assert_eq!((created, 0), (identity.a, identity.b), "PID was reused");
-        close_only.promote()
+        Some(close_only.promote())
     }
     #[cfg(target_os = "windows")]
     #[test]
@@ -681,12 +691,12 @@ mod failure_proof {
             identity,
             PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
         );
-        assert_ne!(
-            unsafe { TerminateProcess(process.handle(), 1) },
-            0,
-            "TerminateProcess"
-        );
-        process.wait_gone();
+        if let Some(process) = process.as_mut() {
+            // A concurrent normal reap can race TerminateProcess. The
+            // already-open, creation-validated handle must signal either way.
+            let _ = unsafe { TerminateProcess(process.handle(), 1) };
+            process.wait_gone();
+        }
         inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
@@ -707,7 +717,9 @@ mod failure_proof {
         let mut process = windows_handle(identity, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
         fs::write(&files.release, "go").expect("release");
         inner.wait_success();
-        process.wait_gone();
+        if let Some(process) = process.as_mut() {
+            process.wait_gone();
+        }
     }
     #[cfg(target_os = "macos")]
     #[test]

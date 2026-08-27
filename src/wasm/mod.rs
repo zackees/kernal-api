@@ -1430,6 +1430,61 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
+    fn barrier_race_between_close_and_execute_keeps_exactly_one_live_session() {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let bytes = threaded_yield_fixture();
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let (prepared, permit) = sketch
+            .prepare_threaded_root_with_permit()
+            .expect("initial preparation");
+        drop(permit);
+        drop(prepared);
+
+        // The barrier makes both contenders start from the same cached
+        // session. Either close wins and execution prepares one replacement,
+        // or execution wins and close reports SessionBusy; neither path may
+        // drop the reservation of an admitted root.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let close_result = Mutex::new(None);
+        std::thread::scope(|scope| {
+            let close_barrier = Arc::clone(&barrier);
+            let close_result = &close_result;
+            let sketch = &sketch;
+            scope.spawn(move || {
+                close_barrier.wait();
+                *close_result.lock().expect("result mutex") = Some(sketch.close_threaded_root());
+            });
+            barrier.wait();
+            let (prepared, permit) = sketch
+                .prepare_threaded_root_with_permit()
+                .expect("racing root permit");
+            drop(permit);
+            drop(prepared);
+        });
+        assert!(matches!(
+            close_result.lock().expect("result mutex").take(),
+            Some(Ok(())) | Some(Err(SketchExecutionError::SessionBusy))
+        ));
+        assert_eq!(
+            compiler
+                .execution_limits_snapshot()
+                .reserved_shared_memory_bytes(),
+            THREADED_RUST_RESERVATION_BYTES
+        );
+        sketch.close_threaded_root().expect("final close");
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
+    }
+
+    #[test]
     fn thread_policy_rejects_requests_above_the_v1_absolute_cap() {
         let policy =
             SketchModulePolicy::threaded_rust_v1(1, THREADED_RUST_MAX_PAGES).expect("policy");

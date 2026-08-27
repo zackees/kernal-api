@@ -54,6 +54,7 @@ struct F {
     bad_meta: bool,
     duplicate_memory: bool,
     alternate_memory: bool,
+    ambient_wasi: bool,
     custom_page_size: bool,
     oversized_metadata: bool,
 }
@@ -72,6 +73,7 @@ impl Default for F {
             bad_meta: false,
             duplicate_memory: false,
             alternate_memory: false,
+            ambient_wasi: false,
             custom_page_size: false,
             oversized_metadata: false,
         }
@@ -91,7 +93,8 @@ fn wasm(f: F) -> Vec<u8> {
         (1 + u32::from(f.thread)
             + u32::from(f.yield_)
             + u32::from(f.duplicate_memory)
-            + u32::from(f.alternate_memory)) as u64,
+            + u32::from(f.alternate_memory)
+            + u32::from(f.ambient_wasi)) as u64,
         &mut i,
     );
     text("env", &mut i);
@@ -131,6 +134,12 @@ fn wasm(f: F) -> Vec<u8> {
         leb(1, &mut i);
         leb(1, &mut i);
     };
+    if f.ambient_wasi {
+        text("wasi_snapshot_preview1", &mut i);
+        text("fd_write", &mut i);
+        i.push(0);
+        leb(0, &mut i);
+    };
     if f.thread {
         text("wasi", &mut i);
         text("thread-spawn", &mut i);
@@ -148,7 +157,7 @@ fn wasm(f: F) -> Vec<u8> {
     leb(1, &mut fun);
     leb(if f.entry_param { 2 } else { 0 }, &mut fun);
     section(3, fun, &mut w);
-    let imports = u32::from(f.thread) + u32::from(f.yield_);
+    let imports = u32::from(f.thread) + u32::from(f.yield_) + u32::from(f.ambient_wasi);
     let mut e = Vec::new();
     leb(if f.extra.is_some() { 2 } else { 1 }, &mut e);
     text("kernal-api-run", &mut e);
@@ -242,6 +251,15 @@ fn duplicate_and_alternate_memory_imports_are_rejected_precompile() {
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::ForbiddenImport { module, name })
             if module == "other" && name == "memory"
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+
+    let mut f = F::default();
+    f.ambient_wasi = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ForbiddenImport { module, name })
+            if module == "wasi_snapshot_preview1" && name == "fd_write"
     ));
     assert_eq!(c.compiled_module_count(), 0);
 }

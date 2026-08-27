@@ -42,7 +42,7 @@ use winapi::um::winnt::{
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 #[cfg(test)]
-use winapi::um::winnt::{PROCESS_TERMINATE, SYNCHRONIZE};
+use winapi::um::winnt::SYNCHRONIZE;
 
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE,
 // TRUE, FALSE) = 0x00020002.

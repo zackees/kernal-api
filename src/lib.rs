@@ -21,9 +21,9 @@ pub mod async_engine;
 
 /// Admission policy for opt-in Rust WebAssembly sketches.
 ///
-/// This module deliberately compiles and validates a module only. It does not
-/// instantiate or execute guest code; thread scheduling, generated async ABI,
-/// resources, and worker-process containment land in later sketch-host slices.
+/// This module privately admits and starts the bounded threaded-root profile.
+/// Thread scheduling, generated async ABI, resources, and worker-process
+/// containment land in later sketch-host slices.
 #[cfg(feature = "wasm-sketch-host")]
 pub mod wasm;
 

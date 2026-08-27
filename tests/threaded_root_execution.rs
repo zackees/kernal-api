@@ -111,6 +111,10 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         outcome.expect("the second spawn must be rejected without a reservation leak"),
         ThreadedRootOutcome::Started,
     );
+    let repeated = runtime.run(async {
+        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+    });
+    assert_eq!(repeated, Ok(ThreadedRootOutcome::Started));
 }
 
 #[test]
@@ -238,9 +242,10 @@ fn threaded_root_wasm(
     // joined before execute_threaded_root returns.
     if assert_thread_spawn_rejection {
         code.extend([
-            // The first child gets opaque arg 0. The configured cap rejects
-            // the second arg-1 request; if admitted it exits nonzero below.
-            12, 0, 0x41, 0, 0x10, 1, 0x1a, 0x41, 1, 0x10, 1, 0x1a, 0x0b, 4, 0, 0x41, 0, 0x0b, 6, 0,
+            // First TID must be positive; the second must be exactly -1.
+            // Either ABI violation calls proc_exit with a nonzero code.
+            32, 0, 0x41, 0, 0x10, 1, 0x41, 0, 0x4a, 0x45, 0x04, 0x40, 0x41, 6, 0x10, 6, 0x0b,
+            0x41, 1, 0x10, 1, 0x41, 0x7f, 0x46, 0x45, 0x04, 0x40, 0x41, 7, 0x10, 6, 0x0b, 0x0b, 4, 0, 0x41, 0, 0x0b, 6, 0,
             0x20, 1, 0x10, 6, 0x0b, // child: proc_exit(arg)
             4, 0, 0x41, 0, 0x0b,
         ]);

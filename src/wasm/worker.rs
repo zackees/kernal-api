@@ -827,7 +827,8 @@ fn force_pre_protocol_with_ledger(
 ) -> SketchWorkerTerminal {
     let (result, forced) = force_result(ledger, &mut *control, failure);
     if !forced {
-        control.cleanup.hand_off_pre_protocol(control.take());
+        let ownership = control.take();
+        control.cleanup.hand_off_pre_protocol(ownership);
     }
     result
 }
@@ -854,8 +855,9 @@ fn force_join_result_with_ledger(
         // The dispatcher owns the unreaped child and both helpers from this
         // point. `ContainmentCleanup` means cleanup remains pending; gauges
         // and the root lease intentionally stay live until its retry succeeds.
+        let ownership = control.take();
         control.cleanup.hand_off(CleanupJob {
-            ownership: control.take(),
+            ownership,
             writer_tx: Some(tx),
             writer: Some(writer),
             reader: Some(reader),
@@ -893,8 +895,9 @@ fn force_join_terminal(
         SketchWorkerFailure::UnexpectedExit,
     );
     if !forced {
+        let ownership = control.take();
         control.cleanup.hand_off(CleanupJob {
-            ownership: control.take(),
+            ownership,
             writer_tx: Some(tx),
             writer: Some(writer),
             reader: Some(reader),

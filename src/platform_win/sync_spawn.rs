@@ -42,7 +42,7 @@ use winapi::um::winnt::{
     JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 #[cfg(test)]
-use winapi::um::winnt::SYNCHRONIZE;
+use winapi::um::winnt::{PROCESS_TERMINATE, SYNCHRONIZE};
 
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE,
 // TRUE, FALSE) = 0x00020002.
@@ -1512,7 +1512,7 @@ mod daemon_flag_tests {
             helper.try_wait().expect("observe helper").is_none(),
             "ordinary helper exited before publishing its entry marker"
         );
-        let descendant = unsafe { OpenProcess(SYNCHRONIZE, FALSE, descendant_pid) };
+        let descendant = unsafe { OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, descendant_pid) };
         assert!(!descendant.is_null(), "open ordinary descendant");
         let descendant = OwnedHandle(descendant);
         helper.kill().expect("terminate ordinary helper");

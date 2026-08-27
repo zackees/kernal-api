@@ -546,20 +546,54 @@ pub(crate) enum StrictWorkerSpawnStage {
     ConfigureJob,
     AssignJob,
     Resume,
+    Terminate,
+    Reap,
 }
 
 #[derive(Debug)]
 pub(crate) struct StrictWorkerSpawnError {
     stage: StrictWorkerSpawnStage,
     source: io::Error,
+    cleanup: Option<StrictWorkerCleanupError>,
 }
+#[derive(Debug)]
+pub(crate) struct StrictWorkerCleanupError { stage: StrictWorkerSpawnStage, source: io::Error }
 impl StrictWorkerSpawnError {
     pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
+    pub(crate) fn cleanup(&self) -> Option<&StrictWorkerCleanupError> { self.cleanup.as_ref() }
 }
+impl StrictWorkerCleanupError { pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage } }
 impl std::fmt::Display for StrictWorkerSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "strict worker spawn failed at {:?}: {}", self.stage, self.source) }
 }
 impl std::error::Error for StrictWorkerSpawnError {}
+
+/// Opaque crate-private worker child. Unlike generic `SpawnedChild`, Drop is
+/// a containment operation: it closes the strict Job and waits/reaps the
+/// direct worker. This covers ordinary CreateProcess descendants; processes
+/// created by nonstandard escape mechanisms remain a platform-policy gap.
+pub(crate) struct StrictWorkerChild {
+    pub(crate) stdin: Option<ChildStdin>,
+    pub(crate) stdout: Option<ChildStdout>,
+    pub(crate) stderr: Option<ChildStderr>,
+    pub(crate) pid: u32,
+    inner: StrictWorkerInner,
+}
+struct StrictWorkerInner { process: Option<OwnedHandle>, job: Option<OwnedHandle> }
+impl StrictWorkerChild {
+    pub(crate) fn pid(&self) -> u32 { self.pid }
+    pub(crate) fn try_wait(&self) -> io::Result<Option<i32>> { self.inner.process.as_ref().map_or(Ok(None), try_wait_inner) }
+    pub(crate) fn wait(&self) -> io::Result<i32> { self.inner.process.as_ref().ok_or_else(|| io::Error::other("worker handle absent")).and_then(wait_inner) }
+    pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> { self.inner.process.as_ref().and_then(terminate_and_reap) }
+    fn shutdown(&mut self) {
+        if let Some(process) = self.inner.process.as_ref() { let _ = terminate_and_reap(process); }
+        // Job is closed after the direct worker has reaped; KILL_ON_JOB_CLOSE
+        // covers its ordinary CreateProcess descendants.
+        drop(self.inner.job.take());
+        drop(self.inner.process.take());
+    }
+}
+impl Drop for StrictWorkerChild { fn drop(&mut self) { self.shutdown(); } }
 
 /// Spawn a worker suspended, attach it to a strict kill-on-close Job Object
 /// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
@@ -569,40 +603,52 @@ pub(crate) fn spawn_strict_contained_worker(
     command: &mut Command,
     stdio: crate::platform::process::SpawnStdio<'_>,
     environment: crate::platform::process::SyncEnvironment,
-) -> Result<crate::platform::process::SpawnedChild, StrictWorkerSpawnError> {
-    let stdin = resolve_slot(&stdio.stdin, SlotDir::Stdin).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
-    let stdout = resolve_slot(&stdio.stdout, SlotDir::Stdout).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
-    let stderr = resolve_slot(&stdio.stderr, SlotDir::Stderr).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source })?;
+) -> Result<StrictWorkerChild, StrictWorkerSpawnError> {
+    let stdin = resolve_slot(&stdio.stdin, SlotDir::Stdin).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    let stdout = resolve_slot(&stdio.stdout, SlotDir::Stdout).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    let stderr = resolve_slot(&stdio.stderr, SlotDir::Stderr).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
+    // Job setup is intentionally before CreateProcessW: failure here leaves
+    // no suspended hostile child to clean up.
+    let job = create_strict_worker_job().map_err(|(stage, source)| StrictWorkerSpawnError { stage, source, cleanup: None })?;
     let (process, thread, pid) = create_process_inner(command, &stdin.child_handle, &stdout.child_handle, &stderr.child_handle, CreateMode::Contained { show_console: false }, environment)
-        .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source })?;
+        .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source, cleanup: None })?;
     let process = OwnedHandle(process);
     let thread = OwnedHandle(thread);
-    let job = match create_strict_worker_job() {
-        Ok(job) => job,
-        Err((stage, source)) => { terminate_and_reap(&process); return Err(StrictWorkerSpawnError { stage, source }); }
-    };
     if unsafe { AssignProcessToJobObject(job.as_raw(), process.as_raw()) } == FALSE {
         let source = io::Error::last_os_error();
-        terminate_and_reap(&process);
-        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source });
+        let cleanup = terminate_and_reap(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::AssignJob, source, cleanup });
     }
-    if unsafe { ResumeThread(thread.as_raw()) } == u32::MAX {
-        let source = io::Error::last_os_error();
-        terminate_and_reap(&process);
-        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Resume, source });
+    let resumed = unsafe { ResumeThread(thread.as_raw()) };
+    if !strict_resume_count_is_valid(resumed) {
+        let source = if resumed == u32::MAX { io::Error::last_os_error() } else { io::Error::other("strict worker suspend count was not one") };
+        let cleanup = terminate_and_reap(&process);
+        return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Resume, source, cleanup });
     }
     drop(thread);
-    Ok(crate::platform::process::SpawnedChild {
+    Ok(StrictWorkerChild {
         stdin: stdin.parent_end.map(OverlappedHandle::into_child_stdin),
         stdout: stdout.parent_end.map(OverlappedHandle::into_child_stdout),
         stderr: stderr.parent_end.map(OverlappedHandle::into_child_stderr),
         pid,
-        inner: Box::new(SpawnedInner { process: Some(process), job: Some(job), _drain_keepalive: None }),
+        inner: StrictWorkerInner { process: Some(process), job: Some(job) },
     })
 }
 
-fn terminate_and_reap(process: &OwnedHandle) {
-    unsafe { let _ = TerminateProcess(process.as_raw(), 1); let _ = WaitForSingleObject(process.as_raw(), INFINITE); }
+fn strict_resume_count_is_valid(previous: u32) -> bool { previous == 1 }
+
+fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
+    let terminate = if unsafe { TerminateProcess(process.as_raw(), 1) } == FALSE {
+        Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
+    } else { None };
+    let reap = if unsafe { WaitForSingleObject(process.as_raw(), INFINITE) } != WAIT_OBJECT_0 {
+        Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Reap, source: io::Error::last_os_error() })
+    } else { None };
+    if let Some(error) = terminate { return Some(error); }
+    if let Some(error) = reap {
+        return Some(error);
+    }
+    None
 }
 
 fn drain_watcher(process_handle: OwnedHandle, timeout: Duration, keep: Arc<()>) {
@@ -925,6 +971,14 @@ mod daemon_flag_tests {
     fn strict_worker_stage_keeps_nested_job_denial_semantic() {
         assert_eq!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::AssignJob);
         assert_ne!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::Resume);
+    }
+
+    #[test]
+    fn strict_worker_accepts_exactly_one_suspension() {
+        assert!(strict_resume_count_is_valid(1));
+        assert!(!strict_resume_count_is_valid(0));
+        assert!(!strict_resume_count_is_valid(2));
+        assert!(!strict_resume_count_is_valid(u32::MAX));
     }
 }
 

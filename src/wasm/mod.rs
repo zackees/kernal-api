@@ -99,6 +99,7 @@ impl Default for SketchCompilerConfig {
 pub struct SketchExecutionLimits {
     maximum_reserved_shared_memory_bytes: u64,
     maximum_active_root_executions: usize,
+    fuel_limits: SketchFuelLimits,
 }
 impl SketchExecutionLimits {
     pub fn new(
@@ -108,6 +109,7 @@ impl SketchExecutionLimits {
         let limits = Self {
             maximum_reserved_shared_memory_bytes,
             maximum_active_root_executions,
+            fuel_limits: SketchFuelLimits::default(),
         };
         limits
             .is_valid()
@@ -120,9 +122,24 @@ impl SketchExecutionLimits {
     pub fn maximum_active_root_executions(self) -> usize {
         self.maximum_active_root_executions
     }
+    /// Sets the fixed root/child partition for each root execution.
+    pub fn with_fuel_limits(
+        mut self,
+        fuel_limits: SketchFuelLimits,
+    ) -> Result<Self, SketchCompilerError> {
+        if !fuel_limits.is_valid() {
+            return Err(SketchCompilerError::InvalidFuelLimits);
+        }
+        self.fuel_limits = fuel_limits;
+        Ok(self)
+    }
+    pub fn fuel_limits(self) -> SketchFuelLimits {
+        self.fuel_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
+            && self.fuel_limits.is_valid()
     }
 }
 impl Default for SketchExecutionLimits {
@@ -132,6 +149,63 @@ impl Default for SketchExecutionLimits {
             // concurrent logical sketches must explicitly reserve more.
             maximum_reserved_shared_memory_bytes: THREADED_RUST_RESERVATION_BYTES,
             maximum_active_root_executions: 1,
+            fuel_limits: SketchFuelLimits::default(),
+        }
+    }
+}
+
+/// Deterministic fuel partition for one root invocation and its bounded child
+/// set. It is a semantic policy, not a Wasmtime type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchFuelLimits {
+    total: u64,
+    root_slice: u64,
+    child_slice: u64,
+}
+impl SketchFuelLimits {
+    pub fn new(total: u64, root_slice: u64, child_slice: u64) -> Result<Self, SketchCompilerError> {
+        let limits = Self {
+            total,
+            root_slice,
+            child_slice,
+        };
+        limits
+            .is_valid()
+            .then_some(limits)
+            .ok_or(SketchCompilerError::InvalidFuelLimits)
+    }
+    pub fn total(self) -> u64 {
+        self.total
+    }
+    pub fn root_slice(self) -> u64 {
+        self.root_slice
+    }
+    pub fn child_slice(self) -> u64 {
+        self.child_slice
+    }
+    fn is_valid(self) -> bool {
+        self.root_slice != 0
+            && self.child_slice != 0
+            && self
+                .total
+                .checked_sub(self.root_slice)
+                .is_some_and(|available| available >= self.child_slice)
+    }
+    fn child_slice_capacity(self) -> usize {
+        // `is_valid` guarantees this is at least one. Cap it independently of
+        // caller policy so the session's native registrations remain bounded.
+        ((self.total - self.root_slice) / self.child_slice).min(MAX_GUEST_THREADS_V1 as u64)
+            as usize
+    }
+}
+impl Default for SketchFuelLimits {
+    fn default() -> Self {
+        // The exact values are a conservative compatibility default; callers
+        // may lower or raise them only as a complete bounded partition.
+        Self {
+            total: 1_700_000,
+            root_slice: 100_000,
+            child_slice: 100_000,
         }
     }
 }
@@ -181,6 +255,7 @@ impl SketchCompiler {
         cfg.wasm_memory64(false);
         cfg.wasm_multi_memory(false);
         cfg.wasm_shared_everything_threads(false);
+        cfg.consume_fuel(true);
         cfg.max_wasm_stack(config.max_wasm_stack_bytes);
         let engine = Engine::new(&cfg).map_err(|_| SketchCompilerError::Unavailable)?;
         Ok(Self {
@@ -231,6 +306,9 @@ impl SketchCompiler {
     /// Snapshot of aggregate logical resources owned by this compiler.
     pub fn execution_limits_snapshot(&self) -> SketchExecutionSnapshot {
         self.execution_ledger.snapshot()
+    }
+    pub fn execution_limits(&self) -> SketchExecutionLimits {
+        self.execution_ledger.limits
     }
 }
 
@@ -381,7 +459,7 @@ impl AdmittedSketch {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
-        let (prepared, _root) = self.prepare_threaded_root_with_permit()?;
+        let (prepared, root) = self.prepare_threaded_root_with_permit()?;
         prepared
             .controller
             .runtime_identity
@@ -395,38 +473,45 @@ impl AdmittedSketch {
             ThreadStoreState {
                 controller: Arc::clone(&prepared.controller),
                 runtime: Some(runtime),
+                fuel_generation: root.fuel_generation,
             },
         );
+        // Instantiation itself executes the module start section, so the
+        // finite root slice must be installed before `instantiate` as well as
+        // before the explicit command `_start` call below.
         // Do not return from this scope before finalization. A Wasm start
         // section can invoke thread-spawn while instantiation is still in
         // progress, and lookup/call failures after that must still close and
         // drain every accepted native child.
         let mut validation_getter = None;
         let mut _instance_observation = None;
-        let outcome = (|| {
-            let instance = match prepared.prelink.instantiate(&mut store) {
-                Ok(instance) => instance,
-                Err(error) => return map_root_error(&error),
-            };
-            _instance_observation = Some(CounterObservation::new(
-                Arc::clone(&prepared.controller.execution_ledger),
-                LedgerCounter::Instances,
-            ));
-            let start = instance
-                .get_typed_func::<(), ()>(&mut store, "_start")
-                .map_err(|_| SketchExecutionError::Trapped)?;
-            if self.validation {
-                validation_getter = Some(
-                    instance
-                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
-                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
-                );
-            }
-            start
-                .call(&mut store, ())
-                .map(|_| ThreadedRootOutcome::Started)
-                .or_else(|error| map_root_error(&error))
-        })();
+        let outcome = match store.set_fuel(root.root_fuel) {
+            Err(_) => Err(SketchExecutionError::PrelinkFailed),
+            Ok(()) => (|| {
+                let instance = match prepared.prelink.instantiate(&mut store) {
+                    Ok(instance) => instance,
+                    Err(error) => return map_root_error(&error),
+                };
+                _instance_observation = Some(CounterObservation::new(
+                    Arc::clone(&prepared.controller.execution_ledger),
+                    LedgerCounter::Instances,
+                ));
+                let start = instance
+                    .get_typed_func::<(), ()>(&mut store, "_start")
+                    .map_err(|_| SketchExecutionError::Trapped)?;
+                if self.validation {
+                    validation_getter = Some(
+                        instance
+                            .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                            .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                    );
+                }
+                start
+                    .call(&mut store, ())
+                    .map(|_| ThreadedRootOutcome::Started)
+                    .or_else(|error| map_root_error(&error))
+            })(),
+        };
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
@@ -436,14 +521,20 @@ impl AdmittedSketch {
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
         let report = if self.validation && outcome.is_ok() && children.is_ok() {
-            let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
-            let offset = getter
-                .call(&mut store, ())
-                .map_err(|_| SketchExecutionError::ValidationReportInvalid)?;
-            validate_report(&prepared.controller.memory, offset)
+            match validation_getter {
+                Some(getter) => getter
+                    .call(&mut store, ())
+                    .map_err(|_| SketchExecutionError::ValidationReportInvalid)
+                    .and_then(|offset| validate_report(&prepared.controller.memory, offset)),
+                None => Err(SketchExecutionError::ValidationReportInvalid),
+            }
         } else {
             Ok(())
         };
+        prepared
+            .controller
+            .last_root_remaining_fuel
+            .store(store.get_fuel().unwrap_or(0), Ordering::Release);
         resolve_threaded_result(outcome, children, report, rejections)
     }
     fn prepare_threaded_root_with_permit(
@@ -484,6 +575,7 @@ impl AdmittedSketch {
                 maximum: self.max_guest_threads,
                 capacity_rejections: 0,
                 closing_rejections: 0,
+                fuel_rejections: 0,
                 handles: Vec::new(),
                 // At most `maximum` spawns are accepted before the controller
                 // closes, so this facade report remains absolutely bounded.
@@ -493,6 +585,8 @@ impl AdmittedSketch {
             runtime_handle_count: AtomicU64::new(0),
             runtime_identity: AtomicUsize::new(0),
             runtime_identity_mismatches: AtomicU64::new(0),
+            last_root_remaining_fuel: AtomicU64::new(0),
+            last_child_remaining_fuel: AtomicU64::new(0),
             execution_ledger: Arc::clone(&self.execution_ledger),
             session: Mutex::new(SessionState::default()),
         });
@@ -506,6 +600,7 @@ impl AdmittedSketch {
             ThreadStoreState {
                 controller: Arc::clone(&controller),
                 runtime: None,
+                fuel_generation: 0,
             },
         );
         linker
@@ -559,6 +654,8 @@ impl AdmittedSketch {
             runtime_identity_mismatches: controller
                 .runtime_identity_mismatches
                 .load(Ordering::Relaxed),
+            last_root_remaining_fuel: controller.last_root_remaining_fuel.load(Ordering::Relaxed),
+            last_child_remaining_fuel: controller.last_child_remaining_fuel.load(Ordering::Relaxed),
             accepted_child_registrations: workers.accepted,
             live_threads: workers.live,
             queued_join_handles: workers.handles.len(),
@@ -609,6 +706,7 @@ pub enum ThreadedRootOutcome {
 pub struct ThreadSpawnRejectionSummary {
     capacity: u32,
     closing: u32,
+    fuel: u32,
 }
 impl ThreadSpawnRejectionSummary {
     pub fn capacity(self) -> u32 {
@@ -617,8 +715,11 @@ impl ThreadSpawnRejectionSummary {
     pub fn closing(self) -> u32 {
         self.closing
     }
+    pub fn fuel(self) -> u32 {
+        self.fuel
+    }
     pub fn is_empty(self) -> bool {
-        self.capacity == 0 && self.closing == 0
+        self.capacity == 0 && self.closing == 0 && self.fuel == 0
     }
 }
 
@@ -629,6 +730,7 @@ pub enum SketchExecutionError {
     SharedMemoryLimitExceeded,
     RootExecutionLimitExceeded,
     SessionBusy,
+    OutOfFuel,
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
@@ -637,6 +739,7 @@ pub enum SketchExecutionError {
     ChildPanicked,
     ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
     ValidationReportInvalid,
+    SessionGenerationExhausted,
     Trapped,
 }
 impl SketchExecutionError {
@@ -646,6 +749,7 @@ impl SketchExecutionError {
             Self::SharedMemoryLimitExceeded => "shared-memory-limit-exceeded",
             Self::RootExecutionLimitExceeded => "root-execution-limit-exceeded",
             Self::SessionBusy => "session-busy",
+            Self::OutOfFuel => "out-of-fuel",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -654,6 +758,7 @@ impl SketchExecutionError {
             Self::ChildPanicked => "child-panicked",
             Self::ChildOutcomes { .. } => "child-outcomes",
             Self::ValidationReportInvalid => "validation-report-invalid",
+            Self::SessionGenerationExhausted => "session-generation-exhausted",
             Self::Trapped => "trapped",
         }
     }
@@ -817,6 +922,34 @@ mod execution_ledger_tests {
     use super::*;
 
     #[test]
+    fn fuel_limits_require_a_complete_nonzero_root_and_child_partition() {
+        assert_eq!(
+            SketchFuelLimits::new(1, 1, 1),
+            Err(SketchCompilerError::InvalidFuelLimits),
+        );
+        assert_eq!(
+            SketchFuelLimits::new(2, 1, 1),
+            Ok(SketchFuelLimits {
+                total: 2,
+                root_slice: 1,
+                child_slice: 1,
+            }),
+        );
+        assert_eq!(
+            SketchFuelLimits::new(1_700_000, 0, 100_000),
+            Err(SketchCompilerError::InvalidFuelLimits),
+        );
+        assert_eq!(
+            SketchFuelLimits::new(1_700_000, 100_000, 0),
+            Err(SketchCompilerError::InvalidFuelLimits),
+        );
+        assert_eq!(
+            SketchFuelLimits::new(1_700_000, 100_000, 100_000),
+            Ok(SketchFuelLimits::default()),
+        );
+    }
+
+    #[test]
     fn execution_limits_reject_an_unreservable_profile_and_zero_root_permits() {
         assert_eq!(
             SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES - 1, 1),
@@ -907,6 +1040,10 @@ struct ThreadController {
     runtime_handle_count: AtomicU64,
     runtime_identity: AtomicUsize,
     runtime_identity_mismatches: AtomicU64,
+    // Bounded private terminal telemetry. No Store or raw trap crosses the
+    // facade; #42 only needs to retain the last execution's accounting.
+    last_root_remaining_fuel: AtomicU64,
+    last_child_remaining_fuel: AtomicU64,
     execution_ledger: Arc<ExecutionLedger>,
     session: Mutex<SessionState>,
     workers: Mutex<Workers>,
@@ -916,6 +1053,13 @@ struct ThreadController {
 struct SessionState {
     active_roots: usize,
     closing: bool,
+    next_fuel_generation: u64,
+    fuel: Option<FuelExecution>,
+}
+struct FuelExecution {
+    generation: u64,
+    remaining_child_slices: usize,
+    child_slice: u64,
 }
 struct Workers {
     next_tid: i32,
@@ -928,6 +1072,7 @@ struct Workers {
     maximum: usize,
     capacity_rejections: u32,
     closing_rejections: u32,
+    fuel_rejections: u32,
     handles: Vec<JoinHandle<()>>,
     // Completion is inherently concurrent; retain the guest TID so reporting
     // is deterministic rather than depending on native scheduler order.
@@ -939,6 +1084,7 @@ enum ChildOutcome {
     Completed,
     Exited,
     NonzeroExit(i32),
+    OutOfFuel,
     Trapped,
     Panicked,
 }
@@ -956,6 +1102,7 @@ pub enum ThreadedChildOutcomeKind {
     Completed,
     Exited,
     NonzeroExit { code: i32 },
+    OutOfFuel,
     Trapped,
     Panicked,
 }
@@ -965,15 +1112,50 @@ impl ThreadController {
             .session
             .lock()
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
-        if session.closing {
+        if session.closing || session.active_roots != 0 {
             return Err(SketchExecutionError::SessionBusy);
         }
         let permit = self.execution_ledger.acquire_root()?;
         session.active_roots += 1;
+        let fuel = self.execution_ledger.limits.fuel_limits;
+        let generation = session
+            .next_fuel_generation
+            .checked_add(1)
+            .ok_or(SketchExecutionError::SessionGenerationExhausted)?;
+        session.next_fuel_generation = generation;
+        session.fuel = Some(FuelExecution {
+            generation,
+            remaining_child_slices: fuel.child_slice_capacity(),
+            child_slice: fuel.child_slice,
+        });
         Ok(LogicalRootPermit {
             controller: Arc::clone(self),
             _permit: permit,
+            root_fuel: fuel.root_slice,
+            fuel_generation: generation,
         })
+    }
+    fn reserve_child_fuel(&self, generation: u64) -> Option<u64> {
+        let mut session = self.session.lock().ok()?;
+        let fuel = session.fuel.as_mut()?;
+        if fuel.generation != generation {
+            return None;
+        }
+        if fuel.remaining_child_slices == 0 {
+            return None;
+        }
+        fuel.remaining_child_slices -= 1;
+        Some(fuel.child_slice)
+    }
+    fn refund_child_fuel(&self) {
+        if let Ok(mut session) = self.session.lock() {
+            if let Some(fuel) = session.fuel.as_mut() {
+                fuel.remaining_child_slices = fuel
+                    .remaining_child_slices
+                    .saturating_add(1)
+                    .min(MAX_GUEST_THREADS_V1);
+            }
+        }
     }
     fn join_completed(&self) -> Result<(), SketchExecutionError> {
         // Mark closing before taking the queue. This prevents a child that is
@@ -1020,6 +1202,7 @@ impl ThreadController {
                     ChildOutcome::NonzeroExit(code) => {
                         ThreadedChildOutcomeKind::NonzeroExit { code }
                     }
+                    ChildOutcome::OutOfFuel => ThreadedChildOutcomeKind::OutOfFuel,
                     ChildOutcome::Trapped => ThreadedChildOutcomeKind::Trapped,
                     ChildOutcome::Panicked => ThreadedChildOutcomeKind::Panicked,
                 },
@@ -1045,9 +1228,11 @@ impl ThreadController {
         let summary = ThreadSpawnRejectionSummary {
             capacity: workers.capacity_rejections,
             closing: workers.closing_rejections,
+            fuel: workers.fuel_rejections,
         };
         workers.capacity_rejections = 0;
         workers.closing_rejections = 0;
+        workers.fuel_rejections = 0;
         summary
     }
 }
@@ -1061,6 +1246,8 @@ struct PreparedThreadedRoot {
 struct LogicalRootPermit {
     controller: Arc<ThreadController>,
     _permit: RootExecutionPermit,
+    root_fuel: u64,
+    fuel_generation: u64,
 }
 impl Drop for LogicalRootPermit {
     fn drop(&mut self) {
@@ -1071,21 +1258,25 @@ impl Drop for LogicalRootPermit {
             .expect("thread controller session mutex poisoned");
         debug_assert_ne!(session.active_roots, 0, "logical root permit underflow");
         session.active_roots = session.active_roots.saturating_sub(1);
+        session.fuel = None;
     }
 }
 
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
+    fuel_generation: u64,
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RootExecutionObservation {
     preparations: u64,
     kernel_yields: u64,
     supplied_runtime_handles: u64,
     runtime_identity_mismatches: u64,
+    last_root_remaining_fuel: u64,
+    last_child_remaining_fuel: u64,
     accepted_child_registrations: usize,
     live_threads: usize,
     queued_join_handles: usize,
@@ -1136,10 +1327,22 @@ fn define_closed_imports(
             |caller: Caller<'_, ThreadStoreState>, arg: i32| -> i32 {
                 let controller = Arc::clone(&caller.data().controller);
                 let runtime = caller.data().runtime.clone();
+                // Fuel must be reserved before a guest-visible TID, native
+                // thread, Store, or instance exists. A failed reservation is
+                // the same closed ABI sentinel as other rejected spawns, with
+                // a separate bounded semantic reason.
+                let generation = caller.data().fuel_generation;
+                let Some(child_fuel) = controller.reserve_child_fuel(generation) else {
+                    if let Ok(mut workers) = controller.workers.lock() {
+                        workers.fuel_rejections = workers.fuel_rejections.saturating_add(1);
+                    }
+                    return THREAD_SPAWN_REJECTED;
+                };
                 let tid = match controller.workers.lock() {
                     Ok(mut w) => {
                         if w.closing {
                             w.closing_rejections = w.closing_rejections.saturating_add(1);
+                            controller.refund_child_fuel();
                             return THREAD_SPAWN_REJECTED;
                         }
                         if w.live >= w.maximum
@@ -1147,6 +1350,7 @@ fn define_closed_imports(
                             || w.next_tid > 0x1fff_ffff
                         {
                             w.capacity_rejections = w.capacity_rejections.saturating_add(1);
+                            controller.refund_child_fuel();
                             return THREAD_SPAWN_REJECTED;
                         }
                         let tid = w.next_tid;
@@ -1155,7 +1359,10 @@ fn define_closed_imports(
                         w.live += 1;
                         tid
                     }
-                    _ => return THREAD_SPAWN_REJECTED,
+                    _ => {
+                        controller.refund_child_fuel();
+                        return THREAD_SPAWN_REJECTED;
+                    }
                 };
                 let child = Arc::clone(&controller);
                 let spawned = std::thread::Builder::new().spawn(move || {
@@ -1173,30 +1380,43 @@ fn define_closed_imports(
                             ThreadStoreState {
                                 controller: Arc::clone(&child),
                                 runtime,
+                                fuel_generation: generation,
                             },
                         );
-                        let Some(prelink) = child.prelink.get() else {
-                            return ChildOutcome::Trapped;
-                        };
-                        let instance = match prelink.instantiate(&mut store) {
-                            Ok(instance) => instance,
-                            Err(error) => return map_child_error(&error),
-                        };
-                        let _instance_observation = CounterObservation::new(
-                            Arc::clone(&child.execution_ledger),
-                            LedgerCounter::Instances,
-                        );
-                        let entry = instance
-                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
-                            .map_err(|_| ())
-                            .ok();
-                        let Some(entry) = entry else {
-                            return ChildOutcome::Trapped;
-                        };
-                        match entry.call(&mut store, (tid, arg)) {
-                            Ok(()) => ChildOutcome::Completed,
-                            Err(error) => map_child_error(&error),
-                        }
+                        let outcome = (|| {
+                            if store.set_fuel(child_fuel).is_err() {
+                                return ChildOutcome::Trapped;
+                            }
+                            let Some(prelink) = child.prelink.get() else {
+                                return ChildOutcome::Trapped;
+                            };
+                            let instance = match prelink.instantiate(&mut store) {
+                                Ok(instance) => instance,
+                                Err(error) => return map_child_error(&error),
+                            };
+                            let _instance_observation = CounterObservation::new(
+                                Arc::clone(&child.execution_ledger),
+                                LedgerCounter::Instances,
+                            );
+                            let entry = instance
+                                .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
+                                .map_err(|_| ())
+                                .ok();
+                            let Some(entry) = entry else {
+                                return ChildOutcome::Trapped;
+                            };
+                            match entry.call(&mut store, (tid, arg)) {
+                                Ok(()) => ChildOutcome::Completed,
+                                Err(error) => map_child_error(&error),
+                            }
+                        })();
+                        // Sample the Store after every entry outcome, including
+                        // OutOfFuel. This remains private bounded telemetry and
+                        // never exposes a Store through the facade.
+                        child
+                            .last_child_remaining_fuel
+                            .store(store.get_fuel().unwrap_or(0), Ordering::Release);
+                        outcome
                     }));
                     let outcome = match result {
                         Ok(outcome) => outcome,
@@ -1227,6 +1447,7 @@ fn define_closed_imports(
                             w.live = w.live.saturating_sub(1);
                             w.accepted = w.accepted.saturating_sub(1);
                         }
+                        controller.refund_child_fuel();
                         THREAD_SPAWN_REJECTED
                     }
                 }
@@ -1446,10 +1667,11 @@ mod threaded_root_observation_tests {
         drop(permit);
         drop(prepared);
 
-        // The barrier makes both contenders start from the same cached
-        // session. Either close wins and execution prepares one replacement,
-        // or execution wins and close reports SessionBusy; neither path may
-        // drop the reservation of an admitted root.
+        // The barrier makes both contenders race on the same cached session.
+        // Close may run after the short-lived permit has drained, in which
+        // case it legitimately releases the newly prepared cache. The stable
+        // invariant is therefore that no more than one 1 GiB reservation is
+        // live, not that one remains cached after the race.
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let close_result = Mutex::new(None);
         std::thread::scope(|scope| {
@@ -1471,12 +1693,9 @@ mod threaded_root_observation_tests {
             close_result.lock().expect("result mutex").take(),
             Some(Ok(())) | Some(Err(SketchExecutionError::SessionBusy))
         ));
-        assert_eq!(
-            compiler
-                .execution_limits_snapshot()
-                .reserved_shared_memory_bytes(),
-            THREADED_RUST_RESERVATION_BYTES
-        );
+        let snapshot = compiler.execution_limits_snapshot();
+        assert!(snapshot.reserved_shared_memory_bytes() <= THREADED_RUST_RESERVATION_BYTES);
+        assert_eq!(snapshot.active_root_executions(), 0);
         sketch.close_threaded_root().expect("final close");
         assert_eq!(
             compiler.execution_limits_snapshot(),
@@ -1530,9 +1749,11 @@ mod threaded_root_observation_tests {
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
                 runtime_identity_mismatches: 0,
+                last_root_remaining_fuel: 99_997,
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                ..RootExecutionObservation::default()
             })
         );
     }
@@ -1565,6 +1786,206 @@ mod threaded_root_observation_tests {
             assert_eq!(observation.live_threads, 0);
             assert_eq!(observation.queued_join_handles, 0);
         }
+    }
+
+    fn fuel_compiler(root_slice: u64, child_slice: u64) -> SketchCompiler {
+        let total = root_slice + child_slice * MAX_GUEST_THREADS_V1 as u64;
+        fuel_compiler_with_total(total, root_slice, child_slice)
+    }
+
+    fn fuel_compiler_with_total(total: u64, root_slice: u64, child_slice: u64) -> SketchCompiler {
+        let fuel = SketchFuelLimits::new(total, root_slice, child_slice).expect("fuel limits");
+        let limits = SketchExecutionLimits::default()
+            .with_fuel_limits(fuel)
+            .expect("execution limits");
+        SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(limits)
+                .expect("compiler config"),
+        )
+        .expect("compiler")
+    }
+
+    fn execute_fuel_fixture(
+        bytes: Vec<u8>,
+        root_slice: u64,
+        child_slice: u64,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        execute_fuel_fixture_with_observation(bytes, root_slice, child_slice).0
+    }
+
+    fn execute_fuel_fixture_with_observation(
+        bytes: Vec<u8>,
+        root_slice: u64,
+        child_slice: u64,
+    ) -> (
+        Result<ThreadedRootOutcome, SketchExecutionError>,
+        RootExecutionObservation,
+    ) {
+        let compiler = fuel_compiler(root_slice, child_slice);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared observation after terminal result");
+        (outcome, observation)
+    }
+
+    #[test]
+    fn finite_fuel_exhausts_the_module_start_before_root_execution() {
+        assert_eq!(
+            execute_fuel_fixture(start_fuel_fixture(), 1, 1),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+    }
+
+    #[test]
+    fn finite_fuel_exhausts_root_start_with_a_typed_error() {
+        assert_eq!(
+            execute_fuel_fixture(root_fuel_fixture(), 10, 1),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+    }
+
+    #[test]
+    fn finite_child_slice_reports_a_typed_ordered_child_outcome() {
+        let (outcome, observation) =
+            execute_fuel_fixture_with_observation(child_fuel_fixture(), 100, 10);
+        assert_eq!(
+            outcome,
+            Err(SketchExecutionError::ChildOutcomes {
+                outcomes: vec![ThreadedChildOutcome {
+                    tid: 1,
+                    kind: ThreadedChildOutcomeKind::OutOfFuel,
+                }],
+            })
+        );
+        // The child Store was sampled after its OutOfFuel terminal path rather
+        // than only after a successful ABI entry call.
+        assert_eq!(observation.last_child_remaining_fuel, 0);
+    }
+
+    #[test]
+    fn root_store_is_sampled_after_a_start_section_fuel_failure() {
+        let (outcome, observation) =
+            execute_fuel_fixture_with_observation(start_fuel_fixture(), 1, 1);
+        assert_eq!(outcome, Err(SketchExecutionError::OutOfFuel));
+        assert_eq!(observation.last_root_remaining_fuel, 0);
+    }
+
+    #[test]
+    fn fuel_generation_exhaustion_is_typed_and_never_wraps() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Ok(ThreadedRootOutcome::Started)
+        );
+        let prepared = sketch
+            .prepared_root
+            .lock()
+            .expect("prepared slot")
+            .as_ref()
+            .expect("prepared root")
+            .clone();
+        prepared
+            .controller
+            .session
+            .lock()
+            .expect("session")
+            .next_fuel_generation = u64::MAX;
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Err(SketchExecutionError::SessionGenerationExhausted)
+        );
+        let session = prepared.controller.session.lock().expect("session");
+        assert_eq!(session.next_fuel_generation, u64::MAX);
+        assert!(session.fuel.is_none());
+    }
+
+    #[test]
+    fn exhausted_child_credit_rejects_before_spawn_and_the_session_is_reusable() {
+        let bytes = fuel_rejection_fixture();
+        let compiler = fuel_compiler_with_total(110, 100, 10);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+                Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+                    if summary.fuel() == 1 && summary.capacity() == 0 && summary.closing() == 0
+            ));
+            let observation = sketch
+                .root_execution_observation_for_test()
+                .expect("prepared observation");
+            assert_eq!(observation.accepted_child_registrations, 0);
+            assert_eq!(observation.live_threads, 0);
+            assert_eq!(observation.queued_join_handles, 0);
+            assert!(observation.last_root_remaining_fuel <= 100);
+            assert!(observation.last_child_remaining_fuel <= 10);
+        }
+    }
+
+    #[test]
+    fn two_children_complete_within_the_fixed_fuel_partition() {
+        let bytes = fuel_rejection_fixture();
+        // 100 credits for the root plus two fixed 10-credit child slices. The
+        // root requests exactly two children, so the complete partition is
+        // within the configured 120-credit total.
+        let compiler = fuel_compiler_with_total(120, 100, 10);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Ok(ThreadedRootOutcome::Started),
+        );
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared observation");
+        assert_eq!(observation.accepted_child_registrations, 0);
+        assert_eq!(observation.live_threads, 0);
+        assert_eq!(observation.queued_join_handles, 0);
+        assert!(observation.last_root_remaining_fuel <= 100);
+        assert!(observation.last_child_remaining_fuel <= 10);
     }
 
     #[test]
@@ -1630,6 +2051,7 @@ mod threaded_root_observation_tests {
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                ..RootExecutionObservation::default()
             })
         );
     }
@@ -1988,6 +2410,103 @@ mod threaded_root_observation_tests {
             section_offset = end;
         }
     }
+
+    fn threaded_code_fixture(bodies: [Vec<u8>; 5]) -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section_offset = 8;
+        loop {
+            let id = bytes[section_offset];
+            let mut body_at = section_offset + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[body_at];
+                body_at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let end = body_at + length;
+            if id == 10 {
+                let mut code = Vec::new();
+                leb(bodies.len() as u32, &mut code);
+                for body in bodies {
+                    leb(body.len() as u32, &mut code);
+                    code.extend(body);
+                }
+                let mut output = bytes[..section_offset].to_vec();
+                section(10, code, &mut output);
+                output.extend_from_slice(&bytes[end..]);
+                return output;
+            }
+            section_offset = end;
+        }
+    }
+
+    fn empty_body() -> Vec<u8> {
+        vec![0, 0x0b]
+    }
+
+    fn i32_zero_body() -> Vec<u8> {
+        vec![0, 0x41, 0, 0x0b]
+    }
+
+    fn yield_body() -> Vec<u8> {
+        vec![0, 0x10, 0, 0x0b]
+    }
+
+    fn infinite_loop_body() -> Vec<u8> {
+        // `loop { br 0 }`; the explicit branch makes every iteration consume
+        // Wasmtime fuel rather than relying on host-side timing.
+        vec![0, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b]
+    }
+
+    fn start_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            empty_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            infinite_loop_body(),
+        ])
+    }
+
+    fn root_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            infinite_loop_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
+    }
+
+    fn child_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            // `_start`: ask the closed host ABI for one child and discard its
+            // positive TID. The child entry below then burns its own slice.
+            vec![0, 0x41, 0, 0x10, 1, 0x1a, 0x0b],
+            i32_zero_body(),
+            infinite_loop_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
+    }
+
+    fn fuel_rejection_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            // `_start`: the first child consumes the only configured child
+            // slice; the second must receive `-1` before it gets a TID,
+            // Store, Instance, or JoinHandle.
+            vec![0, 0x41, 0, 0x10, 1, 0x1a, 0x41, 0, 0x10, 1, 0x1a, 0x0b],
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
+    }
 }
 
 fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
@@ -2193,6 +2712,12 @@ fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, Sketch
             Err(SketchExecutionError::NonzeroExit { code: exit.0 })
         };
     }
+    if matches!(
+        error.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::OutOfFuel)
+    ) {
+        return Err(SketchExecutionError::OutOfFuel);
+    }
     Err(SketchExecutionError::Trapped)
 }
 
@@ -2203,6 +2728,12 @@ fn map_child_error(error: &wasmtime::Error) -> ChildOutcome {
         } else {
             ChildOutcome::NonzeroExit(exit.0)
         };
+    }
+    if matches!(
+        error.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::OutOfFuel)
+    ) {
+        return ChildOutcome::OutOfFuel;
     }
     ChildOutcome::Trapped
 }
@@ -2285,6 +2816,7 @@ mod result_precedence_tests {
         let summary = ThreadSpawnRejectionSummary {
             capacity: 1,
             closing: 0,
+            fuel: 0,
         };
         assert_eq!(
             resolve_threaded_result(Ok(ThreadedRootOutcome::Started), Ok(()), Ok(()), summary,),
@@ -2300,12 +2832,20 @@ mod result_precedence_tests {
             Err(SketchExecutionError::NonzeroExit { code: 7 }),
         );
     }
+
+    #[test]
+    fn fuel_exhaustion_is_mapped_without_exposing_a_wasmtime_trap() {
+        let error = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
+        assert_eq!(map_root_error(&error), Err(SketchExecutionError::OutOfFuel));
+        assert_eq!(map_child_error(&error), ChildOutcome::OutOfFuel);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchCompilerError {
     InvalidStackLimit,
     InvalidExecutionLimits,
+    InvalidFuelLimits,
     Unavailable,
 }
 impl fmt::Display for SketchCompilerError {
@@ -2314,6 +2854,9 @@ impl fmt::Display for SketchCompilerError {
             Self::InvalidStackLimit => "the Wasm stack limit must be nonzero",
             Self::InvalidExecutionLimits => {
                 "execution limits must admit one 1 GiB threaded Rust session and one root"
+            }
+            Self::InvalidFuelLimits => {
+                "fuel limits must reserve nonzero root and all bounded child slices"
             }
             Self::Unavailable => "the sketch compiler is unavailable",
         })

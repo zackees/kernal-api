@@ -341,9 +341,9 @@ impl ActiveOwnership {
 
 struct CleanupJob {
     ownership: ExecutionOwnership,
-    writer_tx: std::sync::mpsc::Sender<WriterCommand>,
-    writer: std::thread::JoinHandle<()>,
-    reader: std::thread::JoinHandle<()>,
+    writer_tx: Option<std::sync::mpsc::Sender<WriterCommand>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    reader: Option<std::thread::JoinHandle<()>>,
 }
 
 struct CleanupDispatcher {
@@ -365,9 +365,11 @@ impl CleanupDispatcher {
                     }
                     ledger.record_forced();
                     ledger.record_reaped();
-                    let _ = job.writer_tx.send(WriterCommand::Close);
-                    let _ = job.writer.join();
-                    let _ = job.reader.join();
+                    if let Some(writer_tx) = job.writer_tx.take() {
+                        let _ = writer_tx.send(WriterCommand::Close);
+                    }
+                    if let Some(writer) = job.writer.take() { let _ = writer.join(); }
+                    if let Some(reader) = job.reader.take() { let _ = reader.join(); }
                     // `job` drops here, releasing the root lease and gauges.
                 }
             })
@@ -382,6 +384,15 @@ impl CleanupDispatcher {
             // `WorkerControl::drop` to synchronously invoke shutdown.
             std::mem::forget(error.0);
         }
+    }
+
+    fn hand_off_pre_protocol(&self, ownership: ExecutionOwnership) {
+        self.hand_off(CleanupJob {
+            ownership,
+            writer_tx: None,
+            writer: None,
+            reader: None,
+        });
     }
 }
 
@@ -430,12 +441,12 @@ fn supervise(
         cleanup,
     };
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        return force_result(sketch, &mut *control, SketchWorkerFailure::Protocol).0;
+        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
     };
     let Some(id) = next_request_id() else {
         drop(stdin);
         drop(stdout);
-        return force_result(sketch, &mut *control, SketchWorkerFailure::Protocol).0;
+        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
     };
     let (write_tx, write_rx) = std::sync::mpsc::channel();
     let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
@@ -773,6 +784,17 @@ fn force_result(
         ),
     }
 }
+fn force_pre_protocol(
+    sketch: &AdmittedSketch,
+    control: &mut ActiveOwnership,
+    failure: SketchWorkerFailure,
+) -> SketchWorkerTerminal {
+    let (result, forced) = force_result(sketch, &mut *control, failure);
+    if !forced {
+        control.cleanup.hand_off_pre_protocol(control.take());
+    }
+    result
+}
 fn force_join_result(
     sketch: &AdmittedSketch,
     control: &mut ActiveOwnership,
@@ -788,9 +810,9 @@ fn force_join_result(
         // and the root lease intentionally stay live until its retry succeeds.
         control.cleanup.hand_off(CleanupJob {
             ownership: control.take(),
-            writer_tx: tx,
-            writer,
-            reader,
+            writer_tx: Some(tx),
+            writer: Some(writer),
+            reader: Some(reader),
         });
         return result;
     }
@@ -823,9 +845,9 @@ fn force_join_terminal(
     if !forced {
         control.cleanup.hand_off(CleanupJob {
             ownership: control.take(),
-            writer_tx: tx,
-            writer,
-            reader,
+            writer_tx: Some(tx),
+            writer: Some(writer),
+            reader: Some(reader),
         });
         return result;
     }

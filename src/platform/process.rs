@@ -465,7 +465,7 @@ impl Drop for WorkerControl {
 mod worker_child_tests {
     use super::{WorkerChild, WorkerChildControl, WorkerError, WorkerStage};
     use std::io;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -475,6 +475,7 @@ mod worker_child_tests {
         forces: AtomicUsize,
         shutdowns: AtomicUsize,
         failed_forces_remaining: AtomicUsize,
+        observed_exit: AtomicBool,
     }
 
     struct FakeControl {
@@ -484,7 +485,7 @@ mod worker_child_tests {
     impl WorkerChildControl for FakeControl {
         fn try_wait(&mut self) -> io::Result<Option<i32>> {
             self.counts.waits.fetch_add(1, Ordering::Relaxed);
-            Ok(None)
+            Ok(self.counts.observed_exit.load(Ordering::Relaxed).then_some(0))
         }
 
         fn force_and_reap(&mut self, _timeout: Duration) -> Result<(), WorkerError> {
@@ -560,6 +561,17 @@ mod worker_child_tests {
         drop(control);
         assert_eq!(counts.forces.load(Ordering::Relaxed), 2);
         assert_eq!(counts.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn clean_observed_exit_never_forces() {
+        let counts = Arc::new(Counts::default());
+        counts.observed_exit.store(true, Ordering::Relaxed);
+        let (mut control, _stdin, _stdout) = fake_worker(Arc::clone(&counts)).into_parts();
+        assert_eq!(control.try_wait().expect("fake exit"), Some(0));
+        drop(control);
+        assert_eq!(counts.forces.load(Ordering::Relaxed), 0);
         assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 0);
     }
 }

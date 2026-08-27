@@ -16,7 +16,7 @@ use kernal_api::wasm::{
 };
 use worker_protocol::{
     read_message, write_message, ExecuteMetadata, FinalCounters, Message, ModuleAssembler,
-    ProtocolError, TerminalKind,
+    ProtocolError, RootOutcome, TerminalDetail, TerminalKind,
 };
 
 fn main() {
@@ -63,9 +63,9 @@ fn run() -> Result<(), String> {
     let _ = sketch.close_threaded_root();
     drop(sketch);
     let counters = snapshot(&compiler);
-    let (kind, diagnostic) = map_result(result);
-    let (kind, diagnostic) = if counters_are_zero(counters) { (kind, diagnostic) } else { (TerminalKind::WorkerFailure, "nonzero-worker-counters".into()) };
-    write_message(&mut output, &Message::Terminal { request_id, kind, diagnostic: bound(diagnostic), counters }).map_err(protocol_text)?;
+    let (kind, detail, diagnostic) = map_result(result);
+    let (kind, detail, diagnostic) = if counters_are_zero(counters) { (kind, detail, diagnostic) } else { (TerminalKind::WorkerFailure, TerminalDetail::none(), "nonzero-worker-counters".into()) };
+    write_message(&mut output, &Message::Terminal { request_id, kind, detail, diagnostic: bound(diagnostic), counters }).map_err(protocol_text)?;
     let _ = control_done.load(Ordering::Acquire);
     Ok(())
 }
@@ -82,22 +82,25 @@ fn reconstruct(metadata: ExecuteMetadata) -> Result<(SketchCompilerConfig, Sketc
     Ok((config, policy))
 }
 
-fn map_result(result: Result<ThreadedRootOutcome, SketchExecutionError>) -> (TerminalKind, String) {
+fn map_result(result: Result<ThreadedRootOutcome, SketchExecutionError>) -> (TerminalKind, TerminalDetail, String) {
     match result {
-        Ok(ThreadedRootOutcome::Started) | Ok(ThreadedRootOutcome::StartedWithThreadRejections(_)) => (TerminalKind::Completed, "started".into()),
-        Ok(ThreadedRootOutcome::Exited) | Ok(ThreadedRootOutcome::ExitedWithThreadRejections(_)) => (TerminalKind::Completed, "exited".into()),
-        Err(SketchExecutionError::Cancelled) => (TerminalKind::Cancelled, "cancelled".into()),
-        Err(SketchExecutionError::DeadlineExceeded) => (TerminalKind::DeadlineExceeded, "deadline-exceeded".into()),
-        Err(SketchExecutionError::OutOfFuel) => (TerminalKind::OutOfFuel, "out-of-fuel".into()),
-        Err(SketchExecutionError::Trapped) => (TerminalKind::Trapped, "trapped".into()),
-        Err(SketchExecutionError::NonzeroExit { code }) | Err(SketchExecutionError::ChildNonzeroExit { code }) => (TerminalKind::NonzeroExit, format!("exit:{code}")),
-        Err(SketchExecutionError::ChildTrapped) | Err(SketchExecutionError::ChildPanicked) | Err(SketchExecutionError::ChildOutcomes { .. }) => (TerminalKind::ChildFailure, "child-failure".into()),
-        Err(error) => (TerminalKind::WorkerFailure, error.code().into()),
+        Ok(ThreadedRootOutcome::Started) => (TerminalKind::Completed, TerminalDetail { root_outcome: RootOutcome::Started, ..TerminalDetail::none() }, "started".into()),
+        Ok(ThreadedRootOutcome::Exited) => (TerminalKind::Completed, TerminalDetail { root_outcome: RootOutcome::Exited, ..TerminalDetail::none() }, "exited".into()),
+        Ok(ThreadedRootOutcome::StartedWithThreadRejections(r)) => (TerminalKind::Completed, rejections(RootOutcome::StartedWithThreadRejections, r), "started".into()),
+        Ok(ThreadedRootOutcome::ExitedWithThreadRejections(r)) => (TerminalKind::Completed, rejections(RootOutcome::ExitedWithThreadRejections, r), "exited".into()),
+        Err(SketchExecutionError::Cancelled) => (TerminalKind::Cancelled, TerminalDetail::none(), "cancelled".into()),
+        Err(SketchExecutionError::DeadlineExceeded) => (TerminalKind::DeadlineExceeded, TerminalDetail::none(), "deadline-exceeded".into()),
+        Err(SketchExecutionError::OutOfFuel) => (TerminalKind::OutOfFuel, TerminalDetail::none(), "out-of-fuel".into()),
+        Err(SketchExecutionError::Trapped) => (TerminalKind::Trapped, TerminalDetail::none(), "trapped".into()),
+        Err(SketchExecutionError::NonzeroExit { code }) | Err(SketchExecutionError::ChildNonzeroExit { code }) => (TerminalKind::NonzeroExit, TerminalDetail { status_code: Some(code), ..TerminalDetail::none() }, "nonzero-exit".into()),
+        Err(SketchExecutionError::ChildTrapped) | Err(SketchExecutionError::ChildPanicked) | Err(SketchExecutionError::ChildOutcomes { .. }) => (TerminalKind::ChildFailure, TerminalDetail::none(), "child-failure".into()),
+        Err(error) => (TerminalKind::WorkerFailure, TerminalDetail::none(), error.code().into()),
     }
 }
+fn rejections(root_outcome: RootOutcome, value: kernal_api::wasm::ThreadSpawnRejectionSummary) -> TerminalDetail { TerminalDetail { root_outcome, capacity_rejections: value.capacity(), closing_rejections: value.closing(), fuel_rejections: value.fuel(), epoch_rejections: value.epoch(), status_code: None } }
 
 fn snapshot(compiler: &SketchCompiler) -> FinalCounters { let value = compiler.execution_limits_snapshot(); FinalCounters { active_roots: value.active_root_executions() as u64, live_stores: value.live_stores() as u64, live_instances: value.live_instances() as u64, active_epoch_registrations: value.active_epoch_registrations() as u64, live_threads: value.live_guest_threads() as u64 } }
 fn counters_are_zero(value: FinalCounters) -> bool { value.active_roots == 0 && value.live_stores == 0 && value.live_instances == 0 && value.active_epoch_registrations == 0 && value.live_threads == 0 }
 fn bound(mut text: String) -> String { text.truncate(1024); text }
 fn protocol_text(error: ProtocolError) -> String { format!("protocol:{error:?}") }
-fn protocol_terminal(output: &mut impl io::Write, request_id: u64, text: &str) -> Result<(), String> { write_message(output, &Message::Terminal { request_id, kind: TerminalKind::ProtocolFailure, diagnostic: bound(text.into()), counters: FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 } }).map_err(protocol_text) }
+fn protocol_terminal(output: &mut impl io::Write, request_id: u64, text: &str) -> Result<(), String> { write_message(output, &Message::Terminal { request_id, kind: TerminalKind::ProtocolFailure, detail: TerminalDetail::none(), diagnostic: bound(text.into()), counters: FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 } }).map_err(protocol_text) }

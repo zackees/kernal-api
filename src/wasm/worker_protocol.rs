@@ -11,6 +11,7 @@ const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 pub(super) const MAX_MODULE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+const NO_STATUS_CODE: i32 = i32::MIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -53,6 +54,44 @@ pub(super) enum TerminalKind {
     ProtocolFailure = 8,
     WorkerFailure = 9,
     ForcedContainment = 10,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum RootOutcome {
+    None = 0, Started = 1, Exited = 2,
+    StartedWithThreadRejections = 3, ExitedWithThreadRejections = 4,
+}
+impl TryFrom<u8> for RootOutcome {
+    type Error = ProtocolError;
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value { 0 => Ok(Self::None), 1 => Ok(Self::Started), 2 => Ok(Self::Exited), 3 => Ok(Self::StartedWithThreadRejections), 4 => Ok(Self::ExitedWithThreadRejections), _ => Err(ProtocolError::InvalidTerminal) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TerminalDetail {
+    pub(super) root_outcome: RootOutcome,
+    pub(super) capacity_rejections: u32,
+    pub(super) closing_rejections: u32,
+    pub(super) fuel_rejections: u32,
+    pub(super) epoch_rejections: u32,
+    pub(super) status_code: Option<i32>,
+}
+impl TerminalDetail {
+    pub(super) const fn none() -> Self { Self { root_outcome: RootOutcome::None, capacity_rejections: 0, closing_rejections: 0, fuel_rejections: 0, epoch_rejections: 0, status_code: None } }
+    fn validate(self, kind: TerminalKind) -> Result<(), ProtocolError> {
+        let counts = self.capacity_rejections != 0 || self.closing_rejections != 0 || self.fuel_rejections != 0 || self.epoch_rejections != 0;
+        match kind {
+            TerminalKind::Completed if self.root_outcome == RootOutcome::None || self.status_code.is_some() => Err(ProtocolError::InvalidTerminal),
+            TerminalKind::Completed if counts && !matches!(self.root_outcome, RootOutcome::StartedWithThreadRejections | RootOutcome::ExitedWithThreadRejections) => Err(ProtocolError::InvalidTerminal),
+            TerminalKind::Completed if !counts && matches!(self.root_outcome, RootOutcome::StartedWithThreadRejections | RootOutcome::ExitedWithThreadRejections) => Err(ProtocolError::InvalidTerminal),
+            TerminalKind::NonzeroExit if self.root_outcome != RootOutcome::None || counts || self.status_code.is_none() => Err(ProtocolError::InvalidTerminal),
+            TerminalKind::Completed | TerminalKind::NonzeroExit => Ok(()),
+            _ if self.root_outcome != RootOutcome::None || counts || self.status_code.is_some() => Err(ProtocolError::InvalidTerminal),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl TryFrom<u8> for TerminalKind {
@@ -147,6 +186,7 @@ pub(super) enum Message {
     Terminal {
         request_id: u64,
         kind: TerminalKind,
+        detail: TerminalDetail,
         diagnostic: String,
         counters: FinalCounters,
     },
@@ -204,14 +244,22 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
         }
         Message::Terminal {
             kind,
+            detail,
             diagnostic,
             counters,
             ..
         } => {
+            detail.validate(*kind)?;
             if diagnostic.len() > MAX_DIAGNOSTIC_BYTES {
                 return Err(ProtocolError::DiagnosticTooLarge);
             }
             payload.push(*kind as u8);
+            payload.push(detail.root_outcome as u8);
+            put_u32(&mut payload, detail.capacity_rejections);
+            put_u32(&mut payload, detail.closing_rejections);
+            put_u32(&mut payload, detail.fuel_rejections);
+            put_u32(&mut payload, detail.epoch_rejections);
+            put_i32(&mut payload, detail.status_code.unwrap_or(NO_STATUS_CODE));
             put_u16(&mut payload, diagnostic.len() as u16);
             payload.extend_from_slice(diagnostic.as_bytes());
             put_counters(&mut payload, counters);
@@ -286,6 +334,8 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         Kind::Cancel => Message::Cancel { request_id },
         Kind::Terminal => {
             let terminal = TerminalKind::try_from(take_u8(&mut input)?)?;
+            let detail = TerminalDetail { root_outcome: RootOutcome::try_from(take_u8(&mut input)?)?, capacity_rejections: take_u32(&mut input)?, closing_rejections: take_u32(&mut input)?, fuel_rejections: take_u32(&mut input)?, epoch_rejections: take_u32(&mut input)?, status_code: match take_i32(&mut input)? { NO_STATUS_CODE => None, code => Some(code) } };
+            detail.validate(terminal)?;
             let text_len = usize::from(take_u16(&mut input)?);
             if text_len > MAX_DIAGNOSTIC_BYTES {
                 return Err(ProtocolError::DiagnosticTooLarge);
@@ -297,6 +347,7 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
             Message::Terminal {
                 request_id,
                 kind: terminal,
+                detail,
                 diagnostic,
                 counters: take_counters(&mut input)?,
             }
@@ -426,6 +477,7 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
+fn put_i32(out: &mut Vec<u8>, value: i32) { out.extend_from_slice(&value.to_le_bytes()); }
 fn get_u16(input: &[u8]) -> Result<u16, ProtocolError> {
     Ok(u16::from_le_bytes(
         input.try_into().map_err(|_| ProtocolError::Truncated)?,
@@ -460,6 +512,7 @@ fn take_u64(input: &mut &[u8]) -> Result<u64, ProtocolError> {
             .map_err(|_| ProtocolError::Truncated)?,
     ))
 }
+fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> { Ok(i32::from_le_bytes(take(input, 4)?.try_into().map_err(|_| ProtocolError::Truncated)?)) }
 fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
     for v in [
         value.max_wasm_stack_bytes,
@@ -545,6 +598,7 @@ mod tests {
         let terminal = Message::Terminal {
             request_id: 7,
             kind: TerminalKind::Completed,
+            detail: TerminalDetail { root_outcome: RootOutcome::Started, ..TerminalDetail::none() },
             diagnostic: "ok".into(),
             counters: FinalCounters {
                 active_roots: 0,
@@ -669,6 +723,7 @@ mod tests {
         let terminal = Message::Terminal {
             request_id: 5,
             kind: TerminalKind::Completed,
+            detail: TerminalDetail { root_outcome: RootOutcome::Started, ..TerminalDetail::none() },
             diagnostic: String::new(),
             counters: FinalCounters {
                 active_roots: 0,
@@ -686,6 +741,7 @@ mod tests {
         let message = Message::Terminal {
             request_id: 1,
             kind: TerminalKind::WorkerFailure,
+            detail: TerminalDetail::none(),
             diagnostic: "x".repeat(MAX_DIAGNOSTIC_BYTES + 1),
             counters: FinalCounters {
                 active_roots: 0,
@@ -696,5 +752,23 @@ mod tests {
             },
         };
         assert_eq!(encode(&message), Err(ProtocolError::DiagnosticTooLarge));
+    }
+    #[test]
+    fn typed_root_outcome_rejections_and_status_round_trip() {
+        let counters = FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 };
+        let completed = Message::Terminal { request_id: 1, kind: TerminalKind::Completed, detail: TerminalDetail { root_outcome: RootOutcome::StartedWithThreadRejections, capacity_rejections: 1, closing_rejections: 2, fuel_rejections: 3, epoch_rejections: 4, status_code: None }, diagnostic: "context".into(), counters };
+        assert_eq!(decode(&encode(&completed).unwrap()).unwrap(), completed);
+        let exit = Message::Terminal { request_id: 1, kind: TerminalKind::NonzeroExit, detail: TerminalDetail { status_code: Some(-9), ..TerminalDetail::none() }, diagnostic: String::new(), counters };
+        assert_eq!(decode(&encode(&exit).unwrap()).unwrap(), exit);
+    }
+    #[test]
+    fn terminal_rejects_illegal_machine_combinations() {
+        let counters = FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 };
+        let missing_outcome = Message::Terminal { request_id: 1, kind: TerminalKind::Completed, detail: TerminalDetail::none(), diagnostic: String::new(), counters };
+        assert_eq!(encode(&missing_outcome), Err(ProtocolError::InvalidTerminal));
+        let missing_status = Message::Terminal { request_id: 1, kind: TerminalKind::NonzeroExit, detail: TerminalDetail::none(), diagnostic: String::new(), counters };
+        assert_eq!(encode(&missing_status), Err(ProtocolError::InvalidTerminal));
+        let cancelled_with_status = Message::Terminal { request_id: 1, kind: TerminalKind::Cancelled, detail: TerminalDetail { status_code: Some(1), ..TerminalDetail::none() }, diagnostic: String::new(), counters };
+        assert_eq!(encode(&cancelled_with_status), Err(ProtocolError::InvalidTerminal));
     }
 }

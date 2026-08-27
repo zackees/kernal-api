@@ -119,7 +119,7 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     section(1, types, &mut wasm);
 
     let mut imports = Vec::new();
-    leb(8 + u32::from(options.extra_p1_import), &mut imports);
+    leb(9 + u32::from(options.extra_p1_import), &mut imports);
     text("env", &mut imports);
     text("memory", &mut imports);
     imports.extend([2, 3, 1]);
@@ -156,16 +156,29 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     leb(0, &mut functions); // _start
     leb(7, &mut functions); // __main_void
     leb(8, &mut functions); // wasi_thread_start
-    leb(if options.wrong_entry_signature { 0 } else { 7 }, &mut functions);
+    leb(
+        if options.wrong_entry_signature { 0 } else { 7 },
+        &mut functions,
+    );
     section(3, functions, &mut wasm);
 
-    let imported_functions = 7 + u32::from(options.extra_p1_import);
+    let imported_functions = 8 + u32::from(options.extra_p1_import);
     let mut exports = Vec::new();
-    leb(if options.missing_memory_export { 4 } else { 5 }, &mut exports);
+    leb(
+        if options.missing_memory_export { 4 } else { 5 },
+        &mut exports,
+    );
     if !options.missing_memory_export {
         text("memory", &mut exports);
         exports.push(if options.wrong_memory_export { 0 } else { 2 });
-        leb(if options.wrong_memory_export { imported_functions } else { 0 }, &mut exports);
+        leb(
+            if options.wrong_memory_export {
+                imported_functions
+            } else {
+                0
+            },
+            &mut exports,
+        );
     }
     for (name, index) in [
         ("_start", imported_functions),
@@ -174,7 +187,11 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
         ("kernal-api-run", imported_functions + 3),
     ] {
         text(name, &mut exports);
-        exports.push(if options.wrong_entry_kind && name == "kernal-api-run" { 3 } else { 0 });
+        exports.push(if options.wrong_entry_kind && name == "kernal-api-run" {
+            3
+        } else {
+            0
+        });
         leb(index, &mut exports);
     }
     section(7, exports, &mut wasm);
@@ -182,11 +199,13 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     if !options.missing_start {
         section(
             8,
-            vec![(if options.mismatched_start {
-                imported_functions + 1
-            } else {
-                imported_functions
-            }) as u8],
+            vec![
+                (if options.mismatched_start {
+                    imported_functions + 1
+                } else {
+                    imported_functions
+                }) as u8,
+            ],
             &mut wasm,
         );
     }
@@ -229,7 +248,9 @@ fn threaded_policy(bytes: &[u8]) -> SketchModulePolicy {
 fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
     let positive = raw_threaded_wasm(RawThreaded::default());
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-    assert!(compiler.admit(&positive, threaded_policy(&positive)).is_ok());
+    compiler
+        .admit(&positive, threaded_policy(&positive))
+        .expect("positive raw threaded profile must admit");
     assert_eq!(compiler.compiled_module_count(), 1);
 
     let cases: Vec<(RawThreaded, SketchModuleError)> = vec![
@@ -238,9 +259,9 @@ fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
                 extra_p1_import: true,
                 ..Default::default()
             },
-            SketchModuleError::MissingRequiredImport {
-                module: "threaded-rust-v1",
-                name: "closed-import-set",
+            SketchModuleError::ForbiddenImport {
+                module: "wasi_snapshot_preview1".to_owned(),
+                name: "random_get".to_owned(),
             },
         ),
         (
@@ -305,11 +326,19 @@ fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
             SketchModuleError::TargetFeaturesMismatch,
         ),
     ];
-    for (options, expected) in cases {
+    for (case_index, (options, expected)) in cases.into_iter().enumerate() {
         let bytes = raw_threaded_wasm(options);
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-        assert_eq!(compiler.admit(&bytes, threaded_policy(&bytes)), Err(expected));
-        assert_eq!(compiler.compiled_module_count(), 0, "rejected before compilation");
+        assert_eq!(
+            compiler.admit(&bytes, threaded_policy(&bytes)).err(),
+            Some(expected),
+            "fixture case {case_index}"
+        );
+        assert_eq!(
+            compiler.compiled_module_count(),
+            0,
+            "rejected before compilation"
+        );
     }
 
     let bytes = raw_threaded_wasm(RawThreaded::default());
@@ -322,5 +351,9 @@ fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
             ..
         })
     ));
-    assert_eq!(compiler.compiled_module_count(), 0, "rejected before compilation");
+    assert_eq!(
+        compiler.compiled_module_count(),
+        0,
+        "rejected before compilation"
+    );
 }

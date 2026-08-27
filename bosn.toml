@@ -6,6 +6,10 @@ workdir = "/repo"
 
 [stack.linux.env]
 CARGO_TARGET_DIR = "/target"
+# Wasmtime/Cranelift is intentionally heavyweight. Serialize Cargo's compiler
+# children in the constrained managed Linux stack so the validation jobs do not
+# OOM before Soldr can reuse their persistent cache.
+CARGO_BUILD_JOBS = "1"
 
 [stack.linux.mounts]
 repo = { source = ".", destination = "/repo", readonly = true }

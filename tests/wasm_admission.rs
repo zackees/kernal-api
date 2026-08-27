@@ -1,4 +1,5 @@
 #![cfg(feature = "wasm-sketch-host")]
+#![allow(clippy::field_reassign_with_default)]
 
 use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy,

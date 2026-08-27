@@ -972,6 +972,42 @@ mod threaded_root_observation_tests {
         }
     }
 
+    // Keep import-section mutation local to the raw fixture. It proves the
+    // validation profile remains closed before Wasmtime compilation rather
+    // than relying on linker failure after an artifact is admitted.
+    fn validation_fixture_with_extra_import() -> Vec<u8> {
+        let mut bytes = threaded_yield_fixture();
+        let mut section = 8;
+        while bytes[section] != 2 {
+            let mut at = section + 1;
+            while bytes[at] & 0x80 != 0 { at += 1; }
+            let length = usize::from(bytes[at] & 0x7f);
+            section = at + 1 + length;
+        }
+        let body_at = section + 2; // all fixture section lengths are one-byte LEBs
+        bytes[body_at] = 10; // import count
+        let end = section + 2 + usize::from(bytes[section + 1]);
+        let mut extra = Vec::new();
+        text("unexpected", &mut extra);
+        text("import", &mut extra);
+        extra.extend([0, 0]);
+        bytes.splice(end..end, extra.iter().copied());
+        bytes[section + 1] = bytes[section + 1].saturating_add(extra.len() as u8);
+        custom(PROFILE_METADATA, VALIDATION_PROFILE_METADATA_VALUE, &mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn validation_extra_import_rejects_before_compilation() {
+        let bytes = validation_fixture_with_extra_import();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+            bytes.len() + 1, THREADED_RUST_MAX_PAGES,
+        ).expect("policy");
+        assert!(matches!(compiler.admit(&bytes, policy), Err(SketchModuleError::ForbiddenImport { .. })));
+        assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
     fn leb(mut value: u32, output: &mut Vec<u8>) {
         loop {
             let mut byte = (value & 0x7f) as u8;

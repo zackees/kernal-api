@@ -13,7 +13,7 @@ use std::time::Duration;
 mod test_support;
 
 use super::worker_protocol::{
-    self, ExecuteMetadata, FinalCounters, Message, RootOutcome, TerminalKind,
+    self, ExecuteMetadata, FinalCounters, Message, RootOutcome, TerminalDetail, TerminalKind,
 };
 use super::{
     AdmittedSketch, RootExecutionPermit, SketchCompilerConfig, SketchExecutionError,
@@ -319,6 +319,100 @@ enum WriterEvent {
     Cancel(Result<(), ()>),
 }
 
+/// Parent-side receive sequencing for one worker request.  This is deliberately
+/// separate from cancellation/deadline selection: it accepts only protocol
+/// facts, then the supervisor decides how to contain a rejected worker.
+struct ParentReceivePhase {
+    request_id: u64,
+    hello_acked: bool,
+    upload_queued: bool,
+    upload_complete: bool,
+    execute_ack_deferred: bool,
+    execute_acked: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ParentReceiveAction {
+    QueueUpload,
+    AwaitingUpload,
+    ExecuteAcknowledged,
+    Terminal(Message),
+}
+
+impl ParentReceivePhase {
+    fn new(request_id: u64) -> Self {
+        Self {
+            request_id,
+            hello_acked: false,
+            upload_queued: false,
+            upload_complete: false,
+            execute_ack_deferred: false,
+            execute_acked: false,
+        }
+    }
+
+    fn upload_queued(&mut self) {
+        self.upload_queued = true;
+    }
+
+    fn upload_complete(&self) -> bool {
+        self.upload_complete
+    }
+
+    fn is_upload_queued(&self) -> bool {
+        self.upload_queued
+    }
+
+    /// Records the writer result. An upload error is terminal regardless of
+    /// what the read side has already received.
+    fn upload(&mut self, result: Result<(), ()>) -> Result<(), SketchWorkerFailure> {
+        if result.is_err() || !self.hello_acked || !self.upload_queued || self.upload_complete {
+            return Err(SketchWorkerFailure::Protocol);
+        }
+        self.upload_complete = true;
+        if self.execute_ack_deferred {
+            self.execute_acked = true;
+        }
+        Ok(())
+    }
+
+    /// Accepts only the worker-to-parent sequence for this request. In
+    /// particular, `ExecuteAck` proves the worker assembled the complete
+    /// module; a terminal before it is always a protocol failure.
+    fn receive(
+        &mut self,
+        message: Message,
+    ) -> Result<ParentReceiveAction, SketchWorkerFailure> {
+        if message.request_id() != self.request_id {
+            return Err(SketchWorkerFailure::Protocol);
+        }
+        match message {
+            Message::HelloAck { .. } if !self.hello_acked => {
+                self.hello_acked = true;
+                Ok(ParentReceiveAction::QueueUpload)
+            }
+            Message::ExecuteAck { .. }
+                if self.hello_acked
+                    && self.upload_queued
+                    && !self.execute_ack_deferred
+                    && !self.execute_acked =>
+            {
+                if self.upload_complete {
+                    self.execute_acked = true;
+                    Ok(ParentReceiveAction::ExecuteAcknowledged)
+                } else {
+                    self.execute_ack_deferred = true;
+                    Ok(ParentReceiveAction::AwaitingUpload)
+                }
+            }
+            message @ Message::Terminal { .. } if self.execute_acked => {
+                Ok(ParentReceiveAction::Terminal(message))
+            }
+            _ => Err(SketchWorkerFailure::Protocol),
+        }
+    }
+}
+
 /// All parent-side resources whose lifetime must extend through deferred
 /// containment.  Keeping these together prevents a failed force attempt from
 /// synchronously dropping the native control or releasing admission early.
@@ -547,15 +641,9 @@ fn supervise(
             SketchWorkerFailure::Protocol,
         );
     }
-    let mut upload_sent = false;
-    let mut upload_complete = false;
     let mut cancel_written = false;
     let mut cancel_queued = false;
-    let mut hello_acked = false;
-    // A malicious worker may write Terminal immediately after HelloAck. Keep
-    // exactly one bounded pending frame, but never accept it until the parent
-    // observed a successful complete upload.
-    let mut execute_acked = false;
+    let mut receive_phase = ParentReceivePhase::new(id);
     let mut selected = None;
     let mut grace_deadline = None;
     loop {
@@ -563,7 +651,7 @@ fn supervise(
             selected = selected_stop(&cancellation, deadline);
         }
         if let Some(trigger) = selected {
-            if !upload_complete {
+            if !receive_phase.upload_complete() {
                 return force_join_terminal(
                     sketch,
                     &mut control,
@@ -577,16 +665,25 @@ fn supervise(
         if let Ok(event) = write_done_rx.try_recv() {
             match event {
                 WriterEvent::Hello(Ok(())) => {}
-                WriterEvent::Upload(Ok(())) => upload_complete = true,
+                WriterEvent::Upload(result) => {
+                    if receive_phase.upload(result).is_err() {
+                        return force_join_result(
+                            sketch,
+                            &mut control,
+                            write_tx,
+                            writer,
+                            reader,
+                            SketchWorkerFailure::Protocol,
+                        );
+                    }
+                }
                 WriterEvent::Cancel(Ok(())) => {
                     cancel_written = true;
                     sketch.worker_ledger.record_cancel_sent();
                     grace_deadline =
                         Some(std::time::Instant::now() + config.cooperative_cancel_grace());
                 }
-                WriterEvent::Hello(Err(()))
-                | WriterEvent::Upload(Err(()))
-                | WriterEvent::Cancel(Err(())) => {
+                WriterEvent::Hello(Err(())) | WriterEvent::Cancel(Err(())) => {
                     return force_join_result(
                         sketch,
                         &mut control,
@@ -615,9 +712,8 @@ fn supervise(
                     }
                 },
             };
-            match message {
-                Message::HelloAck { request_id } if request_id == id && !hello_acked => {
-                    hello_acked = true;
+            match receive_phase.receive(message) {
+                Ok(ParentReceiveAction::QueueUpload) => {
                     if write_tx
                         .send(WriterCommand::Upload {
                             request_id: id,
@@ -635,12 +731,11 @@ fn supervise(
                             SketchWorkerFailure::Protocol,
                         );
                     }
-                    upload_sent = true;
+                    receive_phase.upload_queued();
                 }
-                Message::ExecuteAck { request_id } if hello_acked && upload_sent && upload_complete && !execute_acked && request_id == id => {
-                    execute_acked = true;
-                }
-                Message::Terminal { .. } if hello_acked && execute_acked => {
+                Ok(ParentReceiveAction::AwaitingUpload) => {}
+                Ok(ParentReceiveAction::ExecuteAcknowledged) => {}
+                Ok(ParentReceiveAction::Terminal(message)) => {
                     let mapped = map_terminal(message, id);
                     let mapped = match mapped {
                         Ok(value) => value,
@@ -690,7 +785,7 @@ fn supervise(
                         }
                     }
                 }
-                _ => {
+                Err(_) => {
                     return force_join_result(
                         sketch,
                         &mut control,
@@ -717,7 +812,7 @@ fn supervise(
             }
         }
         if let Some(trigger) = selected {
-            if !upload_complete {
+            if !receive_phase.upload_complete() {
                 return force_join_terminal(
                     sketch,
                     &mut control,
@@ -727,7 +822,7 @@ fn supervise(
                     trigger,
                 );
             }
-            if !cancel_written && !cancel_queued && upload_sent {
+            if !cancel_written && !cancel_queued && receive_phase.is_upload_queued() {
                 if write_tx
                     .send(WriterCommand::Cancel { request_id: id })
                     .is_err()
@@ -772,35 +867,6 @@ fn validate_worker_module_len(module_bytes: usize) -> Result<(), SketchWorkerFai
         .is_some())
     .then_some(())
     .ok_or(SketchWorkerFailure::InvalidConfiguration)
-}
-
-/// Bounded acceptance rule exercised by the supervisor ordering regression:
-/// one terminal may wait for upload success, never for upload failure.
-#[cfg(test)]
-#[derive(Default)]
-struct UploadTerminalGate {
-    upload_complete: bool,
-    deferred: bool,
-}
-#[cfg(test)]
-impl UploadTerminalGate {
-    fn terminal(&mut self) -> Result<bool, SketchWorkerFailure> {
-        if self.upload_complete {
-            return Ok(true);
-        }
-        if self.deferred {
-            return Err(SketchWorkerFailure::Protocol);
-        }
-        self.deferred = true;
-        Ok(false)
-    }
-    fn upload(&mut self, success: bool) -> Result<bool, SketchWorkerFailure> {
-        if !success {
-            return Err(SketchWorkerFailure::Protocol);
-        }
-        self.upload_complete = true;
-        Ok(std::mem::take(&mut self.deferred))
-    }
 }
 
 fn selected_stop(
@@ -1408,18 +1474,126 @@ mod tests {
             Err(SketchWorkerFailure::InvalidConfiguration)
         );
     }
+    fn terminal(request_id: u64) -> Message {
+        Message::Terminal {
+            request_id,
+            kind: TerminalKind::WorkerFailure,
+            detail: TerminalDetail::none(),
+            diagnostic: String::new(),
+            counters: FinalCounters {
+                active_roots: 0,
+                live_stores: 0,
+                live_instances: 0,
+                active_epoch_registrations: 0,
+                live_threads: 0,
+            },
+        }
+    }
+
     #[test]
-    fn early_terminal_gate_requires_upload_success_and_is_bounded() {
-        let mut gate = UploadTerminalGate::default();
-        assert_eq!(gate.terminal(), Ok(false));
-        assert_eq!(gate.upload(false), Err(SketchWorkerFailure::Protocol));
-        let mut gate = UploadTerminalGate::default();
-        assert_eq!(gate.terminal(), Ok(false));
-        assert_eq!(gate.upload(true), Ok(true));
-        assert_eq!(gate.terminal(), Ok(true));
-        let mut gate = UploadTerminalGate::default();
-        assert_eq!(gate.terminal(), Ok(false));
-        assert_eq!(gate.terminal(), Err(SketchWorkerFailure::Protocol));
+    fn parent_receive_phase_accepts_only_the_complete_happy_path() {
+        let mut phase = ParentReceivePhase::new(41);
+        assert!(matches!(
+            phase.receive(Message::HelloAck { request_id: 41 }),
+            Ok(ParentReceiveAction::QueueUpload)
+        ));
+        phase.upload_queued();
+        assert_eq!(phase.upload(Ok(())), Ok(()));
+        assert!(matches!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Ok(ParentReceiveAction::ExecuteAcknowledged)
+        ));
+        assert!(matches!(
+            phase.receive(terminal(41)),
+            Ok(ParentReceiveAction::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn parent_receive_phase_rejects_out_of_order_duplicate_and_wrong_id_messages() {
+        let mut phase = ParentReceivePhase::new(41);
+        assert_eq!(
+            phase.receive(Message::HelloAck { request_id: 42 }),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        assert_eq!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        assert_eq!(
+            phase.receive(terminal(41)),
+            Err(SketchWorkerFailure::Protocol)
+        );
+
+        let mut phase = ParentReceivePhase::new(41);
+        assert!(matches!(
+            phase.receive(Message::HelloAck { request_id: 41 }),
+            Ok(ParentReceiveAction::QueueUpload)
+        ));
+        assert_eq!(
+            phase.receive(Message::HelloAck { request_id: 41 }),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        phase.upload_queued();
+        assert_eq!(phase.upload(Ok(())), Ok(()));
+        assert_eq!(
+            phase.receive(terminal(41)),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        assert!(matches!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Ok(ParentReceiveAction::ExecuteAcknowledged)
+        ));
+        assert_eq!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Err(SketchWorkerFailure::Protocol)
+        );
+    }
+
+    #[test]
+    fn parent_receive_phase_defers_only_a_crossed_execute_ack() {
+        let mut phase = ParentReceivePhase::new(41);
+        assert!(matches!(
+            phase.receive(Message::HelloAck { request_id: 41 }),
+            Ok(ParentReceiveAction::QueueUpload)
+        ));
+        phase.upload_queued();
+        assert!(matches!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Ok(ParentReceiveAction::AwaitingUpload)
+        ));
+        assert_eq!(
+            phase.receive(terminal(41)),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        assert_eq!(phase.upload(Ok(())), Ok(()));
+        assert!(matches!(
+            phase.receive(terminal(41)),
+            Ok(ParentReceiveAction::Terminal(_))
+        ));
+    }
+
+    #[test]
+    fn parent_receive_phase_rejects_upload_failure_and_duplicate_deferred_ack() {
+        let mut phase = ParentReceivePhase::new(41);
+        assert!(matches!(
+            phase.receive(Message::HelloAck { request_id: 41 }),
+            Ok(ParentReceiveAction::QueueUpload)
+        ));
+        phase.upload_queued();
+        assert!(matches!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Ok(ParentReceiveAction::AwaitingUpload)
+        ));
+        assert_eq!(
+            phase.receive(Message::ExecuteAck { request_id: 41 }),
+            Err(SketchWorkerFailure::Protocol)
+        );
+        assert_eq!(phase.upload(Err(())), Err(SketchWorkerFailure::Protocol));
+        assert_eq!(
+            phase.receive(terminal(41)),
+            Err(SketchWorkerFailure::Protocol)
+        );
     }
     #[test]
     fn cancellation_wins_a_same_tick_deadline() {

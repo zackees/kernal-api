@@ -331,6 +331,23 @@ mod tests {
         bytes
     }
 
+    fn metadata() -> ExecuteMetadata {
+        ExecuteMetadata {
+            max_wasm_stack_bytes: 1,
+            reserved_memory_bytes: 1,
+            maximum_active_roots: 1,
+            total_fuel: 3,
+            root_fuel: 1,
+            child_fuel: 1,
+            epoch_deadline_millis: 1,
+            epoch_tick_millis: 1,
+            maximum_epoch_registrations: 1,
+            max_module_bytes: 1,
+            max_shared_memory_pages: 1,
+            max_guest_threads: 1,
+        }
+    }
+
     #[test]
     fn in_memory_handshake_then_wrong_start_writes_typed_protocol_terminal() {
         let request_id = 41;
@@ -361,6 +378,55 @@ mod tests {
         assert_eq!(kind, TerminalKind::ProtocolFailure);
         assert_eq!(detail, TerminalDetail::none());
         assert!(counters_are_zero(counters));
+    }
+
+    #[test]
+    fn complete_upload_orders_execute_ack_after_hello_ack() {
+        let request_id = 41;
+        let mut input = frame(&Message::Hello { request_id });
+        input.extend(frame(&Message::ExecuteStart {
+            request_id,
+            module_len: 0,
+            metadata: metadata(),
+        }));
+        input.extend(frame(&Message::ExecuteEnd { request_id }));
+        let mut output = Vec::new();
+
+        assert!(run_with_io(&mut Cursor::new(input), &mut output)
+            .expect("complete request")
+            .is_some());
+
+        let mut output = Cursor::new(output);
+        assert_eq!(
+            read_message(&mut output).unwrap(),
+            Message::HelloAck { request_id }
+        );
+        assert_eq!(
+            read_message(&mut output).unwrap(),
+            Message::ExecuteAck { request_id }
+        );
+    }
+
+    #[test]
+    fn incomplete_upload_never_writes_execute_ack() {
+        let request_id = 41;
+        let mut input = frame(&Message::Hello { request_id });
+        input.extend(frame(&Message::ExecuteStart {
+            request_id,
+            module_len: 1,
+            metadata: metadata(),
+        }));
+        input.extend(frame(&Message::ExecuteEnd { request_id }));
+        let mut output = Vec::new();
+
+        assert!(run_with_io(&mut Cursor::new(input), &mut output).is_err());
+
+        let mut output = Cursor::new(output);
+        assert_eq!(
+            read_message(&mut output).unwrap(),
+            Message::HelloAck { request_id }
+        );
+        assert!(read_message(&mut output).is_err());
     }
 
     #[test]

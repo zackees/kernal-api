@@ -253,7 +253,7 @@ pub(super) enum Message {
 }
 
 impl Message {
-    fn request_id(&self) -> u64 {
+    pub(super) fn request_id(&self) -> u64 {
         match self {
             Self::Hello { request_id }
             | Self::HelloAck { request_id }

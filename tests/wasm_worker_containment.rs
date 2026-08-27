@@ -330,7 +330,9 @@ mod failure_proof {
             let deadline = Instant::now() + OUTER_BOUND;
             let child = self.0.as_mut().expect("inner child");
             let status = loop {
-                if let Some(status) = child.try_wait().expect("inner exit") { break status; }
+                if let Some(status) = child.try_wait().expect("inner exit") {
+                    break status;
+                }
                 assert!(Instant::now() < deadline, "inner child exceeded bound");
                 std::thread::sleep(Duration::from_millis(10));
             };
@@ -340,11 +342,15 @@ mod failure_proof {
     }
     impl Drop for InnerChild {
         fn drop(&mut self) {
-            let Some(child) = self.0.as_mut() else { return; };
+            let Some(child) = self.0.as_mut() else {
+                return;
+            };
             let _ = child.kill();
             let deadline = Instant::now() + OUTER_BOUND;
             while Instant::now() < deadline {
-                if child.try_wait().ok().flatten().is_some() { break; }
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
@@ -352,14 +358,16 @@ mod failure_proof {
     fn launch(inner: &str, files: &Artifacts) -> InnerChild {
         let worker = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
         assert!(worker.is_absolute(), "real worker path must be absolute");
-        InnerChild(Some(Command::new(std::env::current_exe().expect("test executable"))
-            .args(["--exact", inner, "--ignored", "--nocapture"])
-            .env(MARKER, &files.marker)
-            .env(RESULT, &files.result)
-            .env(RELEASE, &files.release)
-            .env("KERNAL_API_D4_REAL_WORKER", worker)
-            .spawn()
-            .expect("inner harness")))
+        InnerChild(Some(
+            Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", inner, "--ignored", "--nocapture"])
+                .env(MARKER, &files.marker)
+                .env(RESULT, &files.result)
+                .env(RELEASE, &files.release)
+                .env("KERNAL_API_D4_REAL_WORKER", worker)
+                .spawn()
+                .expect("inner harness"),
+        ))
     }
     fn inner_crash() {
         let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel());
@@ -454,20 +462,45 @@ mod failure_proof {
     impl PidFd {
         fn wait_gone(&mut self) {
             let fd = self.0.expect("pidfd");
-            let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            assert!(unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) } > 0, "exact worker survived bound");
-            unsafe { libc::close(fd); }
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(
+                unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) } > 0,
+                "exact worker survived bound"
+            );
+            unsafe {
+                libc::close(fd);
+            }
             self.0 = None;
         }
     }
     #[cfg(target_os = "linux")]
     impl Drop for PidFd {
         fn drop(&mut self) {
-            let Some(fd) = self.0.take() else { return; };
-            let _ = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, fd, libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0) };
-            let mut poll = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let Some(fd) = self.0.take() else {
+                return;
+            };
+            let _ = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            let mut poll = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
             let _ = unsafe { libc::poll(&mut poll, 1, OUTER_BOUND.as_millis() as i32) };
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
     #[cfg(target_os = "linux")]
@@ -536,12 +569,20 @@ mod failure_proof {
             let process = unsafe { OpenProcess(access, 0, pid) };
             Self(Some(process))
         }
-        fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE { self.0.expect("process handle") }
+        fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+            self.0.expect("process handle")
+        }
         fn wait_gone(&mut self) {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
             use windows_sys::Win32::System::Threading::WaitForSingleObject;
-            assert_eq!(unsafe { WaitForSingleObject(self.handle(), OUTER_BOUND.as_millis() as u32) }, WAIT_OBJECT_0, "exact worker survived bound");
-            unsafe { CloseHandle(self.handle()); }
+            assert_eq!(
+                unsafe { WaitForSingleObject(self.handle(), OUTER_BOUND.as_millis() as u32) },
+                WAIT_OBJECT_0,
+                "exact worker survived bound"
+            );
+            unsafe {
+                CloseHandle(self.handle());
+            }
             self.0 = None;
         }
     }
@@ -550,10 +591,14 @@ mod failure_proof {
         fn drop(&mut self) {
             use windows_sys::Win32::Foundation::CloseHandle;
             use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-            let Some(process) = self.0.take() else { return; };
+            let Some(process) = self.0.take() else {
+                return;
+            };
             let _ = unsafe { TerminateProcess(process, 1) };
             let _ = unsafe { WaitForSingleObject(process, OUTER_BOUND.as_millis() as u32) };
-            unsafe { CloseHandle(process); }
+            unsafe {
+                CloseHandle(process);
+            }
         }
     }
     #[cfg(target_os = "windows")]
@@ -570,7 +615,15 @@ mod failure_proof {
         let mut kernel = unsafe { std::mem::zeroed() };
         let mut user = unsafe { std::mem::zeroed() };
         assert_ne!(
-            unsafe { GetProcessTimes(process.handle(), &mut creation, &mut exit, &mut kernel, &mut user) },
+            unsafe {
+                GetProcessTimes(
+                    process.handle(),
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            },
             0,
             "GetProcessTimes"
         );

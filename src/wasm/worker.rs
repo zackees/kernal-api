@@ -598,7 +598,10 @@ fn supervise(
                 }
             }
         }
-        let received = early_terminal.take().map(Ok).or_else(|| read_rx.try_recv().ok());
+        let received = early_terminal
+            .take()
+            .map(Ok)
+            .or_else(|| read_rx.try_recv().ok());
         if let Some(result) = received {
             let message = match result {
                 Ok(message) => message,
@@ -640,7 +643,14 @@ fn supervise(
                 }
                 message @ Message::Terminal { .. } if hello_acked && !upload_complete => {
                     if early_terminal.is_some() {
-                        return force_join_result(sketch, &mut control, write_tx, writer, reader, SketchWorkerFailure::Protocol);
+                        return force_join_result(
+                            sketch,
+                            &mut control,
+                            write_tx,
+                            writer,
+                            reader,
+                            SketchWorkerFailure::Protocol,
+                        );
                     }
                     early_terminal = Some(message);
                 }
@@ -770,24 +780,36 @@ fn supervise(
 /// Validate the private process-transport limit without constraining direct
 /// in-process admission/execution policy.
 fn validate_worker_module_len(module_bytes: usize) -> Result<(), SketchWorkerFailure> {
-    (u64::try_from(module_bytes).ok().filter(|bytes| *bytes <= worker_protocol::WORKER_PROTOCOL_MAX_MODULE_BYTES).is_some())
-        .then_some(())
-        .ok_or(SketchWorkerFailure::InvalidConfiguration)
+    (u64::try_from(module_bytes)
+        .ok()
+        .filter(|bytes| *bytes <= worker_protocol::WORKER_PROTOCOL_MAX_MODULE_BYTES)
+        .is_some())
+    .then_some(())
+    .ok_or(SketchWorkerFailure::InvalidConfiguration)
 }
 
 /// Bounded acceptance rule exercised by the supervisor ordering regression:
 /// one terminal may wait for upload success, never for upload failure.
 #[derive(Default)]
-struct UploadTerminalGate { upload_complete: bool, deferred: bool }
+struct UploadTerminalGate {
+    upload_complete: bool,
+    deferred: bool,
+}
 impl UploadTerminalGate {
     fn terminal(&mut self) -> Result<bool, SketchWorkerFailure> {
-        if self.upload_complete { return Ok(true); }
-        if self.deferred { return Err(SketchWorkerFailure::Protocol); }
+        if self.upload_complete {
+            return Ok(true);
+        }
+        if self.deferred {
+            return Err(SketchWorkerFailure::Protocol);
+        }
         self.deferred = true;
         Ok(false)
     }
     fn upload(&mut self, success: bool) -> Result<bool, SketchWorkerFailure> {
-        if !success { return Err(SketchWorkerFailure::Protocol); }
+        if !success {
+            return Err(SketchWorkerFailure::Protocol);
+        }
         self.upload_complete = true;
         Ok(std::mem::take(&mut self.deferred))
     }

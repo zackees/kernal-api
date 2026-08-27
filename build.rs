@@ -35,18 +35,18 @@ fn verify_wasm_feature_isolation(path: &Path) -> Result<(), Box<dyn std::error::
         .get("wasm-sketch-host")
         .and_then(toml::Value::as_array)
         .ok_or("wasm-sketch-host must be an array feature")?;
-    let has_required_dependency = |name| {
-        sketch_host
-            .iter()
-            .any(|value| value.as_str() == Some(name))
-    };
+    let has_required_dependency =
+        |name| sketch_host.iter().any(|value| value.as_str() == Some(name));
     if !has_required_dependency("dep:wasmtime") || !has_required_dependency("dep:wasmparser") {
         return Err("wasm-sketch-host must opt into wasmtime and wasmparser".into());
     }
     if features
         .get("full")
         .and_then(toml::Value::as_array)
-        .is_some_and(|full| full.iter().any(|value| value.as_str() == Some("wasm-sketch-host")))
+        .is_some_and(|full| {
+            full.iter()
+                .any(|value| value.as_str() == Some("wasm-sketch-host"))
+        })
     {
         return Err("full must not opt into wasm-sketch-host".into());
     }

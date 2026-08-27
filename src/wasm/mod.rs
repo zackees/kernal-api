@@ -43,7 +43,6 @@ const DEFAULT_MAX_GUEST_THREADS: usize = 16;
 pub enum SketchAdmissionProfile {
     SyntheticV1,
     ThreadedRustV1,
-    ThreadedRustValidationV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,10 +109,7 @@ impl SketchCompiler {
         let memory = match policy.profile {
             SketchAdmissionProfile::SyntheticV1 => preflight(bytes, policy)?,
             SketchAdmissionProfile::ThreadedRustV1 => {
-                preflight_threaded_rust(bytes, policy, false)?
-            }
-            SketchAdmissionProfile::ThreadedRustValidationV1 => {
-                preflight_threaded_rust(bytes, policy, true)?
+                preflight_threaded_rust(bytes, policy, policy.validation)?
             }
         };
         let module =
@@ -126,6 +122,7 @@ impl SketchCompiler {
             shared_memory: memory,
             max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
+            validation: policy.validation,
             prepared_root: std::sync::Mutex::new(None),
             #[cfg(test)]
             preparation_count: AtomicU64::new(0),
@@ -143,6 +140,7 @@ pub struct SketchModulePolicy {
     max_shared_memory_pages: u32,
     max_guest_threads: usize,
     profile: SketchAdmissionProfile,
+    validation: bool,
 }
 impl SketchModulePolicy {
     pub fn new(
@@ -160,6 +158,7 @@ impl SketchModulePolicy {
             max_shared_memory_pages,
             max_guest_threads: DEFAULT_MAX_GUEST_THREADS,
             profile: SketchAdmissionProfile::SyntheticV1,
+            validation: false,
         })
     }
     /// Selects the exact Rust 1.95 `wasm32-wasip1-threads` link profile.
@@ -173,15 +172,16 @@ impl SketchModulePolicy {
         policy.profile = SketchAdmissionProfile::ThreadedRustV1;
         Ok(policy)
     }
-    /// Validation-only extension of the exact Rust threaded profile. It adds
-    /// one versioned metadata value and one report getter; ordinary sketches
-    /// keep the narrower closed export surface.
-    pub fn threaded_rust_validation_v1(
+    /// Crate-only artifact characterization contract. Applications cannot opt
+    /// into this wider validation export surface.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn threaded_rust_validation_v1_for_test(
         max_module_bytes: usize,
         max_shared_memory_pages: u32,
     ) -> Result<Self, SketchModuleError> {
         let mut policy = Self::threaded_rust_v1(max_module_bytes, max_shared_memory_pages)?;
-        policy.profile = SketchAdmissionProfile::ThreadedRustValidationV1;
+        policy.validation = true;
         Ok(policy)
     }
     pub fn max_module_bytes(self) -> usize {
@@ -215,6 +215,7 @@ pub struct AdmittedSketch {
     shared_memory: SketchSharedMemory,
     max_guest_threads: usize,
     profile: SketchAdmissionProfile,
+    validation: bool,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
     // controller: it must survive any future controller replacement to prove
@@ -238,11 +239,7 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
-        if !matches!(
-            self.profile,
-            SketchAdmissionProfile::ThreadedRustV1
-                | SketchAdmissionProfile::ThreadedRustValidationV1
-        ) {
+        if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let prepared = self.prepare_threaded_root()?;
@@ -266,7 +263,7 @@ impl AdmittedSketch {
             let start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
                 .map_err(|_| SketchExecutionError::Trapped)?;
-            if self.profile == SketchAdmissionProfile::ThreadedRustValidationV1 {
+            if self.validation {
                 validation_getter = Some(
                     instance
                         .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
@@ -287,7 +284,7 @@ impl AdmittedSketch {
         // concurrent child or report diagnostic.
         let outcome = outcome?;
         children?;
-        if self.profile == SketchAdmissionProfile::ThreadedRustValidationV1 {
+        if self.validation {
             let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
             let offset = getter
                 .call(&mut store, ())

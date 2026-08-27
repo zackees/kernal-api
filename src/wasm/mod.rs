@@ -1055,6 +1055,57 @@ fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecu
     Ok(())
 }
 
+#[cfg(test)]
+mod validation_report_tests {
+    use super::*;
+
+    fn memory() -> SharedMemory {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("engine");
+        SharedMemory::new(&compiler.engine, MemoryType::shared(17, 16_384)).expect("memory")
+    }
+
+    fn write_report(memory: &SharedMemory, offset: i32, words: [u32; 16]) {
+        for (index, value) in words.into_iter().enumerate() {
+            let cells = shared_range(memory, offset + (index as i32 * 4), 4).expect("range");
+            // SAFETY: test offsets are aligned/in-range and this helper only
+            // writes the atomic record representation used by validate_report.
+            unsafe { (&*cells.as_ptr().cast::<AtomicU32>()).store(value, Ordering::Release) };
+        }
+    }
+
+    fn valid() -> [u32; 16] {
+        [0x4b_52_56_31, 1, 64, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn validation_report_rejects_bad_pointer_and_schema() {
+        let memory = memory();
+        assert_eq!(
+            validate_report(&memory, -1),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        assert_eq!(
+            validate_report(&memory, 2),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        assert_eq!(
+            validate_report(&memory, i32::MAX - 2),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        write_report(&memory, 0, valid());
+        assert_eq!(validate_report(&memory, 0), Ok(()));
+        for index in [0, 1, 2, 3, 12, 13, 14, 15] {
+            let mut words = valid();
+            words[index] = if index == 3 { 0 } else { 9 };
+            write_report(&memory, 0, words);
+            assert_eq!(
+                validate_report(&memory, 0),
+                Err(SketchExecutionError::ValidationReportInvalid)
+            );
+        }
+    }
+}
+
 fn shared_range(
     memory: &SharedMemory,
     offset: i32,

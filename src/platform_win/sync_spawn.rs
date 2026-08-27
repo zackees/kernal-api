@@ -31,13 +31,20 @@ use winapi::um::winbase::{
 use winapi::um::winnt::{
     JobObjectExtendedLimitInformation, DUPLICATE_SAME_ACCESS, FILE_SHARE_READ, FILE_SHARE_WRITE,
     GENERIC_READ, GENERIC_WRITE, HANDLE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY,
 };
 
 // PROC_THREAD_ATTRIBUTE_HANDLE_LIST = ProcThreadAttributeValue(2, FALSE,
 // TRUE, FALSE) = 0x00020002.
 const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x00020002;
 const STILL_ACTIVE: u32 = 259;
+/// A containment cleanup must not wedge the host if Windows fails to honor a
+/// Job close or process termination. Worker-process escalation owns any later
+/// retry/reaping policy.
+const STRICT_WORKER_REAP_TIMEOUT_MS: DWORD = 5_000;
+const WAIT_TIMEOUT_RESULT: DWORD = 0x0000_0102;
 
 pub struct OwnedHandle(HANDLE);
 
@@ -550,6 +557,74 @@ pub(crate) enum StrictWorkerSpawnStage {
     Reap,
 }
 
+/// Facade-owned bounds for a hostile Wasm worker Job Object. `None` leaves a
+/// particular Job limit unset; the default still enables KILL_ON_JOB_CLOSE.
+/// Memory values are bytes and must be nonzero and representable as a Windows
+/// `SIZE_T` on the target process.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StrictWorkerLimits {
+    pub(crate) active_processes: Option<u32>,
+    pub(crate) process_memory_bytes: Option<u64>,
+    pub(crate) job_memory_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StrictWorkerLimitError {
+    ZeroActiveProcesses,
+    ZeroProcessMemory,
+    ZeroJobMemory,
+    ProcessMemoryTooLarge,
+    JobMemoryTooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StrictWorkerJobConfiguration {
+    limit_flags: DWORD,
+    active_processes: Option<u32>,
+    process_memory_bytes: Option<usize>,
+    job_memory_bytes: Option<usize>,
+}
+
+impl StrictWorkerLimits {
+    fn job_configuration(self) -> Result<StrictWorkerJobConfiguration, StrictWorkerLimitError> {
+        let active_processes = match self.active_processes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroActiveProcesses),
+            value => value,
+        };
+        let process_memory_bytes = match self.process_memory_bytes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroProcessMemory),
+            Some(value) => Some(
+                usize::try_from(value).map_err(|_| StrictWorkerLimitError::ProcessMemoryTooLarge)?,
+            ),
+            None => None,
+        };
+        let job_memory_bytes = match self.job_memory_bytes {
+            Some(0) => return Err(StrictWorkerLimitError::ZeroJobMemory),
+            Some(value) => Some(
+                usize::try_from(value).map_err(|_| StrictWorkerLimitError::JobMemoryTooLarge)?,
+            ),
+            None => None,
+        };
+
+        let mut limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if active_processes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        }
+        if process_memory_bytes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+        }
+        if job_memory_bytes.is_some() {
+            limit_flags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        }
+        Ok(StrictWorkerJobConfiguration {
+            limit_flags,
+            active_processes,
+            process_memory_bytes,
+            job_memory_bytes,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StrictWorkerSpawnError {
     stage: StrictWorkerSpawnStage,
@@ -557,16 +632,29 @@ pub(crate) struct StrictWorkerSpawnError {
     cleanup: Option<StrictWorkerCleanupError>,
 }
 #[derive(Debug)]
-pub(crate) struct StrictWorkerCleanupError { stage: StrictWorkerSpawnStage, source: io::Error }
+pub(crate) struct StrictWorkerCleanupError {
+    stage: StrictWorkerSpawnStage,
+    source: io::Error,
+}
 impl StrictWorkerSpawnError {
     pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
     pub(crate) fn cleanup(&self) -> Option<&StrictWorkerCleanupError> { self.cleanup.as_ref() }
 }
-impl StrictWorkerCleanupError { pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage } }
+impl StrictWorkerCleanupError {
+    pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
+    pub(crate) fn message(&self) -> String { self.source.to_string() }
+    pub(crate) fn raw_os_error(&self) -> Option<i32> { self.source.raw_os_error() }
+}
 impl std::fmt::Display for StrictWorkerSpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "strict worker spawn failed at {:?}: {}", self.stage, self.source) }
 }
 impl std::error::Error for StrictWorkerSpawnError {}
+impl std::fmt::Display for StrictWorkerCleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "strict worker cleanup failed at {:?}: {}", self.stage, self.source)
+    }
+}
+impl std::error::Error for StrictWorkerCleanupError {}
 
 /// Opaque crate-private worker child. Unlike generic `SpawnedChild`, Drop is
 /// a containment operation: it closes the strict Job and waits/reaps the
@@ -585,7 +673,8 @@ impl StrictWorkerChild {
     pub(crate) fn try_wait(&self) -> io::Result<Option<i32>> { self.inner.process.as_ref().map_or(Ok(None), try_wait_inner) }
     pub(crate) fn wait(&self) -> io::Result<i32> { self.inner.process.as_ref().ok_or_else(|| io::Error::other("worker handle absent")).and_then(wait_inner) }
     /// Idempotent strict shutdown. Closing the Job is the tree termination
-    /// action; `OwnedHandle::Drop` cannot report CloseHandle failure.
+    /// action; `OwnedHandle::Drop` cannot report CloseHandle failure. Reaping
+    /// is bounded, so Drop remains best-effort rather than wedging the host.
     pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> {
         self.shutdown()
     }
@@ -609,13 +698,15 @@ pub(crate) fn spawn_strict_contained_worker(
     command: &mut Command,
     stdio: crate::platform::process::SpawnStdio<'_>,
     environment: crate::platform::process::SyncEnvironment,
+    limits: StrictWorkerLimits,
 ) -> Result<StrictWorkerChild, StrictWorkerSpawnError> {
     let stdin = resolve_slot(&stdio.stdin, SlotDir::Stdin).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
     let stdout = resolve_slot(&stdio.stdout, SlotDir::Stdout).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
     let stderr = resolve_slot(&stdio.stderr, SlotDir::Stderr).map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Pipe, source, cleanup: None })?;
     // Job setup is intentionally before CreateProcessW: failure here leaves
     // no suspended hostile child to clean up.
-    let job = create_strict_worker_job().map_err(|(stage, source)| StrictWorkerSpawnError { stage, source, cleanup: None })?;
+    let job = create_strict_worker_job(limits)
+        .map_err(|(stage, source)| StrictWorkerSpawnError { stage, source, cleanup: None })?;
     let (process, thread, pid) = create_process_inner(command, &stdin.child_handle, &stdout.child_handle, &stderr.child_handle, CreateMode::Contained { show_console: false }, environment)
         .map_err(|source| StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::CreateSuspended, source, cleanup: None })?;
     let process = OwnedHandle(process);
@@ -650,9 +741,7 @@ fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError>
     let terminate = if unsafe { TerminateProcess(process.as_raw(), 1) } == FALSE {
         Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
     } else { None };
-    let reap = if unsafe { WaitForSingleObject(process.as_raw(), INFINITE) } != WAIT_OBJECT_0 {
-        Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Reap, source: io::Error::last_os_error() })
-    } else { None };
+    let reap = reap_only(process);
     if let Some(error) = terminate { return Some(error); }
     if let Some(error) = reap {
         return Some(error);
@@ -661,10 +750,17 @@ fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError>
 }
 
 fn reap_only(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
-    if unsafe { WaitForSingleObject(process.as_raw(), INFINITE) } != WAIT_OBJECT_0 {
-        return Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Reap, source: io::Error::last_os_error() });
+    match unsafe { WaitForSingleObject(process.as_raw(), STRICT_WORKER_REAP_TIMEOUT_MS) } {
+        WAIT_OBJECT_0 => None,
+        WAIT_TIMEOUT_RESULT => Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::new(io::ErrorKind::TimedOut, "strict worker did not exit after containment cleanup"),
+        }),
+        _ => Some(StrictWorkerCleanupError {
+            stage: StrictWorkerSpawnStage::Reap,
+            source: io::Error::last_os_error(),
+        }),
     }
-    None
 }
 
 fn drain_watcher(process_handle: OwnedHandle, timeout: Duration, keep: Arc<()>) {
@@ -977,16 +1073,51 @@ mod daemon_flag_tests {
     }
 
     #[test]
-    fn strict_worker_job_never_permits_breakaway() {
-        let flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    fn strict_worker_limits_default_to_kill_on_close_without_breakaway() {
+        let configuration = StrictWorkerLimits::default().job_configuration().unwrap();
+        let flags = configuration.limit_flags;
         assert_ne!(flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, 0);
         assert_eq!(flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY, 0);
+        assert_eq!(flags & JOB_OBJECT_LIMIT_JOB_MEMORY, 0);
     }
 
     #[test]
-    fn strict_worker_stage_keeps_nested_job_denial_semantic() {
-        assert_eq!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::AssignJob);
-        assert_ne!(StrictWorkerSpawnStage::AssignJob, StrictWorkerSpawnStage::Resume);
+    fn strict_worker_limits_map_every_requested_job_limit() {
+        let configuration = StrictWorkerLimits {
+            active_processes: Some(3),
+            process_memory_bytes: Some(4096),
+            job_memory_bytes: Some(8192),
+        }
+        .job_configuration()
+        .unwrap();
+        assert_eq!(configuration.active_processes, Some(3));
+        assert_eq!(configuration.process_memory_bytes, Some(4096));
+        assert_eq!(configuration.job_memory_bytes, Some(8192));
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_ACTIVE_PROCESS, 0);
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY, 0);
+        assert_ne!(configuration.limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY, 0);
+        assert_eq!(configuration.limit_flags & JOB_OBJECT_LIMIT_BREAKAWAY_OK, 0);
+    }
+
+    #[test]
+    fn strict_worker_limits_reject_zero_values_before_process_creation() {
+        assert_eq!(
+            StrictWorkerLimits { active_processes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroActiveProcesses)
+        );
+        assert_eq!(
+            StrictWorkerLimits { process_memory_bytes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroProcessMemory)
+        );
+        assert_eq!(
+            StrictWorkerLimits { job_memory_bytes: Some(0), ..StrictWorkerLimits::default() }
+                .job_configuration(),
+            Err(StrictWorkerLimitError::ZeroJobMemory)
+        );
     }
 
     #[test]
@@ -1022,7 +1153,15 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     Ok(OwnedHandle(job))
 }
 
-fn create_strict_worker_job() -> Result<OwnedHandle, (StrictWorkerSpawnStage, io::Error)> {
+fn create_strict_worker_job(
+    limits: StrictWorkerLimits,
+) -> Result<OwnedHandle, (StrictWorkerSpawnStage, io::Error)> {
+    let configuration = limits.job_configuration().map_err(|error| {
+        (
+            StrictWorkerSpawnStage::ConfigureJob,
+            io::Error::new(io::ErrorKind::InvalidInput, format!("invalid strict worker limit: {error:?}")),
+        )
+    })?;
     let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
     if job.is_null() || job == INVALID_HANDLE_VALUE {
         return Err((StrictWorkerSpawnStage::CreateJob, io::Error::last_os_error()));
@@ -1031,7 +1170,16 @@ fn create_strict_worker_job() -> Result<OwnedHandle, (StrictWorkerSpawnStage, io
     let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
     // Deliberately no JOB_OBJECT_LIMIT_BREAKAWAY_OK: this worker executes
     // hostile threaded Wasm and every descendant must remain killable.
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    info.BasicLimitInformation.LimitFlags = configuration.limit_flags;
+    if let Some(active_processes) = configuration.active_processes {
+        info.BasicLimitInformation.ActiveProcessLimit = active_processes;
+    }
+    if let Some(process_memory_bytes) = configuration.process_memory_bytes {
+        info.ProcessMemoryLimit = process_memory_bytes;
+    }
+    if let Some(job_memory_bytes) = configuration.job_memory_bytes {
+        info.JobMemoryLimit = job_memory_bytes;
+    }
     if unsafe {
         SetInformationJobObject(
             job.as_raw(),

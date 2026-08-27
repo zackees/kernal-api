@@ -1397,15 +1397,17 @@ fn define_closed_imports(
                         let Some(entry) = entry else {
                             return ChildOutcome::Trapped;
                         };
-                        match entry.call(&mut store, (tid, arg)) {
-                            Ok(()) => {
-                                child
-                                    .last_child_remaining_fuel
-                                    .store(store.get_fuel().unwrap_or(0), Ordering::Release);
-                                ChildOutcome::Completed
-                            }
+                        let outcome = match entry.call(&mut store, (tid, arg)) {
+                            Ok(()) => ChildOutcome::Completed,
                             Err(error) => map_child_error(&error),
-                        }
+                        };
+                        // Sample the Store after every entry outcome, including
+                        // OutOfFuel. This remains private bounded telemetry and
+                        // never exposes a Store through the facade.
+                        child
+                            .last_child_remaining_fuel
+                            .store(store.get_fuel().unwrap_or(0), Ordering::Release);
+                        outcome
                     }));
                     let outcome = match result {
                         Ok(outcome) => outcome,
@@ -1876,6 +1878,38 @@ mod threaded_root_observation_tests {
             assert!(observation.last_root_remaining_fuel <= 100);
             assert!(observation.last_child_remaining_fuel <= 10);
         }
+    }
+
+    #[test]
+    fn two_children_complete_within_the_fixed_fuel_partition() {
+        let bytes = fuel_rejection_fixture();
+        // 100 credits for the root plus two fixed 10-credit child slices. The
+        // root requests exactly two children, so the complete partition is
+        // within the configured 120-credit total.
+        let compiler = fuel_compiler_with_total(120, 100, 10);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Ok(ThreadedRootOutcome::Started),
+        );
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared observation");
+        assert_eq!(observation.accepted_child_registrations, 0);
+        assert_eq!(observation.live_threads, 0);
+        assert_eq!(observation.queued_join_handles, 0);
+        assert!(observation.last_root_remaining_fuel <= 100);
+        assert!(observation.last_child_remaining_fuel <= 10);
     }
 
     #[test]

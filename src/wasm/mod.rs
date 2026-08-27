@@ -510,10 +510,7 @@ fn check_signature(
     Ok(())
 }
 
-fn check_entrypoint_signature(
-    types: &[TypeEntry],
-    index: u32,
-) -> Result<(), SketchModuleError> {
+fn check_entrypoint_signature(types: &[TypeEntry], index: u32) -> Result<(), SketchModuleError> {
     let Some(TypeEntry::Function { params, results }) = types.get(index as usize) else {
         return Err(SketchModuleError::EntrypointMismatch);
     };

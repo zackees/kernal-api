@@ -170,7 +170,7 @@ fn wasm(f: F) -> Vec<u8> {
         text("kernal-api:v1", &mut i);
         text("kernel-yield", &mut i);
         i.push(0);
-        let non_function_index = 2 + u32::from(f.entry_param);
+        let non_function_index = 2 + u64::from(f.entry_param);
         leb(
             if f.non_function_yield {
                 non_function_index
@@ -185,7 +185,7 @@ fn wasm(f: F) -> Vec<u8> {
     section(2, i, &mut w);
     let mut fun = Vec::new();
     leb(1, &mut fun);
-    let non_function_index = 2 + u32::from(f.entry_param);
+    let non_function_index = 2 + u64::from(f.entry_param);
     leb(
         if f.non_function_entry {
             non_function_index

@@ -1,15 +1,17 @@
 //! Bounded admission of versioned core-Wasm sketches.
 //!
-//! This module does not instantiate or execute Wasm. Its only effect is one
-//! private Cranelift compilation after the complete binary admission contract
-//! has succeeded. No Wasmtime handle appears in the public API.
+//! Admission performs one private Cranelift compilation after the complete
+//! binary contract has succeeded. The threaded-root profile can then start in
+//! a fresh private store; no Wasmtime handle appears in the public API.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
-use wasmtime::{Config, Engine, Module, Strategy};
+use wasmtime::{
+    Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store, Strategy,
+};
 
 const PAGE_BYTES: u64 = 64 * 1024;
 const ABI_MODULE: &str = "kernal-api:v1";
@@ -26,6 +28,10 @@ const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
 const MAX_METADATA_BYTES: usize = 128;
 const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
+const ERRNO_SUCCESS: i32 = 0;
+const ERRNO_FAULT: i32 = 21;
+const THREAD_SPAWN_REJECTED: i32 = -1;
+const MAX_P1_IOVECS: usize = 1024;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -104,9 +110,14 @@ impl SketchCompiler {
             Module::new(&self.engine, bytes).map_err(|_| SketchModuleError::InvalidBinary)?;
         self.compilations.fetch_add(1, Ordering::Relaxed);
         Ok(AdmittedSketch {
+            engine: Arc::clone(&self.engine),
             module,
             module_bytes: bytes.len(),
             shared_memory: memory,
+            profile: policy.profile,
+            prepared_root: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            preparation_count: AtomicU64::new(0),
         })
     }
     /// Number of modules whose complete preflight reached private compilation.
@@ -162,9 +173,17 @@ impl SketchModulePolicy {
 
 /// An admitted module. The backend object is private to the crate.
 pub struct AdmittedSketch {
+    engine: Arc<Engine>,
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
+    profile: SketchAdmissionProfile,
+    prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
+    // A unit-only observation belongs to the admitted sketch, not the cached
+    // controller: it must survive any future controller replacement to prove
+    // the cache did not prepare a second private prelink/shared memory.
+    #[cfg(test)]
+    preparation_count: AtomicU64,
 }
 impl AdmittedSketch {
     pub fn module_bytes(&self) -> usize {
@@ -172,6 +191,106 @@ impl AdmittedSketch {
     }
     pub fn shared_memory(&self) -> SketchSharedMemory {
         self.shared_memory
+    }
+    /// Instantiates the admitted module in one fresh root store. Instantiation
+    /// is the sole entry operation: Wasmtime invokes the module start itself.
+    /// Child guest threads are deliberately unavailable until the next slice.
+    pub fn execute_threaded_root(
+        &self,
+        runtime: crate::async_engine::RuntimeHandle,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
+            return Err(SketchExecutionError::ThreadedProfileRequired);
+        }
+        let prepared = self.prepare_threaded_root()?;
+        let mut store = Store::new(
+            &self.engine,
+            ThreadStoreState {
+                controller: Arc::clone(&prepared.controller),
+                runtime: Some(runtime),
+            },
+        );
+        match prepared.prelink.instantiate(&mut store) {
+            Ok(_) => Ok(ThreadedRootOutcome::Started),
+            Err(error) => map_root_error(&error),
+        }
+    }
+    fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
+        let mut prepared = self
+            .prepared_root
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        if let Some(prepared) = prepared.as_ref() {
+            return Ok(Arc::clone(prepared));
+        }
+        let memory = SharedMemory::new(
+            &self.engine,
+            MemoryType::shared(
+                self.shared_memory.minimum_pages,
+                self.shared_memory.maximum_pages,
+            ),
+        )
+        .map_err(|_| SketchExecutionError::SharedMemoryUnavailable)?;
+        let controller = Arc::new(ThreadController {
+            memory,
+            prelink: OnceLock::new(),
+            kernel_yield_count: AtomicU64::new(0),
+            runtime_handle_count: AtomicU64::new(0),
+        });
+        let mut linker = Linker::new(&self.engine);
+        define_closed_imports(&mut linker)?;
+
+        // SharedMemory is engine-owned, so this bootstrap store is only used to
+        // register the import and never owns an instance or crosses a thread.
+        let bootstrap = Store::new(
+            &self.engine,
+            ThreadStoreState {
+                controller: Arc::clone(&controller),
+                runtime: None,
+            },
+        );
+        linker
+            .define(
+                &bootstrap,
+                MEMORY_MODULE,
+                MEMORY_NAME,
+                controller.memory.clone(),
+            )
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let prelink = Arc::new(
+            linker
+                .instantiate_pre(&self.module)
+                .map_err(|_| SketchExecutionError::PrelinkFailed)?,
+        );
+        controller
+            .prelink
+            .set(Arc::clone(&prelink))
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let prelink = Arc::clone(
+            controller
+                .prelink
+                .get()
+                .ok_or(SketchExecutionError::PrelinkFailed)?,
+        );
+
+        let prepared_root = Arc::new(PreparedThreadedRoot {
+            controller,
+            prelink,
+        });
+        #[cfg(test)]
+        self.preparation_count.fetch_add(1, Ordering::Relaxed);
+        *prepared = Some(Arc::clone(&prepared_root));
+        Ok(prepared_root)
+    }
+    #[cfg(test)]
+    fn root_execution_observation_for_test(&self) -> Option<RootExecutionObservation> {
+        let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
+        let controller = &prepared.controller;
+        Some(RootExecutionObservation {
+            preparations: self.preparation_count.load(Ordering::Relaxed),
+            kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
+            supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
+        })
     }
     #[allow(dead_code)]
     pub(crate) fn compiled_module(&self) -> &Module {
@@ -193,6 +312,442 @@ impl SketchSharedMemory {
     pub fn maximum_bytes(self) -> u64 {
         u64::from(self.maximum_pages) * PAGE_BYTES
     }
+}
+
+/// Result of executing the module's root start function.
+///
+/// This is intentionally semantic: backend stores, instances, and shared
+/// memories stay private to the sketch host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadedRootOutcome {
+    /// The module start completed without requesting process exit.
+    Started,
+    /// The module requested the normal `proc_exit(0)` completion path.
+    Exited,
+}
+
+/// Bounded failures from private threaded-root setup and start execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SketchExecutionError {
+    ThreadedProfileRequired,
+    SharedMemoryUnavailable,
+    PrelinkFailed,
+    NonzeroExit { code: i32 },
+    Trapped,
+}
+impl SketchExecutionError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ThreadedProfileRequired => "threaded-profile-required",
+            Self::SharedMemoryUnavailable => "shared-memory-unavailable",
+            Self::PrelinkFailed => "prelink-failed",
+            Self::NonzeroExit { .. } => "nonzero-exit",
+            Self::Trapped => "trapped",
+        }
+    }
+}
+impl fmt::Display for SketchExecutionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "threaded sketch execution failed ({})", self.code())
+    }
+}
+impl std::error::Error for SketchExecutionError {}
+
+struct ThreadController {
+    memory: SharedMemory,
+    // Callbacks reach their controller through ThreadStoreState. Keeping the
+    // prelink here breaks their otherwise cyclic construction without letting a
+    // Store or Instance escape to another thread.
+    prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
+    kernel_yield_count: AtomicU64,
+    runtime_handle_count: AtomicU64,
+}
+
+struct PreparedThreadedRoot {
+    controller: Arc<ThreadController>,
+    prelink: Arc<InstancePre<ThreadStoreState>>,
+}
+
+struct ThreadStoreState {
+    controller: Arc<ThreadController>,
+    runtime: Option<crate::async_engine::RuntimeHandle>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RootExecutionObservation {
+    preparations: u64,
+    kernel_yields: u64,
+    supplied_runtime_handles: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("private kernal-api proc_exit sentinel ({0})")]
+struct ProcExitSentinel(i32);
+
+fn define_closed_imports(
+    linker: &mut Linker<ThreadStoreState>,
+) -> Result<(), SketchExecutionError> {
+    linker
+        .func_wrap(
+            ABI_MODULE,
+            ABI_YIELD,
+            |caller: Caller<'_, ThreadStoreState>| {
+                // The facade handle is deliberately supplied by the caller. This
+                // slice has no scheduler yet, but must never construct a runtime.
+                let controller = &caller.data().controller;
+                controller
+                    .kernel_yield_count
+                    .fetch_add(1, Ordering::Relaxed);
+                if caller.data().runtime.is_some() {
+                    controller
+                        .runtime_handle_count
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let _ = controller.prelink.get();
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            THREAD_MODULE,
+            THREAD_SPAWN,
+            |_caller: Caller<'_, ThreadStoreState>, _arg: i32| -> i32 {
+                // #35 replaces this pure deterministic rejection with the owned
+                // child Store/Instance/native-thread bootstrap.
+                THREAD_SPAWN_REJECTED
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "clock_time_get",
+            |caller: Caller<'_, ThreadStoreState>, _id: i32, _precision: i64, output: i32| -> i32 {
+                write_shared(
+                    &caller.data().controller.memory,
+                    output,
+                    &0_u64.to_le_bytes(),
+                )
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "environ_get",
+            |caller: Caller<'_, ThreadStoreState>, _entries: i32, _buffer: i32| -> i32 {
+                // Empty environment: no guest memory is dereferenced.
+                let _ = &caller.data().controller.memory;
+                ERRNO_SUCCESS
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "environ_sizes_get",
+            |caller: Caller<'_, ThreadStoreState>, count: i32, bytes: i32| -> i32 {
+                let memory = &caller.data().controller.memory;
+                // Validate both output ranges before either write so a bad
+                // second pointer never causes a partial guest-memory update.
+                if shared_range(memory, count, 4).is_none()
+                    || shared_range(memory, bytes, 4).is_none()
+                {
+                    return ERRNO_FAULT;
+                }
+                write_shared(memory, count, &0_u32.to_le_bytes());
+                write_shared(memory, bytes, &0_u32.to_le_bytes())
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_write",
+            |caller: Caller<'_, ThreadStoreState>,
+             _fd: i32,
+             _iovecs: i32,
+             _iovecs_len: i32,
+             written: i32|
+             -> i32 {
+                // Output is intentionally discarded, but P1 still requires a
+                // complete validation of the iovec table and payload ranges.
+                let memory = &caller.data().controller.memory;
+                let result = validate_iovecs(memory, _iovecs, _iovecs_len);
+                if result != ERRNO_SUCCESS {
+                    return result;
+                }
+                write_shared(memory, written, &0_u32.to_le_bytes())
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "proc_exit",
+            |_caller: Caller<'_, ThreadStoreState>, _code: i32| -> wasmtime::Result<()> {
+                Err(wasmtime::Error::new(ProcExitSentinel(_code)))
+            },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "sched_yield",
+            |_caller: Caller<'_, ThreadStoreState>| -> i32 { ERRNO_SUCCESS },
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod threaded_root_observation_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_roots_reuse_one_preparation_and_receive_the_supplied_runtime() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        runtime.run(async {
+            assert_eq!(
+                sketch.execute_threaded_root(handle.clone()),
+                Ok(ThreadedRootOutcome::Started)
+            );
+            assert_eq!(
+                sketch.execute_threaded_root(handle),
+                Ok(ThreadedRootOutcome::Started)
+            );
+        });
+        assert_eq!(compiler.compiled_module_count(), 1);
+        assert_eq!(
+            sketch.root_execution_observation_for_test(),
+            Some(RootExecutionObservation {
+                preparations: 1,
+                kernel_yields: 2,
+                supplied_runtime_handles: 2,
+            })
+        );
+    }
+
+    fn leb(mut value: u32, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                return;
+            }
+        }
+    }
+    fn text(value: &str, output: &mut Vec<u8>) {
+        leb(value.len() as u32, output);
+        output.extend(value.as_bytes());
+    }
+    fn section(id: u8, body: Vec<u8>, output: &mut Vec<u8>) {
+        output.push(id);
+        leb(body.len() as u32, output);
+        output.extend(body);
+    }
+    fn custom(name: &str, value: &[u8], output: &mut Vec<u8>) {
+        let mut body = Vec::new();
+        text(name, &mut body);
+        body.extend(value);
+        section(0, body, output);
+    }
+
+    // Minimal exact ThreadedRustV1 profile whose start calls kernel-yield.
+    // Keeping it in this private unit module prevents test instrumentation
+    // from becoming a public sketch-host API.
+    fn threaded_yield_fixture() -> Vec<u8> {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        let mut types = Vec::new();
+        leb(9, &mut types);
+        types.extend([
+            0x60, 0, 0, 0x60, 1, 0x7f, 1, 0x7f, 0x60, 3, 0x7f, 0x7e, 0x7f, 1, 0x7f, 0x60, 2, 0x7f,
+            0x7f, 1, 0x7f, 0x60, 4, 0x7f, 0x7f, 0x7f, 0x7f, 1, 0x7f, 0x60, 1, 0x7f, 0, 0x60, 0, 1,
+            0x7f, 0x60, 0, 1, 0x7f, 0x60, 2, 0x7f, 0x7f, 0,
+        ]);
+        section(1, types, &mut wasm);
+        let mut imports = Vec::new();
+        leb(9, &mut imports);
+        text("env", &mut imports);
+        text("memory", &mut imports);
+        imports.extend([2, 3]);
+        leb(17, &mut imports);
+        leb(16_384, &mut imports);
+        text(ABI_MODULE, &mut imports);
+        text(ABI_YIELD, &mut imports);
+        imports.extend([0, 0]);
+        text(THREAD_MODULE, &mut imports);
+        text(THREAD_SPAWN, &mut imports);
+        imports.extend([0, 1]);
+        for (name, ty) in [
+            ("clock_time_get", 2),
+            ("environ_get", 3),
+            ("environ_sizes_get", 3),
+            ("fd_write", 4),
+            ("proc_exit", 5),
+            ("sched_yield", 6),
+        ] {
+            text("wasi_snapshot_preview1", &mut imports);
+            text(name, &mut imports);
+            imports.push(0);
+            leb(ty, &mut imports);
+        }
+        section(2, imports, &mut wasm);
+        let mut functions = Vec::new();
+        leb(5, &mut functions);
+        for ty in [0, 7, 8, 7, 0] {
+            leb(ty, &mut functions);
+        }
+        section(3, functions, &mut wasm);
+        let mut exports = Vec::new();
+        leb(5, &mut exports);
+        text("memory", &mut exports);
+        exports.push(2);
+        leb(0, &mut exports);
+        for (name, index) in [
+            ("_start", 8),
+            ("__main_void", 9),
+            ("wasi_thread_start", 10),
+            (ENTRY, 11),
+        ] {
+            text(name, &mut exports);
+            exports.push(0);
+            leb(index, &mut exports);
+        }
+        section(7, exports, &mut wasm);
+        section(8, vec![12], &mut wasm);
+        let mut code = Vec::new();
+        leb(5, &mut code);
+        code.extend([
+            2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 4, 0, 0x10, 0, 0x0b,
+        ]);
+        section(10, code, &mut wasm);
+        let mut features = Vec::new();
+        let names = [
+            "atomics",
+            "bulk-memory",
+            "bulk-memory-opt",
+            "call-indirect-overlong",
+            "extended-const",
+            "multivalue",
+            "mutable-globals",
+            "nontrapping-fptoint",
+            "reference-types",
+            "sign-ext",
+        ];
+        leb(names.len() as u32, &mut features);
+        for name in names {
+            features.push(b'+');
+            text(name, &mut features);
+        }
+        custom("target_features", &features, &mut wasm);
+        wasm
+    }
+}
+
+fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
+    let Some(cells) = shared_range(memory, offset, bytes.len()) else {
+        return ERRNO_FAULT;
+    };
+    for (cell, byte) in cells.iter().zip(bytes) {
+        // SAFETY: UnsafeCell<u8> has alignment 1, matching AtomicU8. The
+        // SharedMemory owns and pins this backing allocation for its lifetime,
+        // and every host access to concurrently reachable guest bytes in this
+        // module uses AtomicU8 (never a plain dereference).
+        unsafe { AtomicU8::from_ptr(cell.get()) }.store(*byte, Ordering::Relaxed);
+    }
+    ERRNO_SUCCESS
+}
+
+fn validate_iovecs(memory: &SharedMemory, iovecs: i32, iovecs_len: i32) -> i32 {
+    let Ok(iovecs_len) = usize::try_from(iovecs_len) else {
+        return ERRNO_FAULT;
+    };
+    if iovecs_len > MAX_P1_IOVECS {
+        return ERRNO_FAULT;
+    }
+    let Some(descriptor_bytes) = iovecs_len.checked_mul(8) else {
+        return ERRNO_FAULT;
+    };
+    if shared_range(memory, iovecs, descriptor_bytes).is_none() {
+        return ERRNO_FAULT;
+    }
+    let base = match usize::try_from(iovecs) {
+        Ok(base) => base,
+        Err(_) => return ERRNO_FAULT,
+    };
+    for index in 0..iovecs_len {
+        let Some(offset) = index
+            .checked_mul(8)
+            .and_then(|delta| base.checked_add(delta))
+        else {
+            return ERRNO_FAULT;
+        };
+        let Ok(offset) = i32::try_from(offset) else {
+            return ERRNO_FAULT;
+        };
+        let Some(payload) = read_shared_u32(memory, offset) else {
+            return ERRNO_FAULT;
+        };
+        let Some(length) = read_shared_u32(memory, offset.saturating_add(4)) else {
+            return ERRNO_FAULT;
+        };
+        if shared_range(memory, payload as i32, length as usize).is_none() {
+            return ERRNO_FAULT;
+        }
+    }
+    ERRNO_SUCCESS
+}
+
+fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
+    let cells = shared_range(memory, offset, 4)?;
+    let mut bytes = [0_u8; 4];
+    for (destination, cell) in bytes.iter_mut().zip(cells) {
+        // SAFETY: UnsafeCell<u8> has AtomicU8-compatible alignment and belongs
+        // to the live SharedMemory. This module's host-side shared-byte access
+        // invariant is atomic-only; AtomicU8 avoids a plain concurrent load.
+        *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+    }
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn shared_range(
+    memory: &SharedMemory,
+    offset: i32,
+    length: usize,
+) -> Option<&[std::cell::UnsafeCell<u8>]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(length)?;
+    memory.data().get(offset..end)
+}
+
+fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    if let Some(exit) = error.downcast_ref::<ProcExitSentinel>() {
+        return if exit.0 == 0 {
+            Ok(ThreadedRootOutcome::Exited)
+        } else {
+            Err(SketchExecutionError::NonzeroExit { code: exit.0 })
+        };
+    }
+    Err(SketchExecutionError::Trapped)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

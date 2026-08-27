@@ -51,6 +51,10 @@ struct F {
     start: bool,
     duplicate: bool,
     bad_meta: bool,
+    duplicate_memory: bool,
+    alternate_memory: bool,
+    custom_page_size: bool,
+    oversized_metadata: bool,
 }
 impl Default for F {
     fn default() -> Self {
@@ -65,6 +69,10 @@ impl Default for F {
             start: false,
             duplicate: false,
             bad_meta: false,
+            duplicate_memory: false,
+            alternate_memory: false,
+            custom_page_size: false,
+            oversized_metadata: false,
         }
     }
 }
@@ -79,7 +87,10 @@ fn wasm(f: F) -> Vec<u8> {
     section(1, t, &mut w);
     let mut i = Vec::new();
     leb(
-        (1 + u32::from(f.thread) + u32::from(f.yield_)) as u64,
+        (1 + u32::from(f.thread)
+            + u32::from(f.yield_)
+            + u32::from(f.duplicate_memory)
+            + u32::from(f.alternate_memory)) as u64,
         &mut i,
     );
     text("env", &mut i);
@@ -92,10 +103,32 @@ fn wasm(f: F) -> Vec<u8> {
     if f.mem64 {
         flags |= 4
     };
+    if f.custom_page_size {
+        flags |= 8
+    };
     leb(flags, &mut i);
     leb(1, &mut i);
     if let Some(x) = f.max {
         leb(x as u64, &mut i)
+    };
+    if f.custom_page_size {
+        leb(0, &mut i)
+    };
+    if f.duplicate_memory {
+        text("env", &mut i);
+        text("memory", &mut i);
+        i.push(2);
+        leb(3, &mut i);
+        leb(3, &mut i);
+        leb(3, &mut i);
+    };
+    if f.alternate_memory {
+        text("other", &mut i);
+        text("memory", &mut i);
+        i.push(2);
+        leb(3, &mut i);
+        leb(1, &mut i);
+        leb(1, &mut i);
     };
     if f.thread {
         text("wasi", &mut i);
@@ -137,6 +170,9 @@ fn wasm(f: F) -> Vec<u8> {
     );
     if f.duplicate {
         custom("kernal-api.abi", b"v1", &mut w)
+    };
+    if f.oversized_metadata {
+        custom("kernal-api.profile", &[b'x'; 129], &mut w)
     };
     custom("kernal-api.profile", b"threaded-core-wasm-v1", &mut w);
     w
@@ -181,6 +217,32 @@ fn memory_forms_are_rejected_precompile() {
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::Memory64)
     ));
+    let mut f = F::default();
+    f.custom_page_size = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::UnsupportedMemoryPageSize)
+    ));
+}
+#[test]
+fn duplicate_and_alternate_memory_imports_are_rejected_precompile() {
+    let c = compiler();
+    let mut f = F::default();
+    f.duplicate_memory = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::MultipleMemoryImports)
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+
+    let mut f = F::default();
+    f.alternate_memory = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ForbiddenImport { module, name })
+            if module == "other" && name == "memory"
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
 }
 #[test]
 fn metadata_start_and_export_allowlist_are_strict() {
@@ -202,6 +264,12 @@ fn metadata_start_and_export_allowlist_are_strict() {
     assert!(matches!(
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::MetadataMismatch { .. })
+    ));
+    let mut f = F::default();
+    f.oversized_metadata = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::MetadataTooLarge { .. })
     ));
     for k in [0, 1, 2, 3, 4] {
         let mut f = F::default();

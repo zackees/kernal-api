@@ -10,8 +10,7 @@ use std::sync::{Arc, OnceLock};
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
-    Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store,
-    Strategy,
+    Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store, Strategy,
 };
 
 const PAGE_BYTES: u64 = 64 * 1024;
@@ -31,7 +30,8 @@ const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
 const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
-const ERRNO_THREAD_SPAWN_UNAVAILABLE: i32 = 11;
+const THREAD_SPAWN_REJECTED: i32 = -1;
+const MAX_P1_IOVECS: usize = 1024;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -114,6 +114,8 @@ impl SketchCompiler {
             module,
             module_bytes: bytes.len(),
             shared_memory: memory,
+            profile: policy.profile,
+            prepared_root: std::sync::Mutex::new(None),
         })
     }
     /// Number of modules whose complete preflight reached private compilation.
@@ -173,6 +175,8 @@ pub struct AdmittedSketch {
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
+    profile: SketchAdmissionProfile,
+    prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
 }
 impl AdmittedSketch {
     pub fn module_bytes(&self) -> usize {
@@ -188,6 +192,37 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
+            return Err(SketchExecutionError::ThreadedProfileRequired);
+        }
+        let prepared = self.prepare_threaded_root()?;
+        let mut store = Store::new(
+            &self.engine,
+            ThreadStoreState {
+                controller: Arc::clone(&prepared.controller),
+                runtime: Some(runtime),
+            },
+        );
+        match prepared.prelink.instantiate(&mut store) {
+            Ok(_) => Ok(ThreadedRootOutcome::Started),
+            Err(error) => map_root_error(&error),
+        }
+    }
+    #[doc(hidden)]
+    pub fn threaded_root_preparation_count_for_test(&self) -> u64 {
+        self.prepared_root
+            .lock()
+            .map(|prepared| u64::from(prepared.is_some()))
+            .unwrap_or(0)
+    }
+    fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
+        let mut prepared = self
+            .prepared_root
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        if let Some(prepared) = prepared.as_ref() {
+            return Ok(Arc::clone(prepared));
+        }
         let memory = SharedMemory::new(
             &self.engine,
             MemoryType::shared(
@@ -209,11 +244,16 @@ impl AdmittedSketch {
             &self.engine,
             ThreadStoreState {
                 controller: Arc::clone(&controller),
-                runtime: runtime.clone(),
+                runtime: None,
             },
         );
         linker
-            .define(&bootstrap, MEMORY_MODULE, MEMORY_NAME, controller.memory.clone())
+            .define(
+                &bootstrap,
+                MEMORY_MODULE,
+                MEMORY_NAME,
+                controller.memory.clone(),
+            )
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         let prelink = Arc::new(
             linker
@@ -231,17 +271,12 @@ impl AdmittedSketch {
                 .ok_or(SketchExecutionError::PrelinkFailed)?,
         );
 
-        let mut store = Store::new(
-            &self.engine,
-            ThreadStoreState {
-                controller,
-                runtime: runtime.clone(),
-            },
-        );
-        match prelink.instantiate(&mut store) {
-            Ok(_) => Ok(ThreadedRootOutcome::Started),
-            Err(error) => map_root_error(&error),
-        }
+        let prepared_root = Arc::new(PreparedThreadedRoot {
+            controller,
+            prelink,
+        });
+        *prepared = Some(Arc::clone(&prepared_root));
+        Ok(prepared_root)
     }
     #[allow(dead_code)]
     pub(crate) fn compiled_module(&self) -> &Module {
@@ -280,6 +315,7 @@ pub enum ThreadedRootOutcome {
 /// Bounded failures from private threaded-root setup and start execution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SketchExecutionError {
+    ThreadedProfileRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
@@ -288,6 +324,7 @@ pub enum SketchExecutionError {
 impl SketchExecutionError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::ThreadedProfileRequired => "threaded-profile-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -310,9 +347,14 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
 }
 
+struct PreparedThreadedRoot {
+    controller: Arc<ThreadController>,
+    prelink: Arc<InstancePre<ThreadStoreState>>,
+}
+
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
-    runtime: crate::async_engine::RuntimeHandle,
+    runtime: Option<crate::async_engine::RuntimeHandle>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -323,12 +365,16 @@ fn define_closed_imports(
     linker: &mut Linker<ThreadStoreState>,
 ) -> Result<(), SketchExecutionError> {
     linker
-        .func_wrap(ABI_MODULE, ABI_YIELD, |caller: Caller<'_, ThreadStoreState>| {
-            // The facade handle is deliberately supplied by the caller. This
-            // slice has no scheduler yet, but must never construct a runtime.
-            let _ = caller.data().runtime.clone();
-            let _ = caller.data().controller.prelink.get();
-        })
+        .func_wrap(
+            ABI_MODULE,
+            ABI_YIELD,
+            |caller: Caller<'_, ThreadStoreState>| {
+                // The facade handle is deliberately supplied by the caller. This
+                // slice has no scheduler yet, but must never construct a runtime.
+                let _ = caller.data().runtime.as_ref();
+                let _ = caller.data().controller.prelink.get();
+            },
+        )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
     linker
         .func_wrap(
@@ -337,7 +383,7 @@ fn define_closed_imports(
             |_caller: Caller<'_, ThreadStoreState>, _arg: i32| -> i32 {
                 // #35 replaces this pure deterministic rejection with the owned
                 // child Store/Instance/native-thread bootstrap.
-                ERRNO_THREAD_SPAWN_UNAVAILABLE
+                THREAD_SPAWN_REJECTED
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -346,12 +392,12 @@ fn define_closed_imports(
         .func_wrap(
             "wasi_snapshot_preview1",
             "clock_time_get",
-            |caller: Caller<'_, ThreadStoreState>,
-             _id: i32,
-             _precision: i64,
-             output: i32|
-             -> i32 {
-                write_shared(&caller.data().controller.memory, output, &0_u64.to_le_bytes())
+            |caller: Caller<'_, ThreadStoreState>, _id: i32, _precision: i64, output: i32| -> i32 {
+                write_shared(
+                    &caller.data().controller.memory,
+                    output,
+                    &0_u64.to_le_bytes(),
+                )
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -371,12 +417,16 @@ fn define_closed_imports(
             "wasi_snapshot_preview1",
             "environ_sizes_get",
             |caller: Caller<'_, ThreadStoreState>, count: i32, bytes: i32| -> i32 {
-                let count =
-                    write_shared(&caller.data().controller.memory, count, &0_u32.to_le_bytes());
-                if count != ERRNO_SUCCESS {
-                    return count;
+                let memory = &caller.data().controller.memory;
+                // Validate both output ranges before either write so a bad
+                // second pointer never causes a partial guest-memory update.
+                if shared_range(memory, count, 4).is_none()
+                    || shared_range(memory, bytes, 4).is_none()
+                {
+                    return ERRNO_FAULT;
                 }
-                write_shared(&caller.data().controller.memory, bytes, &0_u32.to_le_bytes())
+                write_shared(memory, count, &0_u32.to_le_bytes());
+                write_shared(memory, bytes, &0_u32.to_le_bytes())
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -390,9 +440,14 @@ fn define_closed_imports(
              _iovecs_len: i32,
              written: i32|
              -> i32 {
-                // Output is intentionally discarded. We only write a checked
-                // zero-length result, never inspect untrusted iovecs.
-                write_shared(&caller.data().controller.memory, written, &0_u32.to_le_bytes())
+                // Output is intentionally discarded, but P1 still requires a
+                // complete validation of the iovec table and payload ranges.
+                let memory = &caller.data().controller.memory;
+                let result = validate_iovecs(memory, _iovecs, _iovecs_len);
+                if result != ERRNO_SUCCESS {
+                    return result;
+                }
+                write_shared(memory, written, &0_u32.to_le_bytes())
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -416,14 +471,7 @@ fn define_closed_imports(
 }
 
 fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
-    let Ok(offset) = usize::try_from(offset) else {
-        return ERRNO_FAULT;
-    };
-    let Some(end) = offset.checked_add(bytes.len()) else {
-        return ERRNO_FAULT;
-    };
-    let data = memory.data();
-    let Some(cells) = data.get(offset..end) else {
+    let Some(cells) = shared_range(memory, offset, bytes.len()) else {
         return ERRNO_FAULT;
     };
     for (cell, byte) in cells.iter().zip(bytes) {
@@ -431,6 +479,65 @@ fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
         unsafe { AtomicU8::from_ptr(cell.get()) }.store(*byte, Ordering::Relaxed);
     }
     ERRNO_SUCCESS
+}
+
+fn validate_iovecs(memory: &SharedMemory, iovecs: i32, iovecs_len: i32) -> i32 {
+    let Ok(iovecs_len) = usize::try_from(iovecs_len) else {
+        return ERRNO_FAULT;
+    };
+    if iovecs_len > MAX_P1_IOVECS {
+        return ERRNO_FAULT;
+    }
+    let Some(descriptor_bytes) = iovecs_len.checked_mul(8) else {
+        return ERRNO_FAULT;
+    };
+    if shared_range(memory, iovecs, descriptor_bytes).is_none() {
+        return ERRNO_FAULT;
+    }
+    let base = match usize::try_from(iovecs) {
+        Ok(base) => base,
+        Err(_) => return ERRNO_FAULT,
+    };
+    for index in 0..iovecs_len {
+        let Some(offset) = index
+            .checked_mul(8)
+            .and_then(|delta| base.checked_add(delta))
+        else {
+            return ERRNO_FAULT;
+        };
+        let Ok(offset) = i32::try_from(offset) else {
+            return ERRNO_FAULT;
+        };
+        let Some(payload) = read_shared_u32(memory, offset) else {
+            return ERRNO_FAULT;
+        };
+        let Some(length) = read_shared_u32(memory, offset.saturating_add(4)) else {
+            return ERRNO_FAULT;
+        };
+        if shared_range(memory, payload as i32, length as usize).is_none() {
+            return ERRNO_FAULT;
+        }
+    }
+    ERRNO_SUCCESS
+}
+
+fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
+    let cells = shared_range(memory, offset, 4)?;
+    let mut bytes = [0_u8; 4];
+    for (destination, cell) in bytes.iter_mut().zip(cells) {
+        *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+    }
+    Some(u32::from_le_bytes(bytes))
+}
+
+fn shared_range(
+    memory: &SharedMemory,
+    offset: i32,
+    length: usize,
+) -> Option<&[std::cell::UnsafeCell<u8>]> {
+    let offset = usize::try_from(offset).ok()?;
+    let end = offset.checked_add(length)?;
+    memory.data().get(offset..end)
 }
 
 fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, SketchExecutionError> {

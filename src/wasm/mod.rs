@@ -33,7 +33,7 @@ const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
 const MAX_P1_IOVECS: usize = 1024;
-const MAX_GUEST_THREADS: usize = 16;
+const DEFAULT_MAX_GUEST_THREADS: usize = 16;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -116,6 +116,7 @@ impl SketchCompiler {
             module,
             module_bytes: bytes.len(),
             shared_memory: memory,
+            max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
             prepared_root: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -132,6 +133,7 @@ impl SketchCompiler {
 pub struct SketchModulePolicy {
     max_module_bytes: usize,
     max_shared_memory_pages: u32,
+    max_guest_threads: usize,
     profile: SketchAdmissionProfile,
 }
 impl SketchModulePolicy {
@@ -148,6 +150,7 @@ impl SketchModulePolicy {
         Ok(Self {
             max_module_bytes,
             max_shared_memory_pages,
+            max_guest_threads: DEFAULT_MAX_GUEST_THREADS,
             profile: SketchAdmissionProfile::SyntheticV1,
         })
     }
@@ -168,6 +171,18 @@ impl SketchModulePolicy {
     pub fn max_shared_memory_pages(self) -> u32 {
         self.max_shared_memory_pages
     }
+    /// Bounds live guest-owned native threads for one admitted sketch. The
+    /// limit is a semantic controller quota, not a Wasmtime pooling setting.
+    pub fn with_max_guest_threads(mut self, maximum: usize) -> Result<Self, SketchModuleError> {
+        if maximum == 0 {
+            return Err(SketchModuleError::InvalidThreadLimit);
+        }
+        self.max_guest_threads = maximum;
+        Ok(self)
+    }
+    pub fn max_guest_threads(self) -> usize {
+        self.max_guest_threads
+    }
     pub fn profile(self) -> SketchAdmissionProfile {
         self.profile
     }
@@ -179,6 +194,7 @@ pub struct AdmittedSketch {
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
+    max_guest_threads: usize,
     profile: SketchAdmissionProfile,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
@@ -214,21 +230,31 @@ impl AdmittedSketch {
                 runtime: Some(runtime),
             },
         );
-        let instance = match prepared.prelink.instantiate(&mut store) {
-            Ok(instance) => instance,
-            Err(error) => return map_root_error(&error),
-        };
-        let start = instance
-            .get_typed_func::<(), ()>(&mut store, "_start")
-            .map_err(|_| SketchExecutionError::Trapped)?;
-        let outcome = start
-            .call(&mut store, ())
-            .map(|_| ThreadedRootOutcome::Started)
-            .or_else(|e| map_root_error(&e));
+        // Do not return from this scope before finalization. A Wasm start
+        // section can invoke thread-spawn while instantiation is still in
+        // progress, and lookup/call failures after that must still close and
+        // drain every accepted native child.
+        let outcome = (|| {
+            let instance = match prepared.prelink.instantiate(&mut store) {
+                Ok(instance) => instance,
+                Err(error) => return map_root_error(&error),
+            };
+            let start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .map_err(|_| SketchExecutionError::Trapped)?;
+            start
+                .call(&mut store, ())
+                .map(|_| ThreadedRootOutcome::Started)
+                .or_else(|error| map_root_error(&error))
+        })();
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
-        prepared.controller.join_completed()?;
+        let children = prepared.controller.join_completed();
+        // A child outcome is never silently lost. Prefer it to a concurrent
+        // root failure because it is ordered by the guest-assigned TID and
+        // precisely identifies the accepted work that was drained.
+        children?;
         outcome
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
@@ -255,6 +281,7 @@ impl AdmittedSketch {
                 next_tid: 1,
                 live: 0,
                 closing: false,
+                maximum: self.max_guest_threads,
                 handles: Vec::new(),
                 outcomes: Vec::new(),
             }),
@@ -398,8 +425,11 @@ struct Workers {
     next_tid: i32,
     live: usize,
     closing: bool,
+    maximum: usize,
     handles: Vec<JoinHandle<()>>,
-    outcomes: Vec<ChildOutcome>,
+    // Completion is inherently concurrent; retain the guest TID so reporting
+    // is deterministic rather than depending on native scheduler order.
+    outcomes: Vec<(i32, ChildOutcome)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,7 +463,7 @@ impl ThreadController {
                         .workers
                         .lock()
                         .map_err(|_| SketchExecutionError::ChildPanicked)?;
-                    workers.outcomes.push(ChildOutcome::Panicked);
+                    workers.outcomes.push((i32::MAX, ChildOutcome::Panicked));
                 }
             }
         }
@@ -441,18 +471,19 @@ impl ThreadController {
             .workers
             .lock()
             .map_err(|_| SketchExecutionError::ChildPanicked)?;
-        let outcome = workers
-            .outcomes
-            .drain(..)
-            .find(|outcome| !matches!(outcome, ChildOutcome::Completed | ChildOutcome::Exited));
+        let mut outcomes: Vec<_> = workers.outcomes.drain(..).collect();
+        outcomes.sort_by_key(|(tid, _)| *tid);
+        let outcome = outcomes.into_iter().find(|(_, outcome)| {
+            !matches!(outcome, ChildOutcome::Completed | ChildOutcome::Exited)
+        });
         workers.closing = false;
         match outcome {
-            None | Some(ChildOutcome::Completed | ChildOutcome::Exited) => Ok(()),
-            Some(ChildOutcome::NonzeroExit(code)) => {
+            None | Some((_, ChildOutcome::Completed | ChildOutcome::Exited)) => Ok(()),
+            Some((_, ChildOutcome::NonzeroExit(code))) => {
                 Err(SketchExecutionError::ChildNonzeroExit { code })
             }
-            Some(ChildOutcome::Trapped) => Err(SketchExecutionError::ChildTrapped),
-            Some(ChildOutcome::Panicked) => Err(SketchExecutionError::ChildPanicked),
+            Some((_, ChildOutcome::Trapped)) => Err(SketchExecutionError::ChildTrapped),
+            Some((_, ChildOutcome::Panicked)) => Err(SketchExecutionError::ChildPanicked),
         }
     }
 }
@@ -510,11 +541,7 @@ fn define_closed_imports(
                 let controller = Arc::clone(&caller.data().controller);
                 let runtime = caller.data().runtime.clone();
                 let tid = match controller.workers.lock() {
-                    Ok(mut w)
-                        if !w.closing
-                            && w.live < MAX_GUEST_THREADS
-                            && w.next_tid <= 0x1fff_ffff =>
-                    {
+                    Ok(mut w) if !w.closing && w.live < w.maximum && w.next_tid <= 0x1fff_ffff => {
                         let tid = w.next_tid;
                         w.next_tid += 1;
                         w.live += 1;
@@ -557,7 +584,7 @@ fn define_closed_imports(
                     };
                     if let Ok(mut w) = child.workers.lock() {
                         w.live = w.live.saturating_sub(1);
-                        w.outcomes.push(outcome);
+                        w.outcomes.push((tid, outcome));
                     }
                 });
                 match spawned {
@@ -950,6 +977,7 @@ pub enum SketchModuleError {
     InvalidBinary,
     InvalidModuleLimit,
     InvalidSharedMemoryLimit,
+    InvalidThreadLimit,
     ForbiddenImport {
         module: String,
         name: String,
@@ -1014,6 +1042,7 @@ impl SketchModuleError {
             Self::InvalidBinary => "invalid-binary",
             Self::InvalidModuleLimit => "invalid-module-limit",
             Self::InvalidSharedMemoryLimit => "invalid-shared-memory-limit",
+            Self::InvalidThreadLimit => "invalid-thread-limit",
             Self::ForbiddenImport { .. } => "forbidden-import",
             Self::ImportTypeMismatch { .. } => "import-type-mismatch",
             Self::MissingRequiredImport { .. } => "missing-required-import",

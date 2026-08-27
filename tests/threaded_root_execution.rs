@@ -99,14 +99,17 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
 
     let bytes = threaded_root_wasm(None, true, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-    let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
+    let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384)
+        .expect("policy")
+        .with_max_guest_threads(1)
+        .expect("one child cap");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
-    let error = runtime.run(async {
+    let outcome = runtime.run(async {
         sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
     });
     assert_eq!(
-        error.expect_err("the owned child proc_exit must reach the root join"),
-        SketchExecutionError::ChildNonzeroExit { code: 9 },
+        outcome.expect("the second spawn must be rejected without a reservation leak"),
+        ThreadedRootOutcome::Started,
     );
 }
 
@@ -235,8 +238,10 @@ fn threaded_root_wasm(
     // joined before execute_threaded_root returns.
     if assert_thread_spawn_rejection {
         code.extend([
-            7, 0, 0x41, 0, 0x10, 1, 0x1a, 0x0b, // root: spawn then drop TID
-            4, 0, 0x41, 0, 0x0b, 6, 0, 0x41, 9, 0x10, 6, 0x0b, // child: proc_exit(9)
+            // The first child gets opaque arg 0. The configured cap rejects
+            // the second arg-1 request; if admitted it exits nonzero below.
+            12, 0, 0x41, 0, 0x10, 1, 0x1a, 0x41, 1, 0x10, 1, 0x1a, 0x0b, 4, 0, 0x41, 0, 0x0b, 6, 0,
+            0x20, 1, 0x10, 6, 0x0b, // child: proc_exit(arg)
             4, 0, 0x41, 0, 0x0b,
         ]);
     } else {

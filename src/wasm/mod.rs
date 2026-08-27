@@ -24,6 +24,7 @@ const ABI_METADATA_VALUE: &[u8] = b"v1";
 const PROFILE_METADATA: &str = "kernal-api.profile";
 const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
 const MAX_METADATA_BYTES: usize = 128;
+const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
@@ -247,6 +248,10 @@ pub enum SketchModuleError {
         maximum_pages: u64,
         policy_pages: u32,
     },
+    ThreadedMemoryMismatch {
+        minimum_pages: u32,
+        maximum_pages: u32,
+    },
     MissingMetadata {
         name: &'static str,
     },
@@ -291,6 +296,7 @@ impl SketchModuleError {
             Self::SharedMemoryWithoutMaximum => "shared-memory-without-maximum",
             Self::MemoryInitialExceedsMaximum { .. } => "memory-initial-exceeds-maximum",
             Self::SharedMemoryExceedsPolicy { .. } => "shared-memory-exceeds-policy",
+            Self::ThreadedMemoryMismatch { .. } => "threaded-memory-mismatch",
             Self::MissingMetadata { .. } => "missing-metadata",
             Self::DuplicateMetadata { .. } => "duplicate-metadata",
             Self::MetadataMismatch { .. } => "metadata-mismatch",
@@ -800,6 +806,14 @@ fn preflight_threaded_rust(
         }
     }
     let memory = memory.ok_or(SketchModuleError::MissingSharedMemory)?;
+    if memory.minimum_pages != THREADED_RUST_INITIAL_PAGES
+        || memory.maximum_pages != THREADED_RUST_MAX_PAGES
+    {
+        return Err(SketchModuleError::ThreadedMemoryMismatch {
+            minimum_pages: memory.minimum_pages,
+            maximum_pages: memory.maximum_pages,
+        });
+    }
     if policy.max_shared_memory_pages < THREADED_RUST_MAX_PAGES {
         return Err(SketchModuleError::SharedMemoryExceedsPolicy {
             minimum_pages: memory.minimum_pages.into(),
@@ -827,13 +841,22 @@ fn preflight_threaded_rust(
         });
     }
     let features = target_features.ok_or(SketchModuleError::MissingTargetFeatures)?;
-    if !["atomics", "bulk-memory", "mutable-globals"]
-        .iter()
-        .all(|feature| features.contains(*feature))
-        || ["simd128", "relaxed-simd", "memory64"]
-            .iter()
-            .any(|feature| features.contains(*feature))
-    {
+    let expected_features = [
+        "atomics",
+        "bulk-memory",
+        "bulk-memory-opt",
+        "call-indirect-overlong",
+        "extended-const",
+        "multivalue",
+        "mutable-globals",
+        "nontrapping-fptoint",
+        "reference-types",
+        "sign-ext",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    if features != expected_features {
         return Err(SketchModuleError::TargetFeaturesMismatch);
     }
     let allowed = [
@@ -895,6 +918,10 @@ fn preflight_threaded_rust(
             .ok_or(SketchModuleError::EntrypointMismatch)?;
         check_signature(&types, type_index, signature, ABI_MODULE, name)?;
     }
+    // Rust emits a dedicated () -> () start function. It is intentionally not
+    // required to equal exported `_start`: import admission, not that identity,
+    // defines the authority boundary, and the deterministic Rust artifact uses
+    // distinct functions.
     let start = start.ok_or(SketchModuleError::StartMismatch)?;
     let start_type = function_type(start, &imported_function_types, &functions)
         .ok_or(SketchModuleError::StartMismatch)?;
@@ -981,7 +1008,9 @@ fn parse_target_features(
                 .ok_or(SketchModuleError::TargetFeaturesMismatch)?,
         )
         .map_err(|_| SketchModuleError::TargetFeaturesMismatch)?;
-        result.insert(bounded(name));
+        if !result.insert(bounded(name)) {
+            return Err(SketchModuleError::TargetFeaturesMismatch);
+        }
         offset = end;
     }
     if offset != data.len() {

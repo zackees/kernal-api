@@ -95,6 +95,10 @@ struct RawThreaded {
     wrong_memory_export: bool,
     missing_feature: bool,
     forbidden_feature: bool,
+    disabled_feature: bool,
+    duplicate_feature: bool,
+    memory_initial: u32,
+    memory_maximum: u32,
 }
 
 fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
@@ -122,8 +126,23 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     leb(9 + u32::from(options.extra_p1_import), &mut imports);
     text("env", &mut imports);
     text("memory", &mut imports);
-    imports.extend([2, 3, 1]);
-    leb(16_384, &mut imports);
+    imports.extend([2, 3]);
+    leb(
+        if options.memory_initial == 0 {
+            17
+        } else {
+            options.memory_initial
+        },
+        &mut imports,
+    );
+    leb(
+        if options.memory_maximum == 0 {
+            16_384
+        } else {
+            options.memory_maximum
+        },
+        &mut imports,
+    );
     text("kernal-api:v1", &mut imports);
     text("kernel-yield", &mut imports);
     imports.extend([0, 0]);
@@ -152,7 +171,7 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     section(2, imports, &mut wasm);
 
     let mut functions = Vec::new();
-    leb(4, &mut functions);
+    leb(5, &mut functions);
     leb(0, &mut functions); // _start
     leb(7, &mut functions); // __main_void
     leb(8, &mut functions); // wasi_thread_start
@@ -160,6 +179,7 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
         if options.wrong_entry_signature { 0 } else { 7 },
         &mut functions,
     );
+    leb(0, &mut functions); // dedicated, unexported Rust start function
     section(3, functions, &mut wasm);
 
     let imported_functions = 8 + u32::from(options.extra_p1_import);
@@ -203,16 +223,16 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
                 (if options.mismatched_start {
                     imported_functions + 1
                 } else {
-                    imported_functions
+                    imported_functions + 4
                 }) as u8,
             ],
             &mut wasm,
         );
     }
 
-    // Four defined bodies, matching the four defined functions above.
+    // Five bodies include the dedicated, unexported start function.
     let mut code = Vec::new();
-    leb(4, &mut code);
+    leb(5, &mut code);
     code.extend([2, 0, 0x0b]);
     code.extend([4, 0, 0x41, 0, 0x0b]);
     code.extend([2, 0, 0x0b]);
@@ -221,19 +241,38 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     } else {
         code.extend([4, 0, 0x41, 0, 0x0b]);
     }
+    code.extend([2, 0, 0x0b]);
     section(10, code, &mut wasm);
 
     let mut features = Vec::new();
-    let feature_names: &[&str] = if options.missing_feature {
-        &["atomics", "bulk-memory"]
-    } else if options.forbidden_feature {
-        &["atomics", "bulk-memory", "mutable-globals", "simd128"]
-    } else {
-        &["atomics", "bulk-memory", "mutable-globals"]
-    };
+    let mut feature_names = vec![
+        "atomics",
+        "bulk-memory",
+        "bulk-memory-opt",
+        "call-indirect-overlong",
+        "extended-const",
+        "multivalue",
+        "mutable-globals",
+        "nontrapping-fptoint",
+        "reference-types",
+        "sign-ext",
+    ];
+    if options.missing_feature {
+        feature_names.pop();
+    }
+    if options.forbidden_feature {
+        feature_names.push("simd128");
+    }
+    if options.duplicate_feature {
+        feature_names.push("atomics");
+    }
     leb(feature_names.len() as u32, &mut features);
     for name in feature_names {
-        features.push(b'+');
+        features.push(if options.disabled_feature && name == "atomics" {
+            b'-'
+        } else {
+            b'+'
+        });
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
@@ -324,6 +363,40 @@ fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
                 ..Default::default()
             },
             SketchModuleError::TargetFeaturesMismatch,
+        ),
+        (
+            RawThreaded {
+                disabled_feature: true,
+                ..Default::default()
+            },
+            SketchModuleError::TargetFeaturesMismatch,
+        ),
+        (
+            RawThreaded {
+                duplicate_feature: true,
+                ..Default::default()
+            },
+            SketchModuleError::TargetFeaturesMismatch,
+        ),
+        (
+            RawThreaded {
+                memory_initial: 16,
+                ..Default::default()
+            },
+            SketchModuleError::ThreadedMemoryMismatch {
+                minimum_pages: 16,
+                maximum_pages: 16_384,
+            },
+        ),
+        (
+            RawThreaded {
+                memory_maximum: 16_383,
+                ..Default::default()
+            },
+            SketchModuleError::ThreadedMemoryMismatch {
+                minimum_pages: 17,
+                maximum_pages: 16_383,
+            },
         ),
     ];
     for (case_index, (options, expected)) in cases.into_iter().enumerate() {

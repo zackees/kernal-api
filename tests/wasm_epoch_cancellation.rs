@@ -7,7 +7,13 @@
 use std::time::Duration;
 
 use kernal_api::async_engine::{CancellationSource, RuntimeBuilder};
-use kernal_api::wasm::{SketchCompilerConfig, SketchEpochLimits};
+use kernal_api::wasm::{
+    SketchCompiler, SketchCompilerConfig, SketchEpochLimits, SketchExecutionError,
+    SketchExecutionLimits, SketchFuelLimits, SketchModulePolicy,
+};
+
+#[path = "support/threaded_fixture.rs"]
+mod threaded_fixture;
 
 #[test]
 fn epoch_limits_are_bounded_and_cancellation_is_facade_owned() {
@@ -39,4 +45,45 @@ fn epoch_limits_are_bounded_and_cancellation_is_facade_owned() {
     assert!(!cancellation.token().is_cancelled());
     cancellation.cancel();
     assert!(cancellation.token().is_cancelled());
+}
+
+#[test]
+fn public_controlled_execution_cancels_a_running_compute_loop_and_cleans_up() {
+    let fuel = SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
+        .expect("high fuel leaves epoch cancellation observable");
+    let epoch = SketchEpochLimits::new(Duration::from_secs(1), Duration::from_millis(1), 17)
+        .expect("finite epoch policy");
+    let limits = SketchExecutionLimits::default()
+        .with_fuel_limits(fuel)
+        .expect("fuel policy")
+        .with_epoch_limits(epoch)
+        .expect("epoch policy");
+    let compiler = SketchCompiler::new(
+        SketchCompilerConfig::default()
+            .with_execution_limits(limits)
+            .expect("compiler policy"),
+    )
+    .expect("compiler");
+    let bytes = threaded_fixture::looping_root_wasm();
+    let sketch = compiler
+        .admit(
+            &bytes,
+            SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy"),
+        )
+        .expect("admission");
+    let runtime = RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+    runtime.run(async {
+        let source = CancellationSource::new();
+        let task = runtime.handle().launch({
+            let sketch = sketch.clone();
+            let token = source.token();
+            let handle = runtime.handle();
+            async move { sketch.execute_threaded_root_cancellable(handle, token).await }
+        });
+        kernal_api::async_engine::sleep(Duration::from_millis(2)).await;
+        source.cancel();
+        assert_eq!(task.await.expect("execution task"), Err(SketchExecutionError::Cancelled));
+    });
+    sketch.close_threaded_root().expect("close cooperative sketch");
+    assert_eq!(compiler.execution_limits_snapshot(), Default::default());
 }

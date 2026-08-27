@@ -116,6 +116,8 @@ impl SketchCompiler {
             shared_memory: memory,
             profile: policy.profile,
             prepared_root: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            preparation_count: AtomicU64::new(0),
         })
     }
     /// Number of modules whose complete preflight reached private compilation.
@@ -177,6 +179,11 @@ pub struct AdmittedSketch {
     shared_memory: SketchSharedMemory,
     profile: SketchAdmissionProfile,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
+    // A unit-only observation belongs to the admitted sketch, not the cached
+    // controller: it must survive any future controller replacement to prove
+    // the cache did not prepare a second private prelink/shared memory.
+    #[cfg(test)]
+    preparation_count: AtomicU64,
 }
 impl AdmittedSketch {
     pub fn module_bytes(&self) -> usize {
@@ -227,7 +234,6 @@ impl AdmittedSketch {
         let controller = Arc::new(ThreadController {
             memory,
             prelink: OnceLock::new(),
-            preparation_count: AtomicU64::new(1),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
         });
@@ -260,7 +266,6 @@ impl AdmittedSketch {
             .prelink
             .set(Arc::clone(&prelink))
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
-        debug_assert_eq!(controller.preparation_count.load(Ordering::Relaxed), 1);
         let prelink = Arc::clone(
             controller
                 .prelink
@@ -272,6 +277,8 @@ impl AdmittedSketch {
             controller,
             prelink,
         });
+        #[cfg(test)]
+        self.preparation_count.fetch_add(1, Ordering::Relaxed);
         *prepared = Some(Arc::clone(&prepared_root));
         Ok(prepared_root)
     }
@@ -280,7 +287,7 @@ impl AdmittedSketch {
         let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
         let controller = &prepared.controller;
         Some(RootExecutionObservation {
-            preparations: controller.preparation_count.load(Ordering::Relaxed),
+            preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
             supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
         })
@@ -352,10 +359,6 @@ struct ThreadController {
     // prelink here breaks their otherwise cyclic construction without letting a
     // Store or Instance escape to another thread.
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
-    // This remains entirely host-private.  Besides guarding the cached setup,
-    // it gives unit tests a narrow way to prove that repeated root stores do
-    // not quietly create a second prelink or shared memory.
-    preparation_count: AtomicU64,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
 }

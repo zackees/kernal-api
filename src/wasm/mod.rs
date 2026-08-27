@@ -26,6 +26,8 @@ const ABI_METADATA: &str = "kernal-api.abi";
 const ABI_METADATA_VALUE: &[u8] = b"v1";
 const PROFILE_METADATA: &str = "kernal-api.profile";
 const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
+const VALIDATION_PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-validation-v1";
+const VALIDATION_REPORT: &str = "kernal-api-threaded-validation-report-v1";
 const MAX_METADATA_BYTES: usize = 128;
 const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
@@ -41,6 +43,7 @@ const DEFAULT_MAX_GUEST_THREADS: usize = 16;
 pub enum SketchAdmissionProfile {
     SyntheticV1,
     ThreadedRustV1,
+    ThreadedRustValidationV1,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +109,12 @@ impl SketchCompiler {
         }
         let memory = match policy.profile {
             SketchAdmissionProfile::SyntheticV1 => preflight(bytes, policy)?,
-            SketchAdmissionProfile::ThreadedRustV1 => preflight_threaded_rust(bytes, policy)?,
+            SketchAdmissionProfile::ThreadedRustV1 => {
+                preflight_threaded_rust(bytes, policy, false)?
+            }
+            SketchAdmissionProfile::ThreadedRustValidationV1 => {
+                preflight_threaded_rust(bytes, policy, true)?
+            }
         };
         let module =
             Module::new(&self.engine, bytes).map_err(|_| SketchModuleError::InvalidBinary)?;
@@ -165,6 +173,17 @@ impl SketchModulePolicy {
         policy.profile = SketchAdmissionProfile::ThreadedRustV1;
         Ok(policy)
     }
+    /// Validation-only extension of the exact Rust threaded profile. It adds
+    /// one versioned metadata value and one report getter; ordinary sketches
+    /// keep the narrower closed export surface.
+    pub fn threaded_rust_validation_v1(
+        max_module_bytes: usize,
+        max_shared_memory_pages: u32,
+    ) -> Result<Self, SketchModuleError> {
+        let mut policy = Self::threaded_rust_v1(max_module_bytes, max_shared_memory_pages)?;
+        policy.profile = SketchAdmissionProfile::ThreadedRustValidationV1;
+        Ok(policy)
+    }
     pub fn max_module_bytes(self) -> usize {
         self.max_module_bytes
     }
@@ -219,7 +238,11 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
-        if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
+        if !matches!(
+            self.profile,
+            SketchAdmissionProfile::ThreadedRustV1
+                | SketchAdmissionProfile::ThreadedRustValidationV1
+        ) {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let prepared = self.prepare_threaded_root()?;
@@ -234,6 +257,7 @@ impl AdmittedSketch {
         // section can invoke thread-spawn while instantiation is still in
         // progress, and lookup/call failures after that must still close and
         // drain every accepted native child.
+        let mut validation_getter = None;
         let outcome = (|| {
             let instance = match prepared.prelink.instantiate(&mut store) {
                 Ok(instance) => instance,
@@ -242,6 +266,13 @@ impl AdmittedSketch {
             let start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
                 .map_err(|_| SketchExecutionError::Trapped)?;
+            if self.profile == SketchAdmissionProfile::ThreadedRustValidationV1 {
+                validation_getter = Some(
+                    instance
+                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                );
+            }
             start
                 .call(&mut store, ())
                 .map(|_| ThreadedRootOutcome::Started)
@@ -255,7 +286,15 @@ impl AdmittedSketch {
         // root failure because it is ordered by the guest-assigned TID and
         // precisely identifies the accepted work that was drained.
         children?;
-        outcome
+        let outcome = outcome?;
+        if self.profile == SketchAdmissionProfile::ThreadedRustValidationV1 {
+            let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
+            let offset = getter
+                .call(&mut store, ())
+                .map_err(|_| SketchExecutionError::ValidationReportInvalid)?;
+            validate_report(&prepared.controller.memory, offset)?;
+        }
+        Ok(outcome)
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
@@ -387,6 +426,7 @@ pub enum SketchExecutionError {
     ChildNonzeroExit { code: i32 },
     ChildTrapped,
     ChildPanicked,
+    ValidationReportInvalid,
     Trapped,
 }
 impl SketchExecutionError {
@@ -399,6 +439,7 @@ impl SketchExecutionError {
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",
             Self::ChildPanicked => "child-panicked",
+            Self::ValidationReportInvalid => "validation-report-invalid",
             Self::Trapped => "trapped",
         }
     }
@@ -918,6 +959,42 @@ fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
         *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
     }
     Some(u32::from_le_bytes(bytes))
+}
+
+// Validation reports are intentionally private: the guest returns only a
+// bounded offset and the facade consumes the fixed 64-byte schema itself.
+fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecutionError> {
+    if offset < 0 || offset % 4 != 0 || shared_range(memory, offset, 64).is_none() {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    let words: Option<Vec<u32>> = (0..16)
+        .map(|word| read_shared_u32(memory, offset.saturating_add(word * 4)))
+        .collect();
+    let Some(words) = words else {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    };
+    // ready is Release-written by the guest after all fields. Load it first
+    // with Acquire before accepting the remaining atomic record words.
+    if words[3] != 1
+        || words[0] != 0x4b_52_56_31
+        || words[1] != 1
+        || words[2] != 64
+        || words[4] != 2
+        || words[5] != 2
+        || words[6] != 2
+        || words[7] != 2
+        || words[8] != 2
+        || words[9] != 2
+        || words[10] != 2
+        || words[11] != 2
+        || words[12] != 0
+        || words[13] != 0
+        || words[14] != 0
+        || words[15] != 0
+    {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    Ok(())
 }
 
 fn shared_range(
@@ -1449,6 +1526,7 @@ fn check_memory(
 fn preflight_threaded_rust(
     bytes: &[u8],
     policy: SketchModulePolicy,
+    validation: bool,
 ) -> Result<SketchSharedMemory, SketchModuleError> {
     let mut types = Vec::<TypeEntry>::new();
     let mut functions = Vec::<u32>::new();
@@ -1458,6 +1536,7 @@ fn preflight_threaded_rust(
     let mut exports = Vec::<(String, ExternalKind, u32)>::new();
     let mut start = None;
     let mut target_features = None;
+    let mut validation_metadata = 0_u8;
     let mut seen = std::collections::BTreeSet::new();
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
@@ -1541,6 +1620,16 @@ fn preflight_threaded_rust(
             }
             Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => match section.name() {
+                PROFILE_METADATA if validation => {
+                    validation_metadata += 1;
+                    if validation_metadata != 1
+                        || section.data() != VALIDATION_PROFILE_METADATA_VALUE
+                    {
+                        return Err(SketchModuleError::MetadataMismatch {
+                            name: PROFILE_METADATA,
+                        });
+                    }
+                }
                 "target_features" => {
                     if target_features
                         .replace(parse_target_features(section.data())?)
@@ -1618,13 +1707,21 @@ fn preflight_threaded_rust(
     if features != expected_features {
         return Err(SketchModuleError::TargetFeaturesMismatch);
     }
-    let allowed = [
+    let mut allowed = vec![
         ("memory", ExternalKind::Memory),
         ("_start", ExternalKind::Func),
         ("__main_void", ExternalKind::Func),
         ("wasi_thread_start", ExternalKind::Func),
         (ENTRY, ExternalKind::Func),
     ];
+    if validation {
+        allowed.push((VALIDATION_REPORT, ExternalKind::Func));
+        if validation_metadata != 1 {
+            return Err(SketchModuleError::MissingMetadata {
+                name: PROFILE_METADATA,
+            });
+        }
+    }
     if exports.len() != allowed.len() {
         return Err(SketchModuleError::ExportNotAllowed {
             name: exports.first().map(|e| e.0.clone()).unwrap_or_default(),
@@ -1640,7 +1737,7 @@ fn preflight_threaded_rust(
     for (name, _, index) in exports {
         by_name.insert(name, index);
     }
-    for (name, signature) in [
+    let mut signatures = vec![
         (
             "_start",
             Signature {
@@ -1669,7 +1766,17 @@ fn preflight_threaded_rust(
                 results: I32,
             },
         ),
-    ] {
+    ];
+    if validation {
+        signatures.push((
+            VALIDATION_REPORT,
+            Signature {
+                params: EMPTY,
+                results: I32,
+            },
+        ));
+    }
+    for (name, signature) in signatures {
         let index = *by_name
             .get(name)
             .ok_or(SketchModuleError::EntrypointMismatch)?;

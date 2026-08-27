@@ -7,6 +7,10 @@
 #[cfg(feature = "wasm-sketch-worker")]
 #[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
 mod worker_protocol;
+#[cfg(feature = "wasm-sketch-worker")]
+mod worker;
+#[cfg(feature = "wasm-sketch-worker")]
+pub use worker::{SketchWorkerConfig, SketchWorkerFailure, SketchWorkerStopReason, SketchWorkerTerminal};
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -338,6 +342,8 @@ pub struct SketchCompiler {
     compilations: Arc<AtomicU64>,
     execution_ledger: Arc<ExecutionLedger>,
     epoch_broker: Arc<EpochBroker>,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_config: SketchCompilerConfig,
 }
 impl SketchCompiler {
     /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
@@ -366,6 +372,8 @@ impl SketchCompiler {
             engine,
             compilations: Arc::new(AtomicU64::new(0)),
             execution_ledger: Arc::new(ExecutionLedger::new(config.execution_limits)),
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_config: config,
         })
     }
     /// Preflights and then compiles one module. Rejected input cannot compile.
@@ -397,6 +405,12 @@ impl SketchCompiler {
             max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
             validation: policy.validation,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_source: Arc::<[u8]>::from(bytes),
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_compiler_config: self.worker_config,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_policy: policy,
             execution_ledger: Arc::clone(&self.execution_ledger),
             epoch_broker: Arc::clone(&self.epoch_broker),
             prepared_root: std::sync::Mutex::new(None),
@@ -511,6 +525,12 @@ pub struct AdmittedSketch {
     max_guest_threads: usize,
     profile: SketchAdmissionProfile,
     validation: bool,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_source: Arc<[u8]>,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_compiler_config: SketchCompilerConfig,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_policy: SketchModulePolicy,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
     // controller: it must survive any future controller replacement to prove

@@ -1706,6 +1706,31 @@ impl Drop for EpochRegistration {
 mod epoch_broker_tests {
     use super::*;
 
+    /// Owns the deliberately blocked characterization child.  Every assertion
+    /// after spawning remains safe: Drop kills and reaps the exact child and
+    /// removes only its exact marker.
+    struct ContainmentChildGuard {
+        child: Option<std::process::Child>,
+        marker: std::path::PathBuf,
+    }
+    impl ContainmentChildGuard {
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.child.as_mut().expect("containment child remains armed")
+        }
+        fn reap_and_disarm(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_file(&self.marker);
+        }
+    }
+    impl Drop for ContainmentChildGuard {
+        fn drop(&mut self) {
+            self.reap_and_disarm();
+        }
+    }
+
     fn compiler_with_epochs(maximum: usize) -> SketchCompiler {
         let limits =
             SketchEpochLimits::new(Duration::from_millis(5), Duration::from_millis(1), maximum)
@@ -1835,7 +1860,7 @@ mod epoch_broker_tests {
         let executable = std::env::current_exe().expect("test executable");
         let marker = std::env::temp_dir().join(format!("kernal-api-epoch-host-block-{}", std::process::id()));
         let _ = std::fs::remove_file(&marker);
-        let mut child = std::process::Command::new(executable)
+        let child = std::process::Command::new(executable)
             .arg("--exact")
             .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
             .arg("--nocapture")
@@ -1843,18 +1868,36 @@ mod epoch_broker_tests {
             .env(MARKER, &marker)
             .spawn()
             .expect("containment child");
-        for _ in 0..100 {
-            if marker.exists() { break; }
+        let mut guard = ContainmentChildGuard {
+            child: Some(child),
+            marker,
+        };
+        let readiness_deadline = Instant::now() + Duration::from_secs(5);
+        while !guard.marker.exists() && Instant::now() < readiness_deadline {
+            assert!(
+                guard.child_mut().try_wait().expect("child status").is_none(),
+                "containment child exited before reaching the host block"
+            );
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(marker.exists(), "child must reach the Wasm host import before containment classification");
-        std::thread::sleep(Duration::from_millis(10));
-        assert!(child.try_wait().expect("child status").is_none(), "blocked child must outlive an epoch interval");
+        assert!(
+            guard.marker.exists(),
+            "child must reach the Wasm host import before containment classification"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&guard.marker).expect("read readiness marker"),
+            "entered"
+        );
+        // Several clock cadence intervals must elapse without pretending the
+        // parked native host call became interruptible.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            guard.child_mut().try_wait().expect("child status").is_none(),
+            "blocked child must outlive multiple epoch intervals"
+        );
         let classification = SketchExecutionError::ContainmentRequired;
         assert_eq!(classification.code(), "containment-required");
-        child.kill().expect("kill blocked child");
-        let _ = child.wait().expect("reap blocked child");
-        let _ = std::fs::remove_file(marker);
+        guard.reap_and_disarm();
     }
 }
 

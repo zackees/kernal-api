@@ -25,6 +25,11 @@ const OUTER_BOUND: Duration = Duration::from_secs(10);
 // cannot be misclassified as a deadline expiry.
 const WORKER_DEADLINE: Duration = Duration::from_secs(2);
 const CONTAINMENT_DEADLINE: Duration = Duration::from_secs(1);
+// The externally controlled crash and parent-death proofs must acquire an
+// exact live native identity before their intentional action.  Keep their
+// worker deadline beyond the outer acquisition bound so normal containment
+// cannot race the proof into a false success.
+const FAILURE_PROOF_DEADLINE: Duration = Duration::from_secs(30);
 const GRACE: Duration = Duration::from_secs(1);
 
 fn worker_config() -> SketchWorkerConfig {
@@ -370,7 +375,7 @@ mod failure_proof {
         ))
     }
     fn inner_crash() {
-        let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel());
+        let compiler = compiler(FAILURE_PROOF_DEADLINE, long_fuel());
         let sketch = admit(&compiler, threaded_fixture::atomic_wait32_wasm());
         let config = SketchWorkerConfig::new(
             PathBuf::from(std::env::var_os("KERNAL_API_D4_REAL_WORKER").expect("worker")),
@@ -399,7 +404,7 @@ mod failure_proof {
         runtime.run(async { assert_clean(&compiler, &sketch).await });
     }
     fn inner_parent_death() {
-        let compiler = compiler(CONTAINMENT_DEADLINE, long_fuel());
+        let compiler = compiler(FAILURE_PROOF_DEADLINE, long_fuel());
         let sketch = admit(&compiler, threaded_fixture::atomic_wait32_wasm());
         let config = SketchWorkerConfig::new(
             PathBuf::from(std::env::var_os("KERNAL_API_D4_REAL_WORKER").expect("worker")),
@@ -637,19 +642,12 @@ mod failure_proof {
         }
     }
     #[cfg(target_os = "windows")]
-    fn windows_handle(identity: Identity, access: u32) -> Option<ArmedWindowsProcess> {
-        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    fn windows_handle(identity: Identity, access: u32) -> ArmedWindowsProcess {
         use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess};
         let close_only =
             CloseOnlyWindowsHandle(Some(unsafe { OpenProcess(access, 0, identity.pid) }));
         if close_only.0.expect("owned handle").is_null() {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
-                // The marker was validated before this open. A missing PID is
-                // already the required reap outcome; a reused PID opens and
-                // fails the creation-time identity check below.
-                return None;
-            }
             panic!("OpenProcess: {error}");
         }
         assert!(
@@ -675,7 +673,7 @@ mod failure_proof {
         );
         let created = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
         assert_eq!((created, 0), (identity.a, identity.b), "PID was reused");
-        Some(close_only.promote())
+        close_only.promote()
     }
     #[cfg(target_os = "windows")]
     #[test]
@@ -691,12 +689,15 @@ mod failure_proof {
             identity,
             PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
         );
-        if let Some(process) = process.as_mut() {
-            // A concurrent normal reap can race TerminateProcess. The
-            // already-open, creation-validated handle must signal either way.
-            let _ = unsafe { TerminateProcess(process.handle(), 1) };
-            process.wait_gone();
-        }
+        // The long proof deadline keeps normal containment out of this
+        // acquisition/action window. This exact live handle is the worker we
+        // intentionally crash, then wait as proof of its disappearance.
+        assert_ne!(
+            unsafe { TerminateProcess(process.handle(), 1) },
+            0,
+            "TerminateProcess"
+        );
+        process.wait_gone();
         inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
@@ -717,9 +718,9 @@ mod failure_proof {
         let mut process = windows_handle(identity, SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION);
         fs::write(&files.release, "go").expect("release");
         inner.wait_success();
-        if let Some(process) = process.as_mut() {
-            process.wait_gone();
-        }
+        // Release the inner parent only after this creation-validated worker
+        // handle is live; owner death must make this exact handle signal.
+        process.wait_gone();
     }
     #[cfg(target_os = "macos")]
     #[test]

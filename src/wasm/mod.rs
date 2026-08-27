@@ -381,6 +381,7 @@ fn memory_fact(
 fn external_kind(kind: ExternalKind) -> &'static str {
     match kind {
         ExternalKind::Func => "function",
+        ExternalKind::FuncExact => "function-exact",
         ExternalKind::Table => "table",
         ExternalKind::Memory => "memory",
         ExternalKind::Global => "global",

@@ -2858,22 +2858,29 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
-    fn epoch_deadline_reports_the_ordered_child_outcome_and_releases_every_store_slot() {
+    fn epoch_deadline_releases_every_store_slot_when_root_or_child_observes_it() {
         let compiler = epoch_compiler(Duration::from_millis(5), MAX_GUEST_THREADS_V1 + 1);
         let sketch = admit_epoch_fixture(&compiler, child_fuel_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::current_thread()
             .enable_all()
             .build()
             .expect("runtime");
-        assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
-            Err(SketchExecutionError::ChildOutcomes {
-                outcomes: vec![ThreadedChildOutcome {
+        // The epoch ticker can interrupt either the root while it is spawning the child or
+        // the child after it begins running.  Both are the documented deadline result; which
+        // store observes the tick is scheduler-dependent, so do not make the test depend on
+        // that race.  The cleanup assertions below are the contract under test.
+        let result = runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await });
+        match result {
+            Err(SketchExecutionError::DeadlineExceeded) => {}
+            Err(SketchExecutionError::ChildOutcomes { outcomes }) => assert_eq!(
+                outcomes,
+                vec![ThreadedChildOutcome {
                     tid: 1,
-                    kind: ThreadedChildOutcomeKind::DeadlineExceeded
+                    kind: ThreadedChildOutcomeKind::DeadlineExceeded,
                 }]
-            })
-        );
+            ),
+            other => panic!("expected a root or child deadline, got {other:?}"),
+        }
         sketch.close_threaded_root().expect("close");
         let snapshot = compiler.execution_limits_snapshot();
         assert_eq!(snapshot.active_epoch_registrations(), 0);

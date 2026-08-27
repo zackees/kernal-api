@@ -379,10 +379,7 @@ impl ParentReceivePhase {
     /// Accepts only the worker-to-parent sequence for this request. In
     /// particular, `ExecuteAck` proves the worker assembled the complete
     /// module; a terminal before it is always a protocol failure.
-    fn receive(
-        &mut self,
-        message: Message,
-    ) -> Result<ParentReceiveAction, SketchWorkerFailure> {
+    fn receive(&mut self, message: Message) -> Result<ParentReceiveAction, SketchWorkerFailure> {
         if message.request_id() != self.request_id {
             return Err(SketchWorkerFailure::Protocol);
         }

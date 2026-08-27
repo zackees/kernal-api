@@ -226,7 +226,9 @@ pub(super) enum Message {
     HelloAck {
         request_id: u64,
     },
-    ExecuteAck { request_id: u64 },
+    ExecuteAck {
+        request_id: u64,
+    },
     ExecuteStart {
         request_id: u64,
         module_len: u64,

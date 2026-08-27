@@ -2478,6 +2478,13 @@ mod result_precedence_tests {
             Err(SketchExecutionError::NonzeroExit { code: 7 }),
         );
     }
+
+    #[test]
+    fn fuel_exhaustion_is_mapped_without_exposing_a_wasmtime_trap() {
+        let error = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
+        assert_eq!(map_root_error(&error), Err(SketchExecutionError::OutOfFuel));
+        assert_eq!(map_child_error(&error), ChildOutcome::OutOfFuel);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

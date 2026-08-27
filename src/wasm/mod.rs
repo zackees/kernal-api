@@ -911,11 +911,17 @@ pub enum SketchExecutionError {
     ContainmentRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
-    NonzeroExit { code: i32 },
-    ChildNonzeroExit { code: i32 },
+    NonzeroExit {
+        code: i32,
+    },
+    ChildNonzeroExit {
+        code: i32,
+    },
     ChildTrapped,
     ChildPanicked,
-    ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
+    ChildOutcomes {
+        outcomes: Vec<ThreadedChildOutcome>,
+    },
     ValidationReportInvalid,
     SessionGenerationExhausted,
     Trapped,
@@ -1687,9 +1693,10 @@ impl EpochRegistration {
         )
     }
     fn finish(mut self) -> Option<crate::async_engine::Task<()>> {
-        self.entry
-            .take()
-            .and_then(|entry| self.broker.finish_registration(&entry, self.completes_logical))
+        self.entry.take().and_then(|entry| {
+            self.broker
+                .finish_registration(&entry, self.completes_logical)
+        })
     }
 }
 impl Drop for EpochRegistration {
@@ -1715,7 +1722,9 @@ mod epoch_broker_tests {
     }
     impl ContainmentChildGuard {
         fn child_mut(&mut self) -> &mut std::process::Child {
-            self.child.as_mut().expect("containment child remains armed")
+            self.child
+                .as_mut()
+                .expect("containment child remains armed")
         }
         fn reap_and_disarm(&mut self) {
             if let Some(mut child) = self.child.take() {
@@ -1850,15 +1859,29 @@ mod epoch_broker_tests {
         if std::env::var_os(MODE).is_some() {
             let bytes = super::threaded_root_observation_tests::threaded_yield_fixture();
             let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-            let sketch = compiler.admit(&bytes, SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy")).expect("admission");
-            let runtime = crate::async_engine::RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+            let sketch = compiler
+                .admit(
+                    &bytes,
+                    SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                        .expect("policy"),
+                )
+                .expect("admission");
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
             // The fixture's module start enters kernel-yield. The test-only
             // hook writes readiness then parks inside that actual host import.
-            runtime.run(async { let _ = sketch.execute_threaded_root(runtime.handle()).await; });
+            runtime.run(async {
+                let _ = sketch.execute_threaded_root(runtime.handle()).await;
+            });
             return;
         }
         let executable = std::env::current_exe().expect("test executable");
-        let marker = std::env::temp_dir().join(format!("kernal-api-epoch-host-block-{}", std::process::id()));
+        let marker = std::env::temp_dir().join(format!(
+            "kernal-api-epoch-host-block-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&marker);
         let child = std::process::Command::new(executable)
             .arg("--exact")
@@ -1875,7 +1898,11 @@ mod epoch_broker_tests {
         let readiness_deadline = Instant::now() + Duration::from_secs(5);
         while !guard.marker.exists() && Instant::now() < readiness_deadline {
             assert!(
-                guard.child_mut().try_wait().expect("child status").is_none(),
+                guard
+                    .child_mut()
+                    .try_wait()
+                    .expect("child status")
+                    .is_none(),
                 "containment child exited before reaching the host block"
             );
             std::thread::sleep(Duration::from_millis(1));
@@ -1892,7 +1919,11 @@ mod epoch_broker_tests {
         // parked native host call became interruptible.
         std::thread::sleep(Duration::from_millis(30));
         assert!(
-            guard.child_mut().try_wait().expect("child status").is_none(),
+            guard
+                .child_mut()
+                .try_wait()
+                .expect("child status")
+                .is_none(),
             "blocked child must outlive multiple epoch intervals"
         );
         let classification = SketchExecutionError::ContainmentRequired;

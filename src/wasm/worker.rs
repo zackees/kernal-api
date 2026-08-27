@@ -185,6 +185,8 @@ impl WorkerExecutionLedger {
         WorkerGauge {
             ledger: Arc::clone(self),
             kind: GaugeKind::Worker,
+            #[cfg(test)]
+            drop_notification: None,
         }
     }
     fn live_protocol(self: &Arc<Self>) -> WorkerGauge {
@@ -192,6 +194,8 @@ impl WorkerExecutionLedger {
         WorkerGauge {
             ledger: Arc::clone(self),
             kind: GaugeKind::Protocol,
+            #[cfg(test)]
+            drop_notification: None,
         }
     }
     fn live_lease(self: &Arc<Self>) -> WorkerGauge {
@@ -199,6 +203,8 @@ impl WorkerExecutionLedger {
         WorkerGauge {
             ledger: Arc::clone(self),
             kind: GaugeKind::Lease,
+            #[cfg(test)]
+            drop_notification: None,
         }
     }
 }
@@ -210,6 +216,8 @@ enum GaugeKind {
 struct WorkerGauge {
     ledger: Arc<WorkerExecutionLedger>,
     kind: GaugeKind,
+    #[cfg(test)]
+    drop_notification: Option<std::sync::mpsc::Sender<()>>,
 }
 impl Drop for WorkerGauge {
     fn drop(&mut self) {
@@ -227,6 +235,10 @@ impl Drop for WorkerGauge {
                     .pending_root_leases
                     .fetch_sub(1, Ordering::Relaxed);
             }
+        }
+        #[cfg(test)]
+        if let Some(notification) = self.drop_notification.take() {
+            let _ = notification.send(());
         }
     }
 }
@@ -765,17 +777,17 @@ fn write_upload(
     worker_protocol::write_message(input, &Message::ExecuteEnd { request_id }).map_err(|_| ())
 }
 fn force_result(
-    sketch: &AdmittedSketch,
+    ledger: &WorkerExecutionLedger,
     control: &mut crate::platform::process::WorkerControl,
     failure: SketchWorkerFailure,
 ) -> (SketchWorkerTerminal, bool) {
     if failure == SketchWorkerFailure::Protocol {
-        sketch.worker_ledger.record_protocol_failure();
+        ledger.record_protocol_failure();
     }
     match control.force_and_reap(Duration::from_secs(5)) {
         Ok(()) => {
-            sketch.worker_ledger.record_forced();
-            sketch.worker_ledger.record_reaped();
+            ledger.record_forced();
+            ledger.record_reaped();
             (SketchWorkerTerminal::Failure(failure), true)
         }
         Err(_) => (
@@ -789,7 +801,14 @@ fn force_pre_protocol(
     control: &mut ActiveOwnership,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(sketch, &mut *control, failure);
+    force_pre_protocol_with_ledger(&sketch.worker_ledger, control, failure)
+}
+fn force_pre_protocol_with_ledger(
+    ledger: &WorkerExecutionLedger,
+    control: &mut ActiveOwnership,
+    failure: SketchWorkerFailure,
+) -> SketchWorkerTerminal {
+    let (result, forced) = force_result(ledger, &mut *control, failure);
     if !forced {
         control.cleanup.hand_off_pre_protocol(control.take());
     }
@@ -803,7 +822,17 @@ fn force_join_result(
     reader: std::thread::JoinHandle<()>,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(sketch, &mut *control, failure);
+    force_join_result_with_ledger(&sketch.worker_ledger, control, tx, writer, reader, failure)
+}
+fn force_join_result_with_ledger(
+    ledger: &WorkerExecutionLedger,
+    control: &mut ActiveOwnership,
+    tx: std::sync::mpsc::Sender<WriterCommand>,
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+    failure: SketchWorkerFailure,
+) -> SketchWorkerTerminal {
+    let (result, forced) = force_result(ledger, &mut *control, failure);
     if !forced {
         // The dispatcher owns the unreaped child and both helpers from this
         // point. `ContainmentCleanup` means cleanup remains pending; gauges
@@ -841,7 +870,7 @@ fn force_join_terminal(
     reader: std::thread::JoinHandle<()>,
     trigger: SketchWorkerStopReason,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(sketch, &mut *control, SketchWorkerFailure::UnexpectedExit);
+    let (result, forced) = force_result(&sketch.worker_ledger, &mut *control, SketchWorkerFailure::UnexpectedExit);
     if !forced {
         control.cleanup.hand_off(CleanupJob {
             ownership: control.take(),
@@ -979,6 +1008,237 @@ fn next_request_id() -> Option<u64> {
 mod tests {
     use super::super::{SketchCompiler, SketchExecutionSnapshot, THREADED_RUST_MAX_PAGES};
     use super::*;
+    use crate::platform::process::{WorkerChild, WorkerChildControl, WorkerError, WorkerStage};
+    use std::io;
+    use std::sync::{mpsc, Condvar, Mutex};
+
+    const TEST_WAIT: Duration = Duration::from_secs(2);
+
+    struct DeferredFake {
+        calls: Arc<AtomicU64>,
+        shutdown_threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+        drop_threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+        first_failure: Mutex<Option<mpsc::Sender<()>>>,
+        retry_gate: Arc<(Mutex<bool>, Condvar)>,
+        successful_reap: Mutex<Option<mpsc::Sender<()>>>,
+    }
+
+    impl WorkerChildControl for DeferredFake {
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            Ok(None)
+        }
+
+        fn force_and_reap(&mut self, _timeout: Duration) -> Result<(), WorkerError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                if let Some(first_failure) = self.first_failure.lock().expect("first failure lock").take() {
+                    let _ = first_failure.send(());
+                }
+                return Err(WorkerError::new(
+                    WorkerStage::Reap,
+                    io::Error::new(io::ErrorKind::TimedOut, "controlled first failure"),
+                ));
+            }
+            let (released, wake) = &*self.retry_gate;
+            let mut released = released.lock().expect("retry gate lock");
+            while !*released {
+                released = wake.wait(released).expect("retry gate poisoned");
+            }
+            if let Some(successful_reap) = self
+                .successful_reap
+                .lock()
+                .expect("successful reap lock")
+                .take()
+            {
+                let _ = successful_reap.send(());
+            }
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {
+            self.shutdown_threads
+                .lock()
+                .expect("shutdown threads lock")
+                .push(std::thread::current().id());
+        }
+    }
+
+    impl Drop for DeferredFake {
+        fn drop(&mut self) {
+            self.drop_threads
+                .lock()
+                .expect("drop threads lock")
+                .push(std::thread::current().id());
+        }
+    }
+
+    fn deferred_ownership(
+        ledger: &Arc<WorkerExecutionLedger>,
+        fake: DeferredFake,
+        released: Option<mpsc::Sender<()>>,
+    ) -> ExecutionOwnership {
+        let execution_ledger = Arc::new(super::super::ExecutionLedger::new(
+            super::super::SketchExecutionLimits::default(),
+        ));
+        let lease = WorkerParentRootLease {
+            _permit: execution_ledger.acquire_root().expect("test root lease"),
+        };
+        let (control, _, _) = WorkerChild::new(None, None, 77, Box::new(fake)).into_parts();
+        let mut worker_gauge = ledger.live_worker();
+        worker_gauge.drop_notification = released;
+        ExecutionOwnership {
+            control,
+            _lease: lease,
+            _lease_gauge: ledger.live_lease(),
+            _worker_gauge: worker_gauge,
+        }
+    }
+
+    fn release_retry(retry_gate: &Arc<(Mutex<bool>, Condvar)>) {
+        let (released, wake) = &**retry_gate;
+        *released.lock().expect("retry gate lock") = true;
+        wake.notify_all();
+    }
+
+    #[test]
+    fn failed_force_handoff_returns_without_caller_shutdown() {
+        let ledger = Arc::new(WorkerExecutionLedger::default());
+        let (first_failure_tx, first_failure_rx) = mpsc::channel();
+        let retry_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let shutdown_threads = Arc::new(Mutex::new(Vec::new()));
+        let drop_threads = Arc::new(Mutex::new(Vec::new()));
+        let ownership = deferred_ownership(
+            &ledger,
+            DeferredFake {
+                calls: Arc::new(AtomicU64::new(0)),
+                shutdown_threads: Arc::clone(&shutdown_threads),
+                drop_threads: Arc::clone(&drop_threads),
+                first_failure: Mutex::new(Some(first_failure_tx)),
+                retry_gate: Arc::clone(&retry_gate),
+                successful_reap: Mutex::new(None),
+            },
+            None,
+        );
+        let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
+        let mut active = ActiveOwnership { ownership: Some(ownership), cleanup };
+        let caller = std::thread::current().id();
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let (writer_closed_tx, writer_closed_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            assert!(matches!(writer_rx.recv(), Ok(WriterCommand::Close)));
+            let _ = writer_closed_tx.send(());
+        });
+        let reader = std::thread::spawn(|| {});
+
+        let terminal = force_join_result_with_ledger(
+            &ledger,
+            &mut active,
+            writer_tx,
+            writer,
+            reader,
+            SketchWorkerFailure::Protocol,
+        );
+        assert_eq!(terminal, SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup));
+        assert!(active.ownership.is_none());
+        assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
+        assert!(shutdown_threads.lock().expect("shutdown threads lock").iter().all(|id| *id != caller));
+        assert!(drop_threads.lock().expect("drop threads lock").iter().all(|id| *id != caller));
+        release_retry(&retry_gate);
+        assert!(writer_closed_rx.recv_timeout(TEST_WAIT).is_ok());
+    }
+
+    #[test]
+    fn dispatcher_retry_releases_ownership_and_records_one_forced_reap() {
+        let ledger = Arc::new(WorkerExecutionLedger::default());
+        let (first_failure_tx, first_failure_rx) = mpsc::channel();
+        let (successful_reap_tx, successful_reap_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let retry_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let calls = Arc::new(AtomicU64::new(0));
+        let ownership = deferred_ownership(
+            &ledger,
+            DeferredFake {
+                calls: Arc::clone(&calls),
+                shutdown_threads: Arc::new(Mutex::new(Vec::new())),
+                drop_threads: Arc::new(Mutex::new(Vec::new())),
+                first_failure: Mutex::new(Some(first_failure_tx)),
+                retry_gate: Arc::clone(&retry_gate),
+                successful_reap: Mutex::new(Some(successful_reap_tx)),
+            },
+            Some(released_tx),
+        );
+        let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
+        cleanup.hand_off_pre_protocol(ownership);
+        assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
+        release_retry(&retry_gate);
+        assert!(successful_reap_rx.recv_timeout(TEST_WAIT).is_ok());
+        assert!(released_rx.recv_timeout(TEST_WAIT).is_ok());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(ledger.snapshot().forced, 1);
+        assert_eq!(ledger.snapshot().reaped, 1);
+        assert_eq!(ledger.snapshot().live_workers, 0);
+        assert_eq!(ledger.snapshot().live_protocol_tasks, 0);
+        assert_eq!(ledger.snapshot().pending_root_leases, 0);
+    }
+
+    #[test]
+    fn closed_cleanup_receiver_leaks_whole_job_without_caller_shutdown() {
+        let ledger = Arc::new(WorkerExecutionLedger::default());
+        let shutdown_threads = Arc::new(Mutex::new(Vec::new()));
+        let drop_threads = Arc::new(Mutex::new(Vec::new()));
+        let retry_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let ownership = deferred_ownership(
+            &ledger,
+            DeferredFake {
+                calls: Arc::new(AtomicU64::new(0)),
+                shutdown_threads: Arc::clone(&shutdown_threads),
+                drop_threads: Arc::clone(&drop_threads),
+                first_failure: Mutex::new(None),
+                retry_gate,
+                successful_reap: Mutex::new(None),
+            },
+            None,
+        );
+        let (sender, receiver) = mpsc::channel();
+        drop(receiver);
+        let cleanup = CleanupDispatcher { sender };
+        let caller = std::thread::current().id();
+        cleanup.hand_off_pre_protocol(ownership);
+        assert!(shutdown_threads.lock().expect("shutdown threads lock").iter().all(|id| *id != caller));
+        assert!(drop_threads.lock().expect("drop threads lock").iter().all(|id| *id != caller));
+        assert_eq!(ledger.snapshot().live_workers, 1);
+        assert_eq!(ledger.snapshot().pending_root_leases, 1);
+    }
+
+    #[test]
+    fn pre_protocol_failed_force_hands_off_without_pipe_helpers() {
+        let ledger = Arc::new(WorkerExecutionLedger::default());
+        let (first_failure_tx, first_failure_rx) = mpsc::channel();
+        let retry_gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let ownership = deferred_ownership(
+            &ledger,
+            DeferredFake {
+                calls: Arc::new(AtomicU64::new(0)),
+                shutdown_threads: Arc::new(Mutex::new(Vec::new())),
+                drop_threads: Arc::new(Mutex::new(Vec::new())),
+                first_failure: Mutex::new(Some(first_failure_tx)),
+                retry_gate: Arc::clone(&retry_gate),
+                successful_reap: Mutex::new(None),
+            },
+            None,
+        );
+        let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
+        let mut active = ActiveOwnership { ownership: Some(ownership), cleanup };
+        let terminal = force_pre_protocol_with_ledger(
+            &ledger,
+            &mut active,
+            SketchWorkerFailure::Protocol,
+        );
+        assert_eq!(terminal, SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup));
+        assert!(active.ownership.is_none());
+        assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
+        release_retry(&retry_gate);
+    }
     #[test]
     fn worker_config_requires_absolute_path_and_bounded_nonzero_grace() {
         assert_eq!(

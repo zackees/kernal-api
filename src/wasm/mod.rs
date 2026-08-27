@@ -33,8 +33,7 @@ const VALIDATION_REPORT: &str = "kernal-api-threaded-validation-report-v1";
 const MAX_METADATA_BYTES: usize = 128;
 const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
-const THREADED_RUST_RESERVATION_BYTES: u64 =
-    u64::from(THREADED_RUST_MAX_PAGES) * PAGE_BYTES;
+const THREADED_RUST_RESERVATION_BYTES: u64 = (THREADED_RUST_MAX_PAGES as u64) * PAGE_BYTES;
 const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
@@ -110,7 +109,10 @@ impl SketchExecutionLimits {
             maximum_reserved_shared_memory_bytes,
             maximum_active_root_executions,
         };
-        limits.is_valid().then_some(limits).ok_or(SketchCompilerError::InvalidExecutionLimits)
+        limits
+            .is_valid()
+            .then_some(limits)
+            .ok_or(SketchCompilerError::InvalidExecutionLimits)
     }
     pub fn maximum_reserved_shared_memory_bytes(self) -> u64 {
         self.maximum_reserved_shared_memory_bytes
@@ -144,11 +146,21 @@ pub struct SketchExecutionSnapshot {
     live_instances: usize,
 }
 impl SketchExecutionSnapshot {
-    pub fn reserved_shared_memory_bytes(self) -> u64 { self.reserved_shared_memory_bytes }
-    pub fn active_root_executions(self) -> usize { self.active_root_executions }
-    pub fn live_guest_threads(self) -> usize { self.live_guest_threads }
-    pub fn live_stores(self) -> usize { self.live_stores }
-    pub fn live_instances(self) -> usize { self.live_instances }
+    pub fn reserved_shared_memory_bytes(self) -> u64 {
+        self.reserved_shared_memory_bytes
+    }
+    pub fn active_root_executions(self) -> usize {
+        self.active_root_executions
+    }
+    pub fn live_guest_threads(self) -> usize {
+        self.live_guest_threads
+    }
+    pub fn live_stores(self) -> usize {
+        self.live_stores
+    }
+    pub fn live_instances(self) -> usize {
+        self.live_instances
+    }
 }
 
 /// Facade-owned compiler for the selected core-Wasm profile.
@@ -335,19 +347,26 @@ impl AdmittedSketch {
     /// root is executing is rejected; dropping an admitted sketch also
     /// releases its cached session once the last execution reference ends.
     pub fn close_threaded_root(&self) -> Result<(), SketchExecutionError> {
-        let prepared = self
+        let mut slot = self
             .prepared_root
             .lock()
-            .map_err(|_| SketchExecutionError::PrelinkFailed)?
-            .take();
-        if let Some(prepared) = prepared {
-            if prepared.controller.active_roots.load(Ordering::Acquire) != 0 {
-                let mut slot = self.prepared_root.lock().map_err(|_| SketchExecutionError::PrelinkFailed)?;
-                *slot = Some(prepared);
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        if let Some(prepared) = slot.as_ref() {
+            // This lock is shared with root-permit acquisition.  A close either
+            // observes an active root and leaves the cached session untouched,
+            // or marks the session closed before a racing execution can obtain
+            // its permit.  Merely cloning the Arc is not an execution lease.
+            let mut session = prepared
+                .controller
+                .session
+                .lock()
+                .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+            if session.active_roots != 0 {
                 return Err(SketchExecutionError::SessionBusy);
             }
-            drop(prepared);
+            session.closing = true;
         }
+        drop(slot.take());
         Ok(())
     }
     /// Instantiates the admitted module in one fresh root store, then invokes
@@ -362,13 +381,15 @@ impl AdmittedSketch {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
-        let prepared = self.prepare_threaded_root()?;
-        let _root = prepared.controller.acquire_root()?;
+        let (prepared, _root) = self.prepare_threaded_root_with_permit()?;
         prepared
             .controller
             .runtime_identity
             .store(runtime.identity_for_wasm(), Ordering::Release);
-        let _store_observation = CounterObservation::new(&prepared.controller.execution_ledger.live_stores);
+        let _store_observation = CounterObservation::new(
+            Arc::clone(&prepared.controller.execution_ledger),
+            LedgerCounter::Stores,
+        );
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -388,7 +409,8 @@ impl AdmittedSketch {
                 Err(error) => return map_root_error(&error),
             };
             _instance_observation = Some(CounterObservation::new(
-                &prepared.controller.execution_ledger.live_instances,
+                Arc::clone(&prepared.controller.execution_ledger),
+                LedgerCounter::Instances,
             ));
             let start = instance
                 .get_typed_func::<(), ()>(&mut store, "_start")
@@ -424,20 +446,24 @@ impl AdmittedSketch {
         };
         resolve_threaded_result(outcome, children, report, rejections)
     }
-    fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
+    fn prepare_threaded_root_with_permit(
+        &self,
+    ) -> Result<(Arc<PreparedThreadedRoot>, LogicalRootPermit), SketchExecutionError> {
         let mut prepared = self
             .prepared_root
             .lock()
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         if let Some(prepared) = prepared.as_ref() {
-            return Ok(Arc::clone(prepared));
+            let prepared = Arc::clone(prepared);
+            let permit = prepared.controller.acquire_root()?;
+            return Ok((prepared, permit));
         }
         // The Rust threaded link profile has a fixed maximum. Reserve its
         // complete address-space contract before asking Wasmtime to create the
         // engine-owned shared memory; committed pages are telemetry only.
-        let reservation = self.execution_ledger.reserve_shared_memory(
-            THREADED_RUST_RESERVATION_BYTES,
-        )?;
+        let reservation = self
+            .execution_ledger
+            .reserve_shared_memory(THREADED_RUST_RESERVATION_BYTES)?;
         let memory = SharedMemory::new(
             &self.engine,
             MemoryType::shared(
@@ -468,7 +494,7 @@ impl AdmittedSketch {
             runtime_identity: AtomicUsize::new(0),
             runtime_identity_mismatches: AtomicU64::new(0),
             execution_ledger: Arc::clone(&self.execution_ledger),
-            active_roots: AtomicUsize::new(0),
+            session: Mutex::new(SessionState::default()),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -511,10 +537,15 @@ impl AdmittedSketch {
             prelink,
             _reservation: reservation,
         });
+        // Do not cache a newly prepared session until it also has a root
+        // permit. A concurrent compiler-wide root cap rejection must roll back
+        // this new reservation by ordinary RAII rather than parking 1 GiB in
+        // an unusable cache entry.
+        let permit = prepared_root.controller.acquire_root()?;
         #[cfg(test)]
         self.preparation_count.fetch_add(1, Ordering::Relaxed);
         *prepared = Some(Arc::clone(&prepared_root));
-        Ok(prepared_root)
+        Ok((prepared_root, permit))
     }
     #[cfg(test)]
     fn root_execution_observation_for_test(&self) -> Option<RootExecutionObservation> {
@@ -639,61 +670,92 @@ impl std::error::Error for SketchExecutionError {}
 /// per-thread stores in a logical sketch session.
 struct ExecutionLedger {
     limits: SketchExecutionLimits,
-    reserved_shared_memory_bytes: AtomicU64,
-    active_root_executions: AtomicUsize,
-    live_guest_threads: AtomicUsize,
-    live_stores: AtomicUsize,
-    live_instances: AtomicUsize,
+    state: Mutex<ExecutionLedgerState>,
+}
+
+#[derive(Default)]
+struct ExecutionLedgerState {
+    reserved_shared_memory_bytes: u64,
+    active_root_executions: usize,
+    live_guest_threads: usize,
+    live_stores: usize,
+    live_instances: usize,
 }
 impl ExecutionLedger {
     fn new(limits: SketchExecutionLimits) -> Self {
         Self {
             limits,
-            reserved_shared_memory_bytes: AtomicU64::new(0),
-            active_root_executions: AtomicUsize::new(0),
-            live_guest_threads: AtomicUsize::new(0),
-            live_stores: AtomicUsize::new(0),
-            live_instances: AtomicUsize::new(0),
+            state: Mutex::new(ExecutionLedgerState::default()),
         }
     }
     fn snapshot(&self) -> SketchExecutionSnapshot {
+        let state = self.state.lock().expect("execution ledger mutex poisoned");
         SketchExecutionSnapshot {
-            reserved_shared_memory_bytes: self.reserved_shared_memory_bytes.load(Ordering::Acquire),
-            active_root_executions: self.active_root_executions.load(Ordering::Acquire),
-            live_guest_threads: self.live_guest_threads.load(Ordering::Acquire),
-            live_stores: self.live_stores.load(Ordering::Acquire),
-            live_instances: self.live_instances.load(Ordering::Acquire),
+            reserved_shared_memory_bytes: state.reserved_shared_memory_bytes,
+            active_root_executions: state.active_root_executions,
+            live_guest_threads: state.live_guest_threads,
+            live_stores: state.live_stores,
+            live_instances: state.live_instances,
         }
     }
-    fn reserve_shared_memory(self: &Arc<Self>, bytes: u64) -> Result<SharedMemoryReservation, SketchExecutionError> {
-        let mut current = self.reserved_shared_memory_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(bytes) else {
-                return Err(SketchExecutionError::SharedMemoryLimitExceeded);
-            };
-            if next > self.limits.maximum_reserved_shared_memory_bytes {
-                return Err(SketchExecutionError::SharedMemoryLimitExceeded);
-            }
-            match self.reserved_shared_memory_bytes.compare_exchange_weak(
-                current, next, Ordering::AcqRel, Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(SharedMemoryReservation { ledger: Arc::clone(self), bytes }),
-                Err(observed) => current = observed,
-            }
+    fn reserve_shared_memory(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<SharedMemoryReservation, SketchExecutionError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let Some(next) = state.reserved_shared_memory_bytes.checked_add(bytes) else {
+            return Err(SketchExecutionError::SharedMemoryLimitExceeded);
+        };
+        if next > self.limits.maximum_reserved_shared_memory_bytes {
+            return Err(SketchExecutionError::SharedMemoryLimitExceeded);
         }
+        state.reserved_shared_memory_bytes = next;
+        Ok(SharedMemoryReservation {
+            ledger: Arc::clone(self),
+            bytes,
+        })
     }
     fn acquire_root(self: &Arc<Self>) -> Result<RootExecutionPermit, SketchExecutionError> {
-        let mut current = self.active_root_executions.load(Ordering::Acquire);
-        loop {
-            if current >= self.limits.maximum_active_root_executions {
-                return Err(SketchExecutionError::RootExecutionLimitExceeded);
-            }
-            match self.active_root_executions.compare_exchange_weak(
-                current, current + 1, Ordering::AcqRel, Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(RootExecutionPermit { ledger: Arc::clone(self) }),
-                Err(observed) => current = observed,
-            }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        if state.active_root_executions >= self.limits.maximum_active_root_executions {
+            return Err(SketchExecutionError::RootExecutionLimitExceeded);
+        }
+        state.active_root_executions += 1;
+        Ok(RootExecutionPermit {
+            ledger: Arc::clone(self),
+        })
+    }
+    fn increment(&self, counter: LedgerCounter) {
+        let mut state = self.state.lock().expect("execution ledger mutex poisoned");
+        let value = counter.get_mut(&mut state);
+        *value = value.saturating_add(1);
+    }
+    fn decrement(&self, counter: LedgerCounter) {
+        let mut state = self.state.lock().expect("execution ledger mutex poisoned");
+        let value = counter.get_mut(&mut state);
+        debug_assert_ne!(*value, 0, "execution ledger counter underflow");
+        *value = value.saturating_sub(1);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LedgerCounter {
+    GuestThreads,
+    Stores,
+    Instances,
+}
+impl LedgerCounter {
+    fn get_mut(self, state: &mut ExecutionLedgerState) -> &mut usize {
+        match self {
+            Self::GuestThreads => &mut state.live_guest_threads,
+            Self::Stores => &mut state.live_stores,
+            Self::Instances => &mut state.live_instances,
         }
     }
 }
@@ -704,9 +766,18 @@ struct SharedMemoryReservation {
 }
 impl Drop for SharedMemoryReservation {
     fn drop(&mut self) {
-        self.ledger
+        let mut state = self
+            .ledger
+            .state
+            .lock()
+            .expect("execution ledger mutex poisoned");
+        debug_assert!(
+            state.reserved_shared_memory_bytes >= self.bytes,
+            "shared-memory reservation underflow"
+        );
+        state.reserved_shared_memory_bytes = state
             .reserved_shared_memory_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
+            .saturating_sub(self.bytes);
     }
 }
 
@@ -714,23 +785,114 @@ struct RootExecutionPermit {
     ledger: Arc<ExecutionLedger>,
 }
 
-struct CounterObservation<'a> {
-    counter: &'a AtomicUsize,
+struct CounterObservation {
+    ledger: Arc<ExecutionLedger>,
+    counter: LedgerCounter,
 }
-impl<'a> CounterObservation<'a> {
-    fn new(counter: &'a AtomicUsize) -> Self {
-        counter.fetch_add(1, Ordering::AcqRel);
-        Self { counter }
+impl CounterObservation {
+    fn new(ledger: Arc<ExecutionLedger>, counter: LedgerCounter) -> Self {
+        ledger.increment(counter);
+        Self { ledger, counter }
     }
 }
-impl Drop for CounterObservation<'_> {
+impl Drop for CounterObservation {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::AcqRel);
+        self.ledger.decrement(self.counter);
     }
 }
 impl Drop for RootExecutionPermit {
     fn drop(&mut self) {
-        self.ledger.active_root_executions.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self
+            .ledger
+            .state
+            .lock()
+            .expect("execution ledger mutex poisoned");
+        debug_assert_ne!(state.active_root_executions, 0, "root permit underflow");
+        state.active_root_executions = state.active_root_executions.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod execution_ledger_tests {
+    use super::*;
+
+    #[test]
+    fn execution_limits_reject_an_unreservable_profile_and_zero_root_permits() {
+        assert_eq!(
+            SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES - 1, 1),
+            Err(SketchCompilerError::InvalidExecutionLimits)
+        );
+        assert_eq!(
+            SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES, 0),
+            Err(SketchCompilerError::InvalidExecutionLimits)
+        );
+    }
+
+    #[test]
+    fn reservation_is_exact_bounded_and_released_on_drop() {
+        let ledger = Arc::new(ExecutionLedger::new(
+            SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES, 1).expect("limits"),
+        ));
+        let reservation = ledger
+            .reserve_shared_memory(THREADED_RUST_RESERVATION_BYTES)
+            .expect("exact reservation");
+        assert_eq!(
+            ledger.snapshot().reserved_shared_memory_bytes(),
+            THREADED_RUST_RESERVATION_BYTES
+        );
+        assert!(matches!(
+            ledger.reserve_shared_memory(1),
+            Err(SketchExecutionError::SharedMemoryLimitExceeded)
+        ));
+        drop(reservation);
+        assert_eq!(ledger.snapshot(), SketchExecutionSnapshot::default());
+    }
+
+    #[test]
+    fn root_permit_and_all_counter_observations_balance_on_unwind() {
+        let ledger = Arc::new(ExecutionLedger::new(SketchExecutionLimits::default()));
+        let result = std::panic::catch_unwind({
+            let ledger = Arc::clone(&ledger);
+            move || {
+                let _root = ledger.acquire_root().expect("root permit");
+                let _thread =
+                    CounterObservation::new(Arc::clone(&ledger), LedgerCounter::GuestThreads);
+                let _store = CounterObservation::new(Arc::clone(&ledger), LedgerCounter::Stores);
+                let _instance = CounterObservation::new(ledger, LedgerCounter::Instances);
+                panic!("simulated root failure");
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(ledger.snapshot(), SketchExecutionSnapshot::default());
+    }
+
+    #[test]
+    fn concurrent_reservations_admit_exactly_one_default_threaded_session() {
+        let ledger = Arc::new(ExecutionLedger::new(SketchExecutionLimits::default()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let ledger = Arc::clone(&ledger);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ledger.reserve_shared_memory(THREADED_RUST_RESERVATION_BYTES)
+            }));
+        }
+        barrier.wait();
+        let mut reservations = Vec::new();
+        let mut rejected = 0;
+        for worker in workers {
+            match worker.join().expect("worker") {
+                Ok(reservation) => reservations.push(reservation),
+                Err(SketchExecutionError::SharedMemoryLimitExceeded) => rejected += 1,
+                Err(error) => panic!("unexpected reservation error: {}", error.code()),
+            }
+        }
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(rejected, 1);
+        drop(reservations);
+        assert_eq!(ledger.snapshot(), SketchExecutionSnapshot::default());
     }
 }
 
@@ -746,8 +908,14 @@ struct ThreadController {
     runtime_identity: AtomicUsize,
     runtime_identity_mismatches: AtomicU64,
     execution_ledger: Arc<ExecutionLedger>,
-    active_roots: AtomicUsize,
+    session: Mutex<SessionState>,
     workers: Mutex<Workers>,
+}
+
+#[derive(Default)]
+struct SessionState {
+    active_roots: usize,
+    closing: bool,
 }
 struct Workers {
     next_tid: i32,
@@ -792,10 +960,20 @@ pub enum ThreadedChildOutcomeKind {
     Panicked,
 }
 impl ThreadController {
-    fn acquire_root(&self) -> Result<LogicalRootPermit, SketchExecutionError> {
+    fn acquire_root(self: &Arc<Self>) -> Result<LogicalRootPermit, SketchExecutionError> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        if session.closing {
+            return Err(SketchExecutionError::SessionBusy);
+        }
         let permit = self.execution_ledger.acquire_root()?;
-        self.active_roots.fetch_add(1, Ordering::AcqRel);
-        Ok(LogicalRootPermit { controller: self, _permit: permit })
+        session.active_roots += 1;
+        Ok(LogicalRootPermit {
+            controller: Arc::clone(self),
+            _permit: permit,
+        })
     }
     fn join_completed(&self) -> Result<(), SketchExecutionError> {
         // Mark closing before taking the queue. This prevents a child that is
@@ -880,13 +1058,19 @@ struct PreparedThreadedRoot {
     _reservation: SharedMemoryReservation,
 }
 
-struct LogicalRootPermit<'a> {
-    controller: &'a ThreadController,
+struct LogicalRootPermit {
+    controller: Arc<ThreadController>,
     _permit: RootExecutionPermit,
 }
-impl Drop for LogicalRootPermit<'_> {
+impl Drop for LogicalRootPermit {
     fn drop(&mut self) {
-        self.controller.active_roots.fetch_sub(1, Ordering::AcqRel);
+        let mut session = self
+            .controller
+            .session
+            .lock()
+            .expect("thread controller session mutex poisoned");
+        debug_assert_ne!(session.active_roots, 0, "logical root permit underflow");
+        session.active_roots = session.active_roots.saturating_sub(1);
     }
 }
 
@@ -976,11 +1160,13 @@ fn define_closed_imports(
                 let child = Arc::clone(&controller);
                 let spawned = std::thread::Builder::new().spawn(move || {
                     let _thread_observation = CounterObservation::new(
-                        &child.execution_ledger.live_guest_threads,
+                        Arc::clone(&child.execution_ledger),
+                        LedgerCounter::GuestThreads,
                     );
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let _store_observation = CounterObservation::new(
-                            &child.execution_ledger.live_stores,
+                            Arc::clone(&child.execution_ledger),
+                            LedgerCounter::Stores,
                         );
                         let mut store = Store::new(
                             &child.engine,
@@ -997,7 +1183,8 @@ fn define_closed_imports(
                             Err(error) => return map_child_error(&error),
                         };
                         let _instance_observation = CounterObservation::new(
-                            &child.execution_ledger.live_instances,
+                            Arc::clone(&child.execution_ledger),
+                            LedgerCounter::Instances,
                         );
                         let entry = instance
                             .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
@@ -1162,11 +1349,16 @@ mod threaded_root_observation_tests {
             );
         });
         assert_eq!(
-            compiler.execution_limits_snapshot().reserved_shared_memory_bytes(),
+            compiler
+                .execution_limits_snapshot()
+                .reserved_shared_memory_bytes(),
             THREADED_RUST_RESERVATION_BYTES,
         );
         sketch.close_threaded_root().expect("explicit close");
-        assert_eq!(compiler.execution_limits_snapshot(), SketchExecutionSnapshot::default());
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
     }
 
     #[test]
@@ -1182,7 +1374,9 @@ mod threaded_root_observation_tests {
             .build()
             .expect("runtime");
         runtime.run(async {
-            first.execute_threaded_root(runtime.handle()).expect("first preparation");
+            first
+                .execute_threaded_root(runtime.handle())
+                .expect("first preparation");
             assert_eq!(
                 second.execute_threaded_root(runtime.handle()),
                 Err(SketchExecutionError::SharedMemoryLimitExceeded),
@@ -1190,8 +1384,49 @@ mod threaded_root_observation_tests {
         });
         first.close_threaded_root().expect("close first");
         runtime.run(async {
-            second.execute_threaded_root(runtime.handle()).expect("released reservation admits second");
+            second
+                .execute_threaded_root(runtime.handle())
+                .expect("released reservation admits second");
         });
+    }
+
+    #[test]
+    fn close_and_root_permit_are_linearized_by_the_cached_session_lock() {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let bytes = threaded_yield_fixture();
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+
+        // The permit is acquired while `prepared_root` remains locked. A
+        // concurrent close can therefore neither detach this session before
+        // admission nor release its reservation underneath the root.
+        let (prepared, permit) = sketch
+            .prepare_threaded_root_with_permit()
+            .expect("prepared root permit");
+        assert_eq!(
+            sketch.close_threaded_root(),
+            Err(SketchExecutionError::SessionBusy)
+        );
+        assert_eq!(
+            compiler
+                .execution_limits_snapshot()
+                .active_root_executions(),
+            1
+        );
+        drop(permit);
+        sketch
+            .close_threaded_root()
+            .expect("close after root drain");
+        drop(prepared);
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
     }
 
     #[test]

@@ -932,6 +932,36 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
+    fn cap_rejection_drains_private_registrations_and_is_reusable() {
+        let bytes = threaded_cap_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+            .expect("policy")
+            .with_max_guest_threads(1)
+            .expect("cap");
+        let sketch = compiler.admit(&bytes, policy).expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for expected_yields in [0, 0] {
+            let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+            assert!(matches!(
+                outcome,
+                Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+                    if summary.capacity() == 1 && summary.closing() == 0
+            ));
+            let observation = sketch
+                .root_execution_observation_for_test()
+                .expect("prepared observation");
+            assert_eq!(observation.kernel_yields, expected_yields);
+            assert_eq!(observation.accepted_child_registrations, 0);
+            assert_eq!(observation.live_threads, 0);
+            assert_eq!(observation.queued_join_handles, 0);
+        }
+    }
+
+    #[test]
     fn validation_profile_requires_its_metadata_and_rejects_precompile() {
         let bytes = threaded_yield_fixture();
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
@@ -1310,6 +1340,47 @@ mod threaded_root_observation_tests {
         }
         custom("target_features", &features, &mut wasm);
         wasm
+    }
+
+    fn threaded_cap_fixture() -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section_offset = 8;
+        loop {
+            let id = bytes[section_offset];
+            let mut body_at = section_offset + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[body_at];
+                body_at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let end = body_at + length;
+            if id == 10 {
+                let mut code = Vec::new();
+                leb(5, &mut code);
+                // `_start`: first spawn must be positive, second exactly -1;
+                // the child exits normally after the host has accepted it.
+                code.extend([
+                    32, 0, 0x41, 0, 0x10, 1, 0x41, 0, 0x4a, 0x45, 0x04, 0x40, 0x41, 6, 0x10, 6,
+                    0x0b, 0x41, 1, 0x10, 1, 0x41, 0x7f, 0x46, 0x45, 0x04, 0x40, 0x41, 7, 0x10, 6,
+                    0x0b, 0x0b, // root
+                    4, 0, 0x41, 0, 0x0b, // __main_void
+                    6, 0, 0x20, 1, 0x10, 6, 0x0b, // wasi_thread_start
+                    4, 0, 0x41, 0, 0x0b, // kernal-api-run
+                    2, 0, 0x0b, // unexported module start
+                ]);
+                let mut output = bytes[..section_offset].to_vec();
+                section(10, code, &mut output);
+                output.extend_from_slice(&bytes[end..]);
+                return output;
+            }
+            section_offset = end;
+        }
     }
 }
 

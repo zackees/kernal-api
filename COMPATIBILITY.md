@@ -17,6 +17,40 @@ implementations of these facilities.
 | Async task protocol | exactly `console-api` 0.9.0 / `console-subscriber` 0.5.0 |
 | CPU/async export | one checked-in `perftools.profiles` schema |
 
+## Wasm fuel and epoch characterization (#44)
+
+The feature-gated `wasm-sketch-host` resolves **Wasmtime 45.0.0** from the
+checked-in Cargo lockfile. The facade keeps its backend types private while
+characterizing these semantic boundaries:
+
+- a real Wasmtime `OutOfFuel` trap maps to `SketchExecutionError::OutOfFuel`
+  for both root and ordered child execution, even if an epoch terminal winner
+  was also observed;
+- epoch deadline observation for ordinary compute is finite under a configured
+  tick/deadline but wall-clock delivery is scheduling-dependent; same-tick
+  cancellation deterministically wins deadline selection;
+- root failure takes precedence over ordered child failure, followed by private
+  validation reporting; cooperative terminal paths release epoch, Store,
+  instance, and root accounting;
+- an `atomic.wait` or host-blocked call is not an in-process cancellation
+  promise. It is classified as `ContainmentRequired`, characterized only in a
+  killable subprocess, and worker-process reaping remains issue #28.
+
+The default feature set remains empty: Wasmtime and this characterization are
+not selected by ordinary async/process users.
+
+| Target | Native evidence for this boundary |
+|---|---|
+| Linux x86-64 | Bosn/native evidence: not run in this change |
+| Windows x86-64 | native evidence: not run in this change |
+| macOS x86-64 / ARM64 | pending/not run |
+| Linux ARM64 | pending/not run |
+| Windows ARM64 | pending/not run |
+
+This is an evidence matrix, not a statement of test execution. Supported
+targets remain those in the package policy above; unlisted native runs must be
+recorded before being claimed as evidence.
+
 ## Client rule
 
 Until 1.0, the four first-party clients use an exact Cargo requirement:

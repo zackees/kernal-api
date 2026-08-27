@@ -1855,9 +1855,9 @@ mod epoch_broker_tests {
     #[test]
     fn containment_required_host_block_is_killed_only_in_a_subprocess() {
         const MODE: &str = "KERNAL_API_EPOCH_CONTAINMENT_CHILD";
-        const MARKER: &str = "KERNAL_API_EPOCH_HOST_BLOCK_MARKER";
+        const MARKER: &str = "KERNAL_API_EPOCH_ATOMIC_WAIT_MARKER";
         if std::env::var_os(MODE).is_some() {
-            let bytes = super::threaded_root_observation_tests::threaded_yield_fixture();
+            let bytes = super::threaded_root_observation_tests::atomic_wait_fixture();
             let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
             let sketch = compiler
                 .admit(
@@ -1870,8 +1870,8 @@ mod epoch_broker_tests {
                 .enable_all()
                 .build()
                 .expect("runtime");
-            // The fixture's module start enters kernel-yield. The test-only
-            // hook writes readiness then parks inside that actual host import.
+            // The fixture yields once to publish readiness, then enters a real
+            // guest atomic.wait. The parent is the only process that kills it.
             runtime.run(async {
                 let _ = sketch.execute_threaded_root(runtime.handle()).await;
             });
@@ -1909,7 +1909,7 @@ mod epoch_broker_tests {
         }
         assert!(
             guard.marker.exists(),
-            "child must reach the Wasm host import before containment classification"
+            "child must reach the Wasm atomic.wait fixture before containment classification"
         );
         assert_eq!(
             std::fs::read_to_string(&guard.marker).expect("read readiness marker"),
@@ -1975,6 +1975,14 @@ fn define_closed_imports(
                         let _ = file.sync_all();
                     }
                     std::thread::park();
+                }
+                #[cfg(test)]
+                if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_ATOMIC_WAIT_MARKER") {
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::File::create(marker) {
+                        let _ = file.write_all(b"entered");
+                        let _ = file.sync_all();
+                    }
                 }
                 if caller.data().runtime.is_some() {
                     controller
@@ -3344,6 +3352,19 @@ mod threaded_root_observation_tests {
         // `loop { br 0 }`; the explicit branch makes every iteration consume
         // Wasmtime fuel rather than relying on host-side timing.
         vec![0, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b]
+    }
+
+    pub(super) fn atomic_wait_fixture() -> Vec<u8> {
+        // Signal the subprocess parent through the closed yield import, then
+        // execute `memory.atomic.wait32(0, 0, -1)`. This never runs in the
+        // parent process; its reaping boundary belongs to #28.
+        threaded_code_fixture([
+            vec![0, 0x10, 0, 0x41, 0, 0x41, 0, 0x42, 0x7f, 0xfe, 0x01, 0x02, 0, 0x1a, 0x0b],
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            empty_body(),
+        ])
     }
 
     fn start_fuel_fixture() -> Vec<u8> {

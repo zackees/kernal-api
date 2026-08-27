@@ -72,7 +72,7 @@ process/runtime dependency.
 | Target | Focused #28 evidence |
 |---|---|
 | Windows x86-64 | Native local Soldr passthrough with `ZCCACHE_DISABLE=1`: the four core D4 containment tests plus crash and parent-death proofs passed (6 passed); the two exact, ignored inner helpers were intentionally not part of the normal run. Prior current-tip checks, lint, and regression evidence also passed. |
-| Linux x86-64 | Core/full evidence predates this focused record, but D4 crash and parent-death native proof is pending: the foreign managed Bosn lease is protected and was not disturbed. |
+| Linux x86-64 | Managed Bosn 0.1.3 native evidence: `doctor` healthy (+0.130 s), `CARGO_BUILD_JOBS=1`; fmt, test-support check/clippy, parser/identity, and containment passed (6 outer; 2 intended ignored inner helpers, including pidfd crash and `PR_SET_PDEATHSIG` parent-death). All-feature check/clippy/full passed: 323 library + 54 symbolize + 14 worker tests, integrations/docs, and containment 6/2. No-default check/test passed: 112 library tests plus integrations; its tree excludes Wasmtime, wasmparser, and wat. Persisted jobs `j15-cbae57c3`–`j20-805af44d`; cleanup `j22-ae169c23` left zero sessions/artifacts. |
 | Windows ARM64 | Compile-only; native focused evidence pending. |
 | macOS x86-64 / ARM64 | Compile-only; native focused evidence pending. |
 | Linux ARM64 | Pending. |

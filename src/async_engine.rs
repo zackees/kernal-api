@@ -79,6 +79,7 @@ impl std::error::Error for TaskError {}
 /// Owned asynchronous runtime.
 pub struct Runtime {
     inner: tokio::runtime::Runtime,
+    identity: Arc<()>,
 }
 
 impl Runtime {
@@ -91,6 +92,7 @@ impl Runtime {
     pub fn handle(&self) -> RuntimeHandle {
         RuntimeHandle {
             inner: self.inner.handle().clone(),
+            identity: Arc::clone(&self.identity),
         }
     }
 }
@@ -135,7 +137,10 @@ impl RuntimeBuilder {
 
     /// Create the configured runtime.
     pub fn build(mut self) -> std::io::Result<Runtime> {
-        self.inner.build().map(|inner| Runtime { inner })
+        self.inner.build().map(|inner| Runtime {
+            inner,
+            identity: Arc::new(()),
+        })
     }
 }
 
@@ -143,13 +148,17 @@ impl RuntimeBuilder {
 #[derive(Clone)]
 pub struct RuntimeHandle {
     inner: tokio::runtime::Handle,
+    identity: Arc<()>,
 }
 
 impl RuntimeHandle {
     /// Obtain the current runtime handle.
     pub fn current() -> Result<Self, NoRuntime> {
         tokio::runtime::Handle::try_current()
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner,
+                identity: Arc::new(()),
+            })
             .map_err(|_| NoRuntime)
     }
 
@@ -162,6 +171,9 @@ impl RuntimeHandle {
         Task {
             inner: self.inner.spawn(future),
         }
+    }
+    pub(crate) fn identity_for_wasm(&self) -> usize {
+        Arc::as_ptr(&self.identity) as usize
     }
 }
 

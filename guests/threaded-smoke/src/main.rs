@@ -3,8 +3,26 @@
 //! Keep this free of output, environment, filesystem, networking, clocks, and
 //! randomness. It is an artifact-profile fixture, not an example application.
 
+use dashmap::DashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
+
+#[repr(C, align(4))]
+struct ValidationRecord {
+    words: [AtomicU32; 16],
+}
+
+static REPORT: ValidationRecord = ValidationRecord {
+    words: [const { AtomicU32::new(0) }; 16],
+};
+
+// Retained verbatim as the validation-profile custom section. The ordinary
+// threaded profile deliberately has no such extra metadata/export surface.
+#[used]
+#[link_section = "kernal-api.profile"]
+static VALIDATION_PROFILE: [u8; 32] = *b"threaded-core-wasm-validation-v1";
 
 #[link(wasm_import_module = "kernal-api:v1")]
 extern "C" {
@@ -17,13 +35,50 @@ extern "C" {
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
     let counter = Arc::new(AtomicU32::new(0));
-    let worker_counter = Arc::clone(&counter);
-    let worker = std::thread::spawn(move || {
-        worker_counter.fetch_add(1, Ordering::SeqCst);
-    });
-    let joined = worker.join().is_ok();
+    let totals = Arc::new(Mutex::new(0_u32));
+    // Use an explicit deterministic hasher: the closed threaded P1 surface
+    // intentionally owns no ambient `random_get` authority.
+    let map = Arc::new(DashMap::<u32, u32, BuildHasherDefault<DefaultHasher>>::with_hasher(
+        BuildHasherDefault::default(),
+    ));
+    let (tx, rx) = mpsc::channel();
+    let mut workers = Vec::new();
+    for key in 0..2_u32 {
+        let counter = Arc::clone(&counter);
+        let totals = Arc::clone(&totals);
+        let map = Arc::clone(&map);
+        let tx = tx.clone();
+        workers.push(std::thread::spawn(move || {
+            // Each native child crosses the kernel boundary too, proving the
+            // supplied runtime handle is observed in every guest Store.
+            unsafe { kernel_yield() };
+            counter.fetch_add(1, Ordering::SeqCst);
+            *totals.lock().expect("mutex") += 1;
+            map.insert(key, 1_u32);
+            tx.send(1_u32).expect("channel");
+        }));
+    }
+    drop(tx);
+    let joined = workers
+        .into_iter()
+        .map(|worker| u32::from(worker.join().is_ok()))
+        .sum::<u32>();
+    let channel_total: u32 = rx.iter().sum();
+    let map_sum: u32 = map.iter().map(|entry| *entry.value()).sum();
+    let mutex_total = *totals.lock().expect("mutex");
+    let values = [0x4b_52_56_31, 1, 64, 0, 2, joined, counter.load(Ordering::SeqCst), mutex_total,
+        channel_total, map.len() as u32, map_sum, 2, 0, 0, 0, 0];
+    for (word, value) in REPORT.words.iter().zip(values) {
+        word.store(value, Ordering::Relaxed);
+    }
+    REPORT.words[3].store(1, Ordering::Release);
     unsafe { kernel_yield() };
-    counter.load(Ordering::SeqCst) + u32::from(joined)
+    joined
+}
+
+#[export_name = "kernal-api-threaded-validation-report-v1"]
+pub extern "C" fn validation_report() -> i32 {
+    REPORT.words.as_ptr() as usize as i32
 }
 
 fn main() {

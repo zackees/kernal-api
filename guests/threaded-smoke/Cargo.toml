@@ -9,3 +9,6 @@ publish = false
 # guest fixture and must never become a dependency or workspace member of the
 # host facade.
 [workspace]
+
+[dependencies]
+dashmap = "=6.1.0"

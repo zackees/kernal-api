@@ -99,15 +99,29 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
 
     let bytes = threaded_root_wasm(None, true, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-    let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
+    let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384)
+        .expect("policy")
+        .with_max_guest_threads(1)
+        .expect("one child cap");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
     let outcome = runtime.run(async {
         sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
     });
-    assert_eq!(
-        outcome.expect("negative thread-spawn rejection"),
-        ThreadedRootOutcome::Started
-    );
+    match outcome.expect("the second spawn must be rejected without a reservation leak") {
+        ThreadedRootOutcome::StartedWithThreadRejections(summary) => {
+            assert_eq!(summary.capacity(), 1);
+            assert_eq!(summary.closing(), 0);
+        }
+        outcome => panic!("unexpected root outcome: {outcome:?}"),
+    }
+    let repeated = runtime.run(async {
+        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+    });
+    assert!(matches!(
+        repeated,
+        Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+            if summary.capacity() == 1 && summary.closing() == 0
+    ));
 }
 
 #[test]
@@ -228,17 +242,30 @@ fn threaded_root_wasm(
     section(8, vec![12], &mut wasm);
     let mut code = Vec::new();
     leb(5, &mut code);
-    code.extend([
-        2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b,
-    ]);
+    // Root `_start`, `__main_void`, child `wasi_thread_start`, and the
+    // `kernal-api-run` export. The module start below remains a no-op: this
+    // proves the host enters the command only through `_start`, and that a
+    // positive thread-spawn result means a fresh child instance ran and was
+    // joined before execute_threaded_root returns.
+    if assert_thread_spawn_rejection {
+        code.extend([
+            // First TID must be positive; the second must be exactly -1.
+            // Either ABI violation calls proc_exit with a nonzero code.
+            32, 0, 0x41, 0, 0x10, 1, 0x41, 0, 0x4a, 0x45, 0x04, 0x40, 0x41, 6, 0x10, 6, 0x0b, 0x41,
+            1, 0x10, 1, 0x41, 0x7f, 0x46, 0x45, 0x04, 0x40, 0x41, 7, 0x10, 6, 0x0b, 0x0b, 4, 0,
+            0x41, 0, 0x0b, 6, 0, 0x20, 1, 0x10, 6, 0x0b, // child: proc_exit(arg)
+            4, 0, 0x41, 0, 0x0b,
+        ]);
+    } else {
+        code.extend([
+            2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4, 0, 0x41, 0, 0x0b,
+        ]);
+    }
     if let Some(exit_code) = proc_exit {
         // Imported function index 6 is `wasi_snapshot_preview1::proc_exit`.
         code.extend([6, 0, 0x41, exit_code as u8, 0x10, 6, 0x0b]);
     } else if assert_thread_spawn_rejection {
-        // `thread-spawn` import index 1 must return the negative v1 sentinel.
-        code.extend([
-            13, 0, 0x41, 0, 0x10, 1, 0x41, 0x7f, 0x47, 0x04, 0x40, 0x00, 0x0b, 0x0b,
-        ]);
+        code.extend([2, 0, 0x0b]);
     } else if assert_fd_write_fault {
         // `fd_write` import index 5 must reject the negative iovec pointer.
         code.extend([

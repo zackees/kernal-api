@@ -4,9 +4,12 @@
 //! binary contract has succeeded. The threaded-root profile can then start in
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
+use std::cell::UnsafeCell;
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::mem::align_of;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
@@ -25,6 +28,8 @@ const ABI_METADATA: &str = "kernal-api.abi";
 const ABI_METADATA_VALUE: &[u8] = b"v1";
 const PROFILE_METADATA: &str = "kernal-api.profile";
 const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
+const VALIDATION_PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-validation-v1";
+const VALIDATION_REPORT: &str = "kernal-api-threaded-validation-report-v1";
 const MAX_METADATA_BYTES: usize = 128;
 const THREADED_RUST_INITIAL_PAGES: u32 = 17;
 const THREADED_RUST_MAX_PAGES: u32 = 16_384;
@@ -32,6 +37,10 @@ const ERRNO_SUCCESS: i32 = 0;
 const ERRNO_FAULT: i32 = 21;
 const THREAD_SPAWN_REJECTED: i32 = -1;
 const MAX_P1_IOVECS: usize = 1024;
+/// Absolute v1 ceiling. This bounds native JoinHandles and the facade-owned
+/// child-outcome vector independently of a caller's requested quota.
+const MAX_GUEST_THREADS_V1: usize = 16;
+const DEFAULT_MAX_GUEST_THREADS: usize = MAX_GUEST_THREADS_V1;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -104,7 +113,9 @@ impl SketchCompiler {
         }
         let memory = match policy.profile {
             SketchAdmissionProfile::SyntheticV1 => preflight(bytes, policy)?,
-            SketchAdmissionProfile::ThreadedRustV1 => preflight_threaded_rust(bytes, policy)?,
+            SketchAdmissionProfile::ThreadedRustV1 => {
+                preflight_threaded_rust(bytes, policy, policy.validation)?
+            }
         };
         let module =
             Module::new(&self.engine, bytes).map_err(|_| SketchModuleError::InvalidBinary)?;
@@ -114,7 +125,9 @@ impl SketchCompiler {
             module,
             module_bytes: bytes.len(),
             shared_memory: memory,
+            max_guest_threads: policy.max_guest_threads,
             profile: policy.profile,
+            validation: policy.validation,
             prepared_root: std::sync::Mutex::new(None),
             #[cfg(test)]
             preparation_count: AtomicU64::new(0),
@@ -130,7 +143,9 @@ impl SketchCompiler {
 pub struct SketchModulePolicy {
     max_module_bytes: usize,
     max_shared_memory_pages: u32,
+    max_guest_threads: usize,
     profile: SketchAdmissionProfile,
+    validation: bool,
 }
 impl SketchModulePolicy {
     pub fn new(
@@ -146,7 +161,9 @@ impl SketchModulePolicy {
         Ok(Self {
             max_module_bytes,
             max_shared_memory_pages,
+            max_guest_threads: DEFAULT_MAX_GUEST_THREADS,
             profile: SketchAdmissionProfile::SyntheticV1,
+            validation: false,
         })
     }
     /// Selects the exact Rust 1.95 `wasm32-wasip1-threads` link profile.
@@ -160,11 +177,43 @@ impl SketchModulePolicy {
         policy.profile = SketchAdmissionProfile::ThreadedRustV1;
         Ok(policy)
     }
+    /// Crate-only artifact characterization contract. Applications cannot opt
+    /// into this wider validation export surface.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn threaded_rust_validation_v1_for_test(
+        max_module_bytes: usize,
+        max_shared_memory_pages: u32,
+    ) -> Result<Self, SketchModuleError> {
+        let mut policy = Self::threaded_rust_v1(max_module_bytes, max_shared_memory_pages)?;
+        policy.validation = true;
+        Ok(policy)
+    }
     pub fn max_module_bytes(self) -> usize {
         self.max_module_bytes
     }
     pub fn max_shared_memory_pages(self) -> u32 {
         self.max_shared_memory_pages
+    }
+    /// Bounds live guest-owned native threads for one admitted sketch. The
+    /// limit is a semantic controller quota, not a Wasmtime pooling setting.
+    /// V1 accepts at most 16 threads so the native
+    /// registrations and bounded semantic child report cannot grow unbounded.
+    pub fn with_max_guest_threads(mut self, maximum: usize) -> Result<Self, SketchModuleError> {
+        if maximum == 0 {
+            return Err(SketchModuleError::InvalidThreadLimit);
+        }
+        if maximum > MAX_GUEST_THREADS_V1 {
+            return Err(SketchModuleError::ThreadLimitExceedsV1Maximum {
+                requested: maximum,
+                maximum: MAX_GUEST_THREADS_V1,
+            });
+        }
+        self.max_guest_threads = maximum;
+        Ok(self)
+    }
+    pub fn max_guest_threads(self) -> usize {
+        self.max_guest_threads
     }
     pub fn profile(self) -> SketchAdmissionProfile {
         self.profile
@@ -177,7 +226,9 @@ pub struct AdmittedSketch {
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
+    max_guest_threads: usize,
     profile: SketchAdmissionProfile,
+    validation: bool,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
     // controller: it must survive any future controller replacement to prove
@@ -192,9 +243,11 @@ impl AdmittedSketch {
     pub fn shared_memory(&self) -> SketchSharedMemory {
         self.shared_memory
     }
-    /// Instantiates the admitted module in one fresh root store. Instantiation
-    /// is the sole entry operation: Wasmtime invokes the module start itself.
-    /// Child guest threads are deliberately unavailable until the next slice.
+    /// Instantiates the admitted module in one fresh root store, then invokes
+    /// the admitted command ABI's exported `_start` exactly once. The Wasm
+    /// start section runs during instantiation; Rust command artifacts use it
+    /// only for memory initialization, while `_start` performs constructors,
+    /// user entry, and the P1 exit path.
     pub fn execute_threaded_root(
         &self,
         runtime: crate::async_engine::RuntimeHandle,
@@ -203,6 +256,10 @@ impl AdmittedSketch {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let prepared = self.prepare_threaded_root()?;
+        prepared
+            .controller
+            .runtime_identity
+            .store(runtime.identity_for_wasm(), Ordering::Release);
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -210,10 +267,49 @@ impl AdmittedSketch {
                 runtime: Some(runtime),
             },
         );
-        match prepared.prelink.instantiate(&mut store) {
-            Ok(_) => Ok(ThreadedRootOutcome::Started),
-            Err(error) => map_root_error(&error),
-        }
+        // Do not return from this scope before finalization. A Wasm start
+        // section can invoke thread-spawn while instantiation is still in
+        // progress, and lookup/call failures after that must still close and
+        // drain every accepted native child.
+        let mut validation_getter = None;
+        let outcome = (|| {
+            let instance = match prepared.prelink.instantiate(&mut store) {
+                Ok(instance) => instance,
+                Err(error) => return map_root_error(&error),
+            };
+            let start = instance
+                .get_typed_func::<(), ()>(&mut store, "_start")
+                .map_err(|_| SketchExecutionError::Trapped)?;
+            if self.validation {
+                validation_getter = Some(
+                    instance
+                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                );
+            }
+            start
+                .call(&mut store, ())
+                .map(|_| ThreadedRootOutcome::Started)
+                .or_else(|error| map_root_error(&error))
+        })();
+        // Joining happens after the root Store has returned from Wasm and the
+        // workers mutex is not held. A child failure is part of the semantic
+        // execution result rather than a detached native-thread panic.
+        let children = prepared.controller.join_completed();
+        let rejections = prepared.controller.take_thread_spawn_rejections();
+        // Finalization always drains children, but the root call is the
+        // primary operation: its typed failure must not be masked by a
+        // concurrent child or report diagnostic.
+        let report = if self.validation && outcome.is_ok() && children.is_ok() {
+            let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
+            let offset = getter
+                .call(&mut store, ())
+                .map_err(|_| SketchExecutionError::ValidationReportInvalid)?;
+            validate_report(&prepared.controller.memory, offset)
+        } else {
+            Ok(())
+        };
+        resolve_threaded_result(outcome, children, report, rejections)
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
@@ -232,10 +328,26 @@ impl AdmittedSketch {
         )
         .map_err(|_| SketchExecutionError::SharedMemoryUnavailable)?;
         let controller = Arc::new(ThreadController {
+            engine: Arc::clone(&self.engine),
             memory,
             prelink: OnceLock::new(),
+            workers: Mutex::new(Workers {
+                next_tid: 1,
+                accepted: 0,
+                live: 0,
+                closing: false,
+                maximum: self.max_guest_threads,
+                capacity_rejections: 0,
+                closing_rejections: 0,
+                handles: Vec::new(),
+                // At most `maximum` spawns are accepted before the controller
+                // closes, so this facade report remains absolutely bounded.
+                outcomes: Vec::with_capacity(self.max_guest_threads),
+            }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
+            runtime_identity: AtomicUsize::new(0),
+            runtime_identity_mismatches: AtomicU64::new(0),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -286,10 +398,17 @@ impl AdmittedSketch {
     fn root_execution_observation_for_test(&self) -> Option<RootExecutionObservation> {
         let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
         let controller = &prepared.controller;
+        let workers = controller.workers.lock().ok()?;
         Some(RootExecutionObservation {
             preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
             supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
+            runtime_identity_mismatches: controller
+                .runtime_identity_mismatches
+                .load(Ordering::Relaxed),
+            accepted_child_registrations: workers.accepted,
+            live_threads: workers.live,
+            queued_join_handles: workers.handles.len(),
         })
     }
     #[allow(dead_code)]
@@ -322,26 +441,60 @@ impl SketchSharedMemory {
 pub enum ThreadedRootOutcome {
     /// The module start completed without requesting process exit.
     Started,
+    /// The root completed, but bounded guest thread-spawn requests were
+    /// rejected. The guest ABI receives `-1`; this carries the typed host
+    /// accounting without exposing a backend error.
+    StartedWithThreadRejections(ThreadSpawnRejectionSummary),
     /// The module requested the normal `proc_exit(0)` completion path.
     Exited,
+    /// The root requested normal process exit after bounded thread rejections.
+    ExitedWithThreadRejections(ThreadSpawnRejectionSummary),
+}
+
+/// Bounded, facade-owned accounting for guest `wasi::thread-spawn` rejections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadSpawnRejectionSummary {
+    capacity: u32,
+    closing: u32,
+}
+impl ThreadSpawnRejectionSummary {
+    pub fn capacity(self) -> u32 {
+        self.capacity
+    }
+    pub fn closing(self) -> u32 {
+        self.closing
+    }
+    pub fn is_empty(self) -> bool {
+        self.capacity == 0 && self.closing == 0
+    }
 }
 
 /// Bounded failures from private threaded-root setup and start execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SketchExecutionError {
     ThreadedProfileRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
+    ChildNonzeroExit { code: i32 },
+    ChildTrapped,
+    ChildPanicked,
+    ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
+    ValidationReportInvalid,
     Trapped,
 }
 impl SketchExecutionError {
-    pub fn code(self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::ThreadedProfileRequired => "threaded-profile-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
+            Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
+            Self::ChildTrapped => "child-trapped",
+            Self::ChildPanicked => "child-panicked",
+            Self::ChildOutcomes { .. } => "child-outcomes",
+            Self::ValidationReportInvalid => "validation-report-invalid",
             Self::Trapped => "trapped",
         }
     }
@@ -354,6 +507,7 @@ impl fmt::Display for SketchExecutionError {
 impl std::error::Error for SketchExecutionError {}
 
 struct ThreadController {
+    engine: Arc<Engine>,
     memory: SharedMemory,
     // Callbacks reach their controller through ThreadStoreState. Keeping the
     // prelink here breaks their otherwise cyclic construction without letting a
@@ -361,6 +515,128 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
+    runtime_identity: AtomicUsize,
+    runtime_identity_mismatches: AtomicU64,
+    workers: Mutex<Workers>,
+}
+struct Workers {
+    next_tid: i32,
+    // Total child registrations in the current root execution. Unlike `live`,
+    // this never decreases until drain, so a fast-completing guest cannot grow
+    // the bounded facade outcome vector by repeatedly spawning replacements.
+    accepted: usize,
+    live: usize,
+    closing: bool,
+    maximum: usize,
+    capacity_rejections: u32,
+    closing_rejections: u32,
+    handles: Vec<JoinHandle<()>>,
+    // Completion is inherently concurrent; retain the guest TID so reporting
+    // is deterministic rather than depending on native scheduler order.
+    outcomes: Vec<(i32, ChildOutcome)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChildOutcome {
+    Completed,
+    Exited,
+    NonzeroExit(i32),
+    Trapped,
+    Panicked,
+}
+
+/// One cooperatively joined guest child outcome. This facade type contains no
+/// native thread, Store, trap, or backend diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadedChildOutcome {
+    pub tid: i32,
+    pub kind: ThreadedChildOutcomeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadedChildOutcomeKind {
+    Completed,
+    Exited,
+    NonzeroExit { code: i32 },
+    Trapped,
+    Panicked,
+}
+impl ThreadController {
+    fn join_completed(&self) -> Result<(), SketchExecutionError> {
+        // Mark closing before taking the queue. This prevents a child that is
+        // still running from registering another native worker after the final
+        // drain begins; no mutex remains held across `join` or guest Wasm.
+        loop {
+            let handles = self
+                .workers
+                .lock()
+                .map_err(|_| SketchExecutionError::ChildPanicked)
+                .map(|mut w| {
+                    w.closing = true;
+                    std::mem::take(&mut w.handles)
+                })?;
+            if handles.is_empty() {
+                break;
+            }
+            for handle in handles {
+                if handle.join().is_err() {
+                    let mut workers = self
+                        .workers
+                        .lock()
+                        .map_err(|_| SketchExecutionError::ChildPanicked)?;
+                    if workers.outcomes.len() < workers.maximum {
+                        workers.outcomes.push((i32::MAX, ChildOutcome::Panicked));
+                    }
+                }
+            }
+        }
+        let mut workers = self
+            .workers
+            .lock()
+            .map_err(|_| SketchExecutionError::ChildPanicked)?;
+        let mut outcomes: Vec<_> = workers.outcomes.drain(..).collect();
+        workers.accepted = 0;
+        outcomes.sort_by_key(|(tid, _)| *tid);
+        let report: Vec<_> = outcomes
+            .into_iter()
+            .map(|(tid, outcome)| ThreadedChildOutcome {
+                tid,
+                kind: match outcome {
+                    ChildOutcome::Completed => ThreadedChildOutcomeKind::Completed,
+                    ChildOutcome::Exited => ThreadedChildOutcomeKind::Exited,
+                    ChildOutcome::NonzeroExit(code) => {
+                        ThreadedChildOutcomeKind::NonzeroExit { code }
+                    }
+                    ChildOutcome::Trapped => ThreadedChildOutcomeKind::Trapped,
+                    ChildOutcome::Panicked => ThreadedChildOutcomeKind::Panicked,
+                },
+            })
+            .collect();
+        workers.closing = false;
+        if report.iter().all(|outcome| {
+            matches!(
+                outcome.kind,
+                ThreadedChildOutcomeKind::Completed | ThreadedChildOutcomeKind::Exited
+            )
+        }) {
+            Ok(())
+        } else {
+            Err(SketchExecutionError::ChildOutcomes { outcomes: report })
+        }
+    }
+
+    fn take_thread_spawn_rejections(&self) -> ThreadSpawnRejectionSummary {
+        let Ok(mut workers) = self.workers.lock() else {
+            return ThreadSpawnRejectionSummary::default();
+        };
+        let summary = ThreadSpawnRejectionSummary {
+            capacity: workers.capacity_rejections,
+            closing: workers.closing_rejections,
+        };
+        workers.capacity_rejections = 0;
+        workers.closing_rejections = 0;
+        summary
+    }
 }
 
 struct PreparedThreadedRoot {
@@ -379,6 +655,10 @@ struct RootExecutionObservation {
     preparations: u64,
     kernel_yields: u64,
     supplied_runtime_handles: u64,
+    runtime_identity_mismatches: u64,
+    accepted_child_registrations: usize,
+    live_threads: usize,
+    queued_join_handles: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -403,6 +683,17 @@ fn define_closed_imports(
                     controller
                         .runtime_handle_count
                         .fetch_add(1, Ordering::Relaxed);
+                    let actual = caller
+                        .data()
+                        .runtime
+                        .as_ref()
+                        .expect("checked runtime")
+                        .identity_for_wasm();
+                    if controller.runtime_identity.load(Ordering::Acquire) != actual {
+                        controller
+                            .runtime_identity_mismatches
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 let _ = controller.prelink.get();
             },
@@ -412,10 +703,91 @@ fn define_closed_imports(
         .func_wrap(
             THREAD_MODULE,
             THREAD_SPAWN,
-            |_caller: Caller<'_, ThreadStoreState>, _arg: i32| -> i32 {
-                // #35 replaces this pure deterministic rejection with the owned
-                // child Store/Instance/native-thread bootstrap.
-                THREAD_SPAWN_REJECTED
+            |caller: Caller<'_, ThreadStoreState>, arg: i32| -> i32 {
+                let controller = Arc::clone(&caller.data().controller);
+                let runtime = caller.data().runtime.clone();
+                let tid = match controller.workers.lock() {
+                    Ok(mut w) => {
+                        if w.closing {
+                            w.closing_rejections = w.closing_rejections.saturating_add(1);
+                            return THREAD_SPAWN_REJECTED;
+                        }
+                        if w.live >= w.maximum
+                            || w.accepted >= w.maximum
+                            || w.next_tid > 0x1fff_ffff
+                        {
+                            w.capacity_rejections = w.capacity_rejections.saturating_add(1);
+                            return THREAD_SPAWN_REJECTED;
+                        }
+                        let tid = w.next_tid;
+                        w.next_tid += 1;
+                        w.accepted += 1;
+                        w.live += 1;
+                        tid
+                    }
+                    _ => return THREAD_SPAWN_REJECTED,
+                };
+                let child = Arc::clone(&controller);
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let mut store = Store::new(
+                            &child.engine,
+                            ThreadStoreState {
+                                controller: Arc::clone(&child),
+                                runtime,
+                            },
+                        );
+                        let Some(prelink) = child.prelink.get() else {
+                            return ChildOutcome::Trapped;
+                        };
+                        let instance = match prelink.instantiate(&mut store) {
+                            Ok(instance) => instance,
+                            Err(error) => return map_child_error(&error),
+                        };
+                        let entry = instance
+                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
+                            .map_err(|_| ())
+                            .ok();
+                        let Some(entry) = entry else {
+                            return ChildOutcome::Trapped;
+                        };
+                        match entry.call(&mut store, (tid, arg)) {
+                            Ok(()) => ChildOutcome::Completed,
+                            Err(error) => map_child_error(&error),
+                        }
+                    }));
+                    let outcome = match result {
+                        Ok(outcome) => outcome,
+                        Err(_) => ChildOutcome::Panicked,
+                    };
+                    if let Ok(mut w) = child.workers.lock() {
+                        w.live = w.live.saturating_sub(1);
+                        if w.outcomes.len() < w.maximum {
+                            w.outcomes.push((tid, outcome));
+                        }
+                    }
+                });
+                match spawned {
+                    Ok(handle) => {
+                        if let Ok(mut w) = controller.workers.lock() {
+                            w.handles.push(handle);
+                            tid
+                        } else {
+                            // Do not detach a worker if bookkeeping became
+                            // poisoned after reservation. We cannot safely
+                            // expose its positive TID, so wait before failing.
+                            let _ = handle.join();
+                            THREAD_SPAWN_REJECTED
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut w) = controller.workers.lock() {
+                            w.live = w.live.saturating_sub(1);
+                            w.accepted = w.accepted.saturating_sub(1);
+                        }
+                        THREAD_SPAWN_REJECTED
+                    }
+                }
             },
         )
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
@@ -507,6 +879,19 @@ mod threaded_root_observation_tests {
     use super::*;
 
     #[test]
+    fn thread_policy_rejects_requests_above_the_v1_absolute_cap() {
+        let policy =
+            SketchModulePolicy::threaded_rust_v1(1, THREADED_RUST_MAX_PAGES).expect("policy");
+        assert_eq!(
+            policy.with_max_guest_threads(MAX_GUEST_THREADS_V1 + 1),
+            Err(SketchModuleError::ThreadLimitExceedsV1Maximum {
+                requested: MAX_GUEST_THREADS_V1 + 1,
+                maximum: MAX_GUEST_THREADS_V1,
+            })
+        );
+    }
+
+    #[test]
     fn repeated_roots_reuse_one_preparation_and_receive_the_supplied_runtime() {
         let bytes = threaded_yield_fixture();
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
@@ -538,8 +923,303 @@ mod threaded_root_observation_tests {
                 preparations: 1,
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
+                runtime_identity_mismatches: 0,
+                accepted_child_registrations: 0,
+                live_threads: 0,
+                queued_join_handles: 0,
             })
         );
+    }
+
+    #[test]
+    fn cap_rejection_drains_private_registrations_and_is_reusable() {
+        let bytes = threaded_cap_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+            .expect("policy")
+            .with_max_guest_threads(1)
+            .expect("cap");
+        let sketch = compiler.admit(&bytes, policy).expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for expected_yields in [0, 0] {
+            let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+            assert!(matches!(
+                outcome,
+                Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+                    if summary.capacity() == 1 && summary.closing() == 0
+            ));
+            let observation = sketch
+                .root_execution_observation_for_test()
+                .expect("prepared observation");
+            assert_eq!(observation.kernel_yields, expected_yields);
+            assert_eq!(observation.accepted_child_registrations, 0);
+            assert_eq!(observation.live_threads, 0);
+            assert_eq!(observation.queued_join_handles, 0);
+        }
+    }
+
+    #[test]
+    fn validation_profile_requires_its_metadata_and_rejects_precompile() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+            bytes.len() + 1,
+            THREADED_RUST_MAX_PAGES,
+        )
+        .expect("policy");
+        let error = match compiler.admit(&bytes, policy) {
+            Ok(_) => panic!("metadata is required"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            SketchModuleError::MissingMetadata {
+                name: PROFILE_METADATA
+            }
+        );
+        assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
+    #[test]
+    fn supplied_validation_artifact_executes_the_private_validation_lane() {
+        let Ok(path) = std::env::var("KERNAL_API_THREADED_VALIDATION_WASM") else {
+            // The real Rust guest is assembled only by the explicit diagnostic
+            // workflow; normal unit runs remain source-only.
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read validation artifact");
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                    bytes.len() + 1,
+                    THREADED_RUST_MAX_PAGES,
+                )
+                .expect("policy"),
+            )
+            .expect("validation artifact admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(handle) }),
+            Ok(ThreadedRootOutcome::Started)
+        );
+        assert_eq!(compiler.compiled_module_count(), 1);
+        assert_eq!(
+            sketch.root_execution_observation_for_test(),
+            Some(RootExecutionObservation {
+                preparations: 1,
+                // One root `_start` call and the two Rust std-thread entries
+                // each invoke the closed kernel-yield import.
+                kernel_yields: 3,
+                supplied_runtime_handles: 3,
+                runtime_identity_mismatches: 0,
+                accepted_child_registrations: 0,
+                live_threads: 0,
+                queued_join_handles: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn validation_profile_mutations_reject_before_compilation() {
+        let policy = |bytes: usize| {
+            SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                bytes + 1,
+                THREADED_RUST_MAX_PAGES,
+            )
+            .expect("policy")
+        };
+        for (metadata, expected) in [
+            (
+                vec![
+                    VALIDATION_PROFILE_METADATA_VALUE,
+                    VALIDATION_PROFILE_METADATA_VALUE,
+                ],
+                SketchModuleError::DuplicateMetadata {
+                    name: PROFILE_METADATA,
+                },
+            ),
+            (
+                vec![b"wrong-profile"],
+                SketchModuleError::MetadataMismatch {
+                    name: PROFILE_METADATA,
+                },
+            ),
+        ] {
+            let mut bytes = threaded_yield_fixture();
+            for value in metadata {
+                custom(PROFILE_METADATA, value, &mut bytes);
+            }
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let error = match compiler.admit(&bytes, policy(bytes.len())) {
+                Ok(_) => panic!("mutation must reject"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected);
+            assert_eq!(compiler.compiled_module_count(), 0);
+        }
+
+        let mut bytes = threaded_yield_fixture();
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut bytes,
+        );
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let error = match compiler.admit(&bytes, policy(bytes.len())) {
+            Ok(_) => panic!("report export is required"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SketchModuleError::ExportNotAllowed { .. }));
+        assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
+    fn validation_export_mutation(name: &str, kind: u8, index: u32) -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section = 8;
+        loop {
+            if bytes[section] == 7 {
+                break;
+            }
+            let mut at = section + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[at];
+                at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            section = at + length;
+        }
+        let mut at = section + 1;
+        let mut length = 0_usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[at];
+            at += 1;
+            length |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let body = &bytes[at..at + length];
+        let mut replacement = vec![6];
+        replacement.extend_from_slice(&body[1..]);
+        text(name, &mut replacement);
+        replacement.push(kind);
+        leb(index, &mut replacement);
+        let mut output = bytes[..section].to_vec();
+        output.push(7);
+        leb(replacement.len() as u32, &mut output);
+        output.extend(replacement);
+        output.extend_from_slice(&bytes[at + length..]);
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut output,
+        );
+        output
+    }
+
+    #[test]
+    fn validation_report_export_mutations_reject_precompile() {
+        let cases = [
+            ("wrong-name", 0, 9),
+            (VALIDATION_REPORT, 2, 0),
+            (VALIDATION_REPORT, 0, 8),
+            ("extra", 0, 9),
+        ];
+        for (name, kind, index) in cases {
+            let bytes = validation_export_mutation(name, kind, index);
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                bytes.len() + 1,
+                THREADED_RUST_MAX_PAGES,
+            )
+            .expect("policy");
+            assert!(compiler.admit(&bytes, policy).is_err());
+            assert_eq!(compiler.compiled_module_count(), 0);
+        }
+    }
+
+    // Keep import-section mutation local to the raw fixture. It proves the
+    // validation profile remains closed before Wasmtime compilation rather
+    // than relying on linker failure after an artifact is admitted.
+    fn validation_fixture_with_extra_import() -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section = 8;
+        while bytes[section] != 2 {
+            let mut at = section + 1;
+            while bytes[at] & 0x80 != 0 {
+                at += 1;
+            }
+            let length = usize::from(bytes[at] & 0x7f);
+            section = at + 1 + length;
+        }
+        let mut body_at = section + 1;
+        let mut length = 0_usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[body_at];
+            body_at += 1;
+            length |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let end = body_at + length;
+        let mut body = bytes[body_at..end].to_vec();
+        body[0] = 10; // the raw fixture has nine imports; add one.
+        let mut extra = Vec::new();
+        text("unexpected", &mut extra);
+        text("import", &mut extra);
+        extra.extend([0, 0]);
+        body.extend(extra);
+        let mut bytes = bytes[..section].to_vec();
+        bytes.push(2);
+        leb(body.len() as u32, &mut bytes);
+        bytes.extend(body);
+        bytes.extend_from_slice(&threaded_yield_fixture()[end..]);
+        custom(
+            PROFILE_METADATA,
+            VALIDATION_PROFILE_METADATA_VALUE,
+            &mut bytes,
+        );
+        bytes
+    }
+
+    #[test]
+    fn validation_extra_import_rejects_before_compilation() {
+        let bytes = validation_fixture_with_extra_import();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let policy = SketchModulePolicy::threaded_rust_validation_v1_for_test(
+            bytes.len() + 1,
+            THREADED_RUST_MAX_PAGES,
+        )
+        .expect("policy");
+        let error = match compiler.admit(&bytes, policy) {
+            Ok(_) => panic!("extra import admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SketchModuleError::ForbiddenImport { .. }),
+            "unexpected rejection: {error:?}"
+        );
+        assert_eq!(compiler.compiled_module_count(), 0);
     }
 
     fn leb(mut value: u32, output: &mut Vec<u8>) {
@@ -661,6 +1341,47 @@ mod threaded_root_observation_tests {
         custom("target_features", &features, &mut wasm);
         wasm
     }
+
+    fn threaded_cap_fixture() -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section_offset = 8;
+        loop {
+            let id = bytes[section_offset];
+            let mut body_at = section_offset + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[body_at];
+                body_at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let end = body_at + length;
+            if id == 10 {
+                let mut code = Vec::new();
+                leb(5, &mut code);
+                // `_start`: first spawn must be positive, second exactly -1;
+                // the child exits normally after the host has accepted it.
+                code.extend([
+                    32, 0, 0x41, 0, 0x10, 1, 0x41, 0, 0x4a, 0x45, 0x04, 0x40, 0x41, 6, 0x10, 6,
+                    0x0b, 0x41, 1, 0x10, 1, 0x41, 0x7f, 0x46, 0x45, 0x04, 0x40, 0x41, 7, 0x10, 6,
+                    0x0b, 0x0b, // root
+                    4, 0, 0x41, 0, 0x0b, // __main_void
+                    6, 0, 0x20, 1, 0x10, 6, 0x0b, // wasi_thread_start
+                    4, 0, 0x41, 0, 0x0b, // kernal-api-run
+                    2, 0, 0x0b, // unexported module start
+                ]);
+                let mut output = bytes[..section_offset].to_vec();
+                section(10, code, &mut output);
+                output.extend_from_slice(&bytes[end..]);
+                return output;
+            }
+            section_offset = end;
+        }
+    }
 }
 
 fn write_shared(memory: &SharedMemory, offset: i32, bytes: &[u8]) -> i32 {
@@ -729,6 +1450,125 @@ fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
+fn load_shared_atomic_u32(cells: &[UnsafeCell<u8>], ordering: Ordering) -> Option<u32> {
+    if cells.len() != 4 {
+        return None;
+    }
+    let pointer = cells.as_ptr().cast::<AtomicU32>();
+    if pointer.addr() % align_of::<AtomicU32>() != 0 {
+        return None;
+    }
+    // SAFETY: callers provide exactly four live SharedMemory cells and the
+    // computed backing address is checked for AtomicU32 alignment. The shared
+    // report protocol permits only atomic accesses; this reference is used for
+    // one load and never escapes the function.
+    Some(unsafe { (&*pointer).load(ordering) })
+}
+
+// Validation reports are intentionally private: the guest returns only a
+// bounded offset and the facade consumes the fixed 64-byte schema itself.
+fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecutionError> {
+    if offset < 0 || offset % 4 != 0 || shared_range(memory, offset, 64).is_none() {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    let load = |word: i32, ordering| -> Option<u32> {
+        let cells = shared_range(memory, offset.checked_add(word.checked_mul(4)?)?, 4)?;
+        load_shared_atomic_u32(cells, ordering)
+    };
+    // The guest stores ready with Release after all record fields; acquire it
+    // before copying the remaining words.
+    if load(3, Ordering::Acquire) != Some(1) {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    let words: Option<Vec<u32>> = (0..16).map(|word| load(word, Ordering::Relaxed)).collect();
+    let Some(words) = words else {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    };
+    if words[0] != 0x4b_52_56_31
+        || words[1] != 1
+        || words[2] != 64
+        || words[4] != 2
+        || words[5] != 2
+        || words[6] != 2
+        || words[7] != 2
+        || words[8] != 2
+        || words[9] != 2
+        || words[10] != 2
+        || words[11] != 2
+        || words[12] != 0
+        || words[13] != 0
+        || words[14] != 0
+        || words[15] != 0
+    {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validation_report_tests {
+    use super::*;
+
+    fn memory() -> SharedMemory {
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("engine");
+        SharedMemory::new(&compiler.engine, MemoryType::shared(17, 16_384)).expect("memory")
+    }
+
+    fn write_report(memory: &SharedMemory, offset: i32, words: [u32; 16]) {
+        for (index, value) in words.into_iter().enumerate() {
+            let cells = shared_range(memory, offset + (index as i32 * 4), 4).expect("range");
+            // SAFETY: test offsets are aligned/in-range and this helper only
+            // writes the atomic record representation used by validate_report.
+            unsafe { (&*cells.as_ptr().cast::<AtomicU32>()).store(value, Ordering::Release) };
+        }
+    }
+
+    fn valid() -> [u32; 16] {
+        [0x4b_52_56_31, 1, 64, 1, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0]
+    }
+
+    #[test]
+    fn validation_report_rejects_bad_pointer_and_schema() {
+        let memory = memory();
+        assert_eq!(
+            validate_report(&memory, -1),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        assert_eq!(
+            validate_report(&memory, 2),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        assert_eq!(
+            validate_report(&memory, i32::MAX - 2),
+            Err(SketchExecutionError::ValidationReportInvalid)
+        );
+        write_report(&memory, 0, valid());
+        assert_eq!(validate_report(&memory, 0), Ok(()));
+        for index in [0, 1, 2, 3, 12, 13, 14, 15] {
+            let mut words = valid();
+            words[index] = if index == 3 { 0 } else { 9 };
+            write_report(&memory, 0, words);
+            assert_eq!(
+                validate_report(&memory, 0),
+                Err(SketchExecutionError::ValidationReportInvalid)
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_report_load_rejects_a_misaligned_computed_address() {
+        let bytes: [UnsafeCell<u8>; 8] = std::array::from_fn(|_| UnsafeCell::new(0));
+        let base = bytes.as_ptr().addr();
+        let misaligned = (0..4)
+            .find(|offset| !(base + offset).is_multiple_of(align_of::<AtomicU32>()))
+            .expect("one of four adjacent byte addresses is misaligned");
+        assert_eq!(
+            load_shared_atomic_u32(&bytes[misaligned..misaligned + 4], Ordering::Relaxed),
+            None
+        );
+    }
+}
+
 fn shared_range(
     memory: &SharedMemory,
     offset: i32,
@@ -748,6 +1588,112 @@ fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, Sketch
         };
     }
     Err(SketchExecutionError::Trapped)
+}
+
+fn map_child_error(error: &wasmtime::Error) -> ChildOutcome {
+    if let Some(exit) = error.downcast_ref::<ProcExitSentinel>() {
+        return if exit.0 == 0 {
+            ChildOutcome::Exited
+        } else {
+            ChildOutcome::NonzeroExit(exit.0)
+        };
+    }
+    ChildOutcome::Trapped
+}
+
+fn resolve_threaded_result(
+    root: Result<ThreadedRootOutcome, SketchExecutionError>,
+    children: Result<(), SketchExecutionError>,
+    report: Result<(), SketchExecutionError>,
+    rejections: ThreadSpawnRejectionSummary,
+) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    // All callers already drained children before this pure precedence step.
+    // Root remains primary; ordered child aggregation is next; report schema
+    // failures are only meaningful after successful guest execution.
+    let outcome = root?;
+    children?;
+    report?;
+    Ok(match outcome {
+        ThreadedRootOutcome::Started if !rejections.is_empty() => {
+            ThreadedRootOutcome::StartedWithThreadRejections(rejections)
+        }
+        ThreadedRootOutcome::Exited if !rejections.is_empty() => {
+            ThreadedRootOutcome::ExitedWithThreadRejections(rejections)
+        }
+        outcome => outcome,
+    })
+}
+
+#[cfg(test)]
+mod result_precedence_tests {
+    use super::*;
+
+    fn child_error() -> SketchExecutionError {
+        SketchExecutionError::ChildOutcomes {
+            outcomes: vec![
+                ThreadedChildOutcome {
+                    tid: 1,
+                    kind: ThreadedChildOutcomeKind::Trapped,
+                },
+                ThreadedChildOutcome {
+                    tid: 2,
+                    kind: ThreadedChildOutcomeKind::NonzeroExit { code: 9 },
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn root_child_and_report_precedence_is_semantic() {
+        assert_eq!(
+            resolve_threaded_result(
+                Err(SketchExecutionError::NonzeroExit { code: 7 }),
+                Err(child_error()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
+            ),
+            Err(SketchExecutionError::NonzeroExit { code: 7 }),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Ok(ThreadedRootOutcome::Started),
+                Err(child_error()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
+            ),
+            Err(child_error()),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Ok(ThreadedRootOutcome::Started),
+                Ok(()),
+                Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
+            ),
+            Err(SketchExecutionError::ValidationReportInvalid),
+        );
+    }
+
+    #[test]
+    fn thread_rejection_summary_surfaces_only_after_primary_success() {
+        let summary = ThreadSpawnRejectionSummary {
+            capacity: 1,
+            closing: 0,
+        };
+        assert_eq!(
+            resolve_threaded_result(Ok(ThreadedRootOutcome::Started), Ok(()), Ok(()), summary,),
+            Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary)),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Err(SketchExecutionError::NonzeroExit { code: 7 }),
+                Ok(()),
+                Ok(()),
+                summary,
+            ),
+            Err(SketchExecutionError::NonzeroExit { code: 7 }),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -775,6 +1721,11 @@ pub enum SketchModuleError {
     InvalidBinary,
     InvalidModuleLimit,
     InvalidSharedMemoryLimit,
+    InvalidThreadLimit,
+    ThreadLimitExceedsV1Maximum {
+        requested: usize,
+        maximum: usize,
+    },
     ForbiddenImport {
         module: String,
         name: String,
@@ -839,6 +1790,8 @@ impl SketchModuleError {
             Self::InvalidBinary => "invalid-binary",
             Self::InvalidModuleLimit => "invalid-module-limit",
             Self::InvalidSharedMemoryLimit => "invalid-shared-memory-limit",
+            Self::InvalidThreadLimit => "invalid-thread-limit",
+            Self::ThreadLimitExceedsV1Maximum { .. } => "thread-limit-exceeds-v1-maximum",
             Self::ForbiddenImport { .. } => "forbidden-import",
             Self::ImportTypeMismatch { .. } => "import-type-mismatch",
             Self::MissingRequiredImport { .. } => "missing-required-import",
@@ -1245,6 +2198,7 @@ fn check_memory(
 fn preflight_threaded_rust(
     bytes: &[u8],
     policy: SketchModulePolicy,
+    validation: bool,
 ) -> Result<SketchSharedMemory, SketchModuleError> {
     let mut types = Vec::<TypeEntry>::new();
     let mut functions = Vec::<u32>::new();
@@ -1254,6 +2208,7 @@ fn preflight_threaded_rust(
     let mut exports = Vec::<(String, ExternalKind, u32)>::new();
     let mut start = None;
     let mut target_features = None;
+    let mut validation_metadata = 0_u8;
     let mut seen = std::collections::BTreeSet::new();
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
@@ -1337,6 +2292,19 @@ fn preflight_threaded_rust(
             }
             Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => match section.name() {
+                PROFILE_METADATA if validation => {
+                    validation_metadata += 1;
+                    if validation_metadata > 1 {
+                        return Err(SketchModuleError::DuplicateMetadata {
+                            name: PROFILE_METADATA,
+                        });
+                    }
+                    if section.data() != VALIDATION_PROFILE_METADATA_VALUE {
+                        return Err(SketchModuleError::MetadataMismatch {
+                            name: PROFILE_METADATA,
+                        });
+                    }
+                }
                 "target_features" => {
                     if target_features
                         .replace(parse_target_features(section.data())?)
@@ -1414,13 +2382,21 @@ fn preflight_threaded_rust(
     if features != expected_features {
         return Err(SketchModuleError::TargetFeaturesMismatch);
     }
-    let allowed = [
+    let mut allowed = vec![
         ("memory", ExternalKind::Memory),
         ("_start", ExternalKind::Func),
         ("__main_void", ExternalKind::Func),
         ("wasi_thread_start", ExternalKind::Func),
         (ENTRY, ExternalKind::Func),
     ];
+    if validation {
+        allowed.push((VALIDATION_REPORT, ExternalKind::Func));
+        if validation_metadata != 1 {
+            return Err(SketchModuleError::MissingMetadata {
+                name: PROFILE_METADATA,
+            });
+        }
+    }
     if exports.len() != allowed.len() {
         return Err(SketchModuleError::ExportNotAllowed {
             name: exports.first().map(|e| e.0.clone()).unwrap_or_default(),
@@ -1436,7 +2412,7 @@ fn preflight_threaded_rust(
     for (name, _, index) in exports {
         by_name.insert(name, index);
     }
-    for (name, signature) in [
+    let mut signatures = vec![
         (
             "_start",
             Signature {
@@ -1465,7 +2441,17 @@ fn preflight_threaded_rust(
                 results: I32,
             },
         ),
-    ] {
+    ];
+    if validation {
+        signatures.push((
+            VALIDATION_REPORT,
+            Signature {
+                params: EMPTY,
+                results: I32,
+            },
+        ));
+    }
+    for (name, signature) in signatures {
         let index = *by_name
             .get(name)
             .ok_or(SketchModuleError::EntrypointMismatch)?;

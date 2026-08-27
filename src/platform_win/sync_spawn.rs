@@ -12,7 +12,9 @@ use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
 use winapi::um::handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE};
 use winapi::um::jobapi2::{AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject};
 #[cfg(test)]
-use winapi::um::jobapi2::IsProcessInJob;
+use windows_sys::Win32::Foundation::HANDLE as WindowsHandle;
+#[cfg(test)]
+use windows_sys::Win32::System::JobObjects::IsProcessInJob;
 use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
 use winapi::um::namedpipeapi::CreateNamedPipeW;
 use winapi::um::processenv::GetStdHandle;
@@ -49,7 +51,9 @@ const STILL_ACTIVE: u32 = 259;
 /// A containment cleanup must not wedge the host if Windows fails to honor a
 /// Job close or process termination. Worker-process escalation owns any later
 /// retry/reaping policy.
+#[allow(dead_code)] // exercised by the native containment regression; worker wiring follows in #28.
 const STRICT_WORKER_REAP_TIMEOUT_MS: DWORD = 5_000;
+#[allow(dead_code)]
 const WAIT_TIMEOUT_RESULT: DWORD = 0x0000_0102;
 
 pub struct OwnedHandle(HANDLE);
@@ -552,6 +556,7 @@ pub fn spawn_sync(
 /// from generic `spawn_sync`: that path deliberately supports daemon/breakaway
 /// compatibility and must not silently acquire stricter semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum StrictWorkerSpawnStage {
     Pipe,
     CreateSuspended,
@@ -568,6 +573,7 @@ pub(crate) enum StrictWorkerSpawnStage {
 /// Memory values are bytes and must be nonzero and representable as a Windows
 /// `SIZE_T` on the target process.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct StrictWorkerLimits {
     pub(crate) active_processes: Option<u32>,
     pub(crate) process_memory_bytes: Option<u64>,
@@ -575,6 +581,7 @@ pub(crate) struct StrictWorkerLimits {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 enum StrictWorkerLimitError {
     ZeroActiveProcesses,
     ZeroProcessMemory,
@@ -584,6 +591,7 @@ enum StrictWorkerLimitError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 struct StrictWorkerJobConfiguration {
     limit_flags: DWORD,
     active_processes: Option<u32>,
@@ -632,20 +640,24 @@ impl StrictWorkerLimits {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct StrictWorkerSpawnError {
     stage: StrictWorkerSpawnStage,
     source: io::Error,
     cleanup: Option<StrictWorkerCleanupError>,
 }
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) struct StrictWorkerCleanupError {
     stage: StrictWorkerSpawnStage,
     source: io::Error,
 }
+#[allow(dead_code)]
 impl StrictWorkerSpawnError {
     pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
     pub(crate) fn cleanup(&self) -> Option<&StrictWorkerCleanupError> { self.cleanup.as_ref() }
 }
+#[allow(dead_code)]
 impl StrictWorkerCleanupError {
     pub(crate) fn stage(&self) -> StrictWorkerSpawnStage { self.stage }
     pub(crate) fn message(&self) -> String { self.source.to_string() }
@@ -666,6 +678,7 @@ impl std::error::Error for StrictWorkerCleanupError {}
 /// a containment operation: it closes the strict Job and waits/reaps the
 /// direct worker. This covers ordinary CreateProcess descendants; processes
 /// created by nonstandard escape mechanisms remain a platform-policy gap.
+#[allow(dead_code)]
 pub(crate) struct StrictWorkerChild {
     pub(crate) stdin: Option<ChildStdin>,
     pub(crate) stdout: Option<ChildStdout>,
@@ -673,7 +686,9 @@ pub(crate) struct StrictWorkerChild {
     pub(crate) pid: u32,
     inner: StrictWorkerInner,
 }
+#[allow(dead_code)]
 struct StrictWorkerInner { process: Option<OwnedHandle>, job: Option<OwnedHandle> }
+#[allow(dead_code)]
 impl StrictWorkerChild {
     pub(crate) fn pid(&self) -> u32 { self.pid }
     pub(crate) fn try_wait(&self) -> io::Result<Option<i32>> { self.inner.process.as_ref().map_or(Ok(None), try_wait_inner) }
@@ -744,7 +759,9 @@ mod strict_worker_test_hook {
         );
         let mut contained = FALSE;
         assert_ne!(
-            unsafe { IsProcessInJob(process, job, &mut contained) },
+            unsafe {
+                IsProcessInJob(process as WindowsHandle, job as WindowsHandle, &mut contained)
+            },
             FALSE,
             "IsProcessInJob failed: {}",
             io::Error::last_os_error()
@@ -758,6 +775,7 @@ mod strict_worker_test_hook {
 /// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
 /// (including hostile nested-job policy) is an AssignJob failure, never a
 /// successful "already contained" fallback.
+#[allow(dead_code)]
 pub(crate) fn spawn_strict_contained_worker(
     command: &mut Command,
     stdio: crate::platform::process::SpawnStdio<'_>,
@@ -801,8 +819,10 @@ pub(crate) fn spawn_strict_contained_worker(
     })
 }
 
+#[allow(dead_code)]
 fn strict_resume_count_is_valid(previous: u32) -> bool { previous == 1 }
 
+#[allow(dead_code)]
 fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
     let terminate = if unsafe { TerminateProcess(process.as_raw(), 1) } == FALSE {
         Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
@@ -815,6 +835,7 @@ fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError>
     None
 }
 
+#[allow(dead_code)]
 fn reap_only(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
     match unsafe { WaitForSingleObject(process.as_raw(), STRICT_WORKER_REAP_TIMEOUT_MS) } {
         WAIT_OBJECT_0 => None,
@@ -1208,6 +1229,7 @@ mod daemon_flag_tests {
     /// its PID through a marker file, and stays alive until Job close kills it.
     #[test]
     #[ignore]
+    #[allow(clippy::zombie_processes)] // closing the strict Job, not Child::wait, proves tree reaping.
     fn strict_worker_native_helper() {
         let Some(marker) = std::env::var_os("KERNAL_API_STRICT_WORKER_MARKER") else {
             return;
@@ -1344,6 +1366,7 @@ fn create_job_object() -> io::Result<OwnedHandle> {
     Ok(OwnedHandle(job))
 }
 
+#[allow(dead_code)]
 fn create_strict_worker_job(
     limits: StrictWorkerLimits,
 ) -> Result<OwnedHandle, (StrictWorkerSpawnStage, io::Error)> {

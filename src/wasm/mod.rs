@@ -2145,7 +2145,7 @@ mod threaded_root_observation_tests {
 
     fn fuel_compiler_with_total(total: u64, root_slice: u64, child_slice: u64) -> SketchCompiler {
         let fuel = SketchFuelLimits::new(total, root_slice, child_slice).expect("fuel limits");
-        let limits = SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES * 2, 2).expect("two sessions")
+        let limits = SketchExecutionLimits::default()
             .with_fuel_limits(fuel)
             .expect("execution limits");
         SketchCompiler::new(
@@ -2392,7 +2392,7 @@ mod threaded_root_observation_tests {
 
     #[test]
     fn cancellation_wins_deadline_and_current_thread_drives_the_blocking_lane() {
-        let compiler = concurrent_epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+        let compiler = epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
         let sketch = admit_epoch_fixture(&compiler, root_fuel_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
         runtime.run(async {
@@ -2408,7 +2408,7 @@ mod threaded_root_observation_tests {
 
     #[test]
     fn multi_thread_runtime_and_unrelated_same_engine_sketch_remain_isolated() {
-        let compiler = epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+        let compiler = concurrent_epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
         let looping = admit_epoch_fixture(&compiler, root_fuel_fixture());
         let normal = admit_epoch_fixture(&compiler, threaded_yield_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::multi_thread().worker_threads(2).enable_all().build().expect("runtime");

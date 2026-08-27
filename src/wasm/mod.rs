@@ -11,7 +11,8 @@ mod worker;
 mod worker_protocol;
 #[cfg(feature = "wasm-sketch-worker")]
 pub use worker::{
-    SketchWorkerConfig, SketchWorkerFailure, SketchWorkerStopReason, SketchWorkerTerminal,
+    SketchWorkerConfig, SketchWorkerExecutionSnapshot, SketchWorkerFailure,
+    SketchWorkerStopReason, SketchWorkerTerminal,
 };
 
 use std::cell::UnsafeCell;
@@ -346,6 +347,8 @@ pub struct SketchCompiler {
     epoch_broker: Arc<EpochBroker>,
     #[cfg(feature = "wasm-sketch-worker")]
     worker_config: SketchCompilerConfig,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_ledger: Arc<worker::WorkerExecutionLedger>,
 }
 impl SketchCompiler {
     /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
@@ -376,6 +379,8 @@ impl SketchCompiler {
             execution_ledger: Arc::new(ExecutionLedger::new(config.execution_limits)),
             #[cfg(feature = "wasm-sketch-worker")]
             worker_config: config,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_ledger: Arc::new(worker::WorkerExecutionLedger::default()),
         })
     }
     /// Preflights and then compiles one module. Rejected input cannot compile.
@@ -413,6 +418,8 @@ impl SketchCompiler {
             worker_compiler_config: self.worker_config,
             #[cfg(feature = "wasm-sketch-worker")]
             worker_policy: policy,
+            #[cfg(feature = "wasm-sketch-worker")]
+            worker_ledger: Arc::clone(&self.worker_ledger),
             execution_ledger: Arc::clone(&self.execution_ledger),
             epoch_broker: Arc::clone(&self.epoch_broker),
             prepared_root: std::sync::Mutex::new(None),
@@ -536,6 +543,8 @@ pub struct AdmittedSketch {
     #[cfg(feature = "wasm-sketch-worker")]
     #[allow(dead_code)] // Retained for the phase-D worker supervisor.
     worker_policy: SketchModulePolicy,
+    #[cfg(feature = "wasm-sketch-worker")]
+    worker_ledger: Arc<worker::WorkerExecutionLedger>,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached
     // controller: it must survive any future controller replacement to prove

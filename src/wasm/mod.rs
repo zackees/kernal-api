@@ -414,7 +414,7 @@ pub enum ThreadedRootOutcome {
 }
 
 /// Bounded failures from private threaded-root setup and start execution.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SketchExecutionError {
     ThreadedProfileRequired,
     SharedMemoryUnavailable,
@@ -423,11 +423,12 @@ pub enum SketchExecutionError {
     ChildNonzeroExit { code: i32 },
     ChildTrapped,
     ChildPanicked,
+    ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
     ValidationReportInvalid,
     Trapped,
 }
 impl SketchExecutionError {
-    pub fn code(self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::ThreadedProfileRequired => "threaded-profile-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
@@ -436,6 +437,7 @@ impl SketchExecutionError {
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",
             Self::ChildPanicked => "child-panicked",
+            Self::ChildOutcomes { .. } => "child-outcomes",
             Self::ValidationReportInvalid => "validation-report-invalid",
             Self::Trapped => "trapped",
         }
@@ -478,6 +480,23 @@ enum ChildOutcome {
     Trapped,
     Panicked,
 }
+
+/// One cooperatively joined guest child outcome. This facade type contains no
+/// native thread, Store, trap, or backend diagnostic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadedChildOutcome {
+    pub tid: i32,
+    pub kind: ThreadedChildOutcomeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadedChildOutcomeKind {
+    Completed,
+    Exited,
+    NonzeroExit { code: i32 },
+    Trapped,
+    Panicked,
+}
 impl ThreadController {
     fn join_completed(&self) -> Result<(), SketchExecutionError> {
         // Mark closing before taking the queue. This prevents a child that is
@@ -511,17 +530,31 @@ impl ThreadController {
             .map_err(|_| SketchExecutionError::ChildPanicked)?;
         let mut outcomes: Vec<_> = workers.outcomes.drain(..).collect();
         outcomes.sort_by_key(|(tid, _)| *tid);
-        let outcome = outcomes.into_iter().find(|(_, outcome)| {
-            !matches!(outcome, ChildOutcome::Completed | ChildOutcome::Exited)
-        });
+        let report: Vec<_> = outcomes
+            .into_iter()
+            .map(|(tid, outcome)| ThreadedChildOutcome {
+                tid,
+                kind: match outcome {
+                    ChildOutcome::Completed => ThreadedChildOutcomeKind::Completed,
+                    ChildOutcome::Exited => ThreadedChildOutcomeKind::Exited,
+                    ChildOutcome::NonzeroExit(code) => {
+                        ThreadedChildOutcomeKind::NonzeroExit { code }
+                    }
+                    ChildOutcome::Trapped => ThreadedChildOutcomeKind::Trapped,
+                    ChildOutcome::Panicked => ThreadedChildOutcomeKind::Panicked,
+                },
+            })
+            .collect();
         workers.closing = false;
-        match outcome {
-            None | Some((_, ChildOutcome::Completed | ChildOutcome::Exited)) => Ok(()),
-            Some((_, ChildOutcome::NonzeroExit(code))) => {
-                Err(SketchExecutionError::ChildNonzeroExit { code })
-            }
-            Some((_, ChildOutcome::Trapped)) => Err(SketchExecutionError::ChildTrapped),
-            Some((_, ChildOutcome::Panicked)) => Err(SketchExecutionError::ChildPanicked),
+        if report.iter().all(|outcome| {
+            matches!(
+                outcome.kind,
+                ThreadedChildOutcomeKind::Completed | ThreadedChildOutcomeKind::Exited
+            )
+        }) {
+            Ok(())
+        } else {
+            Err(SketchExecutionError::ChildOutcomes { outcomes: report })
         }
     }
 }

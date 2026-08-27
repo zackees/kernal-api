@@ -379,10 +379,13 @@ impl AdmittedSketch {
     fn root_execution_observation_for_test(&self) -> Option<RootExecutionObservation> {
         let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
         let controller = &prepared.controller;
+        let workers = controller.workers.lock().ok()?;
         Some(RootExecutionObservation {
             preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
             supplied_runtime_handles: controller.runtime_handle_count.load(Ordering::Relaxed),
+            live_threads: workers.live,
+            queued_join_handles: workers.handles.len(),
         })
     }
     #[allow(dead_code)]
@@ -583,6 +586,8 @@ struct RootExecutionObservation {
     preparations: u64,
     kernel_yields: u64,
     supplied_runtime_handles: u64,
+    live_threads: usize,
+    queued_join_handles: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -819,6 +824,8 @@ mod threaded_root_observation_tests {
                 preparations: 1,
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
+                live_threads: 0,
+                queued_join_handles: 0,
             })
         );
     }
@@ -843,6 +850,49 @@ mod threaded_root_observation_tests {
             }
         );
         assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
+    #[test]
+    fn supplied_validation_artifact_executes_the_private_validation_lane() {
+        let Ok(path) = std::env::var("KERNAL_API_THREADED_VALIDATION_WASM") else {
+            // The real Rust guest is assembled only by the explicit diagnostic
+            // workflow; normal unit runs remain source-only.
+            return;
+        };
+        let bytes = std::fs::read(path).expect("read validation artifact");
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                    bytes.len() + 1,
+                    THREADED_RUST_MAX_PAGES,
+                )
+                .expect("policy"),
+            )
+            .expect("validation artifact admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle();
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(handle) }),
+            Ok(ThreadedRootOutcome::Started)
+        );
+        assert_eq!(compiler.compiled_module_count(), 1);
+        assert_eq!(
+            sketch.root_execution_observation_for_test(),
+            Some(RootExecutionObservation {
+                preparations: 1,
+                // One root `_start` call and the two Rust std-thread entries
+                // each invoke the closed kernel-yield import.
+                kernel_yields: 3,
+                supplied_runtime_handles: 3,
+                live_threads: 0,
+                queued_join_handles: 0,
+            })
+        );
     }
 
     #[test]
@@ -976,7 +1026,7 @@ mod threaded_root_observation_tests {
     // validation profile remains closed before Wasmtime compilation rather
     // than relying on linker failure after an artifact is admitted.
     fn validation_fixture_with_extra_import() -> Vec<u8> {
-        let mut bytes = threaded_yield_fixture();
+        let bytes = threaded_yield_fixture();
         let mut section = 8;
         while bytes[section] != 2 {
             let mut at = section + 1;
@@ -986,15 +1036,31 @@ mod threaded_root_observation_tests {
             let length = usize::from(bytes[at] & 0x7f);
             section = at + 1 + length;
         }
-        let body_at = section + 2; // all fixture section lengths are one-byte LEBs
-        bytes[body_at] = 10; // import count
-        let end = section + 2 + usize::from(bytes[section + 1]);
+        let mut body_at = section + 1;
+        let mut length = 0_usize;
+        let mut shift = 0;
+        loop {
+            let byte = bytes[body_at];
+            body_at += 1;
+            length |= usize::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+        }
+        let end = body_at + length;
+        let mut body = bytes[body_at..end].to_vec();
+        body[0] = 10; // the raw fixture has nine imports; add one.
         let mut extra = Vec::new();
         text("unexpected", &mut extra);
         text("import", &mut extra);
         extra.extend([0, 0]);
-        bytes.splice(end..end, extra.iter().copied());
-        bytes[section + 1] = bytes[section + 1].saturating_add(extra.len() as u8);
+        body.extend(extra);
+        let mut bytes = bytes[..section].to_vec();
+        bytes.push(2);
+        leb(body.len() as u32, &mut bytes);
+        bytes.extend(body);
+        bytes.extend_from_slice(&threaded_yield_fixture()[end..]);
         custom(
             PROFILE_METADATA,
             VALIDATION_PROFILE_METADATA_VALUE,
@@ -1012,10 +1078,14 @@ mod threaded_root_observation_tests {
             THREADED_RUST_MAX_PAGES,
         )
         .expect("policy");
-        assert!(matches!(
-            compiler.admit(&bytes, policy),
-            Err(SketchModuleError::ForbiddenImport { .. })
-        ));
+        let error = match compiler.admit(&bytes, policy) {
+            Ok(_) => panic!("extra import admitted"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, SketchModuleError::ForbiddenImport { .. }),
+            "unexpected rejection: {error:?}"
+        );
         assert_eq!(compiler.compiled_module_count(), 0);
     }
 

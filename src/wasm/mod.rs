@@ -273,6 +273,121 @@ impl fmt::Display for SketchModuleError {
 }
 impl std::error::Error for SketchModuleError {}
 
+/// Deterministically describes the semantic sections of an untrusted Wasm
+/// artifact for the threaded-smoke RED test. This is intentionally an
+/// inspection seam, not a loader or an execution API.
+#[doc(hidden)]
+pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, SketchModuleError> {
+    let mut facts = Vec::new();
+    let mut type_index = 0_u32;
+    for item in Parser::new(0).parse_all(bytes) {
+        match item.map_err(|_| SketchModuleError::InvalidBinary)? {
+            Payload::TypeSection(reader) => {
+                for group in reader {
+                    let group = group.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    for ty in group.types() {
+                        let fact = if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
+                            format!(
+                                "type index={type_index} kind=function params={:?} results={:?}",
+                                function.params(),
+                                function.results(),
+                            )
+                        } else {
+                            format!("type index={type_index} kind=non-function")
+                        };
+                        facts.push(fact);
+                        type_index += 1;
+                    }
+                }
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import = import.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    facts.push(format!(
+                        "import module={} name={} kind={}",
+                        bounded(import.module),
+                        bounded(import.name),
+                        import_kind(import.ty),
+                    ));
+                }
+            }
+            Payload::MemorySection(reader) => {
+                for memory in reader {
+                    let memory = memory.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    facts.push(memory_fact(
+                        "defined-memory",
+                        memory.initial,
+                        memory.maximum,
+                        memory.shared,
+                        memory.memory64,
+                        memory.page_size_log2,
+                    ));
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    facts.push(format!(
+                        "export name={} kind={} index={}",
+                        bounded(export.name),
+                        external_kind(export.kind),
+                        export.index,
+                    ));
+                }
+            }
+            Payload::StartSection { .. } => facts.push("start present".to_owned()),
+            Payload::CustomSection(section) => facts.push(format!(
+                "custom name={} bytes={}",
+                bounded(section.name()),
+                section.data().len(),
+            )),
+            _ => {}
+        }
+    }
+    facts.sort_unstable();
+    Ok(format!("threaded-artifact-manifest-v1\n{}\n", facts.join("\n")))
+}
+
+fn import_kind(import: TypeRef) -> String {
+    match import {
+        TypeRef::Func(index) | TypeRef::FuncExact(index) => format!("function type={index}"),
+        TypeRef::Table(_) => "table".to_owned(),
+        TypeRef::Memory(memory) => memory_fact(
+            "memory",
+            memory.initial,
+            memory.maximum,
+            memory.shared,
+            memory.memory64,
+            memory.page_size_log2,
+        ),
+        TypeRef::Global(_) => "global".to_owned(),
+        TypeRef::Tag(_) => "tag".to_owned(),
+    }
+}
+
+fn memory_fact(
+    prefix: &str,
+    initial: u64,
+    maximum: Option<u64>,
+    shared: bool,
+    memory64: bool,
+    page_size_log2: Option<u32>,
+) -> String {
+    format!(
+        "{prefix} initial={initial} maximum={maximum:?} shared={shared} memory64={memory64} page-size-log2={page_size_log2:?}"
+    )
+}
+
+fn external_kind(kind: ExternalKind) -> &'static str {
+    match kind {
+        ExternalKind::Func => "function",
+        ExternalKind::Table => "table",
+        ExternalKind::Memory => "memory",
+        ExternalKind::Global => "global",
+        ExternalKind::Tag => "tag",
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Signature {
     params: &'static [ValType],

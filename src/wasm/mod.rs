@@ -1821,27 +1821,40 @@ mod epoch_broker_tests {
     #[test]
     fn containment_required_host_block_is_killed_only_in_a_subprocess() {
         const MODE: &str = "KERNAL_API_EPOCH_CONTAINMENT_CHILD";
+        const MARKER: &str = "KERNAL_API_EPOCH_HOST_BLOCK_MARKER";
         if std::env::var_os(MODE).is_some() {
-            // Deliberately never run this host-block analogue in the parent
-            // process or an in-process execution thread. #28 owns final
-            // process containment; epoch cancellation cannot stop it.
-            std::thread::park();
+            let bytes = super::threaded_root_observation_tests::threaded_yield_fixture();
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let sketch = compiler.admit(&bytes, SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).expect("policy")).expect("admission");
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+            // The fixture's module start enters kernel-yield. The test-only
+            // hook writes readiness then parks inside that actual host import.
+            runtime.run(async { let _ = sketch.execute_threaded_root(runtime.handle()).await; });
             return;
         }
         let executable = std::env::current_exe().expect("test executable");
+        let marker = std::env::temp_dir().join(format!("kernal-api-epoch-host-block-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
         let mut child = std::process::Command::new(executable)
             .arg("--exact")
             .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
             .arg("--nocapture")
             .env(MODE, "1")
+            .env(MARKER, &marker)
             .spawn()
             .expect("containment child");
+        for _ in 0..100 {
+            if marker.exists() { break; }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(marker.exists(), "child must reach the Wasm host import before containment classification");
         std::thread::sleep(Duration::from_millis(10));
         assert!(child.try_wait().expect("child status").is_none(), "blocked child must outlive an epoch interval");
         let classification = SketchExecutionError::ContainmentRequired;
         assert_eq!(classification.code(), "containment-required");
         child.kill().expect("kill blocked child");
         let _ = child.wait().expect("reap blocked child");
+        let _ = std::fs::remove_file(marker);
     }
 }
 
@@ -1877,6 +1890,18 @@ fn define_closed_imports(
                 controller
                     .kernel_yield_count
                     .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_HOST_BLOCK_MARKER") {
+                    // This test-only seam characterizes the exact boundary:
+                    // Wasm reached a closed host import, after which an
+                    // in-process epoch interrupt cannot reclaim the thread.
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::File::create(marker) {
+                        let _ = file.write_all(b"entered");
+                        let _ = file.sync_all();
+                    }
+                    std::thread::park();
+                }
                 if caller.data().runtime.is_some() {
                     controller
                         .runtime_handle_count
@@ -3066,7 +3091,7 @@ mod threaded_root_observation_tests {
     // Minimal exact ThreadedRustV1 profile whose start calls kernel-yield.
     // Keeping it in this private unit module prevents test instrumentation
     // from becoming a public sketch-host API.
-    fn threaded_yield_fixture() -> Vec<u8> {
+    pub(super) fn threaded_yield_fixture() -> Vec<u8> {
         let mut wasm = b"\0asm\x01\0\0\0".to_vec();
         let mut types = Vec::new();
         leb(9, &mut types);

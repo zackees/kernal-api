@@ -1,0 +1,103 @@
+//! Private one-request Wasm worker. Parent supervision and forced tree reaping
+//! are deliberately phase-D responsibilities.
+
+#[path = "../wasm/worker_protocol.rs"]
+mod worker_protocol;
+
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use kernal_api::async_engine::{CancellationSource, RuntimeBuilder};
+use kernal_api::wasm::{
+    SketchCompiler, SketchCompilerConfig, SketchEpochLimits, SketchExecutionError,
+    SketchExecutionLimits, SketchFuelLimits, SketchModulePolicy, ThreadedRootOutcome,
+};
+use worker_protocol::{
+    read_message, write_message, ExecuteMetadata, FinalCounters, Message, ModuleAssembler,
+    ProtocolError, TerminalKind,
+};
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("kernal-wasm-worker: {error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut input = io::stdin();
+    let hello = read_message(&mut input).map_err(protocol_text)?;
+    let request_id = match hello { Message::Hello { request_id } => request_id, _ => return Err("expected hello".into()) };
+    let mut output = io::stdout();
+    write_message(&mut output, &Message::HelloAck { request_id }).map_err(protocol_text)?;
+    let start = read_message(&mut input).map_err(protocol_text)?;
+    let (module_len, metadata) = match start {
+        Message::ExecuteStart { request_id: id, module_len, metadata } if id == request_id => (module_len, metadata),
+        _ => return protocol_terminal(&mut output, request_id, "expected matching execute-start"),
+    };
+    let mut assembler = ModuleAssembler::start(request_id, module_len, metadata.max_module_bytes).map_err(protocol_text)?;
+    let module = loop {
+        let message = read_message(&mut input).map_err(protocol_text)?;
+        match assembler.accept(message).map_err(protocol_text)? { Some(module) => break module, None => {} }
+    };
+    let (config, policy) = reconstruct(metadata).map_err(|text| protocol_terminal(&mut output, request_id, &text).err().unwrap_or(text))?;
+    let cancellation = CancellationSource::new();
+    let token = cancellation.token();
+    let control_done = Arc::new(AtomicBool::new(false));
+    let control_done_thread = Arc::clone(&control_done);
+    let source = cancellation.clone();
+    std::thread::spawn(move || {
+        let mut control = io::stdin();
+        match read_message(&mut control) {
+            Ok(Message::Cancel { request_id: id }) if id == request_id => source.cancel(),
+            Ok(_) | Err(_) => source.cancel(),
+        }
+        control_done_thread.store(true, Ordering::Release);
+    });
+    let runtime = RuntimeBuilder::current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    let compiler = match SketchCompiler::new(config) { Ok(value) => value, Err(error) => return protocol_terminal(&mut output, request_id, error.to_string().as_str()) };
+    let sketch = match compiler.admit(&module, policy) { Ok(value) => value, Err(error) => return protocol_terminal(&mut output, request_id, error.to_string().as_str()) };
+    let result = runtime.run(async { sketch.execute_threaded_root_cancellable(runtime.handle(), token).await });
+    let _ = sketch.close_threaded_root();
+    drop(sketch);
+    let counters = snapshot(&compiler);
+    let (kind, diagnostic) = map_result(result);
+    let (kind, diagnostic) = if counters_are_zero(counters) { (kind, diagnostic) } else { (TerminalKind::WorkerFailure, "nonzero-worker-counters".into()) };
+    write_message(&mut output, &Message::Terminal { request_id, kind, diagnostic: bound(diagnostic), counters }).map_err(protocol_text)?;
+    let _ = control_done.load(Ordering::Acquire);
+    Ok(())
+}
+
+fn reconstruct(metadata: ExecuteMetadata) -> Result<(SketchCompilerConfig, SketchModulePolicy), String> {
+    let roots = usize::try_from(metadata.maximum_active_roots).map_err(|_| "active-roots-overflow")?;
+    let stack = usize::try_from(metadata.max_wasm_stack_bytes).map_err(|_| "stack-overflow")?;
+    let threads = usize::try_from(metadata.max_guest_threads).map_err(|_| "thread-limit-overflow")?;
+    let fuel = SketchFuelLimits::new(metadata.total_fuel, metadata.root_fuel, metadata.child_fuel).map_err(|e| e.to_string())?;
+    let epoch = SketchEpochLimits::new(Duration::from_millis(metadata.epoch_deadline_millis), Duration::from_millis(metadata.epoch_tick_millis), usize::try_from(metadata.maximum_epoch_registrations).map_err(|_| "epoch-registration-overflow")?).map_err(|e| e.to_string())?;
+    let limits = SketchExecutionLimits::new(metadata.reserved_memory_bytes, roots).map_err(|e| e.to_string())?.with_fuel_limits(fuel).map_err(|e| e.to_string())?.with_epoch_limits(epoch).map_err(|e| e.to_string())?;
+    let config = SketchCompilerConfig::new(stack).map_err(|e| e.to_string())?.with_execution_limits(limits).map_err(|e| e.to_string())?;
+    let policy = SketchModulePolicy::threaded_rust_v1(usize::try_from(metadata.max_module_bytes).map_err(|_| "module-limit-overflow")?, metadata.max_shared_memory_pages).map_err(|e| e.to_string())?.with_max_guest_threads(threads).map_err(|e| e.to_string())?;
+    Ok((config, policy))
+}
+
+fn map_result(result: Result<ThreadedRootOutcome, SketchExecutionError>) -> (TerminalKind, String) {
+    match result {
+        Ok(ThreadedRootOutcome::Started) | Ok(ThreadedRootOutcome::StartedWithThreadRejections(_)) => (TerminalKind::Completed, "started".into()),
+        Ok(ThreadedRootOutcome::Exited) | Ok(ThreadedRootOutcome::ExitedWithThreadRejections(_)) => (TerminalKind::Completed, "exited".into()),
+        Err(SketchExecutionError::Cancelled) => (TerminalKind::Cancelled, "cancelled".into()),
+        Err(SketchExecutionError::DeadlineExceeded) => (TerminalKind::DeadlineExceeded, "deadline-exceeded".into()),
+        Err(SketchExecutionError::OutOfFuel) => (TerminalKind::OutOfFuel, "out-of-fuel".into()),
+        Err(SketchExecutionError::Trapped) => (TerminalKind::Trapped, "trapped".into()),
+        Err(SketchExecutionError::NonzeroExit { code }) | Err(SketchExecutionError::ChildNonzeroExit { code }) => (TerminalKind::NonzeroExit, format!("exit:{code}")),
+        Err(SketchExecutionError::ChildTrapped) | Err(SketchExecutionError::ChildPanicked) | Err(SketchExecutionError::ChildOutcomes { .. }) => (TerminalKind::ChildFailure, "child-failure".into()),
+        Err(error) => (TerminalKind::WorkerFailure, error.code().into()),
+    }
+}
+
+fn snapshot(compiler: &SketchCompiler) -> FinalCounters { let value = compiler.execution_limits_snapshot(); FinalCounters { active_roots: value.active_root_executions() as u64, live_stores: value.live_stores() as u64, live_instances: value.live_instances() as u64, active_epoch_registrations: value.active_epoch_registrations() as u64, live_threads: value.live_guest_threads() as u64 } }
+fn counters_are_zero(value: FinalCounters) -> bool { value.active_roots == 0 && value.live_stores == 0 && value.live_instances == 0 && value.active_epoch_registrations == 0 && value.live_threads == 0 }
+fn bound(mut text: String) -> String { text.truncate(1024); text }
+fn protocol_text(error: ProtocolError) -> String { format!("protocol:{error:?}") }
+fn protocol_terminal(output: &mut impl io::Write, request_id: u64, text: &str) -> Result<(), String> { write_message(output, &Message::Terminal { request_id, kind: TerminalKind::ProtocolFailure, diagnostic: bound(text.into()), counters: FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 } }).map_err(protocol_text) }

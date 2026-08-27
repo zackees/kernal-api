@@ -22,6 +22,11 @@ name = "kernal-symbolize"
 path = "src/bin/kernal-symbolize.rs"
 required-features = ["symbolize-worker"]
 
+[[bin]]
+name = "kernal-wasm-worker"
+path = "src/bin/kernal-wasm-worker.rs"
+required-features = ["wasm-sketch-worker"]
+
 [features]
 default = []
 fs = ["dep:dirs"]

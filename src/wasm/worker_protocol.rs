@@ -3,6 +3,8 @@
 //! This intentionally transports only one module and terminal observation. It
 //! is not a capability, resource, or generic streaming protocol.
 
+use std::io::{self, Read, Write};
+
 const MAGIC: [u8; 4] = *b"KWW1";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 11;
@@ -304,6 +306,29 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         return Err(ProtocolError::TrailingBytes);
     }
     Ok(message)
+}
+
+/// Reads a complete bounded frame. Header validation precedes allocation.
+pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolError> {
+    let mut header = [0; HEADER_LEN];
+    reader.read_exact(&mut header).map_err(|_| ProtocolError::Truncated)?;
+    if header[..4] != MAGIC { return Err(ProtocolError::BadMagic); }
+    if get_u16(&header[4..6])? != VERSION { return Err(ProtocolError::UnsupportedVersion); }
+    let _ = Kind::try_from(header[6])?;
+    let length = usize::try_from(get_u32(&header[7..11])?).map_err(|_| ProtocolError::LengthOverflow)?;
+    if length > MAX_FRAME_PAYLOAD { return Err(ProtocolError::FrameTooLarge); }
+    let total = HEADER_LEN.checked_add(length).ok_or(ProtocolError::LengthOverflow)?;
+    let mut frame = Vec::with_capacity(total);
+    frame.extend_from_slice(&header);
+    frame.resize(total, 0);
+    reader.read_exact(&mut frame[HEADER_LEN..]).map_err(|_| ProtocolError::Truncated)?;
+    decode(&frame)
+}
+
+pub(super) fn write_message<W: Write>(writer: &mut W, message: &Message) -> Result<(), ProtocolError> {
+    let frame = encode(message)?;
+    writer.write_all(&frame).map_err(|_| ProtocolError::InvalidPayload)?;
+    writer.flush().map_err(|_| ProtocolError::InvalidPayload)
 }
 
 /// Assembles only an ExecuteStart/chunks/ExecuteEnd sequence for one request.

@@ -3,7 +3,7 @@
 //! This intentionally transports only one module and terminal observation. It
 //! is not a capability, resource, or generic streaming protocol.
 
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
 const VERSION: u16 = 1;
@@ -59,13 +59,23 @@ pub(super) enum TerminalKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(super) enum RootOutcome {
-    None = 0, Started = 1, Exited = 2,
-    StartedWithThreadRejections = 3, ExitedWithThreadRejections = 4,
+    None = 0,
+    Started = 1,
+    Exited = 2,
+    StartedWithThreadRejections = 3,
+    ExitedWithThreadRejections = 4,
 }
 impl TryFrom<u8> for RootOutcome {
     type Error = ProtocolError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value { 0 => Ok(Self::None), 1 => Ok(Self::Started), 2 => Ok(Self::Exited), 3 => Ok(Self::StartedWithThreadRejections), 4 => Ok(Self::ExitedWithThreadRejections), _ => Err(ProtocolError::InvalidTerminal) }
+        match value {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Started),
+            2 => Ok(Self::Exited),
+            3 => Ok(Self::StartedWithThreadRejections),
+            4 => Ok(Self::ExitedWithThreadRejections),
+            _ => Err(ProtocolError::InvalidTerminal),
+        }
     }
 }
 
@@ -79,16 +89,58 @@ pub(super) struct TerminalDetail {
     pub(super) status_code: Option<i32>,
 }
 impl TerminalDetail {
-    pub(super) const fn none() -> Self { Self { root_outcome: RootOutcome::None, capacity_rejections: 0, closing_rejections: 0, fuel_rejections: 0, epoch_rejections: 0, status_code: None } }
+    pub(super) const fn none() -> Self {
+        Self {
+            root_outcome: RootOutcome::None,
+            capacity_rejections: 0,
+            closing_rejections: 0,
+            fuel_rejections: 0,
+            epoch_rejections: 0,
+            status_code: None,
+        }
+    }
     fn validate(self, kind: TerminalKind) -> Result<(), ProtocolError> {
-        let counts = self.capacity_rejections != 0 || self.closing_rejections != 0 || self.fuel_rejections != 0 || self.epoch_rejections != 0;
+        let counts = self.capacity_rejections != 0
+            || self.closing_rejections != 0
+            || self.fuel_rejections != 0
+            || self.epoch_rejections != 0;
         match kind {
-            TerminalKind::Completed if self.root_outcome == RootOutcome::None || self.status_code.is_some() => Err(ProtocolError::InvalidTerminal),
-            TerminalKind::Completed if counts && !matches!(self.root_outcome, RootOutcome::StartedWithThreadRejections | RootOutcome::ExitedWithThreadRejections) => Err(ProtocolError::InvalidTerminal),
-            TerminalKind::Completed if !counts && matches!(self.root_outcome, RootOutcome::StartedWithThreadRejections | RootOutcome::ExitedWithThreadRejections) => Err(ProtocolError::InvalidTerminal),
-            TerminalKind::NonzeroExit if self.root_outcome != RootOutcome::None || counts || self.status_code.is_none() => Err(ProtocolError::InvalidTerminal),
+            TerminalKind::Completed
+                if self.root_outcome == RootOutcome::None || self.status_code.is_some() =>
+            {
+                Err(ProtocolError::InvalidTerminal)
+            }
+            TerminalKind::Completed
+                if counts
+                    && !matches!(
+                        self.root_outcome,
+                        RootOutcome::StartedWithThreadRejections
+                            | RootOutcome::ExitedWithThreadRejections
+                    ) =>
+            {
+                Err(ProtocolError::InvalidTerminal)
+            }
+            TerminalKind::Completed
+                if !counts
+                    && matches!(
+                        self.root_outcome,
+                        RootOutcome::StartedWithThreadRejections
+                            | RootOutcome::ExitedWithThreadRejections
+                    ) =>
+            {
+                Err(ProtocolError::InvalidTerminal)
+            }
+            TerminalKind::NonzeroExit
+                if self.root_outcome != RootOutcome::None
+                    || counts
+                    || self.status_code.is_none() =>
+            {
+                Err(ProtocolError::InvalidTerminal)
+            }
             TerminalKind::Completed | TerminalKind::NonzeroExit => Ok(()),
-            _ if self.root_outcome != RootOutcome::None || counts || self.status_code.is_some() => Err(ProtocolError::InvalidTerminal),
+            _ if self.root_outcome != RootOutcome::None || counts || self.status_code.is_some() => {
+                Err(ProtocolError::InvalidTerminal)
+            }
             _ => Ok(()),
         }
     }
@@ -334,7 +386,17 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         Kind::Cancel => Message::Cancel { request_id },
         Kind::Terminal => {
             let terminal = TerminalKind::try_from(take_u8(&mut input)?)?;
-            let detail = TerminalDetail { root_outcome: RootOutcome::try_from(take_u8(&mut input)?)?, capacity_rejections: take_u32(&mut input)?, closing_rejections: take_u32(&mut input)?, fuel_rejections: take_u32(&mut input)?, epoch_rejections: take_u32(&mut input)?, status_code: match take_i32(&mut input)? { NO_STATUS_CODE => None, code => Some(code) } };
+            let detail = TerminalDetail {
+                root_outcome: RootOutcome::try_from(take_u8(&mut input)?)?,
+                capacity_rejections: take_u32(&mut input)?,
+                closing_rejections: take_u32(&mut input)?,
+                fuel_rejections: take_u32(&mut input)?,
+                epoch_rejections: take_u32(&mut input)?,
+                status_code: match take_i32(&mut input)? {
+                    NO_STATUS_CODE => None,
+                    code => Some(code),
+                },
+            };
             detail.validate(terminal)?;
             let text_len = usize::from(take_u16(&mut input)?);
             if text_len > MAX_DIAGNOSTIC_BYTES {
@@ -362,23 +424,41 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
 /// Reads a complete bounded frame. Header validation precedes allocation.
 pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolError> {
     let mut header = [0; HEADER_LEN];
-    reader.read_exact(&mut header).map_err(|_| ProtocolError::Truncated)?;
-    if header[..4] != MAGIC { return Err(ProtocolError::BadMagic); }
-    if get_u16(&header[4..6])? != VERSION { return Err(ProtocolError::UnsupportedVersion); }
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| ProtocolError::Truncated)?;
+    if header[..4] != MAGIC {
+        return Err(ProtocolError::BadMagic);
+    }
+    if get_u16(&header[4..6])? != VERSION {
+        return Err(ProtocolError::UnsupportedVersion);
+    }
     let _ = Kind::try_from(header[6])?;
-    let length = usize::try_from(get_u32(&header[7..11])?).map_err(|_| ProtocolError::LengthOverflow)?;
-    if length > MAX_FRAME_PAYLOAD { return Err(ProtocolError::FrameTooLarge); }
-    let total = HEADER_LEN.checked_add(length).ok_or(ProtocolError::LengthOverflow)?;
+    let length =
+        usize::try_from(get_u32(&header[7..11])?).map_err(|_| ProtocolError::LengthOverflow)?;
+    if length > MAX_FRAME_PAYLOAD {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    let total = HEADER_LEN
+        .checked_add(length)
+        .ok_or(ProtocolError::LengthOverflow)?;
     let mut frame = Vec::with_capacity(total);
     frame.extend_from_slice(&header);
     frame.resize(total, 0);
-    reader.read_exact(&mut frame[HEADER_LEN..]).map_err(|_| ProtocolError::Truncated)?;
+    reader
+        .read_exact(&mut frame[HEADER_LEN..])
+        .map_err(|_| ProtocolError::Truncated)?;
     decode(&frame)
 }
 
-pub(super) fn write_message<W: Write>(writer: &mut W, message: &Message) -> Result<(), ProtocolError> {
+pub(super) fn write_message<W: Write>(
+    writer: &mut W,
+    message: &Message,
+) -> Result<(), ProtocolError> {
     let frame = encode(message)?;
-    writer.write_all(&frame).map_err(|_| ProtocolError::InvalidPayload)?;
+    writer
+        .write_all(&frame)
+        .map_err(|_| ProtocolError::InvalidPayload)?;
     writer.flush().map_err(|_| ProtocolError::InvalidPayload)
 }
 
@@ -477,7 +557,9 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 fn put_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
-fn put_i32(out: &mut Vec<u8>, value: i32) { out.extend_from_slice(&value.to_le_bytes()); }
+fn put_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
 fn get_u16(input: &[u8]) -> Result<u16, ProtocolError> {
     Ok(u16::from_le_bytes(
         input.try_into().map_err(|_| ProtocolError::Truncated)?,
@@ -512,7 +594,13 @@ fn take_u64(input: &mut &[u8]) -> Result<u64, ProtocolError> {
             .map_err(|_| ProtocolError::Truncated)?,
     ))
 }
-fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> { Ok(i32::from_le_bytes(take(input, 4)?.try_into().map_err(|_| ProtocolError::Truncated)?)) }
+fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
+    Ok(i32::from_le_bytes(
+        take(input, 4)?
+            .try_into()
+            .map_err(|_| ProtocolError::Truncated)?,
+    ))
+}
 fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
     for v in [
         value.max_wasm_stack_bytes,
@@ -598,7 +686,10 @@ mod tests {
         let terminal = Message::Terminal {
             request_id: 7,
             kind: TerminalKind::Completed,
-            detail: TerminalDetail { root_outcome: RootOutcome::Started, ..TerminalDetail::none() },
+            detail: TerminalDetail {
+                root_outcome: RootOutcome::Started,
+                ..TerminalDetail::none()
+            },
             diagnostic: "ok".into(),
             counters: FinalCounters {
                 active_roots: 0,
@@ -723,7 +814,10 @@ mod tests {
         let terminal = Message::Terminal {
             request_id: 5,
             kind: TerminalKind::Completed,
-            detail: TerminalDetail { root_outcome: RootOutcome::Started, ..TerminalDetail::none() },
+            detail: TerminalDetail {
+                root_outcome: RootOutcome::Started,
+                ..TerminalDetail::none()
+            },
             diagnostic: String::new(),
             counters: FinalCounters {
                 active_roots: 0,
@@ -755,20 +849,81 @@ mod tests {
     }
     #[test]
     fn typed_root_outcome_rejections_and_status_round_trip() {
-        let counters = FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 };
-        let completed = Message::Terminal { request_id: 1, kind: TerminalKind::Completed, detail: TerminalDetail { root_outcome: RootOutcome::StartedWithThreadRejections, capacity_rejections: 1, closing_rejections: 2, fuel_rejections: 3, epoch_rejections: 4, status_code: None }, diagnostic: "context".into(), counters };
+        let counters = FinalCounters {
+            active_roots: 0,
+            live_stores: 0,
+            live_instances: 0,
+            active_epoch_registrations: 0,
+            live_threads: 0,
+        };
+        let completed = Message::Terminal {
+            request_id: 1,
+            kind: TerminalKind::Completed,
+            detail: TerminalDetail {
+                root_outcome: RootOutcome::StartedWithThreadRejections,
+                capacity_rejections: 1,
+                closing_rejections: 2,
+                fuel_rejections: 3,
+                epoch_rejections: 4,
+                status_code: None,
+            },
+            diagnostic: "context".into(),
+            counters,
+        };
         assert_eq!(decode(&encode(&completed).unwrap()).unwrap(), completed);
-        let exit = Message::Terminal { request_id: 1, kind: TerminalKind::NonzeroExit, detail: TerminalDetail { status_code: Some(-9), ..TerminalDetail::none() }, diagnostic: String::new(), counters };
+        let exit = Message::Terminal {
+            request_id: 1,
+            kind: TerminalKind::NonzeroExit,
+            detail: TerminalDetail {
+                status_code: Some(-9),
+                ..TerminalDetail::none()
+            },
+            diagnostic: String::new(),
+            counters,
+        };
         assert_eq!(decode(&encode(&exit).unwrap()).unwrap(), exit);
     }
     #[test]
     fn terminal_rejects_illegal_machine_combinations() {
-        let counters = FinalCounters { active_roots: 0, live_stores: 0, live_instances: 0, active_epoch_registrations: 0, live_threads: 0 };
-        let missing_outcome = Message::Terminal { request_id: 1, kind: TerminalKind::Completed, detail: TerminalDetail::none(), diagnostic: String::new(), counters };
-        assert_eq!(encode(&missing_outcome), Err(ProtocolError::InvalidTerminal));
-        let missing_status = Message::Terminal { request_id: 1, kind: TerminalKind::NonzeroExit, detail: TerminalDetail::none(), diagnostic: String::new(), counters };
+        let counters = FinalCounters {
+            active_roots: 0,
+            live_stores: 0,
+            live_instances: 0,
+            active_epoch_registrations: 0,
+            live_threads: 0,
+        };
+        let missing_outcome = Message::Terminal {
+            request_id: 1,
+            kind: TerminalKind::Completed,
+            detail: TerminalDetail::none(),
+            diagnostic: String::new(),
+            counters,
+        };
+        assert_eq!(
+            encode(&missing_outcome),
+            Err(ProtocolError::InvalidTerminal)
+        );
+        let missing_status = Message::Terminal {
+            request_id: 1,
+            kind: TerminalKind::NonzeroExit,
+            detail: TerminalDetail::none(),
+            diagnostic: String::new(),
+            counters,
+        };
         assert_eq!(encode(&missing_status), Err(ProtocolError::InvalidTerminal));
-        let cancelled_with_status = Message::Terminal { request_id: 1, kind: TerminalKind::Cancelled, detail: TerminalDetail { status_code: Some(1), ..TerminalDetail::none() }, diagnostic: String::new(), counters };
-        assert_eq!(encode(&cancelled_with_status), Err(ProtocolError::InvalidTerminal));
+        let cancelled_with_status = Message::Terminal {
+            request_id: 1,
+            kind: TerminalKind::Cancelled,
+            detail: TerminalDetail {
+                status_code: Some(1),
+                ..TerminalDetail::none()
+            },
+            diagnostic: String::new(),
+            counters,
+        };
+        assert_eq!(
+            encode(&cancelled_with_status),
+            Err(ProtocolError::InvalidTerminal)
+        );
     }
 }

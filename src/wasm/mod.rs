@@ -5,7 +5,7 @@
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -243,6 +243,10 @@ impl AdmittedSketch {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let prepared = self.prepare_threaded_root()?;
+        prepared
+            .controller
+            .runtime_identity
+            .store(runtime.identity_for_wasm(), Ordering::Release);
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -323,6 +327,8 @@ impl AdmittedSketch {
             }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
+            runtime_identity: AtomicUsize::new(0),
+            runtime_identity_mismatches: AtomicU64::new(0),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -459,6 +465,8 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
+    runtime_identity: AtomicUsize,
+    runtime_identity_mismatches: AtomicU64,
     workers: Mutex<Workers>,
 }
 struct Workers {
@@ -599,6 +607,17 @@ fn define_closed_imports(
                     controller
                         .runtime_handle_count
                         .fetch_add(1, Ordering::Relaxed);
+                    let actual = caller
+                        .data()
+                        .runtime
+                        .as_ref()
+                        .expect("checked runtime")
+                        .identity_for_wasm();
+                    if controller.runtime_identity.load(Ordering::Acquire) != actual {
+                        controller
+                            .runtime_identity_mismatches
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 let _ = controller.prelink.get();
             },

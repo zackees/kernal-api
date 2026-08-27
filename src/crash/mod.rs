@@ -113,11 +113,83 @@ static RUNTIME: OnceLock<Mutex<Weak<Runtime>>> = OnceLock::new();
 static OWNER_PID: AtomicU32 = AtomicU32::new(0);
 static HANDLER_TRANSITION: Mutex<()> = Mutex::new(());
 #[cfg(test)]
-static TEST_PAUSE_RESUME: AtomicBool = AtomicBool::new(false);
+static TEST_RESUME_PAUSE: Mutex<Option<TestResumePause>> = Mutex::new(None);
 #[cfg(test)]
-static TEST_RESUME_ENTERED: AtomicBool = AtomicBool::new(false);
+static TEST_SAMPLER_DISABLED: Mutex<bool> = Mutex::new(false);
+
 #[cfg(test)]
-static TEST_RELEASE_RESUME: AtomicBool = AtomicBool::new(false);
+struct TestResumePause {
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+fn set_test_resume_pause(pause: TestResumePause) -> TestResumePauseGuard {
+    let mut slot = match TEST_RESUME_PAUSE.lock() {
+        Ok(slot) => slot,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(
+        slot.replace(pause).is_none(),
+        "a test resume pause is already active"
+    );
+    TestResumePauseGuard
+}
+
+#[cfg(test)]
+fn take_test_resume_pause() -> Option<TestResumePause> {
+    match TEST_RESUME_PAUSE.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
+#[cfg(test)]
+struct TestResumePauseGuard;
+
+#[cfg(test)]
+impl Drop for TestResumePauseGuard {
+    fn drop(&mut self) {
+        let mut slot = match TEST_RESUME_PAUSE.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.take();
+    }
+}
+
+#[cfg(test)]
+fn disable_test_sampler() -> TestSamplerDisabledGuard {
+    let mut disabled = match TEST_SAMPLER_DISABLED.lock() {
+        Ok(disabled) => disabled,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    assert!(!*disabled, "a test sampler disable guard is already active");
+    *disabled = true;
+    TestSamplerDisabledGuard
+}
+
+#[cfg(test)]
+fn test_sampler_disabled() -> bool {
+    match TEST_SAMPLER_DISABLED.lock() {
+        Ok(disabled) => *disabled,
+        Err(poisoned) => *poisoned.into_inner(),
+    }
+}
+
+#[cfg(test)]
+struct TestSamplerDisabledGuard;
+
+#[cfg(test)]
+impl Drop for TestSamplerDisabledGuard {
+    fn drop(&mut self) {
+        let mut disabled = match TEST_SAMPLER_DISABLED.lock() {
+            Ok(disabled) => disabled,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *disabled = false;
+    }
+}
 
 /// Arm native crash capture unless policy or environment opts out.
 pub fn install(policy: CrashPolicy, metadata: CrashMetadata) -> Result<CrashGuard, InstallError> {
@@ -206,22 +278,26 @@ impl Runtime {
             }
         };
 
-        let sampler_state = Arc::clone(&shared);
-        let sampler = match std::thread::Builder::new()
-            .name("rp-crash-sampler".into())
-            .spawn(move || sampler_loop(sampler_state))
-        {
-            Ok(sampler) => sampler,
-            Err(error) => {
-                #[cfg(windows)]
-                uninstall_windows_abort_chain();
-                #[cfg(target_os = "macos")]
-                uninstall_macos_abort_chain();
-                drop(handler);
-                drop(shared);
-                let _ = std::fs::remove_file(&path);
-                return Err(InstallError::Sampler(error));
-            }
+        #[cfg(test)]
+        let sampler_disabled = test_sampler_disabled();
+        #[cfg(not(test))]
+        let sampler_disabled = false;
+        let sampler = if sampler_disabled {
+            None
+        } else {
+            Some(match start_sampler(&shared) {
+                Ok(sampler) => sampler,
+                Err(error) => {
+                    #[cfg(windows)]
+                    uninstall_windows_abort_chain();
+                    #[cfg(target_os = "macos")]
+                    uninstall_macos_abort_chain();
+                    drop(handler);
+                    drop(shared);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(InstallError::Sampler(error));
+                }
+            })
         };
 
         let registration_id = 1;
@@ -232,7 +308,7 @@ impl Runtime {
                 shared,
                 handler: Mutex::new(Some(handler)),
                 handler_armed: AtomicBool::new(true),
-                sampler: Some(sampler),
+                sampler,
                 path,
                 pid: std::process::id(),
                 registrations: Mutex::new(RegistrationState {
@@ -302,12 +378,13 @@ impl Runtime {
             Err(poisoned) => poisoned.into_inner(),
         };
         #[cfg(test)]
-        if TEST_PAUSE_RESUME.load(Ordering::Acquire) {
-            TEST_RESUME_ENTERED.store(true, Ordering::Release);
-            while !TEST_RELEASE_RESUME.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
-            TEST_PAUSE_RESUME.store(false, Ordering::Release);
+        if let Some(pause) = take_test_resume_pause() {
+            // This one-shot channel gate is a test seam for the exact point
+            // where installation owns the transition and handler locks. The
+            // release sender closing during test unwinding also wakes this
+            // thread, so a failed assertion cannot retain global pause state.
+            let _ = pause.entered.send(());
+            let _ = pause.release.recv();
         }
         if handler.is_none() {
             *handler = Some(attach_handler(&self.shared)?);
@@ -315,6 +392,13 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+fn start_sampler(shared: &Arc<Shared>) -> io::Result<JoinHandle<()>> {
+    let sampler_state = Arc::clone(shared);
+    std::thread::Builder::new()
+        .name("rp-crash-sampler".into())
+        .spawn(move || sampler_loop(sampler_state))
 }
 
 struct RegistrationState {
@@ -1265,6 +1349,11 @@ mod tests {
     #[test]
     fn failed_install_rearm_drops_last_runtime_after_transition_gate() {
         let _state = process_state();
+        // This regression exercises only the transition/handler teardown
+        // ordering. A live sampler can be resolving a process-wide capture
+        // while unrelated tests run, which would turn its normal join into a
+        // timing-dependent part of this lock-order assertion.
+        let _sampler = disable_test_sampler();
         let guard = install(CrashPolicy::On, metadata("last-guard")).unwrap();
         let foreign = Arc::new(Mutex::new(None));
         let foreign_slot = Arc::clone(&foreign);
@@ -1281,28 +1370,26 @@ mod tests {
         assert!(matches!(failure, Err(InstallError::Handler(_))));
         assert!(!guard.is_armed());
 
-        TEST_RESUME_ENTERED.store(false, Ordering::Release);
-        TEST_RELEASE_RESUME.store(false, Ordering::Release);
-        TEST_PAUSE_RESUME.store(true, Ordering::Release);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let _pause = set_test_resume_pause(TestResumePause {
+            entered: entered_tx,
+            release: release_rx,
+        });
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         let installer = std::thread::spawn(move || {
             result_tx
                 .send(install(CrashPolicy::On, metadata("racer")))
                 .unwrap();
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !TEST_RESUME_ENTERED.load(Ordering::Acquire) {
-            if std::time::Instant::now() >= deadline {
-                TEST_RELEASE_RESUME.store(true, Ordering::Release);
-                panic!("install never reached the forced reattach point");
-            }
-            std::thread::yield_now();
-        }
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("install never reached the forced reattach point");
 
         // The installer now owns the only other Runtime Arc and is paused
         // while holding both the transition and handler locks.
         drop(guard);
-        TEST_RELEASE_RESUME.store(true, Ordering::Release);
+        release_tx.send(()).expect("release paused installer");
         let result = result_rx
             .recv_timeout(Duration::from_secs(2))
             .expect("failed reattach deadlocked while dropping the final Runtime Arc");

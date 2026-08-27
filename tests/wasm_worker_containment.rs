@@ -583,7 +583,6 @@ mod failure_proof {
             .is_none_or(|now| now.a != identity.a || now.b != identity.b));
     }
     #[cfg(target_os = "windows")]
-    #[cfg(target_os = "windows")]
     struct CloseOnlyWindowsHandle(Option<windows_sys::Win32::Foundation::HANDLE>);
     #[cfg(target_os = "windows")]
     impl Drop for CloseOnlyWindowsHandle {
@@ -605,11 +604,6 @@ mod failure_proof {
     struct ArmedWindowsProcess(Option<windows_sys::Win32::Foundation::HANDLE>);
     #[cfg(target_os = "windows")]
     impl ArmedWindowsProcess {
-        fn acquire(pid: u32, access: u32) -> Self {
-            use windows_sys::Win32::System::Threading::OpenProcess;
-            let process = unsafe { OpenProcess(access, 0, pid) };
-            Self(Some(process))
-        }
         fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
             self.0.expect("process handle")
         }

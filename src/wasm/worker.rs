@@ -12,8 +12,10 @@ use std::time::Duration;
 #[cfg(feature = "wasm-sketch-worker-test-support")]
 mod test_support;
 
+#[cfg(test)]
+use super::worker_protocol::TerminalDetail;
 use super::worker_protocol::{
-    self, ExecuteMetadata, FinalCounters, Message, RootOutcome, TerminalDetail, TerminalKind,
+    self, ExecuteMetadata, FinalCounters, Message, RootOutcome, TerminalKind,
 };
 use super::{
     AdmittedSketch, RootExecutionPermit, SketchCompilerConfig, SketchExecutionError,

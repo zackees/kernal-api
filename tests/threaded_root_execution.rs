@@ -5,6 +5,9 @@ use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchExecutionError, SketchModulePolicy,
     ThreadedRootOutcome,
 };
+#[path = "support/threaded_fixture.rs"]
+mod threaded_fixture;
+use threaded_fixture::threaded_root_wasm;
 
 #[test]
 fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handle() {
@@ -189,7 +192,7 @@ fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) {
 // Minimal structurally valid ThreadedRustV1 artifact. The start function is
 // intentionally unexported: Wasmtime runs it during instantiate, not by
 // calling exported `_start` or `kernal-api-run` separately.
-pub fn threaded_root_wasm(
+fn legacy_threaded_root_wasm(
     proc_exit: Option<i32>,
     assert_thread_spawn_rejection: bool,
     assert_fd_write_fault: bool,

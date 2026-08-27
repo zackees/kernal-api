@@ -479,39 +479,39 @@ impl AdmittedSketch {
         // Instantiation itself executes the module start section, so the
         // finite root slice must be installed before `instantiate` as well as
         // before the explicit command `_start` call below.
-        store
-            .set_fuel(root.root_fuel)
-            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         // Do not return from this scope before finalization. A Wasm start
         // section can invoke thread-spawn while instantiation is still in
         // progress, and lookup/call failures after that must still close and
         // drain every accepted native child.
         let mut validation_getter = None;
         let mut _instance_observation = None;
-        let outcome = (|| {
-            let instance = match prepared.prelink.instantiate(&mut store) {
-                Ok(instance) => instance,
-                Err(error) => return map_root_error(&error),
-            };
-            _instance_observation = Some(CounterObservation::new(
-                Arc::clone(&prepared.controller.execution_ledger),
-                LedgerCounter::Instances,
-            ));
-            let start = instance
-                .get_typed_func::<(), ()>(&mut store, "_start")
-                .map_err(|_| SketchExecutionError::Trapped)?;
-            if self.validation {
-                validation_getter = Some(
-                    instance
-                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
-                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
-                );
-            }
-            start
-                .call(&mut store, ())
-                .map(|_| ThreadedRootOutcome::Started)
-                .or_else(|error| map_root_error(&error))
-        })();
+        let outcome = match store.set_fuel(root.root_fuel) {
+            Err(_) => Err(SketchExecutionError::PrelinkFailed),
+            Ok(()) => (|| {
+                let instance = match prepared.prelink.instantiate(&mut store) {
+                    Ok(instance) => instance,
+                    Err(error) => return map_root_error(&error),
+                };
+                _instance_observation = Some(CounterObservation::new(
+                    Arc::clone(&prepared.controller.execution_ledger),
+                    LedgerCounter::Instances,
+                ));
+                let start = instance
+                    .get_typed_func::<(), ()>(&mut store, "_start")
+                    .map_err(|_| SketchExecutionError::Trapped)?;
+                if self.validation {
+                    validation_getter = Some(
+                        instance
+                            .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                            .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                    );
+                }
+                start
+                    .call(&mut store, ())
+                    .map(|_| ThreadedRootOutcome::Started)
+                    .or_else(|error| map_root_error(&error))
+            })(),
+        };
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
@@ -521,11 +521,13 @@ impl AdmittedSketch {
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
         let report = if self.validation && outcome.is_ok() && children.is_ok() {
-            let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
-            let offset = getter
-                .call(&mut store, ())
-                .map_err(|_| SketchExecutionError::ValidationReportInvalid)?;
-            validate_report(&prepared.controller.memory, offset)
+            match validation_getter {
+                Some(getter) => getter
+                    .call(&mut store, ())
+                    .map_err(|_| SketchExecutionError::ValidationReportInvalid)
+                    .and_then(|offset| validate_report(&prepared.controller.memory, offset)),
+                None => Err(SketchExecutionError::ValidationReportInvalid),
+            }
         } else {
             Ok(())
         };
@@ -737,6 +739,7 @@ pub enum SketchExecutionError {
     ChildPanicked,
     ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
     ValidationReportInvalid,
+    SessionGenerationExhausted,
     Trapped,
 }
 impl SketchExecutionError {
@@ -755,6 +758,7 @@ impl SketchExecutionError {
             Self::ChildPanicked => "child-panicked",
             Self::ChildOutcomes { .. } => "child-outcomes",
             Self::ValidationReportInvalid => "validation-report-invalid",
+            Self::SessionGenerationExhausted => "session-generation-exhausted",
             Self::Trapped => "trapped",
         }
     }
@@ -1114,8 +1118,11 @@ impl ThreadController {
         let permit = self.execution_ledger.acquire_root()?;
         session.active_roots += 1;
         let fuel = self.execution_ledger.limits.fuel_limits;
-        session.next_fuel_generation = session.next_fuel_generation.wrapping_add(1).max(1);
-        let generation = session.next_fuel_generation;
+        let generation = session
+            .next_fuel_generation
+            .checked_add(1)
+            .ok_or(SketchExecutionError::SessionGenerationExhausted)?;
+        session.next_fuel_generation = generation;
         session.fuel = Some(FuelExecution {
             generation,
             remaining_child_slices: fuel.child_slice_capacity(),
@@ -1376,31 +1383,33 @@ fn define_closed_imports(
                                 fuel_generation: generation,
                             },
                         );
-                        if store.set_fuel(child_fuel).is_err() {
-                            return ChildOutcome::Trapped;
-                        }
-                        let Some(prelink) = child.prelink.get() else {
-                            return ChildOutcome::Trapped;
-                        };
-                        let instance = match prelink.instantiate(&mut store) {
-                            Ok(instance) => instance,
-                            Err(error) => return map_child_error(&error),
-                        };
-                        let _instance_observation = CounterObservation::new(
-                            Arc::clone(&child.execution_ledger),
-                            LedgerCounter::Instances,
-                        );
-                        let entry = instance
-                            .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
-                            .map_err(|_| ())
-                            .ok();
-                        let Some(entry) = entry else {
-                            return ChildOutcome::Trapped;
-                        };
-                        let outcome = match entry.call(&mut store, (tid, arg)) {
-                            Ok(()) => ChildOutcome::Completed,
-                            Err(error) => map_child_error(&error),
-                        };
+                        let outcome = (|| {
+                            if store.set_fuel(child_fuel).is_err() {
+                                return ChildOutcome::Trapped;
+                            }
+                            let Some(prelink) = child.prelink.get() else {
+                                return ChildOutcome::Trapped;
+                            };
+                            let instance = match prelink.instantiate(&mut store) {
+                                Ok(instance) => instance,
+                                Err(error) => return map_child_error(&error),
+                            };
+                            let _instance_observation = CounterObservation::new(
+                                Arc::clone(&child.execution_ledger),
+                                LedgerCounter::Instances,
+                            );
+                            let entry = instance
+                                .get_typed_func::<(i32, i32), ()>(&mut store, "wasi_thread_start")
+                                .map_err(|_| ())
+                                .ok();
+                            let Some(entry) = entry else {
+                                return ChildOutcome::Trapped;
+                            };
+                            match entry.call(&mut store, (tid, arg)) {
+                                Ok(()) => ChildOutcome::Completed,
+                                Err(error) => map_child_error(&error),
+                            }
+                        })();
                         // Sample the Store after every entry outcome, including
                         // OutOfFuel. This remains private bounded telemetry and
                         // never exposes a Store through the facade.
@@ -1804,6 +1813,17 @@ mod threaded_root_observation_tests {
         root_slice: u64,
         child_slice: u64,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        execute_fuel_fixture_with_observation(bytes, root_slice, child_slice).0
+    }
+
+    fn execute_fuel_fixture_with_observation(
+        bytes: Vec<u8>,
+        root_slice: u64,
+        child_slice: u64,
+    ) -> (
+        Result<ThreadedRootOutcome, SketchExecutionError>,
+        RootExecutionObservation,
+    ) {
         let compiler = fuel_compiler(root_slice, child_slice);
         let sketch = compiler
             .admit(
@@ -1816,7 +1836,11 @@ mod threaded_root_observation_tests {
             .enable_all()
             .build()
             .expect("runtime");
-        runtime.run(async { sketch.execute_threaded_root(runtime.handle()) })
+        let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared observation after terminal result");
+        (outcome, observation)
     }
 
     #[test]
@@ -1837,8 +1861,10 @@ mod threaded_root_observation_tests {
 
     #[test]
     fn finite_child_slice_reports_a_typed_ordered_child_outcome() {
+        let (outcome, observation) =
+            execute_fuel_fixture_with_observation(child_fuel_fixture(), 100, 10);
         assert_eq!(
-            execute_fuel_fixture(child_fuel_fixture(), 100, 10),
+            outcome,
             Err(SketchExecutionError::ChildOutcomes {
                 outcomes: vec![ThreadedChildOutcome {
                     tid: 1,
@@ -1846,6 +1872,58 @@ mod threaded_root_observation_tests {
                 }],
             })
         );
+        // The child Store was sampled after its OutOfFuel terminal path rather
+        // than only after a successful ABI entry call.
+        assert_eq!(observation.last_child_remaining_fuel, 0);
+    }
+
+    #[test]
+    fn root_store_is_sampled_after_a_start_section_fuel_failure() {
+        let (outcome, observation) =
+            execute_fuel_fixture_with_observation(start_fuel_fixture(), 1, 1);
+        assert_eq!(outcome, Err(SketchExecutionError::OutOfFuel));
+        assert_eq!(observation.last_root_remaining_fuel, 0);
+    }
+
+    #[test]
+    fn fuel_generation_exhaustion_is_typed_and_never_wraps() {
+        let bytes = threaded_yield_fixture();
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Ok(ThreadedRootOutcome::Started)
+        );
+        let prepared = sketch
+            .prepared_root
+            .lock()
+            .expect("prepared slot")
+            .as_ref()
+            .expect("prepared root")
+            .clone();
+        prepared
+            .controller
+            .session
+            .lock()
+            .expect("session")
+            .next_fuel_generation = u64::MAX;
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            Err(SketchExecutionError::SessionGenerationExhausted)
+        );
+        let session = prepared.controller.session.lock().expect("session");
+        assert_eq!(session.next_fuel_generation, u64::MAX);
+        assert!(session.fuel.is_none());
     }
 
     #[test]

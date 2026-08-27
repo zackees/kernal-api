@@ -34,7 +34,11 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
         Ok(_) => panic!("the synthetic profile must reject the threaded Rust artifact"),
         Err(error) => error,
     };
-    assert_eq!(compiler.compiled_module_count(), 0, "rejection is pre-compilation");
+    assert_eq!(
+        compiler.compiled_module_count(),
+        0,
+        "rejection is pre-compilation"
+    );
     eprintln!("threaded-artifact-synthetic-rejection={}", error.code());
 
     let threaded = SketchModulePolicy::threaded_rust_v1(bytes.len().saturating_add(1), 16_384)

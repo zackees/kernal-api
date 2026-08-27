@@ -264,7 +264,9 @@ pub enum SketchModuleError {
         name: String,
     },
     EntrypointMismatch,
-    ForbiddenCustomSection { name: String },
+    ForbiddenCustomSection {
+        name: String,
+    },
     MissingTargetFeatures,
     TargetFeaturesMismatch,
     StartMismatch,
@@ -317,6 +319,11 @@ impl std::error::Error for SketchModuleError {}
 #[doc(hidden)]
 pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, SketchModuleError> {
     let mut facts = Vec::new();
+    let mut types = Vec::<TypeEntry>::new();
+    let mut imported_function_types = Vec::<u32>::new();
+    let mut functions = Vec::<u32>::new();
+    let mut exports = Vec::<(String, ExternalKind, u32)>::new();
+    let mut start = None;
     let mut type_index = 0_u32;
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
@@ -324,15 +331,21 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
                 for group in reader {
                     let group = group.map_err(|_| SketchModuleError::InvalidBinary)?;
                     for ty in group.types() {
-                        let fact = if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
-                            format!(
+                        let fact =
+                            if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
+                                types.push(TypeEntry::Function {
+                                    params: function.params().to_vec(),
+                                    results: function.results().to_vec(),
+                                });
+                                format!(
                                 "type index={type_index} kind=function params={:?} results={:?}",
                                 function.params(),
                                 function.results(),
                             )
-                        } else {
-                            format!("type index={type_index} kind=non-function")
-                        };
+                            } else {
+                                types.push(TypeEntry::NonFunction);
+                                format!("type index={type_index} kind=non-function")
+                            };
                         facts.push(fact);
                         type_index += 1;
                     }
@@ -347,6 +360,14 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
                         bounded(import.name),
                         import_kind(import.ty),
                     ));
+                    if let TypeRef::Func(index) | TypeRef::FuncExact(index) = import.ty {
+                        imported_function_types.push(index);
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for index in reader {
+                    functions.push(index.map_err(|_| SketchModuleError::InvalidBinary)?);
                 }
             }
             Payload::MemorySection(reader) => {
@@ -365,15 +386,10 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
             Payload::ExportSection(reader) => {
                 for export in reader {
                     let export = export.map_err(|_| SketchModuleError::InvalidBinary)?;
-                    facts.push(format!(
-                        "export name={} kind={} index={}",
-                        bounded(export.name),
-                        external_kind(export.kind),
-                        export.index,
-                    ));
+                    exports.push((bounded(export.name), export.kind, export.index));
                 }
             }
-            Payload::StartSection { .. } => facts.push("start present".to_owned()),
+            Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => facts.push(format!(
                 "custom name={} bytes={}",
                 bounded(section.name()),
@@ -382,8 +398,27 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
             _ => {}
         }
     }
+    for (name, kind, index) in exports {
+        let type_index = match kind {
+            ExternalKind::Func | ExternalKind::FuncExact => {
+                function_type(index, &imported_function_types, &functions)
+            }
+            _ => None,
+        };
+        facts.push(format!(
+            "export name={name} kind={} index={index} type={type_index:?}",
+            external_kind(kind),
+        ));
+    }
+    if let Some(index) = start {
+        let type_index = function_type(index, &imported_function_types, &functions);
+        facts.push(format!("start function index={index} type={type_index:?}"));
+    }
     facts.sort_unstable();
-    Ok(format!("threaded-artifact-manifest-v1\n{}\n", facts.join("\n")))
+    Ok(format!(
+        "threaded-artifact-manifest-v1\n{}\n",
+        facts.join("\n")
+    ))
 }
 
 fn import_kind(import: TypeRef) -> String {
@@ -661,121 +696,306 @@ fn preflight_threaded_rust(
     let mut seen = std::collections::BTreeSet::new();
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
-            Payload::TypeSection(reader) => for group in reader {
-                let group = group.map_err(|_| SketchModuleError::InvalidBinary)?;
-                for ty in group.types() {
-                    if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
-                        types.push(TypeEntry::Function { params: function.params().to_vec(), results: function.results().to_vec() });
-                    } else { types.push(TypeEntry::NonFunction); }
-                }
-            },
-            Payload::ImportSection(reader) => for import in reader.into_imports() {
-                let import = import.map_err(|_| SketchModuleError::InvalidBinary)?;
-                match import.ty {
-                    TypeRef::Memory(ty) if import.module == MEMORY_MODULE && import.name == MEMORY_NAME => {
-                        if memory.is_some() { return Err(SketchModuleError::MultipleMemoryImports); }
-                        memory = Some(check_memory(ty.initial, ty.maximum, ty.shared, ty.memory64, ty.page_size_log2, policy)?);
-                    }
-                    TypeRef::Func(index) | TypeRef::FuncExact(index) => {
-                        if !threaded_import_signature(import.module, import.name, &types, index)? {
-                            return Err(SketchModuleError::ForbiddenImport { module: bounded(import.module), name: bounded(import.name) });
+            Payload::TypeSection(reader) => {
+                for group in reader {
+                    let group = group.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    for ty in group.types() {
+                        if let CompositeInnerType::Func(function) = &ty.composite_type.inner {
+                            types.push(TypeEntry::Function {
+                                params: function.params().to_vec(),
+                                results: function.results().to_vec(),
+                            });
+                        } else {
+                            types.push(TypeEntry::NonFunction);
                         }
-                        if !seen.insert((import.module, import.name)) {
-                            return Err(SketchModuleError::ForbiddenImport { module: bounded(import.module), name: bounded(import.name) });
-                        }
-                        imported_function_types.push(index);
                     }
-                    _ => return Err(SketchModuleError::ForbiddenImport { module: bounded(import.module), name: bounded(import.name) }),
                 }
-            },
-            Payload::FunctionSection(reader) => for index in reader { functions.push(index.map_err(|_| SketchModuleError::InvalidBinary)?); },
+            }
+            Payload::ImportSection(reader) => {
+                for import in reader.into_imports() {
+                    let import = import.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    match import.ty {
+                        TypeRef::Memory(ty)
+                            if import.module == MEMORY_MODULE && import.name == MEMORY_NAME =>
+                        {
+                            if memory.is_some() {
+                                return Err(SketchModuleError::MultipleMemoryImports);
+                            }
+                            memory = Some(check_memory(
+                                ty.initial,
+                                ty.maximum,
+                                ty.shared,
+                                ty.memory64,
+                                ty.page_size_log2,
+                                policy,
+                            )?);
+                        }
+                        TypeRef::Func(index) | TypeRef::FuncExact(index) => {
+                            if !threaded_import_signature(
+                                import.module,
+                                import.name,
+                                &types,
+                                index,
+                            )? {
+                                return Err(SketchModuleError::ForbiddenImport {
+                                    module: bounded(import.module),
+                                    name: bounded(import.name),
+                                });
+                            }
+                            if !seen.insert((import.module, import.name)) {
+                                return Err(SketchModuleError::ForbiddenImport {
+                                    module: bounded(import.module),
+                                    name: bounded(import.name),
+                                });
+                            }
+                            imported_function_types.push(index);
+                        }
+                        _ => {
+                            return Err(SketchModuleError::ForbiddenImport {
+                                module: bounded(import.module),
+                                name: bounded(import.name),
+                            })
+                        }
+                    }
+                }
+            }
+            Payload::FunctionSection(reader) => {
+                for index in reader {
+                    functions.push(index.map_err(|_| SketchModuleError::InvalidBinary)?);
+                }
+            }
             Payload::MemorySection(_) => return Err(SketchModuleError::DefinedMemoryForbidden),
-            Payload::ExportSection(reader) => for export in reader {
-                let export = export.map_err(|_| SketchModuleError::InvalidBinary)?;
-                if export.name == "memory" { memory_export = Some((export.kind, export.index)); }
-                exports.push((bounded(export.name), export.kind, export.index));
-            },
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|_| SketchModuleError::InvalidBinary)?;
+                    if export.name == "memory" {
+                        memory_export = Some((export.kind, export.index));
+                    }
+                    exports.push((bounded(export.name), export.kind, export.index));
+                }
+            }
             Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => match section.name() {
                 "target_features" => {
-                    if target_features.replace(parse_target_features(section.data())?).is_some() { return Err(SketchModuleError::TargetFeaturesMismatch); }
+                    if target_features
+                        .replace(parse_target_features(section.data())?)
+                        .is_some()
+                    {
+                        return Err(SketchModuleError::TargetFeaturesMismatch);
+                    }
                 }
-                "name" | "producers" | ".debug_abbrev" | ".debug_info" | ".debug_line" | ".debug_ranges" | ".debug_str" => {
-                    if section.data().len() > MAX_METADATA_BYTES * 1024 { return Err(SketchModuleError::MetadataTooLarge { name: "debug" }); }
+                "name" | "producers" | ".debug_abbrev" | ".debug_info" | ".debug_line"
+                | ".debug_ranges" | ".debug_str" => {
+                    if section.data().len() > MAX_METADATA_BYTES * 1024 {
+                        return Err(SketchModuleError::MetadataTooLarge { name: "debug" });
+                    }
                 }
-                name => return Err(SketchModuleError::ForbiddenCustomSection { name: bounded(name) }),
+                name => {
+                    return Err(SketchModuleError::ForbiddenCustomSection {
+                        name: bounded(name),
+                    })
+                }
             },
             _ => {}
         }
     }
     let memory = memory.ok_or(SketchModuleError::MissingSharedMemory)?;
     if policy.max_shared_memory_pages < THREADED_RUST_MAX_PAGES {
-        return Err(SketchModuleError::SharedMemoryExceedsPolicy { minimum_pages: memory.minimum_pages.into(), maximum_pages: THREADED_RUST_MAX_PAGES.into(), policy_pages: policy.max_shared_memory_pages });
+        return Err(SketchModuleError::SharedMemoryExceedsPolicy {
+            minimum_pages: memory.minimum_pages.into(),
+            maximum_pages: THREADED_RUST_MAX_PAGES.into(),
+            policy_pages: policy.max_shared_memory_pages,
+        });
     }
-    if memory_export != Some((ExternalKind::Memory, 0)) { return Err(SketchModuleError::MemoryExportMismatch); }
+    if memory_export != Some((ExternalKind::Memory, 0)) {
+        return Err(SketchModuleError::MemoryExportMismatch);
+    }
     let required = [
-        (ABI_MODULE, ABI_YIELD), (THREAD_MODULE, THREAD_SPAWN),
-        ("wasi_snapshot_preview1", "clock_time_get"), ("wasi_snapshot_preview1", "environ_get"),
-        ("wasi_snapshot_preview1", "environ_sizes_get"), ("wasi_snapshot_preview1", "fd_write"),
-        ("wasi_snapshot_preview1", "proc_exit"), ("wasi_snapshot_preview1", "sched_yield"),
+        (ABI_MODULE, ABI_YIELD),
+        (THREAD_MODULE, THREAD_SPAWN),
+        ("wasi_snapshot_preview1", "clock_time_get"),
+        ("wasi_snapshot_preview1", "environ_get"),
+        ("wasi_snapshot_preview1", "environ_sizes_get"),
+        ("wasi_snapshot_preview1", "fd_write"),
+        ("wasi_snapshot_preview1", "proc_exit"),
+        ("wasi_snapshot_preview1", "sched_yield"),
     ];
-    if !required.iter().all(|pair| seen.contains(pair)) || seen.len() != required.len() { return Err(SketchModuleError::MissingRequiredImport { module: "threaded-rust-v1", name: "closed-import-set" }); }
+    if !required.iter().all(|pair| seen.contains(pair)) || seen.len() != required.len() {
+        return Err(SketchModuleError::MissingRequiredImport {
+            module: "threaded-rust-v1",
+            name: "closed-import-set",
+        });
+    }
     let features = target_features.ok_or(SketchModuleError::MissingTargetFeatures)?;
-    if !["atomics", "bulk-memory", "mutable-globals"].iter().all(|feature| features.contains(*feature)) { return Err(SketchModuleError::TargetFeaturesMismatch); }
-    let allowed = [("memory", ExternalKind::Memory), ("_start", ExternalKind::Func), ("__main_void", ExternalKind::Func), ("wasi_thread_start", ExternalKind::Func), (ENTRY, ExternalKind::Func)];
-    if exports.len() != allowed.len() || !exports.iter().all(|(name, kind, _)| allowed.contains(&(name.as_str(), *kind))) { return Err(SketchModuleError::ExportNotAllowed { name: exports.first().map(|e| e.0.clone()).unwrap_or_default() }); }
+    if !["atomics", "bulk-memory", "mutable-globals"]
+        .iter()
+        .all(|feature| features.contains(*feature))
+    {
+        return Err(SketchModuleError::TargetFeaturesMismatch);
+    }
+    let allowed = [
+        ("memory", ExternalKind::Memory),
+        ("_start", ExternalKind::Func),
+        ("__main_void", ExternalKind::Func),
+        ("wasi_thread_start", ExternalKind::Func),
+        (ENTRY, ExternalKind::Func),
+    ];
+    if exports.len() != allowed.len()
+        || !exports
+            .iter()
+            .all(|(name, kind, _)| allowed.contains(&(name.as_str(), *kind)))
+    {
+        return Err(SketchModuleError::ExportNotAllowed {
+            name: exports.first().map(|e| e.0.clone()).unwrap_or_default(),
+        });
+    }
     let mut by_name = std::collections::BTreeMap::new();
-    for (name, _, index) in exports { by_name.insert(name, index); }
-    for (name, signature) in [("_start", Signature { params: EMPTY, results: EMPTY }), ("__main_void", Signature { params: EMPTY, results: EMPTY }), ("wasi_thread_start", Signature { params: &[ValType::I32, ValType::I32], results: EMPTY }), (ENTRY, Signature { params: EMPTY, results: I32 })] {
-        let index = *by_name.get(name).ok_or(SketchModuleError::EntrypointMismatch)?;
-        let type_index = function_type(index, &imported_function_types, &functions).ok_or(SketchModuleError::EntrypointMismatch)?;
+    for (name, _, index) in exports {
+        by_name.insert(name, index);
+    }
+    for (name, signature) in [
+        (
+            "_start",
+            Signature {
+                params: EMPTY,
+                results: EMPTY,
+            },
+        ),
+        (
+            "__main_void",
+            Signature {
+                params: EMPTY,
+                results: I32,
+            },
+        ),
+        (
+            "wasi_thread_start",
+            Signature {
+                params: &[ValType::I32, ValType::I32],
+                results: EMPTY,
+            },
+        ),
+        (
+            ENTRY,
+            Signature {
+                params: EMPTY,
+                results: I32,
+            },
+        ),
+    ] {
+        let index = *by_name
+            .get(name)
+            .ok_or(SketchModuleError::EntrypointMismatch)?;
+        let type_index = function_type(index, &imported_function_types, &functions)
+            .ok_or(SketchModuleError::EntrypointMismatch)?;
         check_signature(&types, type_index, signature, ABI_MODULE, name)?;
     }
-    if start != by_name.get("_start").copied() { return Err(SketchModuleError::StartMismatch); }
+    let start = start.ok_or(SketchModuleError::StartMismatch)?;
+    let start_type = function_type(start, &imported_function_types, &functions)
+        .ok_or(SketchModuleError::StartMismatch)?;
+    let Some(TypeEntry::Function { params, results }) = types.get(start_type as usize) else {
+        return Err(SketchModuleError::StartMismatch);
+    };
+    if params.as_slice() != EMPTY || results.as_slice() != EMPTY {
+        return Err(SketchModuleError::StartMismatch);
+    }
     Ok(memory)
 }
 
 fn function_type(index: u32, imported: &[u32], defined: &[u32]) -> Option<u32> {
-    if (index as usize) < imported.len() { imported.get(index as usize).copied() } else { defined.get(index as usize - imported.len()).copied() }
+    if (index as usize) < imported.len() {
+        imported.get(index as usize).copied()
+    } else {
+        defined.get(index as usize - imported.len()).copied()
+    }
 }
 
-fn threaded_import_signature(module: &str, name: &str, types: &[TypeEntry], index: u32) -> Result<bool, SketchModuleError> {
+fn threaded_import_signature(
+    module: &str,
+    name: &str,
+    types: &[TypeEntry],
+    index: u32,
+) -> Result<bool, SketchModuleError> {
     let signature = match (module, name) {
-        (ABI_MODULE, ABI_YIELD) => Signature { params: EMPTY, results: EMPTY },
-        (THREAD_MODULE, THREAD_SPAWN) => Signature { params: I32, results: I32 },
-        ("wasi_snapshot_preview1", "clock_time_get") => Signature { params: &[ValType::I32, ValType::I64, ValType::I32], results: I32 },
-        ("wasi_snapshot_preview1", "environ_get") | ("wasi_snapshot_preview1", "environ_sizes_get") => Signature { params: &[ValType::I32, ValType::I32], results: I32 },
-        ("wasi_snapshot_preview1", "fd_write") => Signature { params: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32], results: I32 },
-        ("wasi_snapshot_preview1", "proc_exit") => Signature { params: I32, results: EMPTY },
-        ("wasi_snapshot_preview1", "sched_yield") => Signature { params: EMPTY, results: I32 },
+        (ABI_MODULE, ABI_YIELD) => Signature {
+            params: EMPTY,
+            results: EMPTY,
+        },
+        (THREAD_MODULE, THREAD_SPAWN) => Signature {
+            params: I32,
+            results: I32,
+        },
+        ("wasi_snapshot_preview1", "clock_time_get") => Signature {
+            params: &[ValType::I32, ValType::I64, ValType::I32],
+            results: I32,
+        },
+        ("wasi_snapshot_preview1", "environ_get")
+        | ("wasi_snapshot_preview1", "environ_sizes_get") => Signature {
+            params: &[ValType::I32, ValType::I32],
+            results: I32,
+        },
+        ("wasi_snapshot_preview1", "fd_write") => Signature {
+            params: &[ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            results: I32,
+        },
+        ("wasi_snapshot_preview1", "proc_exit") => Signature {
+            params: I32,
+            results: EMPTY,
+        },
+        ("wasi_snapshot_preview1", "sched_yield") => Signature {
+            params: EMPTY,
+            results: I32,
+        },
         _ => return Ok(false),
     };
     check_signature(types, index, signature, module, name)?;
     Ok(true)
 }
 
-fn parse_target_features(data: &[u8]) -> Result<std::collections::BTreeSet<String>, SketchModuleError> {
+fn parse_target_features(
+    data: &[u8],
+) -> Result<std::collections::BTreeSet<String>, SketchModuleError> {
     let (count, mut offset) = read_leb(data, 0)?;
     let mut result = std::collections::BTreeSet::new();
     for _ in 0..count {
-        if offset >= data.len() { return Err(SketchModuleError::TargetFeaturesMismatch); }
-        let prefix = data[offset]; offset += 1;
-        if prefix != b'+' { return Err(SketchModuleError::TargetFeaturesMismatch); }
-        let (length, next) = read_leb(data, offset)?; offset = next;
-        let end = offset.checked_add(length as usize).ok_or(SketchModuleError::TargetFeaturesMismatch)?;
-        let name = std::str::from_utf8(data.get(offset..end).ok_or(SketchModuleError::TargetFeaturesMismatch)?).map_err(|_| SketchModuleError::TargetFeaturesMismatch)?;
-        result.insert(bounded(name)); offset = end;
+        if offset >= data.len() {
+            return Err(SketchModuleError::TargetFeaturesMismatch);
+        }
+        let prefix = data[offset];
+        offset += 1;
+        if prefix != b'+' {
+            return Err(SketchModuleError::TargetFeaturesMismatch);
+        }
+        let (length, next) = read_leb(data, offset)?;
+        offset = next;
+        let end = offset
+            .checked_add(length as usize)
+            .ok_or(SketchModuleError::TargetFeaturesMismatch)?;
+        let name = std::str::from_utf8(
+            data.get(offset..end)
+                .ok_or(SketchModuleError::TargetFeaturesMismatch)?,
+        )
+        .map_err(|_| SketchModuleError::TargetFeaturesMismatch)?;
+        result.insert(bounded(name));
+        offset = end;
     }
-    if offset != data.len() { return Err(SketchModuleError::TargetFeaturesMismatch); }
+    if offset != data.len() {
+        return Err(SketchModuleError::TargetFeaturesMismatch);
+    }
     Ok(result)
 }
 
 fn read_leb(data: &[u8], mut offset: usize) -> Result<(u32, usize), SketchModuleError> {
     let mut value = 0_u32;
     for shift in (0..35).step_by(7) {
-        let byte = *data.get(offset).ok_or(SketchModuleError::TargetFeaturesMismatch)?; offset += 1;
+        let byte = *data
+            .get(offset)
+            .ok_or(SketchModuleError::TargetFeaturesMismatch)?;
+        offset += 1;
         value |= u32::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 { return Ok((value, offset)); }
+        if byte & 0x80 == 0 {
+            return Ok((value, offset));
+        }
     }
     Err(SketchModuleError::TargetFeaturesMismatch)
 }

@@ -9,6 +9,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use wasmparser::{ExternalKind, Parser, Payload, TypeRef};
 use wasmtime::{Config, Engine, ExternType, Module, Strategy, ValType};
 
 const PAGE_BYTES: u64 = 64 * 1024;
@@ -70,9 +71,7 @@ impl SketchEngine {
     /// pooling allocator, Winch, and any engine-managed task runtime.
     pub fn new(config: SketchEngineConfig) -> Result<Self, SketchEngineError> {
         let mut wasmtime = Config::new();
-        wasmtime
-            .strategy(Strategy::Cranelift)
-            .map_err(|error| SketchEngineError::Initialization(error.to_string()))?;
+        wasmtime.strategy(Strategy::Cranelift);
         wasmtime.wasm_threads(true);
         // Shared memories are off by default in Wasmtime even when threads are
         // enabled, so make this policy choice explicit.
@@ -105,6 +104,7 @@ impl SketchEngine {
             });
         }
 
+        preflight(bytes, policy)?;
         let module = Module::new(&self.inner, bytes)
             .map_err(|error| SketchAdmissionError::InvalidModule(error.to_string()))?;
         let shared_memory = validate_imports(&module, policy)?;
@@ -116,6 +116,91 @@ impl SketchEngine {
             shared_memory,
         })
     }
+}
+
+fn preflight(bytes: &[u8], policy: SketchAdmissionPolicy) -> Result<(), SketchAdmissionError> {
+    let mut memory = false;
+    let mut thread_spawn = false;
+    let mut kernel_yield = false;
+    let mut entrypoint = false;
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|_| SketchAdmissionError::InvalidModule("malformed module".into()))? {
+            Payload::ImportSection(reader) => {
+                for group in reader {
+                    let group = group.map_err(|_| {
+                        SketchAdmissionError::InvalidModule("malformed import".into())
+                    })?;
+                    for import in group.into_iter() {
+                        let (_, import) = import.map_err(|_| {
+                            SketchAdmissionError::InvalidModule("malformed import".into())
+                        })?;
+                        match (import.module, import.name, import.ty) {
+                            (MEMORY_NAMESPACE, MEMORY_NAME, TypeRef::Memory(memory_type)) => {
+                                if memory {
+                                    return Err(SketchAdmissionError::MultipleMemoryImports);
+                                }
+                                memory = true;
+                                if !memory_type.shared {
+                                    return Err(SketchAdmissionError::UnsharedMemory);
+                                }
+                                if memory_type.memory64 {
+                                    return Err(SketchAdmissionError::Memory64);
+                                }
+                                let Some(maximum) = memory_type.maximum else {
+                                    return Err(SketchAdmissionError::SharedMemoryWithoutMaximum);
+                                };
+                                if memory_type.initial > u64::from(policy.max_shared_memory_pages)
+                                    || maximum > u64::from(policy.max_shared_memory_pages)
+                                {
+                                    return Err(SketchAdmissionError::SharedMemoryExceedsPolicy {
+                                        minimum_pages: memory_type.initial,
+                                        maximum_pages: maximum,
+                                        policy_pages: policy.max_shared_memory_pages,
+                                    });
+                                }
+                            }
+                            (
+                                THREAD_NAMESPACE,
+                                THREAD_SPAWN,
+                                TypeRef::Func(_) | TypeRef::FuncExact(_),
+                            ) => thread_spawn = true,
+                            (
+                                KERNEL_ABI_V1_NAMESPACE,
+                                KERNEL_YIELD,
+                                TypeRef::Func(_) | TypeRef::FuncExact(_),
+                            ) => kernel_yield = true,
+                            _ => {
+                                return Err(SketchAdmissionError::ForbiddenImport {
+                                    module: import.module.into(),
+                                    name: import.name.into(),
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+            Payload::ExportSection(reader) => {
+                for export in reader {
+                    let export = export.map_err(|_| {
+                        SketchAdmissionError::InvalidModule("malformed export".into())
+                    })?;
+                    if export.name != ENTRYPOINT_NAME || export.kind != ExternalKind::Func {
+                        return Err(SketchAdmissionError::EntrypointMismatch);
+                    }
+                    entrypoint = true;
+                }
+            }
+            Payload::StartSection { .. } => return Err(SketchAdmissionError::EntrypointMismatch),
+            _ => {}
+        }
+    }
+    if !memory {
+        return Err(SketchAdmissionError::MissingSharedMemory);
+    }
+    if !thread_spawn || !kernel_yield || !entrypoint {
+        return Err(SketchAdmissionError::EntrypointMismatch);
+    }
+    Ok(())
 }
 
 /// Limits applied before a sketch module may be instantiated.
@@ -218,7 +303,9 @@ impl fmt::Display for SketchEngineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidStackLimit => formatter.write_str("the Wasm stack limit must be nonzero"),
-            Self::Initialization(detail) => write!(formatter, "could not initialize sketch engine: {detail}"),
+            Self::Initialization(detail) => {
+                write!(formatter, "could not initialize sketch engine: {detail}")
+            }
         }
     }
 }
@@ -307,12 +394,13 @@ fn validate_imports(
             if shared_memory.is_some() {
                 return Err(SketchAdmissionError::MultipleMemoryImports);
             }
-            let memory = external_type.memory().ok_or_else(|| {
-                SketchAdmissionError::ImportTypeMismatch {
-                    module: module_name.to_owned(),
-                    name: name.to_owned(),
-                }
-            })?;
+            let memory =
+                external_type
+                    .memory()
+                    .ok_or_else(|| SketchAdmissionError::ImportTypeMismatch {
+                        module: module_name.to_owned(),
+                        name: name.to_owned(),
+                    })?;
             shared_memory = Some(validate_shared_memory(memory, policy)?);
             continue;
         }
@@ -386,7 +474,7 @@ fn matches_thread_spawn(external_type: &ExternType) -> bool {
     };
     let params: Vec<_> = function.params().collect();
     let results: Vec<_> = function.results().collect();
-    params.as_slice() == [ValType::I32] && results.as_slice() == [ValType::I32]
+    matches!(params.as_slice(), [ValType::I32]) && matches!(results.as_slice(), [ValType::I32])
 }
 
 fn matches_empty_function(external_type: &ExternType) -> bool {

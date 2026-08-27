@@ -31,7 +31,9 @@ fn valid_module() -> Vec<u8> {
 
 #[test]
 fn valid_versioned_kernel_module_is_admitted_once_with_bounded_shared_memory() {
-    let module = engine().admit(&valid_module(), policy()).expect("admit module");
+    let module = engine()
+        .admit(&valid_module(), policy())
+        .expect("admit module");
 
     assert!(module.module_bytes() > 0);
     assert_eq!(module.shared_memory().minimum_pages(), 1);
@@ -102,7 +104,10 @@ fn shared_memory_must_be_the_owned_bounded_compatibility_import() {
     );
     assert!(matches!(
         engine().admit(&oversized, policy()),
-        Err(SketchAdmissionError::SharedMemoryExceedsPolicy { policy_pages: 16, .. })
+        Err(SketchAdmissionError::SharedMemoryExceedsPolicy {
+            policy_pages: 16,
+            ..
+        })
     ));
 }
 

@@ -304,6 +304,87 @@ enum WriterEvent {
     Cancel(Result<(), ()>),
 }
 
+/// All parent-side resources whose lifetime must extend through deferred
+/// containment.  Keeping these together prevents a failed force attempt from
+/// synchronously dropping the native control or releasing admission early.
+struct ExecutionOwnership {
+    control: crate::platform::process::WorkerControl,
+    _lease: WorkerParentRootLease,
+    _lease_gauge: WorkerGauge,
+    _worker_gauge: WorkerGauge,
+}
+
+struct ActiveOwnership {
+    ownership: Option<ExecutionOwnership>,
+    cleanup: CleanupDispatcher,
+}
+
+impl std::ops::Deref for ActiveOwnership {
+    type Target = crate::platform::process::WorkerControl;
+
+    fn deref(&self) -> &Self::Target {
+        &self.ownership.as_ref().expect("active worker ownership").control
+    }
+}
+
+impl std::ops::DerefMut for ActiveOwnership {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.ownership.as_mut().expect("active worker ownership").control
+    }
+}
+
+impl ActiveOwnership {
+    fn take(&mut self) -> ExecutionOwnership {
+        self.ownership.take().expect("active worker ownership")
+    }
+}
+
+struct CleanupJob {
+    ownership: ExecutionOwnership,
+    writer_tx: std::sync::mpsc::Sender<WriterCommand>,
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+struct CleanupDispatcher {
+    sender: std::sync::mpsc::Sender<CleanupJob>,
+}
+
+impl CleanupDispatcher {
+    fn start(ledger: Arc<WorkerExecutionLedger>) -> Result<Self, ()> {
+        let (sender, receiver) = std::sync::mpsc::channel::<CleanupJob>();
+        std::thread::Builder::new()
+            .name("kernal-worker-cleanup".into())
+            .spawn(move || {
+                while let Ok(mut job) = receiver.recv() {
+                    // A failed force leaves the contained process and both
+                    // pipe owners alive. Retry until containment completes;
+                    // only then can joining the helpers be bounded.
+                    while job.ownership.control.force_and_reap(Duration::from_secs(5)).is_err() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    ledger.record_forced();
+                    ledger.record_reaped();
+                    let _ = job.writer_tx.send(WriterCommand::Close);
+                    let _ = job.writer.join();
+                    let _ = job.reader.join();
+                    // `job` drops here, releasing the root lease and gauges.
+                }
+            })
+            .map_err(|_| ())?;
+        Ok(Self { sender })
+    }
+
+    fn hand_off(&self, job: CleanupJob) {
+        if let Err(error) = self.sender.send(job) {
+            // The dispatcher is intentionally durable. A dead receiver is an
+            // impossible terminal condition; leaking is safer than allowing
+            // `WorkerControl::drop` to synchronously invoke shutdown.
+            std::mem::forget(error.0);
+        }
+    }
+}
+
 fn supervise(
     sketch: &AdmittedSketch,
     config: SketchWorkerConfig,
@@ -327,21 +408,34 @@ fn supervise(
     if let Some(trigger) = selected_stop(&cancellation, deadline) {
         return SketchWorkerTerminal::Stopped(trigger);
     }
+    let cleanup = match CleanupDispatcher::start(Arc::clone(&sketch.worker_ledger)) {
+        Ok(dispatcher) => dispatcher,
+        Err(()) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
+    };
     let mut command = std::process::Command::new(config.executable());
     let child = match spawn_worker(&mut command) {
         Ok(child) => child,
         Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
     };
     sketch.worker_ledger.record_spawned();
-    let _worker_gauge = sketch.worker_ledger.live_worker();
-    let (mut control, stdin, stdout) = child.into_parts();
+    let worker_gauge = sketch.worker_ledger.live_worker();
+    let (native_control, stdin, stdout) = child.into_parts();
+    let mut control = ActiveOwnership {
+        ownership: Some(ExecutionOwnership {
+            control: native_control,
+            _lease,
+            _lease_gauge,
+            _worker_gauge: worker_gauge,
+        }),
+        cleanup,
+    };
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol).0;
+        return force_result(sketch, &mut *control, SketchWorkerFailure::Protocol).0;
     };
     let Some(id) = next_request_id() else {
         drop(stdin);
         drop(stdout);
-        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol).0;
+        return force_result(sketch, &mut *control, SketchWorkerFailure::Protocol).0;
     };
     let (write_tx, write_rx) = std::sync::mpsc::channel();
     let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
@@ -681,22 +775,23 @@ fn force_result(
 }
 fn force_join_result(
     sketch: &AdmittedSketch,
-    control: &mut crate::platform::process::WorkerControl,
+    control: &mut ActiveOwnership,
     tx: std::sync::mpsc::Sender<WriterCommand>,
     writer: std::thread::JoinHandle<()>,
     reader: std::thread::JoinHandle<()>,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(sketch, control, failure);
+    let (result, forced) = force_result(sketch, &mut *control, failure);
     if !forced {
-        // The platform still owns an unreaped child.  Joining either pipe task
-        // could block behind that child, so detach them and return the bounded
-        // containment result.  Their gauges remain live until the operating
-        // system eventually closes the owned pipes; no handle is discarded by
-        // a successful path.
-        drop(tx);
-        drop(writer);
-        drop(reader);
+        // The dispatcher owns the unreaped child and both helpers from this
+        // point. `ContainmentCleanup` means cleanup remains pending; gauges
+        // and the root lease intentionally stay live until its retry succeeds.
+        control.cleanup.hand_off(CleanupJob {
+            ownership: control.take(),
+            writer_tx: tx,
+            writer,
+            reader,
+        });
         return result;
     }
     let _ = tx.send(WriterCommand::Close);
@@ -718,17 +813,20 @@ fn exited_join_result(
 }
 fn force_join_terminal(
     sketch: &AdmittedSketch,
-    control: &mut crate::platform::process::WorkerControl,
+    control: &mut ActiveOwnership,
     tx: std::sync::mpsc::Sender<WriterCommand>,
     writer: std::thread::JoinHandle<()>,
     reader: std::thread::JoinHandle<()>,
     trigger: SketchWorkerStopReason,
 ) -> SketchWorkerTerminal {
-    let (result, forced) = force_result(sketch, control, SketchWorkerFailure::UnexpectedExit);
+    let (result, forced) = force_result(sketch, &mut *control, SketchWorkerFailure::UnexpectedExit);
     if !forced {
-        drop(tx);
-        drop(writer);
-        drop(reader);
+        control.cleanup.hand_off(CleanupJob {
+            ownership: control.take(),
+            writer_tx: tx,
+            writer,
+            reader,
+        });
         return result;
     }
     let _ = tx.send(WriterCommand::Close);

@@ -383,7 +383,9 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         Kind::ModuleChunk => Message::ModuleChunk {
             request_id,
             sequence: take_u32(&mut input)?,
-            bytes: input.to_vec(),
+            // Move the bounded remainder out of the frame so the common
+            // trailing-byte check below sees that this variant consumed it.
+            bytes: std::mem::take(&mut input).to_vec(),
         },
         Kind::ExecuteEnd => Message::ExecuteEnd { request_id },
         Kind::Cancel => Message::Cancel { request_id },
@@ -703,6 +705,15 @@ mod tests {
             },
         };
         assert_eq!(decode(&encode(&terminal).unwrap()).unwrap(), terminal);
+    }
+    #[test]
+    fn round_trip_module_chunk_consumes_its_payload() {
+        let chunk = Message::ModuleChunk {
+            request_id: 7,
+            sequence: 3,
+            bytes: vec![0, 1, 2, 3],
+        };
+        assert_eq!(decode(&encode(&chunk).unwrap()).unwrap(), chunk);
     }
     #[test]
     fn multi_chunk_module_is_ordered_and_exact() {

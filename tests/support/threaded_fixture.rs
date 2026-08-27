@@ -153,9 +153,10 @@ pub(crate) fn looping_root_wasm() -> Vec<u8> {
 
 /// A true root-level `unreachable` trap.  Keep this body shape aligned with
 /// the core-Wasm host fixtures: only the exported root is replaced.
+#[allow(dead_code)] // used only by the wasm_worker_containment integration crate.
 pub(crate) fn unreachable_root_wasm() -> Vec<u8> {
     threaded_code_fixture([
-        vec![0, 0x0b],
+        vec![0, 0x00, 0x0b],
         vec![0, 0x41, 0, 0x0b],
         vec![0, 0x0b],
         vec![0, 0x00, 0x0b],
@@ -165,6 +166,7 @@ pub(crate) fn unreachable_root_wasm() -> Vec<u8> {
 
 /// The exact shared-memory `memory.atomic.wait32(0, 0, -1)` blocker used by
 /// the private core-Wasm fixture.  It deliberately has no wake-up path.
+#[allow(dead_code)] // used only by the wasm_worker_containment integration crate.
 pub(crate) fn atomic_wait32_wasm() -> Vec<u8> {
     threaded_code_fixture([
         vec![
@@ -177,6 +179,7 @@ pub(crate) fn atomic_wait32_wasm() -> Vec<u8> {
     ])
 }
 
+#[allow(dead_code)] // reached exclusively through the two containment-only fixtures above.
 fn threaded_code_fixture(bodies: [Vec<u8>; 5]) -> Vec<u8> {
     let bytes = threaded_root_wasm(None, false, false, false);
     let mut section_offset = 8;

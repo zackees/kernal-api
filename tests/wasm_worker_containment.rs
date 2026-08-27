@@ -18,8 +18,13 @@ use kernal_api::wasm::{
 mod threaded_fixture;
 
 const OUTER_BOUND: Duration = Duration::from_secs(10);
-const DEADLINE: Duration = Duration::from_millis(150);
-const GRACE: Duration = Duration::from_millis(100);
+// Process launch and the first Wasmtime initialization are intentionally
+// outside the sub-second deadline used to prove forced containment below.
+// Keep ordinary guest outcomes on a generous bound so a cold Windows worker
+// cannot be misclassified as a deadline expiry.
+const WORKER_DEADLINE: Duration = Duration::from_secs(2);
+const CONTAINMENT_DEADLINE: Duration = Duration::from_secs(1);
+const GRACE: Duration = Duration::from_secs(1);
 
 fn worker_config() -> SketchWorkerConfig {
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
@@ -55,7 +60,7 @@ fn long_fuel() -> SketchFuelLimits {
 }
 
 fn tiny_fuel() -> SketchFuelLimits {
-    SketchFuelLimits::new(10_000, 10_000, 1_000).expect("tiny fuel")
+    SketchFuelLimits::new(30_000, 10_000, 10_000).expect("tiny fuel")
 }
 
 fn admit(compiler: &SketchCompiler, bytes: Vec<u8>) -> Arc<kernal_api::wasm::AdmittedSketch> {
@@ -132,7 +137,10 @@ fn run_case(
             async move { contained(&sketch, handle, &config, Some(source)).await }
         });
         if cancel {
-            async_engine::sleep(Duration::from_millis(10)).await;
+            // Let the parent finish the bounded upload and the child enter
+            // Wasm before checking cooperative cancellation. A cancellation
+            // during protocol upload intentionally exercises forced cleanup.
+            async_engine::sleep(Duration::from_millis(500)).await;
             source.cancel();
         }
         assert_eq!(task.await.expect("contained task"), expected);
@@ -144,21 +152,21 @@ fn run_case(
 fn real_worker_classifies_normal_and_trap() {
     run_case(
         threaded_fixture::threaded_root_wasm(None, false, false, false),
-        DEADLINE,
+        WORKER_DEADLINE,
         normal_fuel(),
         false,
         SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
     );
     run_case(
         threaded_fixture::threaded_root_wasm(Some(0), false, false, false),
-        DEADLINE,
+        WORKER_DEADLINE,
         normal_fuel(),
         false,
         SketchWorkerTerminal::Completed(ThreadedRootOutcome::Exited),
     );
     run_case(
         threaded_fixture::unreachable_root_wasm(),
-        DEADLINE,
+        WORKER_DEADLINE,
         normal_fuel(),
         false,
         SketchWorkerTerminal::Execution(SketchExecutionError::Trapped),
@@ -183,7 +191,7 @@ fn real_worker_classifies_fuel_cancellation_and_deadline() {
     );
     run_case(
         threaded_fixture::looping_root_wasm(),
-        DEADLINE,
+        CONTAINMENT_DEADLINE,
         long_fuel(),
         false,
         SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded),
@@ -194,7 +202,7 @@ fn real_worker_classifies_fuel_cancellation_and_deadline() {
 fn real_worker_forces_containment_for_atomic_wait() {
     run_case(
         threaded_fixture::atomic_wait32_wasm(),
-        DEADLINE,
+        CONTAINMENT_DEADLINE,
         long_fuel(),
         false,
         SketchWorkerTerminal::ForcedContainment {
@@ -208,14 +216,14 @@ fn real_worker_sequential_stress_leaves_no_parent_state() {
     for _ in 0..3 {
         run_case(
             threaded_fixture::threaded_root_wasm(None, false, false, false),
-            DEADLINE,
+            WORKER_DEADLINE,
             normal_fuel(),
             false,
             SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
         );
         run_case(
             threaded_fixture::atomic_wait32_wasm(),
-            DEADLINE,
+            CONTAINMENT_DEADLINE,
             long_fuel(),
             false,
             SketchWorkerTerminal::ForcedContainment {
@@ -224,7 +232,7 @@ fn real_worker_sequential_stress_leaves_no_parent_state() {
         );
         run_case(
             threaded_fixture::unreachable_root_wasm(),
-            DEADLINE,
+            WORKER_DEADLINE,
             normal_fuel(),
             false,
             SketchWorkerTerminal::Execution(SketchExecutionError::Trapped),

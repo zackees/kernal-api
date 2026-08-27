@@ -271,7 +271,22 @@ pub(crate) struct WorkerChild {
     stdin: Option<std::process::ChildStdin>,
     stdout: Option<std::process::ChildStdout>,
     pid: u32,
-    inner: Box<dyn WorkerChildControl>,
+    // `Option` permits the consuming split below without moving a field out
+    // of a Drop type.  The sole remaining owner always performs containment.
+    inner: Option<Box<dyn WorkerChildControl>>,
+    contained: bool,
+}
+
+/// The lifecycle half of a split contained worker.
+///
+/// Pipes are intentionally not retained here: protocol I/O can be owned by
+/// independent blocking reader/writer tasks without placing this native
+/// lifecycle capability behind an async mutex.
+#[allow(dead_code)] // Phase-D private worker supervisor owns it.
+pub(crate) struct WorkerControl {
+    pid: u32,
+    inner: Option<Box<dyn WorkerChildControl>>,
+    contained: bool,
 }
 
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
@@ -286,7 +301,8 @@ impl WorkerChild {
             stdin,
             stdout,
             pid,
-            inner,
+            inner: Some(inner),
+            contained: false,
         }
     }
 
@@ -300,7 +316,7 @@ impl WorkerChild {
         self.stdout.take()
     }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner.try_wait()
+        self.inner.as_mut().map_or(Ok(None), |inner| inner.try_wait())
     }
 
     /// Close the control writer before hard containment, then reap within the
@@ -311,14 +327,184 @@ impl WorkerChild {
         timeout: std::time::Duration,
     ) -> Result<(), WorkerError> {
         drop(self.stdin.take());
-        self.inner.force_and_reap(timeout)
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        inner.force_and_reap(timeout)?;
+        self.contained = true;
+        Ok(())
+    }
+
+    /// Separates protocol pipes from the sole native lifecycle owner.
+    ///
+    /// `WorkerControl` remains responsible for best-effort containment even
+    /// after both pipe owners have been dropped.  This consumes `self`, so no
+    /// second Drop implementation can kill or reap the same process tree.
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (
+        WorkerControl,
+        Option<std::process::ChildStdin>,
+        Option<std::process::ChildStdout>,
+    ) {
+        let control = WorkerControl {
+            pid: self.pid,
+            inner: self.inner.take(),
+            contained: self.contained,
+        };
+        let stdin = self.stdin.take();
+        let stdout = self.stdout.take();
+        (control, stdin, stdout)
     }
 }
 
 impl Drop for WorkerChild {
     fn drop(&mut self) {
         drop(self.stdin.take());
-        self.inner.shutdown();
+        if !self.contained {
+            if let Some(inner) = self.inner.as_mut() {
+                inner.shutdown();
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // Phase-D private worker supervisor owns it.
+impl WorkerControl {
+    pub(crate) fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
+        self.inner.as_mut().map_or(Ok(None), |inner| inner.try_wait())
+    }
+
+    /// Force containment and reap on a caller-selected blocking lane.  A
+    /// failure deliberately retains the backend owner for a later retry or
+    /// bounded Drop cleanup.
+    pub(crate) fn force_and_reap(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<(), WorkerError> {
+        let Some(inner) = self.inner.as_mut() else {
+            return Ok(());
+        };
+        inner.force_and_reap(timeout)?;
+        self.contained = true;
+        Ok(())
+    }
+}
+
+impl Drop for WorkerControl {
+    fn drop(&mut self) {
+        if !self.contained {
+            if let Some(inner) = self.inner.as_mut() {
+                inner.shutdown();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_child_tests {
+    use super::{WorkerChild, WorkerChildControl, WorkerError, WorkerStage};
+    use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Counts {
+        waits: AtomicUsize,
+        forces: AtomicUsize,
+        shutdowns: AtomicUsize,
+        failed_forces_remaining: AtomicUsize,
+    }
+
+    struct FakeControl {
+        counts: Arc<Counts>,
+    }
+
+    impl WorkerChildControl for FakeControl {
+        fn try_wait(&mut self) -> io::Result<Option<i32>> {
+            self.counts.waits.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        fn force_and_reap(&mut self, _timeout: Duration) -> Result<(), WorkerError> {
+            self.counts.forces.fetch_add(1, Ordering::Relaxed);
+            if self
+                .counts
+                .failed_forces_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(WorkerError::new(
+                    WorkerStage::Reap,
+                    io::Error::new(io::ErrorKind::TimedOut, "fake reap timeout"),
+                ));
+            }
+            Ok(())
+        }
+
+        fn shutdown(&mut self) {
+            self.counts.shutdowns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn fake_worker(counts: Arc<Counts>) -> WorkerChild {
+        WorkerChild::new(None, None, 77, Box::new(FakeControl { counts }))
+    }
+
+    #[test]
+    fn unsplit_drop_contains_exactly_once() {
+        let counts = Arc::new(Counts::default());
+        drop(fake_worker(Arc::clone(&counts)));
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn split_pipes_do_not_contain_before_control_drop() {
+        let counts = Arc::new(Counts::default());
+        let (control, stdin, stdout) = fake_worker(Arc::clone(&counts)).into_parts();
+        drop(stdin);
+        drop(stdout);
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 0);
+        drop(control);
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn successful_force_is_not_repeated_by_drop() {
+        let counts = Arc::new(Counts::default());
+        let (mut control, _stdin, _stdout) = fake_worker(Arc::clone(&counts)).into_parts();
+        control
+            .force_and_reap(Duration::from_millis(1))
+            .expect("fake force succeeds");
+        drop(control);
+        assert_eq!(counts.forces.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn timed_out_force_retains_control_for_retry_and_drop() {
+        let counts = Arc::new(Counts::default());
+        counts.failed_forces_remaining.store(1, Ordering::Relaxed);
+        let (mut control, _stdin, _stdout) = fake_worker(Arc::clone(&counts)).into_parts();
+        let error = control
+            .force_and_reap(Duration::from_millis(1))
+            .expect_err("first fake force times out");
+        assert_eq!(error.stage(), WorkerStage::Reap);
+        assert_eq!(control.try_wait().expect("fake wait"), None);
+        control
+            .force_and_reap(Duration::from_millis(1))
+            .expect("retry keeps the backend owner");
+        drop(control);
+        assert_eq!(counts.forces.load(Ordering::Relaxed), 2);
+        assert_eq!(counts.waits.load(Ordering::Relaxed), 1);
+        assert_eq!(counts.shutdowns.load(Ordering::Relaxed), 0);
     }
 }
 

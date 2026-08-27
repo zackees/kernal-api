@@ -11,8 +11,8 @@ mod worker;
 mod worker_protocol;
 #[cfg(feature = "wasm-sketch-worker")]
 pub use worker::{
-    SketchWorkerConfig, SketchWorkerExecutionSnapshot, SketchWorkerFailure,
-    SketchWorkerStopReason, SketchWorkerTerminal,
+    SketchWorkerConfig, SketchWorkerExecutionSnapshot, SketchWorkerFailure, SketchWorkerStopReason,
+    SketchWorkerTerminal,
 };
 
 use std::cell::UnsafeCell;
@@ -920,7 +920,12 @@ impl ThreadSpawnRejectionSummary {
         fuel: u32,
         epoch: u32,
     ) -> Self {
-        Self { capacity, closing, fuel, epoch }
+        Self {
+            capacity,
+            closing,
+            fuel,
+            epoch,
+        }
     }
     pub fn capacity(self) -> u32 {
         self.capacity

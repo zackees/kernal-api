@@ -227,14 +227,21 @@ fn map_result(
             TerminalDetail::none(),
             "trapped".into(),
         ),
-        Err(SketchExecutionError::NonzeroExit { code })
-        | Err(SketchExecutionError::ChildNonzeroExit { code }) => (
+        Err(SketchExecutionError::NonzeroExit { code }) => (
             TerminalKind::NonzeroExit,
             TerminalDetail {
                 status_code: Some(code),
                 ..TerminalDetail::none()
             },
             "nonzero-exit".into(),
+        ),
+        Err(SketchExecutionError::ChildNonzeroExit { code }) => (
+            TerminalKind::ChildFailure,
+            TerminalDetail {
+                status_code: Some(code),
+                ..TerminalDetail::none()
+            },
+            "child-nonzero-exit".into(),
         ),
         Err(SketchExecutionError::ChildTrapped)
         | Err(SketchExecutionError::ChildPanicked)

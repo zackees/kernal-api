@@ -322,7 +322,8 @@ impl WorkerChild {
         self.stdout.take()
     }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        let exit = self.inner
+        let exit = self
+            .inner
             .as_mut()
             .map_or(Ok(None), |inner| inner.try_wait())?;
         if exit.is_some() {
@@ -388,7 +389,8 @@ impl WorkerControl {
     }
 
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        let exit = self.inner
+        let exit = self
+            .inner
             .as_mut()
             .map_or(Ok(None), |inner| inner.try_wait())?;
         if exit.is_some() {
@@ -406,7 +408,10 @@ impl WorkerControl {
     ) -> Result<WorkerNormalReap, WorkerError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match self.try_wait().map_err(|source| WorkerError::new(WorkerStage::Reap, source))? {
+            match self
+                .try_wait()
+                .map_err(|source| WorkerError::new(WorkerStage::Reap, source))?
+            {
                 Some(0) => {
                     self.contained = true;
                     return Ok(WorkerNormalReap::Clean);
@@ -419,7 +424,10 @@ impl WorkerControl {
                 None if std::time::Instant::now() >= deadline => {
                     return Err(WorkerError::new(
                         WorkerStage::Reap,
-                        std::io::Error::new(std::io::ErrorKind::TimedOut, "worker clean reap timed out"),
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "worker clean reap timed out",
+                        ),
                     ));
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(1)),

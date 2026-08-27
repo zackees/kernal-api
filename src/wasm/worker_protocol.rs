@@ -137,6 +137,9 @@ impl TerminalDetail {
             {
                 Err(ProtocolError::InvalidTerminal)
             }
+            TerminalKind::ChildFailure if self.root_outcome != RootOutcome::None || counts => {
+                Err(ProtocolError::InvalidTerminal)
+            }
             TerminalKind::Completed | TerminalKind::NonzeroExit => Ok(()),
             _ if self.root_outcome != RootOutcome::None || counts || self.status_code.is_some() => {
                 Err(ProtocolError::InvalidTerminal)

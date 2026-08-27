@@ -227,9 +227,33 @@ fn supervise(sketch: &AdmittedSketch, config: SketchWorkerConfig, cancellation: 
         let metadata = metadata(sketch, deadline); let source = sketch.worker_source();
         worker_protocol::write_message(input, &Message::ExecuteStart { request_id: id, module_len: source.len() as u64, metadata }).map_err(|_| SketchWorkerFailure::Protocol)?;
         for (sequence, bytes) in source.chunks(worker_protocol::MAX_FRAME_PAYLOAD - 12).enumerate() { if cancellation.is_cancelled() || std::time::Instant::now() >= deadline { return Ok(SketchWorkerTerminal::Stopped(winner(&cancellation, deadline))); } worker_protocol::write_message(input, &Message::ModuleChunk { request_id: id, sequence: u32::try_from(sequence).map_err(|_| SketchWorkerFailure::Protocol)?, bytes: bytes.to_vec() }).map_err(|_| SketchWorkerFailure::Protocol)?; }
-        worker_protocol::write_message(input, &Message::ExecuteEnd { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?; drop(stdin.take());
-        let message = worker_protocol::read_message(output).map_err(|_| SketchWorkerFailure::Protocol)?;
-        map_terminal(message, id)
+        worker_protocol::write_message(input, &Message::ExecuteEnd { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?;
+        let reader = stdout.take().ok_or(SketchWorkerFailure::Protocol)?;
+        let (terminal_tx, terminal_rx) = std::sync::mpsc::sync_channel(1);
+        let reader_thread = std::thread::spawn(move || { let mut reader = reader; let _ = terminal_tx.send(worker_protocol::read_message(&mut reader)); });
+        let mut selected = None;
+        let mut grace_deadline = None;
+        loop {
+            if let Ok(message) = terminal_rx.try_recv() {
+                let _ = reader_thread.join();
+                let mapped = map_terminal(message.map_err(|_| SketchWorkerFailure::Protocol)?, id)?;
+                return Ok(selected.map_or(mapped, SketchWorkerTerminal::Stopped));
+            }
+            if selected.is_none() && cancellation.is_cancelled() { selected = Some(SketchWorkerStopReason::Cancelled); }
+            if selected.is_none() && std::time::Instant::now() >= deadline { selected = Some(SketchWorkerStopReason::DeadlineExceeded); }
+            if let Some(trigger) = selected {
+                if grace_deadline.is_none() {
+                    sketch.worker_ledger.record_cancel_sent();
+                    worker_protocol::write_message(input, &Message::Cancel { request_id: id }).map_err(|_| SketchWorkerFailure::Protocol)?;
+                    grace_deadline = Some(std::time::Instant::now() + config.cooperative_cancel_grace());
+                }
+                if std::time::Instant::now() >= grace_deadline.expect("grace") {
+                    sketch.worker_ledger.record_grace_expired();
+                    return Ok(SketchWorkerTerminal::ForcedContainment { trigger });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     })();
     match terminal { Ok(value) => { if control.force_and_reap(Duration::from_secs(5)).is_ok() { sketch.worker_ledger.record_reaped(); value } else { SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup) } }, Err(error) => { sketch.worker_ledger.record_protocol_failure(); let _ = control.force_and_reap(Duration::from_secs(5)); sketch.worker_ledger.record_forced(); SketchWorkerTerminal::Failure(error) } }
 }

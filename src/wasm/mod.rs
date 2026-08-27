@@ -205,10 +205,15 @@ pub enum SketchModuleError {
     },
     MissingSharedMemory,
     MultipleMemoryImports,
+    DefinedMemoryForbidden,
     UnsharedMemory,
     Memory64,
     UnsupportedMemoryPageSize,
     SharedMemoryWithoutMaximum,
+    MemoryInitialExceedsMaximum {
+        minimum_pages: u64,
+        maximum_pages: u64,
+    },
     SharedMemoryExceedsPolicy {
         minimum_pages: u64,
         maximum_pages: u64,
@@ -244,10 +249,12 @@ impl SketchModuleError {
             Self::MissingRequiredImport { .. } => "missing-required-import",
             Self::MissingSharedMemory => "missing-shared-memory",
             Self::MultipleMemoryImports => "multiple-memory-imports",
+            Self::DefinedMemoryForbidden => "defined-memory-forbidden",
             Self::UnsharedMemory => "unshared-memory",
             Self::Memory64 => "memory64",
             Self::UnsupportedMemoryPageSize => "unsupported-memory-page-size",
             Self::SharedMemoryWithoutMaximum => "shared-memory-without-maximum",
+            Self::MemoryInitialExceedsMaximum { .. } => "memory-initial-exceeds-maximum",
             Self::SharedMemoryExceedsPolicy { .. } => "shared-memory-exceeds-policy",
             Self::MissingMetadata { .. } => "missing-metadata",
             Self::DuplicateMetadata { .. } => "duplicate-metadata",
@@ -360,6 +367,10 @@ fn preflight(
                     functions.push(index.map_err(|_| SketchModuleError::InvalidBinary)?);
                 }
             }
+            // This profile has exactly one shared memory, supplied by the host.
+            // Rejecting a defined memory here also guarantees that no second
+            // memory shape reaches Wasmtime before the semantic boundary.
+            Payload::MemorySection(_) => return Err(SketchModuleError::DefinedMemoryForbidden),
             Payload::ExportSection(reader) => {
                 for export in reader {
                     let e = export.map_err(|_| SketchModuleError::InvalidBinary)?;
@@ -452,6 +463,12 @@ fn check_memory(
         return Err(SketchModuleError::UnsupportedMemoryPageSize);
     }
     let maximum = maximum.ok_or(SketchModuleError::SharedMemoryWithoutMaximum)?;
+    if initial > maximum {
+        return Err(SketchModuleError::MemoryInitialExceedsMaximum {
+            minimum_pages: initial,
+            maximum_pages: maximum,
+        });
+    }
     if initial > u64::from(policy.max_shared_memory_pages)
         || maximum > u64::from(policy.max_shared_memory_pages)
     {

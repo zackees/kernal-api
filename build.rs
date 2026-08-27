@@ -1,6 +1,14 @@
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cargo_manifest = Path::new(
+        &std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("cargo always sets CARGO_MANIFEST_DIR for build.rs"),
+    )
+    .join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", cargo_manifest.display());
+    verify_wasm_feature_isolation(&cargo_manifest)?;
+    println!("cargo:rustc-env=KERNAL_API_WASM_FEATURE_ISOLATION=verified");
     let manifest_path = Path::new(
         &std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("cargo always sets CARGO_MANIFEST_DIR for build.rs"),
@@ -13,6 +21,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&out_dir).join("conpty_sidecar_hashes.rs"),
         rendered,
     )?;
+    Ok(())
+}
+
+fn verify_wasm_feature_isolation(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let raw = std::fs::read_to_string(path)?;
+    let manifest = raw.parse::<toml::Value>()?;
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or("Cargo.toml is missing [features]")?;
+    let sketch_host = features
+        .get("wasm-sketch-host")
+        .and_then(toml::Value::as_array)
+        .ok_or("wasm-sketch-host must be an array feature")?;
+    let has_required_dependency = |name| {
+        sketch_host
+            .iter()
+            .any(|value| value.as_str() == Some(name))
+    };
+    if !has_required_dependency("dep:wasmtime") || !has_required_dependency("dep:wasmparser") {
+        return Err("wasm-sketch-host must opt into wasmtime and wasmparser".into());
+    }
+    if features
+        .get("full")
+        .and_then(toml::Value::as_array)
+        .is_some_and(|full| full.iter().any(|value| value.as_str() == Some("wasm-sketch-host")))
+    {
+        return Err("full must not opt into wasm-sketch-host".into());
+    }
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .ok_or("Cargo.toml is missing [dependencies]")?;
+    if dependencies.contains_key("wasmtime-wasi") {
+        return Err("ambient wasmtime-wasi must not be a direct dependency".into());
+    }
+    let wasmtime = dependencies
+        .get("wasmtime")
+        .and_then(toml::Value::as_table)
+        .ok_or("wasmtime must be an optional table dependency")?;
+    if wasmtime.get("version").and_then(toml::Value::as_str) != Some("=45.0.0")
+        || wasmtime
+            .get("default-features")
+            .and_then(toml::Value::as_bool)
+            != Some(false)
+        || wasmtime.get("optional").and_then(toml::Value::as_bool) != Some(true)
+    {
+        return Err("wasmtime must remain exact-pinned, optional, and defaults-disabled".into());
+    }
     Ok(())
 }
 

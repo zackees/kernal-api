@@ -57,6 +57,10 @@ struct F {
     ambient_wasi: bool,
     custom_page_size: bool,
     oversized_metadata: bool,
+    defined_memory: bool,
+    initial: u32,
+    wrong_thread_signature: bool,
+    wrong_yield_signature: bool,
 }
 impl Default for F {
     fn default() -> Self {
@@ -76,6 +80,10 @@ impl Default for F {
             ambient_wasi: false,
             custom_page_size: false,
             oversized_metadata: false,
+            defined_memory: false,
+            initial: 1,
+            wrong_thread_signature: false,
+            wrong_yield_signature: false,
         }
     }
 }
@@ -111,7 +119,7 @@ fn wasm(f: F) -> Vec<u8> {
         flags |= 8
     };
     leb(flags, &mut i);
-    leb(1, &mut i);
+    leb(f.initial as u64, &mut i);
     if let Some(x) = f.max {
         leb(x as u64, &mut i)
     };
@@ -144,19 +152,27 @@ fn wasm(f: F) -> Vec<u8> {
         text("wasi", &mut i);
         text("thread-spawn", &mut i);
         i.push(0);
-        leb(1, &mut i)
+        leb(if f.wrong_thread_signature { 0 } else { 1 }, &mut i)
     };
     if f.yield_ {
         text("kernal-api:v1", &mut i);
         text("kernel-yield", &mut i);
         i.push(0);
-        leb(0, &mut i)
+        leb(if f.wrong_yield_signature { 1 } else { 0 }, &mut i)
     };
     section(2, i, &mut w);
     let mut fun = Vec::new();
     leb(1, &mut fun);
     leb(if f.entry_param { 2 } else { 0 }, &mut fun);
     section(3, fun, &mut w);
+    if f.defined_memory {
+        let mut m = Vec::new();
+        leb(1, &mut m);
+        leb(1, &mut m);
+        leb(1, &mut m);
+        leb(1, &mut m);
+        section(5, m, &mut w);
+    }
     let imports = u32::from(f.thread) + u32::from(f.yield_) + u32::from(f.ambient_wasi);
     let mut e = Vec::new();
     leb(if f.extra.is_some() { 2 } else { 1 }, &mut e);
@@ -233,6 +249,20 @@ fn memory_forms_are_rejected_precompile() {
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::UnsupportedMemoryPageSize)
     ));
+    let mut f = F::default();
+    f.initial = 17;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::MemoryInitialExceedsMaximum { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+    let mut f = F::default();
+    f.defined_memory = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::DefinedMemoryForbidden)
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
 }
 #[test]
 fn duplicate_and_alternate_memory_imports_are_rejected_precompile() {
@@ -309,6 +339,21 @@ fn malformed_oversized_and_abi_mismatches_have_stable_errors() {
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::ImportTypeMismatch { .. })
     ));
+    assert_eq!(c.compiled_module_count(), 0);
+    let mut f = F::default();
+    f.wrong_thread_signature = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ImportTypeMismatch { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+    let mut f = F::default();
+    f.wrong_yield_signature = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ImportTypeMismatch { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
     let p = SketchModulePolicy::new(4, 16).unwrap();
     assert!(matches!(
         c.admit(&wasm(F::default()), p),

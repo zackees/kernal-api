@@ -282,11 +282,11 @@ impl AdmittedSketch {
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
         let children = prepared.controller.join_completed();
-        // A child outcome is never silently lost. Prefer it to a concurrent
-        // root failure because it is ordered by the guest-assigned TID and
-        // precisely identifies the accepted work that was drained.
-        children?;
+        // Finalization always drains children, but the root call is the
+        // primary operation: its typed failure must not be masked by a
+        // concurrent child or report diagnostic.
         let outcome = outcome?;
+        children?;
         if self.profile == SketchAdmissionProfile::ThreadedRustValidationV1 {
             let getter = validation_getter.ok_or(SketchExecutionError::ValidationReportInvalid)?;
             let offset = getter

@@ -16,6 +16,12 @@ static REPORT: ValidationRecord = ValidationRecord {
     words: [const { AtomicU32::new(0) }; 16],
 };
 
+// Retained verbatim as the validation-profile custom section. The ordinary
+// threaded profile deliberately has no such extra metadata/export surface.
+#[used]
+#[link_section = "kernal-api.profile"]
+static VALIDATION_PROFILE: [u8; 32] = *b"threaded-core-wasm-validation-v1";
+
 #[link(wasm_import_module = "kernal-api:v1")]
 extern "C" {
     #[link_name = "kernel-yield"]

@@ -906,6 +906,9 @@ pub enum SketchExecutionError {
     EpochRegistrationLimitExceeded,
     ForeignRuntime,
     BlockingTaskFailed,
+    /// A host-blocked or atomic-wait guest requires the killable process
+    /// containment boundary; an in-process epoch interrupt is insufficient.
+    ContainmentRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
     NonzeroExit { code: i32 },
@@ -930,6 +933,7 @@ impl SketchExecutionError {
             Self::EpochRegistrationLimitExceeded => "epoch-registration-limit-exceeded",
             Self::ForeignRuntime => "foreign-runtime",
             Self::BlockingTaskFailed => "blocking-task-failed",
+            Self::ContainmentRequired => "containment-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -1498,6 +1502,7 @@ struct EpochEntry {
 struct EpochRegistration {
     broker: Arc<EpochBroker>,
     entry: Option<Arc<EpochEntry>>,
+    completes_logical: bool,
 }
 impl EpochBroker {
     fn new(engine: Arc<Engine>, limits: SketchEpochLimits) -> Self {
@@ -1522,7 +1527,7 @@ impl EpochBroker {
             deadline: Instant::now() + self.limits.wall_clock_deadline,
             winner: AtomicU8::new(EPOCH_PENDING),
         });
-        self.register_entry(runtime, logical)
+        self.register_entry(runtime, logical, true)
     }
     fn register_child(
         self: &Arc<Self>,
@@ -1535,12 +1540,13 @@ impl EpochBroker {
             .runtime
             .clone()
             .ok_or(SketchExecutionError::ForeignRuntime)?;
-        self.register_entry(runtime, logical)
+        self.register_entry(runtime, logical, false)
     }
     fn register_entry(
         self: &Arc<Self>,
         runtime: crate::async_engine::RuntimeHandle,
         logical: Arc<LogicalEpoch>,
+        completes_logical: bool,
     ) -> Result<EpochRegistration, SketchExecutionError> {
         let entry = Arc::new(EpochEntry {
             logical: Arc::clone(&logical),
@@ -1583,6 +1589,7 @@ impl EpochBroker {
         Ok(EpochRegistration {
             broker: Arc::clone(self),
             entry: Some(entry),
+            completes_logical,
         })
     }
     async fn tick(self: Arc<Self>, generation: u64) {
@@ -1646,14 +1653,17 @@ impl EpochBroker {
     fn finish_registration(
         &self,
         entry: &Arc<EpochEntry>,
+        completes_logical: bool,
     ) -> Option<crate::async_engine::Task<()>> {
         let mut state = self.state.lock().ok()?;
-        let _ = entry.logical.winner.compare_exchange(
-            EPOCH_PENDING,
-            EPOCH_COMPLETED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        if completes_logical {
+            let _ = entry.logical.winner.compare_exchange(
+                EPOCH_PENDING,
+                EPOCH_COMPLETED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         state.registrations.retain(|candidate| {
             candidate
                 .upgrade()
@@ -1679,13 +1689,15 @@ impl EpochRegistration {
     fn finish(mut self) -> Option<crate::async_engine::Task<()>> {
         self.entry
             .take()
-            .and_then(|entry| self.broker.finish_registration(&entry))
+            .and_then(|entry| self.broker.finish_registration(&entry, self.completes_logical))
     }
 }
 impl Drop for EpochRegistration {
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            let _ = self.broker.finish_registration(&entry);
+            let _ = self
+                .broker
+                .finish_registration(&entry, self.completes_logical);
         }
     }
 }
@@ -1734,6 +1746,10 @@ mod epoch_broker_tests {
                 Err(SketchExecutionError::EpochRegistrationLimitExceeded)
             ));
             drop(child);
+            // A child Store's normal release must not publish logical
+            // completion. The root remains runnable across a broker tick.
+            crate::async_engine::sleep(Duration::from_millis(2)).await;
+            assert_eq!(root.logical().winner.load(Ordering::Acquire), EPOCH_PENDING);
             if let Some(ticker) = root.finish() {
                 let _ = ticker.await;
             }
@@ -1800,6 +1816,32 @@ mod epoch_broker_tests {
             Err(SketchExecutionError::OutOfFuel)
         );
         assert_eq!(map_child_error(&fuel, &epoch), ChildOutcome::OutOfFuel);
+    }
+
+    #[test]
+    fn containment_required_host_block_is_killed_only_in_a_subprocess() {
+        const MODE: &str = "KERNAL_API_EPOCH_CONTAINMENT_CHILD";
+        if std::env::var_os(MODE).is_some() {
+            // Deliberately never run this host-block analogue in the parent
+            // process or an in-process execution thread. #28 owns final
+            // process containment; epoch cancellation cannot stop it.
+            std::thread::park();
+            return;
+        }
+        let executable = std::env::current_exe().expect("test executable");
+        let mut child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
+            .arg("--nocapture")
+            .env(MODE, "1")
+            .spawn()
+            .expect("containment child");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(child.try_wait().expect("child status").is_none(), "blocked child must outlive an epoch interval");
+        let classification = SketchExecutionError::ContainmentRequired;
+        assert_eq!(classification.code(), "containment-required");
+        child.kill().expect("kill blocked child");
+        let _ = child.wait().expect("reap blocked child");
     }
 }
 

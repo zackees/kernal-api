@@ -336,12 +336,12 @@ fn supervise(
     let _worker_gauge = sketch.worker_ledger.live_worker();
     let (mut control, stdin, stdout) = child.into_parts();
     let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol);
+        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol).0;
     };
     let Some(id) = next_request_id() else {
         drop(stdin);
         drop(stdout);
-        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol);
+        return force_result(sketch, &mut control, SketchWorkerFailure::Protocol).0;
     };
     let (write_tx, write_rx) = std::sync::mpsc::channel();
     let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
@@ -400,7 +400,6 @@ fn supervise(
             SketchWorkerFailure::Protocol,
         );
     }
-    let mut hello_written = false;
     let mut upload_sent = false;
     let mut upload_complete = false;
     let mut cancel_written = false;
@@ -426,7 +425,7 @@ fn supervise(
         }
         if let Ok(event) = write_done_rx.try_recv() {
             match event {
-                WriterEvent::Hello(Ok(())) => hello_written = true,
+                WriterEvent::Hello(Ok(())) => {}
                 WriterEvent::Upload(Ok(())) => upload_complete = true,
                 WriterEvent::Cancel(Ok(())) => {
                     cancel_written = true;
@@ -468,14 +467,13 @@ fn supervise(
             match message {
                 Message::HelloAck { request_id } if request_id == id && !hello_acked => {
                     hello_acked = true;
-                    if !hello_written
-                        || write_tx
-                            .send(WriterCommand::Upload {
-                                request_id: id,
-                                source: sketch.worker_source(),
-                                metadata: metadata(sketch, deadline),
-                            })
-                            .is_err()
+                    if write_tx
+                        .send(WriterCommand::Upload {
+                            request_id: id,
+                            source: sketch.worker_source(),
+                            metadata: metadata(sketch, deadline),
+                        })
+                        .is_err()
                     {
                         return force_join_result(
                             sketch,
@@ -665,7 +663,7 @@ fn force_result(
     sketch: &AdmittedSketch,
     control: &mut crate::platform::process::WorkerControl,
     failure: SketchWorkerFailure,
-) -> SketchWorkerTerminal {
+) -> (SketchWorkerTerminal, bool) {
     if failure == SketchWorkerFailure::Protocol {
         sketch.worker_ledger.record_protocol_failure();
     }
@@ -673,9 +671,12 @@ fn force_result(
         Ok(()) => {
             sketch.worker_ledger.record_forced();
             sketch.worker_ledger.record_reaped();
-            SketchWorkerTerminal::Failure(failure)
+            (SketchWorkerTerminal::Failure(failure), true)
         }
-        Err(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup),
+        Err(_) => (
+            SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup),
+            false,
+        ),
     }
 }
 fn force_join_result(
@@ -686,11 +687,8 @@ fn force_join_result(
     reader: std::thread::JoinHandle<()>,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
-    let result = force_result(sketch, control, failure);
-    if matches!(
-        result,
-        SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup)
-    ) {
+    let (result, forced) = force_result(sketch, control, failure);
+    if !forced {
         // The platform still owns an unreaped child.  Joining either pipe task
         // could block behind that child, so detach them and return the bounded
         // containment result.  Their gauges remain live until the operating
@@ -726,11 +724,8 @@ fn force_join_terminal(
     reader: std::thread::JoinHandle<()>,
     trigger: SketchWorkerStopReason,
 ) -> SketchWorkerTerminal {
-    let result = force_result(sketch, control, SketchWorkerFailure::UnexpectedExit);
-    if matches!(
-        result,
-        SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup)
-    ) {
+    let (result, forced) = force_result(sketch, control, SketchWorkerFailure::UnexpectedExit);
+    if !forced {
         drop(tx);
         drop(writer);
         drop(reader);

@@ -845,6 +845,49 @@ mod threaded_root_observation_tests {
         assert_eq!(compiler.compiled_module_count(), 0);
     }
 
+    #[test]
+    fn validation_profile_mutations_reject_before_compilation() {
+        let policy = |bytes: usize| {
+            SketchModulePolicy::threaded_rust_validation_v1_for_test(
+                bytes + 1,
+                THREADED_RUST_MAX_PAGES,
+            )
+            .expect("policy")
+        };
+        for (metadata, expected) in [
+            (
+                vec![VALIDATION_PROFILE_METADATA_VALUE, VALIDATION_PROFILE_METADATA_VALUE],
+                SketchModuleError::DuplicateMetadata { name: PROFILE_METADATA },
+            ),
+            (
+                vec![b"wrong-profile"],
+                SketchModuleError::MetadataMismatch { name: PROFILE_METADATA },
+            ),
+        ] {
+            let mut bytes = threaded_yield_fixture();
+            for value in metadata {
+                custom(PROFILE_METADATA, value, &mut bytes);
+            }
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let error = match compiler.admit(&bytes, policy(bytes.len())) {
+                Ok(_) => panic!("mutation must reject"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected);
+            assert_eq!(compiler.compiled_module_count(), 0);
+        }
+
+        let mut bytes = threaded_yield_fixture();
+        custom(PROFILE_METADATA, VALIDATION_PROFILE_METADATA_VALUE, &mut bytes);
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let error = match compiler.admit(&bytes, policy(bytes.len())) {
+            Ok(_) => panic!("report export is required"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SketchModuleError::ExportNotAllowed { .. }));
+        assert_eq!(compiler.compiled_module_count(), 0);
+    }
+
     fn leb(mut value: u32, output: &mut Vec<u8>) {
         loop {
             let mut byte = (value & 0x7f) as u8;
@@ -1753,9 +1796,10 @@ fn preflight_threaded_rust(
             Payload::CustomSection(section) => match section.name() {
                 PROFILE_METADATA if validation => {
                     validation_metadata += 1;
-                    if validation_metadata != 1
-                        || section.data() != VALIDATION_PROFILE_METADATA_VALUE
-                    {
+                    if validation_metadata > 1 {
+                        return Err(SketchModuleError::DuplicateMetadata { name: PROFILE_METADATA });
+                    }
+                    if section.data() != VALIDATION_PROFILE_METADATA_VALUE {
                         return Err(SketchModuleError::MetadataMismatch {
                             name: PROFILE_METADATA,
                         });

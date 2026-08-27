@@ -7,13 +7,15 @@
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::align_of;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use wasmparser::{CompositeInnerType, ExternalKind, Parser, Payload, TypeRef, ValType};
 use wasmtime::{
     Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store, Strategy,
+    UpdateDeadline,
 };
 
 const PAGE_BYTES: u64 = 64 * 1024;
@@ -42,6 +44,10 @@ const MAX_P1_IOVECS: usize = 1024;
 /// child-outcome vector independently of a caller's requested quota.
 const MAX_GUEST_THREADS_V1: usize = 16;
 const DEFAULT_MAX_GUEST_THREADS: usize = MAX_GUEST_THREADS_V1;
+const EPOCH_PENDING: u8 = 0;
+const EPOCH_CANCELLED: u8 = 1;
+const EPOCH_DEADLINE_EXCEEDED: u8 = 2;
+const EPOCH_COMPLETED: u8 = 3;
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -83,6 +89,17 @@ impl SketchCompilerConfig {
     pub fn execution_limits(self) -> SketchExecutionLimits {
         self.execution_limits
     }
+    /// Sets the compiler-global epoch broker policy.
+    pub fn with_epoch_limits(
+        mut self,
+        limits: SketchEpochLimits,
+    ) -> Result<Self, SketchCompilerError> {
+        if !limits.is_valid() {
+            return Err(SketchCompilerError::InvalidEpochLimits);
+        }
+        self.execution_limits.epoch_limits = limits;
+        Ok(self)
+    }
 }
 impl Default for SketchCompilerConfig {
     fn default() -> Self {
@@ -100,6 +117,7 @@ pub struct SketchExecutionLimits {
     maximum_reserved_shared_memory_bytes: u64,
     maximum_active_root_executions: usize,
     fuel_limits: SketchFuelLimits,
+    epoch_limits: SketchEpochLimits,
 }
 impl SketchExecutionLimits {
     pub fn new(
@@ -110,6 +128,7 @@ impl SketchExecutionLimits {
             maximum_reserved_shared_memory_bytes,
             maximum_active_root_executions,
             fuel_limits: SketchFuelLimits::default(),
+            epoch_limits: SketchEpochLimits::default(),
         };
         limits
             .is_valid()
@@ -136,10 +155,25 @@ impl SketchExecutionLimits {
     pub fn fuel_limits(self) -> SketchFuelLimits {
         self.fuel_limits
     }
+    /// Sets bounded epoch polling for cancellation and wall-clock deadlines.
+    pub fn with_epoch_limits(
+        mut self,
+        epoch_limits: SketchEpochLimits,
+    ) -> Result<Self, SketchCompilerError> {
+        if !epoch_limits.is_valid() {
+            return Err(SketchCompilerError::InvalidEpochLimits);
+        }
+        self.epoch_limits = epoch_limits;
+        Ok(self)
+    }
+    pub fn epoch_limits(self) -> SketchEpochLimits {
+        self.epoch_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
             && self.fuel_limits.is_valid()
+            && self.epoch_limits.is_valid()
     }
 }
 impl Default for SketchExecutionLimits {
@@ -150,6 +184,58 @@ impl Default for SketchExecutionLimits {
             maximum_reserved_shared_memory_bytes: THREADED_RUST_RESERVATION_BYTES,
             maximum_active_root_executions: 1,
             fuel_limits: SketchFuelLimits::default(),
+            epoch_limits: SketchEpochLimits::default(),
+        }
+    }
+}
+
+/// Facade-owned epoch polling policy for a logical sketch execution.
+///
+/// The Wasmtime engine clock is compiler-global; these limits bound only the
+/// logical registrations consulted by Store callbacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchEpochLimits {
+    wall_clock_deadline: Duration,
+    tick_interval: Duration,
+    maximum_active_registrations: usize,
+}
+impl SketchEpochLimits {
+    pub fn new(
+        wall_clock_deadline: Duration,
+        tick_interval: Duration,
+        maximum_active_registrations: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let limits = Self {
+            wall_clock_deadline,
+            tick_interval,
+            maximum_active_registrations,
+        };
+        limits
+            .is_valid()
+            .then_some(limits)
+            .ok_or(SketchCompilerError::InvalidEpochLimits)
+    }
+    pub fn wall_clock_deadline(self) -> Duration {
+        self.wall_clock_deadline
+    }
+    pub fn tick_interval(self) -> Duration {
+        self.tick_interval
+    }
+    pub fn maximum_active_registrations(self) -> usize {
+        self.maximum_active_registrations
+    }
+    fn is_valid(self) -> bool {
+        !self.wall_clock_deadline.is_zero()
+            && !self.tick_interval.is_zero()
+            && self.maximum_active_registrations != 0
+    }
+}
+impl Default for SketchEpochLimits {
+    fn default() -> Self {
+        Self {
+            wall_clock_deadline: Duration::from_secs(30),
+            tick_interval: Duration::from_millis(10),
+            maximum_active_registrations: MAX_GUEST_THREADS_V1 + 1,
         }
     }
 }
@@ -218,6 +304,7 @@ pub struct SketchExecutionSnapshot {
     live_guest_threads: usize,
     live_stores: usize,
     live_instances: usize,
+    active_epoch_registrations: usize,
 }
 impl SketchExecutionSnapshot {
     pub fn reserved_shared_memory_bytes(self) -> u64 {
@@ -235,6 +322,9 @@ impl SketchExecutionSnapshot {
     pub fn live_instances(self) -> usize {
         self.live_instances
     }
+    pub fn active_epoch_registrations(self) -> usize {
+        self.active_epoch_registrations
+    }
 }
 
 /// Facade-owned compiler for the selected core-Wasm profile.
@@ -243,6 +333,7 @@ pub struct SketchCompiler {
     engine: Arc<Engine>,
     compilations: Arc<AtomicU64>,
     execution_ledger: Arc<ExecutionLedger>,
+    epoch_broker: Arc<EpochBroker>,
 }
 impl SketchCompiler {
     /// Creates a Cranelift, threads, and shared-memory profile. Pooling,
@@ -256,10 +347,19 @@ impl SketchCompiler {
         cfg.wasm_multi_memory(false);
         cfg.wasm_shared_everything_threads(false);
         cfg.consume_fuel(true);
+        // Epoch is Engine-global. Stores install per-generation callbacks so
+        // an increment only interrupts the logical execution whose terminal
+        // state has already been chosen by its ticker.
+        cfg.epoch_interruption(true);
         cfg.max_wasm_stack(config.max_wasm_stack_bytes);
         let engine = Engine::new(&cfg).map_err(|_| SketchCompilerError::Unavailable)?;
+        let engine = Arc::new(engine);
         Ok(Self {
-            engine: Arc::new(engine),
+            epoch_broker: Arc::new(EpochBroker::new(
+                Arc::clone(&engine),
+                config.execution_limits.epoch_limits,
+            )),
+            engine,
             compilations: Arc::new(AtomicU64::new(0)),
             execution_ledger: Arc::new(ExecutionLedger::new(config.execution_limits)),
         })
@@ -269,7 +369,7 @@ impl SketchCompiler {
         &self,
         bytes: &[u8],
         policy: SketchModulePolicy,
-    ) -> Result<AdmittedSketch, SketchModuleError> {
+    ) -> Result<Arc<AdmittedSketch>, SketchModuleError> {
         if bytes.len() > policy.max_module_bytes {
             return Err(SketchModuleError::ModuleTooLarge {
                 actual_bytes: bytes.len(),
@@ -285,7 +385,7 @@ impl SketchCompiler {
         let module =
             Module::new(&self.engine, bytes).map_err(|_| SketchModuleError::InvalidBinary)?;
         self.compilations.fetch_add(1, Ordering::Relaxed);
-        Ok(AdmittedSketch {
+        Ok(Arc::new(AdmittedSketch {
             engine: Arc::clone(&self.engine),
             module,
             module_bytes: bytes.len(),
@@ -294,10 +394,11 @@ impl SketchCompiler {
             profile: policy.profile,
             validation: policy.validation,
             execution_ledger: Arc::clone(&self.execution_ledger),
+            epoch_broker: Arc::clone(&self.epoch_broker),
             prepared_root: std::sync::Mutex::new(None),
             #[cfg(test)]
             preparation_count: AtomicU64::new(0),
-        })
+        }))
     }
     /// Number of modules whose complete preflight reached private compilation.
     pub fn compiled_module_count(&self) -> u64 {
@@ -305,7 +406,9 @@ impl SketchCompiler {
     }
     /// Snapshot of aggregate logical resources owned by this compiler.
     pub fn execution_limits_snapshot(&self) -> SketchExecutionSnapshot {
-        self.execution_ledger.snapshot()
+        let mut snapshot = self.execution_ledger.snapshot();
+        snapshot.active_epoch_registrations = self.epoch_broker.active_registrations();
+        snapshot
     }
     pub fn execution_limits(&self) -> SketchExecutionLimits {
         self.execution_ledger.limits
@@ -397,6 +500,7 @@ impl SketchModulePolicy {
 pub struct AdmittedSketch {
     engine: Arc<Engine>,
     execution_ledger: Arc<ExecutionLedger>,
+    epoch_broker: Arc<EpochBroker>,
     module: Module,
     module_bytes: usize,
     shared_memory: SketchSharedMemory,
@@ -419,7 +523,9 @@ impl AdmittedSketch {
     }
     /// Aggregate accounting owned by the compiler that admitted this sketch.
     pub fn execution_limits_snapshot(&self) -> SketchExecutionSnapshot {
-        self.execution_ledger.snapshot()
+        let mut snapshot = self.execution_ledger.snapshot();
+        snapshot.active_epoch_registrations = self.epoch_broker.active_registrations();
+        snapshot
     }
     /// Explicitly releases the cached logical session. Calling this while a
     /// root is executing is rejected; dropping an admitted sketch also
@@ -452,18 +558,64 @@ impl AdmittedSketch {
     /// start section runs during instantiation; Rust command artifacts use it
     /// only for memory initialization, while `_start` performs constructors,
     /// user entry, and the P1 exit path.
-    pub fn execute_threaded_root(
+    /// Runs a threaded sketch on the caller-selected runtime's blocking lane.
+    /// Cancellation and deadlines are cooperative epoch observations; native
+    /// host calls and `atomic.wait` require the process containment boundary
+    /// documented in ARCHITECTURE.md and tracked by #28.
+    pub async fn execute_threaded_root(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        let never_cancelled = crate::async_engine::CancellationSource::new();
+        self.execute_threaded_root_cancellable(runtime, never_cancelled.token())
+            .await
+    }
+    /// Runs with a caller-owned cancellation capability.
+    pub async fn execute_threaded_root_cancellable(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
+            return Err(SketchExecutionError::ThreadedProfileRequired);
+        }
+        // Registration precedes every root Store/instance. It retains only
+        // facade state and a weak broker entry, never a Store, Instance, or
+        // guest memory.
+        let registration = self
+            .epoch_broker
+            .register_root(runtime.clone(), cancellation)?;
+        let sketch = Arc::clone(self);
+        let logical = registration.logical();
+        let blocking_runtime = runtime.clone();
+        let blocking = runtime.launch_blocking(move || {
+            sketch.execute_threaded_root_blocking(blocking_runtime, logical)
+        });
+        let outcome = match blocking.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(SketchExecutionError::BlockingTaskFailed),
+        };
+        // Explicitly remove this Store registration before joining only the
+        // ticker generation it made idle.  Keeping the registration alive
+        // here would make the ticker wait for itself forever; joining a newer
+        // generation would incorrectly couple independent sketches.
+        if let Some(ticker) = registration.finish() {
+            let _ = ticker.await;
+        }
+        outcome
+    }
+    fn execute_threaded_root_blocking(
         &self,
         runtime: crate::async_engine::RuntimeHandle,
+        logical_epoch: Arc<LogicalEpoch>,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let (prepared, root) = self.prepare_threaded_root_with_permit()?;
-        prepared
-            .controller
-            .runtime_identity
-            .store(runtime.identity_for_wasm(), Ordering::Release);
+        if let Ok(mut identity) = prepared.controller.runtime_identity.lock() {
+            *identity = Some(runtime.clone());
+        }
         let _store_observation = CounterObservation::new(
             Arc::clone(&prepared.controller.execution_ledger),
             LedgerCounter::Stores,
@@ -474,8 +626,10 @@ impl AdmittedSketch {
                 controller: Arc::clone(&prepared.controller),
                 runtime: Some(runtime),
                 fuel_generation: root.fuel_generation,
+                epoch: Arc::clone(&logical_epoch),
             },
         );
+        install_epoch_deadline(&mut store);
         // Instantiation itself executes the module start section, so the
         // finite root slice must be installed before `instantiate` as well as
         // before the explicit command `_start` call below.
@@ -490,7 +644,7 @@ impl AdmittedSketch {
             Ok(()) => (|| {
                 let instance = match prepared.prelink.instantiate(&mut store) {
                     Ok(instance) => instance,
-                    Err(error) => return map_root_error(&error),
+                    Err(error) => return map_root_error(&error, &logical_epoch),
                 };
                 _instance_observation = Some(CounterObservation::new(
                     Arc::clone(&prepared.controller.execution_ledger),
@@ -509,8 +663,13 @@ impl AdmittedSketch {
                 start
                     .call(&mut store, ())
                     .map(|_| ThreadedRootOutcome::Started)
-                    .or_else(|error| map_root_error(&error))
+                    .or_else(|error| map_root_error(&error, &logical_epoch))
             })(),
+        };
+        let outcome = if matches!(&outcome, Err(SketchExecutionError::OutOfFuel)) {
+            outcome
+        } else {
+            epoch_error(&logical_epoch).map_or(outcome, Err)
         };
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
@@ -576,6 +735,7 @@ impl AdmittedSketch {
                 capacity_rejections: 0,
                 closing_rejections: 0,
                 fuel_rejections: 0,
+                epoch_rejections: 0,
                 handles: Vec::new(),
                 // At most `maximum` spawns are accepted before the controller
                 // closes, so this facade report remains absolutely bounded.
@@ -583,11 +743,12 @@ impl AdmittedSketch {
             }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
-            runtime_identity: AtomicUsize::new(0),
+            runtime_identity: Mutex::new(None),
             runtime_identity_mismatches: AtomicU64::new(0),
             last_root_remaining_fuel: AtomicU64::new(0),
             last_child_remaining_fuel: AtomicU64::new(0),
             execution_ledger: Arc::clone(&self.execution_ledger),
+            epoch_broker: Arc::clone(&self.epoch_broker),
             session: Mutex::new(SessionState::default()),
         });
         let mut linker = Linker::new(&self.engine);
@@ -601,6 +762,11 @@ impl AdmittedSketch {
                 controller: Arc::clone(&controller),
                 runtime: None,
                 fuel_generation: 0,
+                epoch: Arc::new(LogicalEpoch {
+                    cancellation: crate::async_engine::CancellationSource::new().token(),
+                    deadline: Instant::now() + self.epoch_broker.limits.wall_clock_deadline,
+                    winner: AtomicU8::new(EPOCH_COMPLETED),
+                }),
             },
         );
         linker
@@ -707,6 +873,7 @@ pub struct ThreadSpawnRejectionSummary {
     capacity: u32,
     closing: u32,
     fuel: u32,
+    epoch: u32,
 }
 impl ThreadSpawnRejectionSummary {
     pub fn capacity(self) -> u32 {
@@ -718,8 +885,11 @@ impl ThreadSpawnRejectionSummary {
     pub fn fuel(self) -> u32 {
         self.fuel
     }
+    pub fn epoch(self) -> u32 {
+        self.epoch
+    }
     pub fn is_empty(self) -> bool {
-        self.capacity == 0 && self.closing == 0 && self.fuel == 0
+        self.capacity == 0 && self.closing == 0 && self.fuel == 0 && self.epoch == 0
     }
 }
 
@@ -731,13 +901,27 @@ pub enum SketchExecutionError {
     RootExecutionLimitExceeded,
     SessionBusy,
     OutOfFuel,
+    Cancelled,
+    DeadlineExceeded,
+    EpochRegistrationLimitExceeded,
+    ForeignRuntime,
+    BlockingTaskFailed,
+    /// A host-blocked or atomic-wait guest requires the killable process
+    /// containment boundary; an in-process epoch interrupt is insufficient.
+    ContainmentRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
-    NonzeroExit { code: i32 },
-    ChildNonzeroExit { code: i32 },
+    NonzeroExit {
+        code: i32,
+    },
+    ChildNonzeroExit {
+        code: i32,
+    },
     ChildTrapped,
     ChildPanicked,
-    ChildOutcomes { outcomes: Vec<ThreadedChildOutcome> },
+    ChildOutcomes {
+        outcomes: Vec<ThreadedChildOutcome>,
+    },
     ValidationReportInvalid,
     SessionGenerationExhausted,
     Trapped,
@@ -750,6 +934,12 @@ impl SketchExecutionError {
             Self::RootExecutionLimitExceeded => "root-execution-limit-exceeded",
             Self::SessionBusy => "session-busy",
             Self::OutOfFuel => "out-of-fuel",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExceeded => "deadline-exceeded",
+            Self::EpochRegistrationLimitExceeded => "epoch-registration-limit-exceeded",
+            Self::ForeignRuntime => "foreign-runtime",
+            Self::BlockingTaskFailed => "blocking-task-failed",
+            Self::ContainmentRequired => "containment-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -801,6 +991,7 @@ impl ExecutionLedger {
             live_guest_threads: state.live_guest_threads,
             live_stores: state.live_stores,
             live_instances: state.live_instances,
+            active_epoch_registrations: 0,
         }
     }
     fn reserve_shared_memory(
@@ -1038,13 +1229,14 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
-    runtime_identity: AtomicUsize,
+    runtime_identity: Mutex<Option<crate::async_engine::RuntimeHandle>>,
     runtime_identity_mismatches: AtomicU64,
     // Bounded private terminal telemetry. No Store or raw trap crosses the
     // facade; #42 only needs to retain the last execution's accounting.
     last_root_remaining_fuel: AtomicU64,
     last_child_remaining_fuel: AtomicU64,
     execution_ledger: Arc<ExecutionLedger>,
+    epoch_broker: Arc<EpochBroker>,
     session: Mutex<SessionState>,
     workers: Mutex<Workers>,
 }
@@ -1073,6 +1265,7 @@ struct Workers {
     capacity_rejections: u32,
     closing_rejections: u32,
     fuel_rejections: u32,
+    epoch_rejections: u32,
     handles: Vec<JoinHandle<()>>,
     // Completion is inherently concurrent; retain the guest TID so reporting
     // is deterministic rather than depending on native scheduler order.
@@ -1082,6 +1275,8 @@ struct Workers {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildOutcome {
     Completed,
+    Cancelled,
+    DeadlineExceeded,
     Exited,
     NonzeroExit(i32),
     OutOfFuel,
@@ -1100,6 +1295,8 @@ pub struct ThreadedChildOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadedChildOutcomeKind {
     Completed,
+    Cancelled,
+    DeadlineExceeded,
     Exited,
     NonzeroExit { code: i32 },
     OutOfFuel,
@@ -1198,6 +1395,8 @@ impl ThreadController {
                 tid,
                 kind: match outcome {
                     ChildOutcome::Completed => ThreadedChildOutcomeKind::Completed,
+                    ChildOutcome::Cancelled => ThreadedChildOutcomeKind::Cancelled,
+                    ChildOutcome::DeadlineExceeded => ThreadedChildOutcomeKind::DeadlineExceeded,
                     ChildOutcome::Exited => ThreadedChildOutcomeKind::Exited,
                     ChildOutcome::NonzeroExit(code) => {
                         ThreadedChildOutcomeKind::NonzeroExit { code }
@@ -1229,10 +1428,12 @@ impl ThreadController {
             capacity: workers.capacity_rejections,
             closing: workers.closing_rejections,
             fuel: workers.fuel_rejections,
+            epoch: workers.epoch_rejections,
         };
         workers.capacity_rejections = 0;
         workers.closing_rejections = 0;
         workers.fuel_rejections = 0;
+        workers.epoch_rejections = 0;
         summary
     }
 }
@@ -1266,6 +1467,469 @@ struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
     fuel_generation: u64,
+    // The callback owns only an Arc to facade state. The broker retains weak
+    // entries, never a Store, Instance, Caller, or guest memory.
+    epoch: Arc<LogicalEpoch>,
+}
+
+fn install_epoch_deadline(store: &mut Store<ThreadStoreState>) {
+    store.set_epoch_deadline(1);
+    // Wasmtime 45 installs this callback infallibly and the callback returns
+    // `()`: UpdateDeadline is the callback result, not a fallible registration.
+    store.epoch_deadline_callback(|state| {
+        if state.data().epoch.winner.load(Ordering::Acquire) == EPOCH_PENDING {
+            Ok(UpdateDeadline::Continue(1))
+        } else {
+            Ok(UpdateDeadline::Interrupt)
+        }
+    });
+}
+
+/// One engine-global ticker with bounded weak logical-execution entries.
+struct EpochBroker {
+    engine: Arc<Engine>,
+    limits: SketchEpochLimits,
+    state: Mutex<EpochBrokerState>,
+}
+struct EpochBrokerState {
+    runtime: Option<crate::async_engine::RuntimeHandle>,
+    registrations: Vec<Weak<EpochEntry>>,
+    generation: u64,
+    ticker: Option<(u64, crate::async_engine::Task<()>)>,
+}
+struct LogicalEpoch {
+    cancellation: crate::async_engine::CancellationToken,
+    deadline: Instant,
+    winner: AtomicU8,
+}
+struct EpochEntry {
+    logical: Arc<LogicalEpoch>,
+}
+struct EpochRegistration {
+    broker: Arc<EpochBroker>,
+    entry: Option<Arc<EpochEntry>>,
+    completes_logical: bool,
+}
+impl EpochBroker {
+    fn new(engine: Arc<Engine>, limits: SketchEpochLimits) -> Self {
+        Self {
+            engine,
+            limits,
+            state: Mutex::new(EpochBrokerState {
+                runtime: None,
+                registrations: Vec::with_capacity(limits.maximum_active_registrations),
+                generation: 0,
+                ticker: None,
+            }),
+        }
+    }
+    fn register_root(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+    ) -> Result<EpochRegistration, SketchExecutionError> {
+        let logical = Arc::new(LogicalEpoch {
+            cancellation,
+            deadline: Instant::now() + self.limits.wall_clock_deadline,
+            winner: AtomicU8::new(EPOCH_PENDING),
+        });
+        self.register_entry(runtime, logical, true)
+    }
+    fn register_child(
+        self: &Arc<Self>,
+        logical: Arc<LogicalEpoch>,
+    ) -> Result<EpochRegistration, SketchExecutionError> {
+        let runtime = self
+            .state
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?
+            .runtime
+            .clone()
+            .ok_or(SketchExecutionError::ForeignRuntime)?;
+        self.register_entry(runtime, logical, false)
+    }
+    fn register_entry(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        logical: Arc<LogicalEpoch>,
+        completes_logical: bool,
+    ) -> Result<EpochRegistration, SketchExecutionError> {
+        let entry = Arc::new(EpochEntry {
+            logical: Arc::clone(&logical),
+        });
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        state
+            .registrations
+            .retain(|entry| entry.strong_count() != 0);
+        // Registration and terminal-state publication are serialized by this
+        // mutex. A child can therefore never acquire a Store slot after its
+        // logical execution has committed cancellation/deadline/completion.
+        if logical.winner.load(Ordering::Acquire) != EPOCH_PENDING {
+            return Err(SketchExecutionError::EpochRegistrationLimitExceeded);
+        }
+        if state.registrations.len() >= self.limits.maximum_active_registrations {
+            return Err(SketchExecutionError::EpochRegistrationLimitExceeded);
+        }
+        if let Some(expected) = state.runtime.as_ref() {
+            if !runtime.same_runtime_for_wasm(expected) {
+                return Err(SketchExecutionError::ForeignRuntime);
+            }
+        } else {
+            state.runtime = Some(runtime.clone());
+        }
+        state.registrations.push(Arc::downgrade(&entry));
+        if state.ticker.is_none() {
+            state.generation = state.generation.wrapping_add(1);
+            let generation = state.generation;
+            let broker = Arc::clone(self);
+            state.ticker = Some((
+                generation,
+                runtime.launch(async move {
+                    broker.tick(generation).await;
+                }),
+            ));
+        }
+        Ok(EpochRegistration {
+            broker: Arc::clone(self),
+            entry: Some(entry),
+            completes_logical,
+        })
+    }
+    async fn tick(self: Arc<Self>, generation: u64) {
+        loop {
+            crate::async_engine::sleep(self.limits.tick_interval).await;
+            let entries = match self.state.lock() {
+                Ok(mut state) => {
+                    if state.generation != generation {
+                        return;
+                    }
+                    state
+                        .registrations
+                        .retain(|entry| entry.strong_count() != 0);
+                    let entries = state
+                        .registrations
+                        .iter()
+                        .filter_map(Weak::upgrade)
+                        .collect::<Vec<_>>();
+                    for entry in &entries {
+                        let logical = &entry.logical;
+                        // Cancellation wins the same tick as deadline. The
+                        // winner is published while registration is locked.
+                        let terminal = if logical.cancellation.is_cancelled() {
+                            EPOCH_CANCELLED
+                        } else if Instant::now() >= logical.deadline {
+                            EPOCH_DEADLINE_EXCEEDED
+                        } else {
+                            EPOCH_PENDING
+                        };
+                        if terminal != EPOCH_PENDING {
+                            let _ = logical.winner.compare_exchange(
+                                EPOCH_PENDING,
+                                terminal,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            );
+                        }
+                    }
+                    entries
+                }
+                Err(_) => Vec::new(),
+            };
+            if entries.is_empty() {
+                return;
+            }
+            self.engine.increment_epoch();
+        }
+    }
+    fn active_registrations(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .registrations
+                    .iter()
+                    .filter(|entry| entry.strong_count() != 0)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+    fn finish_registration(
+        &self,
+        entry: &Arc<EpochEntry>,
+        completes_logical: bool,
+    ) -> Option<crate::async_engine::Task<()>> {
+        let mut state = self.state.lock().ok()?;
+        if completes_logical {
+            let _ = entry.logical.winner.compare_exchange(
+                EPOCH_PENDING,
+                EPOCH_COMPLETED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        state.registrations.retain(|candidate| {
+            candidate
+                .upgrade()
+                .is_some_and(|live| !Arc::ptr_eq(&live, entry))
+        });
+        if state.registrations.is_empty() {
+            state.generation = state.generation.wrapping_add(1);
+            return state.ticker.take().map(|(_, ticker)| ticker);
+        }
+        None
+    }
+}
+impl EpochRegistration {
+    fn logical(&self) -> Arc<LogicalEpoch> {
+        Arc::clone(
+            &self
+                .entry
+                .as_ref()
+                .expect("active epoch registration")
+                .logical,
+        )
+    }
+    fn finish(mut self) -> Option<crate::async_engine::Task<()>> {
+        self.entry.take().and_then(|entry| {
+            self.broker
+                .finish_registration(&entry, self.completes_logical)
+        })
+    }
+}
+impl Drop for EpochRegistration {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            let _ = self
+                .broker
+                .finish_registration(&entry, self.completes_logical);
+        }
+    }
+}
+
+#[cfg(test)]
+mod epoch_broker_tests {
+    use super::*;
+
+    /// Owns the deliberately blocked characterization child.  Every assertion
+    /// after spawning remains safe: Drop kills and reaps the exact child and
+    /// removes only its exact marker.
+    struct ContainmentChildGuard {
+        child: Option<std::process::Child>,
+        marker: std::path::PathBuf,
+    }
+    impl ContainmentChildGuard {
+        fn child_mut(&mut self) -> &mut std::process::Child {
+            self.child
+                .as_mut()
+                .expect("containment child remains armed")
+        }
+        fn reap_and_disarm(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_file(&self.marker);
+        }
+    }
+    impl Drop for ContainmentChildGuard {
+        fn drop(&mut self) {
+            self.reap_and_disarm();
+        }
+    }
+
+    fn compiler_with_epochs(maximum: usize) -> SketchCompiler {
+        let limits =
+            SketchEpochLimits::new(Duration::from_millis(5), Duration::from_millis(1), maximum)
+                .expect("limits");
+        SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_epoch_limits(limits)
+                .expect("config"),
+        )
+        .expect("compiler")
+    }
+
+    #[test]
+    fn registrations_are_per_store_bounded_and_last_generation_is_joined() {
+        let compiler = compiler_with_epochs(2);
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async {
+            let source = crate::async_engine::CancellationSource::new();
+            let root = compiler
+                .epoch_broker
+                .register_root(runtime.handle(), source.token())
+                .expect("root");
+            let child = compiler
+                .epoch_broker
+                .register_child(root.logical())
+                .expect("child");
+            assert_eq!(
+                compiler
+                    .execution_limits_snapshot()
+                    .active_epoch_registrations(),
+                2
+            );
+            assert!(matches!(
+                compiler.epoch_broker.register_child(root.logical()),
+                Err(SketchExecutionError::EpochRegistrationLimitExceeded)
+            ));
+            drop(child);
+            // A child Store's normal release must not publish logical
+            // completion. The root remains runnable across a broker tick.
+            crate::async_engine::sleep(Duration::from_millis(2)).await;
+            assert_eq!(root.logical().winner.load(Ordering::Acquire), EPOCH_PENDING);
+            if let Some(ticker) = root.finish() {
+                let _ = ticker.await;
+            }
+            assert_eq!(
+                compiler
+                    .execution_limits_snapshot()
+                    .active_epoch_registrations(),
+                0
+            );
+            let state = compiler.epoch_broker.state.lock().expect("broker state");
+            assert_eq!(
+                state.generation, 2,
+                "one start and one exact-once final removal"
+            );
+            assert!(state.ticker.is_none());
+        });
+    }
+
+    #[test]
+    fn broker_rejects_a_foreign_runtime_but_accepts_the_same_live_runtime() {
+        let compiler = compiler_with_epochs(2);
+        let first = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("first");
+        let second = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("second");
+        let source = crate::async_engine::CancellationSource::new();
+        first.run(async {
+            let root = compiler
+                .epoch_broker
+                .register_root(first.handle(), source.token())
+                .expect("root");
+            let same = compiler
+                .epoch_broker
+                .register_child(root.logical())
+                .expect("same runtime");
+            drop(same);
+            if let Some(ticker) = root.finish() {
+                let _ = ticker.await;
+            }
+        });
+        assert!(matches!(
+            compiler
+                .epoch_broker
+                .register_root(second.handle(), source.token()),
+            Err(SketchExecutionError::ForeignRuntime)
+        ));
+    }
+
+    #[test]
+    fn cancellation_wins_a_same_tick_deadline_without_reclassifying_fuel() {
+        let epoch = LogicalEpoch {
+            cancellation: crate::async_engine::CancellationSource::new().token(),
+            deadline: Instant::now(),
+            winner: AtomicU8::new(EPOCH_CANCELLED),
+        };
+        assert_eq!(epoch_error(&epoch), Some(SketchExecutionError::Cancelled));
+        let fuel = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
+        assert_eq!(
+            map_root_error(&fuel, &epoch),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+        assert_eq!(map_child_error(&fuel, &epoch), ChildOutcome::OutOfFuel);
+    }
+
+    #[test]
+    fn containment_required_host_block_is_killed_only_in_a_subprocess() {
+        const MODE: &str = "KERNAL_API_EPOCH_CONTAINMENT_CHILD";
+        const MARKER: &str = "KERNAL_API_EPOCH_HOST_BLOCK_MARKER";
+        if std::env::var_os(MODE).is_some() {
+            let bytes = super::threaded_root_observation_tests::threaded_yield_fixture();
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let sketch = compiler
+                .admit(
+                    &bytes,
+                    SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                        .expect("policy"),
+                )
+                .expect("admission");
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            // The fixture's module start enters kernel-yield. The test-only
+            // hook writes readiness then parks inside that actual host import.
+            runtime.run(async {
+                let _ = sketch.execute_threaded_root(runtime.handle()).await;
+            });
+            return;
+        }
+        let executable = std::env::current_exe().expect("test executable");
+        let marker = std::env::temp_dir().join(format!(
+            "kernal-api-epoch-host-block-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let child = std::process::Command::new(executable)
+            .arg("--exact")
+            .arg("wasm::epoch_broker_tests::containment_required_host_block_is_killed_only_in_a_subprocess")
+            .arg("--nocapture")
+            .env(MODE, "1")
+            .env(MARKER, &marker)
+            .spawn()
+            .expect("containment child");
+        let mut guard = ContainmentChildGuard {
+            child: Some(child),
+            marker,
+        };
+        let readiness_deadline = Instant::now() + Duration::from_secs(5);
+        while !guard.marker.exists() && Instant::now() < readiness_deadline {
+            assert!(
+                guard
+                    .child_mut()
+                    .try_wait()
+                    .expect("child status")
+                    .is_none(),
+                "containment child exited before reaching the host block"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            guard.marker.exists(),
+            "child must reach the Wasm host import before containment classification"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&guard.marker).expect("read readiness marker"),
+            "entered"
+        );
+        // Several clock cadence intervals must elapse without pretending the
+        // parked native host call became interruptible.
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            guard
+                .child_mut()
+                .try_wait()
+                .expect("child status")
+                .is_none(),
+            "blocked child must outlive multiple epoch intervals"
+        );
+        let classification = SketchExecutionError::ContainmentRequired;
+        assert_eq!(classification.code(), "containment-required");
+        guard.reap_and_disarm();
+    }
 }
 
 #[cfg(test)]
@@ -1300,17 +1964,30 @@ fn define_closed_imports(
                 controller
                     .kernel_yield_count
                     .fetch_add(1, Ordering::Relaxed);
+                #[cfg(test)]
+                if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_HOST_BLOCK_MARKER") {
+                    // This test-only seam characterizes the exact boundary:
+                    // Wasm reached a closed host import, after which an
+                    // in-process epoch interrupt cannot reclaim the thread.
+                    use std::io::Write as _;
+                    if let Ok(mut file) = std::fs::File::create(marker) {
+                        let _ = file.write_all(b"entered");
+                        let _ = file.sync_all();
+                    }
+                    std::thread::park();
+                }
                 if caller.data().runtime.is_some() {
                     controller
                         .runtime_handle_count
                         .fetch_add(1, Ordering::Relaxed);
-                    let actual = caller
-                        .data()
-                        .runtime
-                        .as_ref()
-                        .expect("checked runtime")
-                        .identity_for_wasm();
-                    if controller.runtime_identity.load(Ordering::Acquire) != actual {
+                    let actual = caller.data().runtime.as_ref().expect("checked runtime");
+                    let matches = controller
+                        .runtime_identity
+                        .lock()
+                        .ok()
+                        .and_then(|identity| identity.as_ref().cloned())
+                        .is_none_or(|expected| actual.same_runtime_for_wasm(&expected));
+                    if !matches {
                         controller
                             .runtime_identity_mismatches
                             .fetch_add(1, Ordering::Relaxed);
@@ -1332,6 +2009,25 @@ fn define_closed_imports(
                 // the same closed ABI sentinel as other rejected spawns, with
                 // a separate bounded semantic reason.
                 let generation = caller.data().fuel_generation;
+                let epoch = Arc::clone(&caller.data().epoch);
+                if epoch.winner.load(Ordering::Acquire) != EPOCH_PENDING {
+                    if let Ok(mut workers) = controller.workers.lock() {
+                        workers.epoch_rejections = workers.epoch_rejections.saturating_add(1);
+                    }
+                    return THREAD_SPAWN_REJECTED;
+                }
+                // A child consumes an independently bounded Store epoch slot
+                // before fuel, TID, native-thread, Store, or instance state.
+                // RAII refunds that slot on every later rejection path.
+                let child_epoch = match controller.epoch_broker.register_child(Arc::clone(&epoch)) {
+                    Ok(registration) => registration,
+                    Err(_) => {
+                        if let Ok(mut workers) = controller.workers.lock() {
+                            workers.epoch_rejections = workers.epoch_rejections.saturating_add(1);
+                        }
+                        return THREAD_SPAWN_REJECTED;
+                    }
+                };
                 let Some(child_fuel) = controller.reserve_child_fuel(generation) else {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.fuel_rejections = workers.fuel_rejections.saturating_add(1);
@@ -1366,6 +2062,7 @@ fn define_closed_imports(
                 };
                 let child = Arc::clone(&controller);
                 let spawned = std::thread::Builder::new().spawn(move || {
+                    let _epoch_registration = child_epoch;
                     let _thread_observation = CounterObservation::new(
                         Arc::clone(&child.execution_ledger),
                         LedgerCounter::GuestThreads,
@@ -1381,8 +2078,10 @@ fn define_closed_imports(
                                 controller: Arc::clone(&child),
                                 runtime,
                                 fuel_generation: generation,
+                                epoch: Arc::clone(&epoch),
                             },
                         );
+                        install_epoch_deadline(&mut store);
                         let outcome = (|| {
                             if store.set_fuel(child_fuel).is_err() {
                                 return ChildOutcome::Trapped;
@@ -1392,7 +2091,7 @@ fn define_closed_imports(
                             };
                             let instance = match prelink.instantiate(&mut store) {
                                 Ok(instance) => instance,
-                                Err(error) => return map_child_error(&error),
+                                Err(error) => return map_child_error(&error, &epoch),
                             };
                             let _instance_observation = CounterObservation::new(
                                 Arc::clone(&child.execution_ledger),
@@ -1407,7 +2106,7 @@ fn define_closed_imports(
                             };
                             match entry.call(&mut store, (tid, arg)) {
                                 Ok(()) => ChildOutcome::Completed,
-                                Err(error) => map_child_error(&error),
+                                Err(error) => map_child_error(&error, &epoch),
                             }
                         })();
                         // Sample the Store after every entry outcome, including
@@ -1565,7 +2264,7 @@ mod threaded_root_observation_tests {
             .expect("runtime");
         runtime.run(async {
             assert_eq!(
-                sketch.execute_threaded_root(runtime.handle()),
+                sketch.execute_threaded_root(runtime.handle()).await,
                 Ok(ThreadedRootOutcome::Started)
             );
         });
@@ -1597,9 +2296,10 @@ mod threaded_root_observation_tests {
         runtime.run(async {
             first
                 .execute_threaded_root(runtime.handle())
+                .await
                 .expect("first preparation");
             assert_eq!(
-                second.execute_threaded_root(runtime.handle()),
+                second.execute_threaded_root(runtime.handle()).await,
                 Err(SketchExecutionError::SharedMemoryLimitExceeded),
             );
         });
@@ -1607,6 +2307,7 @@ mod threaded_root_observation_tests {
         runtime.run(async {
             second
                 .execute_threaded_root(runtime.handle())
+                .await
                 .expect("released reservation admits second");
         });
     }
@@ -1733,11 +2434,11 @@ mod threaded_root_observation_tests {
         let handle = runtime.handle();
         runtime.run(async {
             assert_eq!(
-                sketch.execute_threaded_root(handle.clone()),
+                sketch.execute_threaded_root(handle.clone()).await,
                 Ok(ThreadedRootOutcome::Started)
             );
             assert_eq!(
-                sketch.execute_threaded_root(handle),
+                sketch.execute_threaded_root(handle).await,
                 Ok(ThreadedRootOutcome::Started)
             );
         });
@@ -1772,7 +2473,8 @@ mod threaded_root_observation_tests {
             .build()
             .expect("runtime");
         for expected_yields in [0, 0] {
-            let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+            let outcome =
+                runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await });
             assert!(matches!(
                 outcome,
                 Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
@@ -1834,10 +2536,17 @@ mod threaded_root_observation_tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()) });
+        let outcome = runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await });
         let observation = sketch
             .root_execution_observation_for_test()
             .expect("prepared observation after terminal result");
+        sketch
+            .close_threaded_root()
+            .expect("terminal execution releases cache");
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
         (outcome, observation)
     }
 
@@ -1899,7 +2608,7 @@ mod threaded_root_observation_tests {
             .build()
             .expect("runtime");
         assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
             Ok(ThreadedRootOutcome::Started)
         );
         let prepared = sketch
@@ -1916,7 +2625,7 @@ mod threaded_root_observation_tests {
             .expect("session")
             .next_fuel_generation = u64::MAX;
         assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
             Err(SketchExecutionError::SessionGenerationExhausted)
         );
         let session = prepared.controller.session.lock().expect("session");
@@ -1941,7 +2650,7 @@ mod threaded_root_observation_tests {
             .expect("runtime");
         for _ in 0..2 {
             assert!(matches!(
-                runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+                runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
                 Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
                     if summary.fuel() == 1 && summary.capacity() == 0 && summary.closing() == 0
             ));
@@ -1975,7 +2684,7 @@ mod threaded_root_observation_tests {
             .build()
             .expect("runtime");
         assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
             Ok(ThreadedRootOutcome::Started),
         );
         let observation = sketch
@@ -1986,6 +2695,180 @@ mod threaded_root_observation_tests {
         assert_eq!(observation.queued_join_handles, 0);
         assert!(observation.last_root_remaining_fuel <= 100);
         assert!(observation.last_child_remaining_fuel <= 10);
+    }
+
+    fn epoch_compiler(deadline: Duration, registrations: usize) -> SketchCompiler {
+        let fuel = SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
+            .expect("high fuel partition");
+        let limits = SketchExecutionLimits::default()
+            .with_fuel_limits(fuel)
+            .expect("fuel")
+            .with_epoch_limits(
+                SketchEpochLimits::new(deadline, Duration::from_millis(1), registrations)
+                    .expect("epoch"),
+            )
+            .expect("epoch limits");
+        SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(limits)
+                .expect("config"),
+        )
+        .expect("compiler")
+    }
+
+    fn concurrent_epoch_compiler(deadline: Duration, registrations: usize) -> SketchCompiler {
+        let fuel = SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
+            .expect("high fuel partition");
+        let reserved = THREADED_RUST_RESERVATION_BYTES
+            .checked_mul(2)
+            .expect("two exact reservations");
+        let limits = SketchExecutionLimits::new(reserved, 2)
+            .expect("two roots")
+            .with_fuel_limits(fuel)
+            .expect("fuel")
+            .with_epoch_limits(
+                SketchEpochLimits::new(deadline, Duration::from_millis(1), registrations)
+                    .expect("epoch"),
+            )
+            .expect("epoch limits");
+        SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(limits)
+                .expect("config"),
+        )
+        .expect("compiler")
+    }
+
+    fn admit_epoch_fixture(compiler: &SketchCompiler, bytes: Vec<u8>) -> Arc<AdmittedSketch> {
+        compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission")
+    }
+
+    #[test]
+    fn epoch_deadline_interrupts_looping_module_start_and_root_with_high_fuel() {
+        for bytes in [start_fuel_fixture(), root_fuel_fixture()] {
+            let compiler = epoch_compiler(Duration::from_millis(5), MAX_GUEST_THREADS_V1 + 1);
+            let sketch = admit_epoch_fixture(&compiler, bytes);
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            assert_eq!(
+                runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
+                Err(SketchExecutionError::DeadlineExceeded)
+            );
+            sketch.close_threaded_root().expect("close");
+            assert_eq!(
+                compiler.execution_limits_snapshot(),
+                SketchExecutionSnapshot::default()
+            );
+        }
+    }
+
+    #[test]
+    fn epoch_deadline_reports_the_ordered_child_outcome_and_releases_every_store_slot() {
+        let compiler = epoch_compiler(Duration::from_millis(5), MAX_GUEST_THREADS_V1 + 1);
+        let sketch = admit_epoch_fixture(&compiler, child_fuel_fixture());
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        assert_eq!(
+            runtime.run(async { sketch.execute_threaded_root(runtime.handle()).await }),
+            Err(SketchExecutionError::ChildOutcomes {
+                outcomes: vec![ThreadedChildOutcome {
+                    tid: 1,
+                    kind: ThreadedChildOutcomeKind::DeadlineExceeded
+                }]
+            })
+        );
+        sketch.close_threaded_root().expect("close");
+        let snapshot = compiler.execution_limits_snapshot();
+        assert_eq!(snapshot.active_epoch_registrations(), 0);
+        assert_eq!(snapshot.live_stores(), 0);
+        assert_eq!(snapshot.live_instances(), 0);
+        assert_eq!(snapshot.active_root_executions(), 0);
+    }
+
+    #[test]
+    fn cancellation_wins_deadline_and_current_thread_drives_the_blocking_lane() {
+        let compiler = epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+        let sketch = admit_epoch_fixture(&compiler, root_fuel_fixture());
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async {
+            let source = crate::async_engine::CancellationSource::new();
+            let task = runtime.handle().launch({
+                let sketch = Arc::clone(&sketch);
+                let token = source.token();
+                let handle = runtime.handle();
+                async move {
+                    sketch
+                        .execute_threaded_root_cancellable(handle, token)
+                        .await
+                }
+            });
+            crate::async_engine::sleep(Duration::from_millis(1)).await;
+            source.cancel();
+            assert_eq!(
+                task.await.expect("join"),
+                Err(SketchExecutionError::Cancelled)
+            );
+        });
+        sketch.close_threaded_root().expect("close");
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
+    }
+
+    #[test]
+    fn multi_thread_runtime_and_unrelated_same_engine_sketch_remain_isolated() {
+        let compiler =
+            concurrent_epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+        let looping = admit_epoch_fixture(&compiler, root_fuel_fixture());
+        let normal = admit_epoch_fixture(&compiler, threaded_yield_fixture());
+        let runtime = crate::async_engine::RuntimeBuilder::multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async {
+            let source = crate::async_engine::CancellationSource::new();
+            let loop_task = runtime.handle().launch({
+                let sketch = Arc::clone(&looping);
+                let token = source.token();
+                let handle = runtime.handle();
+                async move {
+                    sketch
+                        .execute_threaded_root_cancellable(handle, token)
+                        .await
+                }
+            });
+            crate::async_engine::sleep(Duration::from_millis(1)).await;
+            assert_eq!(
+                normal.execute_threaded_root(runtime.handle()).await,
+                Ok(ThreadedRootOutcome::Started)
+            );
+            source.cancel();
+            assert_eq!(
+                loop_task.await.expect("join"),
+                Err(SketchExecutionError::Cancelled)
+            );
+        });
+        looping.close_threaded_root().expect("close looping");
+        normal.close_threaded_root().expect("close normal");
+        assert_eq!(
+            compiler.execution_limits_snapshot(),
+            SketchExecutionSnapshot::default()
+        );
     }
 
     #[test]
@@ -2035,7 +2918,7 @@ mod threaded_root_observation_tests {
             .expect("runtime");
         let handle = runtime.handle();
         assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(handle) }),
+            runtime.run(async { sketch.execute_threaded_root(handle).await }),
             Ok(ThreadedRootOutcome::Started)
         );
         assert_eq!(compiler.compiled_module_count(), 1);
@@ -2282,7 +3165,7 @@ mod threaded_root_observation_tests {
     // Minimal exact ThreadedRustV1 profile whose start calls kernel-yield.
     // Keeping it in this private unit module prevents test instrumentation
     // from becoming a public sketch-host API.
-    fn threaded_yield_fixture() -> Vec<u8> {
+    pub(super) fn threaded_yield_fixture() -> Vec<u8> {
         let mut wasm = b"\0asm\x01\0\0\0".to_vec();
         let mut types = Vec::new();
         leb(9, &mut types);
@@ -2704,7 +3587,27 @@ fn shared_range(
     memory.data().get(offset..end)
 }
 
-fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+fn epoch_error(epoch: &LogicalEpoch) -> Option<SketchExecutionError> {
+    match epoch.winner.load(Ordering::Acquire) {
+        EPOCH_CANCELLED => Some(SketchExecutionError::Cancelled),
+        EPOCH_DEADLINE_EXCEEDED => Some(SketchExecutionError::DeadlineExceeded),
+        _ => None,
+    }
+}
+
+fn map_root_error(
+    error: &wasmtime::Error,
+    epoch: &LogicalEpoch,
+) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    if matches!(
+        error.downcast_ref::<wasmtime::Trap>(),
+        Some(wasmtime::Trap::OutOfFuel)
+    ) {
+        return Err(SketchExecutionError::OutOfFuel);
+    }
+    if let Some(error) = epoch_error(epoch) {
+        return Err(error);
+    }
     if let Some(exit) = error.downcast_ref::<ProcExitSentinel>() {
         return if exit.0 == 0 {
             Ok(ThreadedRootOutcome::Exited)
@@ -2712,28 +3615,27 @@ fn map_root_error(error: &wasmtime::Error) -> Result<ThreadedRootOutcome, Sketch
             Err(SketchExecutionError::NonzeroExit { code: exit.0 })
         };
     }
+    Err(SketchExecutionError::Trapped)
+}
+
+fn map_child_error(error: &wasmtime::Error, epoch: &LogicalEpoch) -> ChildOutcome {
     if matches!(
         error.downcast_ref::<wasmtime::Trap>(),
         Some(wasmtime::Trap::OutOfFuel)
     ) {
-        return Err(SketchExecutionError::OutOfFuel);
+        return ChildOutcome::OutOfFuel;
     }
-    Err(SketchExecutionError::Trapped)
-}
-
-fn map_child_error(error: &wasmtime::Error) -> ChildOutcome {
+    match epoch.winner.load(Ordering::Acquire) {
+        EPOCH_CANCELLED => return ChildOutcome::Cancelled,
+        EPOCH_DEADLINE_EXCEEDED => return ChildOutcome::DeadlineExceeded,
+        _ => {}
+    }
     if let Some(exit) = error.downcast_ref::<ProcExitSentinel>() {
         return if exit.0 == 0 {
             ChildOutcome::Exited
         } else {
             ChildOutcome::NonzeroExit(exit.0)
         };
-    }
-    if matches!(
-        error.downcast_ref::<wasmtime::Trap>(),
-        Some(wasmtime::Trap::OutOfFuel)
-    ) {
-        return ChildOutcome::OutOfFuel;
     }
     ChildOutcome::Trapped
 }
@@ -2817,6 +3719,7 @@ mod result_precedence_tests {
             capacity: 1,
             closing: 0,
             fuel: 0,
+            epoch: 0,
         };
         assert_eq!(
             resolve_threaded_result(Ok(ThreadedRootOutcome::Started), Ok(()), Ok(()), summary,),
@@ -2836,8 +3739,16 @@ mod result_precedence_tests {
     #[test]
     fn fuel_exhaustion_is_mapped_without_exposing_a_wasmtime_trap() {
         let error = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
-        assert_eq!(map_root_error(&error), Err(SketchExecutionError::OutOfFuel));
-        assert_eq!(map_child_error(&error), ChildOutcome::OutOfFuel);
+        let epoch = LogicalEpoch {
+            cancellation: crate::async_engine::CancellationSource::new().token(),
+            deadline: Instant::now() + Duration::from_secs(1),
+            winner: AtomicU8::new(EPOCH_PENDING),
+        };
+        assert_eq!(
+            map_root_error(&error, &epoch),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+        assert_eq!(map_child_error(&error, &epoch), ChildOutcome::OutOfFuel);
     }
 }
 
@@ -2845,6 +3756,7 @@ mod result_precedence_tests {
 pub enum SketchCompilerError {
     InvalidStackLimit,
     InvalidExecutionLimits,
+    InvalidEpochLimits,
     InvalidFuelLimits,
     Unavailable,
 }
@@ -2854,6 +3766,9 @@ impl fmt::Display for SketchCompilerError {
             Self::InvalidStackLimit => "the Wasm stack limit must be nonzero",
             Self::InvalidExecutionLimits => {
                 "execution limits must admit one 1 GiB threaded Rust session and one root"
+            }
+            Self::InvalidEpochLimits => {
+                "epoch limits must have a nonzero deadline, tick, and quota"
             }
             Self::InvalidFuelLimits => {
                 "fuel limits must reserve nonzero root and all bounded child slices"

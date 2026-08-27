@@ -79,7 +79,6 @@ impl std::error::Error for TaskError {}
 /// Owned asynchronous runtime.
 pub struct Runtime {
     inner: tokio::runtime::Runtime,
-    identity: Arc<()>,
 }
 
 impl Runtime {
@@ -92,7 +91,6 @@ impl Runtime {
     pub fn handle(&self) -> RuntimeHandle {
         RuntimeHandle {
             inner: self.inner.handle().clone(),
-            identity: Arc::clone(&self.identity),
         }
     }
 }
@@ -137,28 +135,32 @@ impl RuntimeBuilder {
 
     /// Create the configured runtime.
     pub fn build(mut self) -> std::io::Result<Runtime> {
-        self.inner.build().map(|inner| Runtime {
-            inner,
-            identity: Arc::new(()),
-        })
+        self.inner.build().map(|inner| Runtime { inner })
     }
 }
 
 /// Clonable handle to a running asynchronous runtime.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RuntimeHandle {
     inner: tokio::runtime::Handle,
-    identity: Arc<()>,
 }
+
+impl PartialEq for RuntimeHandle {
+    fn eq(&self, other: &Self) -> bool {
+        // Tokio assigns this identifier to the live runtime, rather than to a
+        // particular Handle wrapper. This fixes `current()` and cloned owned
+        // handles comparing as distinct runtimes.
+        self.inner.id() == other.inner.id()
+    }
+}
+
+impl Eq for RuntimeHandle {}
 
 impl RuntimeHandle {
     /// Obtain the current runtime handle.
     pub fn current() -> Result<Self, NoRuntime> {
         tokio::runtime::Handle::try_current()
-            .map(|inner| Self {
-                inner,
-                identity: Arc::new(()),
-            })
+            .map(|inner| Self { inner })
             .map_err(|_| NoRuntime)
     }
 
@@ -172,8 +174,25 @@ impl RuntimeHandle {
             inner: self.inner.spawn(future),
         }
     }
-    pub(crate) fn identity_for_wasm(&self) -> usize {
-        Arc::as_ptr(&self.identity) as usize
+    /// Launch blocking work on this handle's blocking lane.
+    ///
+    /// Unlike the ambient helper, this preserves caller-selected runtime
+    /// ownership for facilities (such as the sketch epoch clock) that need a
+    /// single executor identity.
+    pub fn launch_blocking<F, R>(&self, operation: F) -> Task<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        Task {
+            inner: self.inner.spawn_blocking(operation),
+        }
+    }
+    pub(crate) fn same_runtime_for_wasm(&self, other: &Self) -> bool {
+        // `tokio::runtime::Id` deliberately has no public numeric conversion.
+        // Preserve it as opaque backend identity and compare only through
+        // Tokio's equality semantics; never hash, truncate, or expose it.
+        self.inner.id() == other.inner.id()
     }
 }
 

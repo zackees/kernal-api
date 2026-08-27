@@ -5,10 +5,13 @@ use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchExecutionError, SketchModulePolicy,
     ThreadedRootOutcome,
 };
+#[path = "support/threaded_fixture.rs"]
+mod threaded_fixture;
+use threaded_fixture::threaded_root_wasm;
 
 #[test]
 fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handle() {
-    let bytes = threaded_root_wasm(None, false, false);
+    let bytes = threaded_root_wasm(None, false, false, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
@@ -18,7 +21,9 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
         .expect("runtime");
 
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("root execution"),
@@ -30,7 +35,9 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
         "root execution must not compile again"
     );
     let repeated = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         repeated.expect("repeated root execution"),
@@ -55,6 +62,7 @@ fn synthetic_profile_cannot_prepare_or_allocate_a_threaded_root() {
     let error = runtime.run(async {
         sketch
             .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
             .expect_err("synthetic execution must fail before preparation")
     });
     assert_eq!(error, SketchExecutionError::ThreadedProfileRequired);
@@ -62,7 +70,7 @@ fn synthetic_profile_cannot_prepare_or_allocate_a_threaded_root() {
 
 #[test]
 fn proc_exit_zero_is_a_controlled_root_completion() {
-    let bytes = threaded_root_wasm(Some(0), false, false);
+    let bytes = threaded_root_wasm(Some(0), false, false, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
@@ -72,7 +80,9 @@ fn proc_exit_zero_is_a_controlled_root_completion() {
         .expect("runtime");
 
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("normal proc_exit"),
@@ -86,18 +96,19 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         .enable_all()
         .build()
         .expect("runtime");
-    let bytes = threaded_root_wasm(Some(7), false, false);
+    let bytes = threaded_root_wasm(Some(7), false, false, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
     let error = runtime.run(async {
         sketch
             .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
             .expect_err("nonzero proc exit")
     });
     assert_eq!(error, SketchExecutionError::NonzeroExit { code: 7 });
 
-    let bytes = threaded_root_wasm(None, true, false);
+    let bytes = threaded_root_wasm(None, true, false, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384)
         .expect("policy")
@@ -105,7 +116,9 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         .expect("one child cap");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     match outcome.expect("the second spawn must be rejected without a reservation leak") {
         ThreadedRootOutcome::StartedWithThreadRejections(summary) => {
@@ -115,7 +128,9 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         outcome => panic!("unexpected root outcome: {outcome:?}"),
     }
     let repeated = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert!(matches!(
         repeated,
@@ -126,7 +141,7 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
 
 #[test]
 fn fd_write_rejects_an_out_of_bounds_iovec_before_writing() {
-    let bytes = threaded_root_wasm(None, false, true);
+    let bytes = threaded_root_wasm(None, false, true, false);
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
     let policy = SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, 16_384).expect("policy");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
@@ -135,7 +150,9 @@ fn fd_write_rejects_an_out_of_bounds_iovec_before_writing() {
         .build()
         .expect("runtime");
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("invalid iovec is contained"),
@@ -175,10 +192,12 @@ fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) {
 // Minimal structurally valid ThreadedRustV1 artifact. The start function is
 // intentionally unexported: Wasmtime runs it during instantiate, not by
 // calling exported `_start` or `kernal-api-run` separately.
-fn threaded_root_wasm(
+#[allow(dead_code)]
+fn legacy_threaded_root_wasm(
     proc_exit: Option<i32>,
     assert_thread_spawn_rejection: bool,
     assert_fd_write_fault: bool,
+    loop_root: bool,
 ) -> Vec<u8> {
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
     let mut types = Vec::new();
@@ -255,6 +274,12 @@ fn threaded_root_wasm(
             1, 0x10, 1, 0x41, 0x7f, 0x46, 0x45, 0x04, 0x40, 0x41, 7, 0x10, 6, 0x0b, 0x0b, 4, 0,
             0x41, 0, 0x0b, 6, 0, 0x20, 1, 0x10, 6, 0x0b, // child: proc_exit(arg)
             4, 0, 0x41, 0, 0x0b,
+        ]);
+    } else if loop_root {
+        // `_start`: plain compute loop; it has epoch checks but no atomic wait.
+        code.extend([
+            10, 0, 0x02, 0x40, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b, 4, 0, 0x41, 0, 0x0b, 2, 0, 0x0b, 4,
+            0, 0x41, 0, 0x0b,
         ]);
     } else {
         code.extend([

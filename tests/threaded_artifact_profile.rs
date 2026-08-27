@@ -29,11 +29,18 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
     eprintln!("{manifest}");
 
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
-    let policy = SketchModulePolicy::new(bytes.len().saturating_add(1), 65_536).expect("policy");
-    let error = match compiler.admit(&bytes, policy) {
-        Ok(_) => panic!("#25 must reject the real threaded Rust artifact in this RED slice"),
+    let synthetic = SketchModulePolicy::new(bytes.len().saturating_add(1), 65_536).expect("policy");
+    let error = match compiler.admit(&bytes, synthetic) {
+        Ok(_) => panic!("the synthetic profile must reject the threaded Rust artifact"),
         Err(error) => error,
     };
     assert_eq!(compiler.compiled_module_count(), 0, "rejection is pre-compilation");
-    eprintln!("threaded-artifact-admission-red={}", error.code());
+    eprintln!("threaded-artifact-synthetic-rejection={}", error.code());
+
+    let threaded = SketchModulePolicy::threaded_rust_v1(bytes.len().saturating_add(1), 16_384)
+        .expect("threaded Rust policy");
+    compiler
+        .admit(&bytes, threaded)
+        .expect("threaded-rust-v1 must admit the exact artifact");
+    assert_eq!(compiler.compiled_module_count(), 1);
 }

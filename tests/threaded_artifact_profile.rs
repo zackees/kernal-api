@@ -49,9 +49,9 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
         .expect("threaded-rust-v1 must admit the exact artifact");
     assert_eq!(compiler.compiled_module_count(), 1);
 
-    // #34 starts the supplied, direct Rust artifact through Wasmtime start;
-    // #35 owns its thread-spawn path. Until then the guest's std::thread call
-    // reaches the deterministic rejection and is contained as a semantic trap.
+    // #35 must bootstrap the artifact's ordinary Rust `std::thread` calls.
+    // This stays artifact-gated: a raw/WAT substitute cannot prove Rust TLS,
+    // `wasi_thread_start`, or the P1 thread convention.
     let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
         .enable_all()
         .build()
@@ -61,7 +61,7 @@ fn real_threaded_rust_guest_is_a_red_admission_characterization() {
             kernal_api::async_engine::RuntimeHandle::current().expect("runtime handle"),
         )
     });
-    assert_eq!(outcome, Err(SketchExecutionError::Trapped));
+    assert_eq!(outcome, Ok(kernal_api::wasm::ThreadedRootOutcome::Started));
     assert_eq!(
         compiler.compiled_module_count(),
         1,

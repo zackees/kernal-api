@@ -123,14 +123,19 @@ impl SketchExecutionLimits {
         self.maximum_active_root_executions
     }
     /// Sets the fixed root/child partition for each root execution.
-    pub fn with_fuel_limits(mut self, fuel_limits: SketchFuelLimits) -> Result<Self, SketchCompilerError> {
+    pub fn with_fuel_limits(
+        mut self,
+        fuel_limits: SketchFuelLimits,
+    ) -> Result<Self, SketchCompilerError> {
         if !fuel_limits.is_valid() {
             return Err(SketchCompilerError::InvalidFuelLimits);
         }
         self.fuel_limits = fuel_limits;
         Ok(self)
     }
-    pub fn fuel_limits(self) -> SketchFuelLimits { self.fuel_limits }
+    pub fn fuel_limits(self) -> SketchFuelLimits {
+        self.fuel_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
@@ -159,24 +164,49 @@ pub struct SketchFuelLimits {
 }
 impl SketchFuelLimits {
     pub fn new(total: u64, root_slice: u64, child_slice: u64) -> Result<Self, SketchCompilerError> {
-        let limits = Self { total, root_slice, child_slice };
-        limits.is_valid().then_some(limits).ok_or(SketchCompilerError::InvalidFuelLimits)
+        let limits = Self {
+            total,
+            root_slice,
+            child_slice,
+        };
+        limits
+            .is_valid()
+            .then_some(limits)
+            .ok_or(SketchCompilerError::InvalidFuelLimits)
     }
-    pub fn total(self) -> u64 { self.total }
-    pub fn root_slice(self) -> u64 { self.root_slice }
-    pub fn child_slice(self) -> u64 { self.child_slice }
+    pub fn total(self) -> u64 {
+        self.total
+    }
+    pub fn root_slice(self) -> u64 {
+        self.root_slice
+    }
+    pub fn child_slice(self) -> u64 {
+        self.child_slice
+    }
     fn is_valid(self) -> bool {
-        self.root_slice != 0 && self.child_slice != 0 && self.total >= self.root_slice
-            && self.child_slice.checked_mul(MAX_GUEST_THREADS_V1 as u64)
-                .and_then(|children| self.root_slice.checked_add(children))
-                .is_some_and(|required| required <= self.total)
+        self.root_slice != 0
+            && self.child_slice != 0
+            && self
+                .total
+                .checked_sub(self.root_slice)
+                .is_some_and(|available| available >= self.child_slice)
+    }
+    fn child_slice_capacity(self) -> usize {
+        // `is_valid` guarantees this is at least one. Cap it independently of
+        // caller policy so the session's native registrations remain bounded.
+        ((self.total - self.root_slice) / self.child_slice).min(MAX_GUEST_THREADS_V1 as u64)
+            as usize
     }
 }
 impl Default for SketchFuelLimits {
     fn default() -> Self {
         // The exact values are a conservative compatibility default; callers
         // may lower or raise them only as a complete bounded partition.
-        Self { total: 1_700_000, root_slice: 100_000, child_slice: 100_000 }
+        Self {
+            total: 1_700_000,
+            root_slice: 100_000,
+            child_slice: 100_000,
+        }
     }
 }
 
@@ -499,10 +529,10 @@ impl AdmittedSketch {
         } else {
             Ok(())
         };
-        prepared.controller.last_root_remaining_fuel.store(
-            store.get_fuel().unwrap_or(0),
-            Ordering::Release,
-        );
+        prepared
+            .controller
+            .last_root_remaining_fuel
+            .store(store.get_fuel().unwrap_or(0), Ordering::Release);
         resolve_threaded_result(outcome, children, report, rejections)
     }
     fn prepare_threaded_root_with_permit(
@@ -622,6 +652,8 @@ impl AdmittedSketch {
             runtime_identity_mismatches: controller
                 .runtime_identity_mismatches
                 .load(Ordering::Relaxed),
+            last_root_remaining_fuel: controller.last_root_remaining_fuel.load(Ordering::Relaxed),
+            last_child_remaining_fuel: controller.last_child_remaining_fuel.load(Ordering::Relaxed),
             accepted_child_registrations: workers.accepted,
             live_threads: workers.live,
             queued_join_handles: workers.handles.len(),
@@ -681,7 +713,9 @@ impl ThreadSpawnRejectionSummary {
     pub fn closing(self) -> u32 {
         self.closing
     }
-    pub fn fuel(self) -> u32 { self.fuel }
+    pub fn fuel(self) -> u32 {
+        self.fuel
+    }
     pub fn is_empty(self) -> bool {
         self.capacity == 0 && self.closing == 0 && self.fuel == 0
     }
@@ -890,6 +924,14 @@ mod execution_ledger_tests {
             Err(SketchCompilerError::InvalidFuelLimits),
         );
         assert_eq!(
+            SketchFuelLimits::new(2, 1, 1),
+            Ok(SketchFuelLimits {
+                total: 2,
+                root_slice: 1,
+                child_slice: 1,
+            }),
+        );
+        assert_eq!(
             SketchFuelLimits::new(1_700_000, 0, 100_000),
             Err(SketchCompilerError::InvalidFuelLimits),
         );
@@ -1076,7 +1118,7 @@ impl ThreadController {
         let generation = session.next_fuel_generation;
         session.fuel = Some(FuelExecution {
             generation,
-            remaining_child_slices: MAX_GUEST_THREADS_V1,
+            remaining_child_slices: fuel.child_slice_capacity(),
             child_slice: fuel.child_slice,
         });
         Ok(LogicalRootPermit {
@@ -1101,7 +1143,9 @@ impl ThreadController {
     fn refund_child_fuel(&self) {
         if let Ok(mut session) = self.session.lock() {
             if let Some(fuel) = session.fuel.as_mut() {
-                fuel.remaining_child_slices = fuel.remaining_child_slices.saturating_add(1)
+                fuel.remaining_child_slices = fuel
+                    .remaining_child_slices
+                    .saturating_add(1)
                     .min(MAX_GUEST_THREADS_V1);
             }
         }
@@ -1218,12 +1262,14 @@ struct ThreadStoreState {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RootExecutionObservation {
     preparations: u64,
     kernel_yields: u64,
     supplied_runtime_handles: u64,
     runtime_identity_mismatches: u64,
+    last_root_remaining_fuel: u64,
+    last_child_remaining_fuel: u64,
     accepted_child_registrations: usize,
     live_threads: usize,
     queued_join_handles: usize,
@@ -1353,10 +1399,9 @@ fn define_closed_imports(
                         };
                         match entry.call(&mut store, (tid, arg)) {
                             Ok(()) => {
-                                child.last_child_remaining_fuel.store(
-                                    store.get_fuel().unwrap_or(0),
-                                    Ordering::Release,
-                                );
+                                child
+                                    .last_child_remaining_fuel
+                                    .store(store.get_fuel().unwrap_or(0), Ordering::Release);
                                 ChildOutcome::Completed
                             }
                             Err(error) => map_child_error(&error),
@@ -1695,9 +1740,11 @@ mod threaded_root_observation_tests {
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
                 runtime_identity_mismatches: 0,
+                last_root_remaining_fuel: 99_997,
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                ..RootExecutionObservation::default()
             })
         );
     }
@@ -1729,6 +1776,105 @@ mod threaded_root_observation_tests {
             assert_eq!(observation.accepted_child_registrations, 0);
             assert_eq!(observation.live_threads, 0);
             assert_eq!(observation.queued_join_handles, 0);
+        }
+    }
+
+    fn fuel_compiler(root_slice: u64, child_slice: u64) -> SketchCompiler {
+        let total = root_slice + child_slice * MAX_GUEST_THREADS_V1 as u64;
+        fuel_compiler_with_total(total, root_slice, child_slice)
+    }
+
+    fn fuel_compiler_with_total(total: u64, root_slice: u64, child_slice: u64) -> SketchCompiler {
+        let fuel = SketchFuelLimits::new(total, root_slice, child_slice).expect("fuel limits");
+        let limits = SketchExecutionLimits::default()
+            .with_fuel_limits(fuel)
+            .expect("execution limits");
+        SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(limits)
+                .expect("compiler config"),
+        )
+        .expect("compiler")
+    }
+
+    fn execute_fuel_fixture(
+        bytes: Vec<u8>,
+        root_slice: u64,
+        child_slice: u64,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        let compiler = fuel_compiler(root_slice, child_slice);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.run(async { sketch.execute_threaded_root(runtime.handle()) })
+    }
+
+    #[test]
+    fn finite_fuel_exhausts_the_module_start_before_root_execution() {
+        assert_eq!(
+            execute_fuel_fixture(start_fuel_fixture(), 1, 1),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+    }
+
+    #[test]
+    fn finite_fuel_exhausts_root_start_with_a_typed_error() {
+        assert_eq!(
+            execute_fuel_fixture(root_fuel_fixture(), 10, 1),
+            Err(SketchExecutionError::OutOfFuel)
+        );
+    }
+
+    #[test]
+    fn finite_child_slice_reports_a_typed_ordered_child_outcome() {
+        assert_eq!(
+            execute_fuel_fixture(child_fuel_fixture(), 100, 10),
+            Err(SketchExecutionError::ChildOutcomes {
+                outcomes: vec![ThreadedChildOutcome {
+                    tid: 1,
+                    kind: ThreadedChildOutcomeKind::OutOfFuel,
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn exhausted_child_credit_rejects_before_spawn_and_the_session_is_reusable() {
+        let bytes = fuel_rejection_fixture();
+        let compiler = fuel_compiler_with_total(110, 100, 10);
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
+            )
+            .expect("admission");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for _ in 0..2 {
+            assert!(matches!(
+                runtime.run(async { sketch.execute_threaded_root(runtime.handle()) }),
+                Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+                    if summary.fuel() == 1 && summary.capacity() == 0 && summary.closing() == 0
+            ));
+            let observation = sketch
+                .root_execution_observation_for_test()
+                .expect("prepared observation");
+            assert_eq!(observation.accepted_child_registrations, 0);
+            assert_eq!(observation.live_threads, 0);
+            assert_eq!(observation.queued_join_handles, 0);
+            assert!(observation.last_root_remaining_fuel <= 100);
+            assert!(observation.last_child_remaining_fuel <= 10);
         }
     }
 
@@ -1795,6 +1941,7 @@ mod threaded_root_observation_tests {
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                ..RootExecutionObservation::default()
             })
         );
     }
@@ -2152,6 +2299,103 @@ mod threaded_root_observation_tests {
             }
             section_offset = end;
         }
+    }
+
+    fn threaded_code_fixture(bodies: [Vec<u8>; 5]) -> Vec<u8> {
+        let bytes = threaded_yield_fixture();
+        let mut section_offset = 8;
+        loop {
+            let id = bytes[section_offset];
+            let mut body_at = section_offset + 1;
+            let mut length = 0_usize;
+            let mut shift = 0;
+            loop {
+                let byte = bytes[body_at];
+                body_at += 1;
+                length |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            let end = body_at + length;
+            if id == 10 {
+                let mut code = Vec::new();
+                leb(bodies.len() as u32, &mut code);
+                for body in bodies {
+                    leb(body.len() as u32, &mut code);
+                    code.extend(body);
+                }
+                let mut output = bytes[..section_offset].to_vec();
+                section(10, code, &mut output);
+                output.extend_from_slice(&bytes[end..]);
+                return output;
+            }
+            section_offset = end;
+        }
+    }
+
+    fn empty_body() -> Vec<u8> {
+        vec![0, 0x0b]
+    }
+
+    fn i32_zero_body() -> Vec<u8> {
+        vec![0, 0x41, 0, 0x0b]
+    }
+
+    fn yield_body() -> Vec<u8> {
+        vec![0, 0x10, 0, 0x0b]
+    }
+
+    fn infinite_loop_body() -> Vec<u8> {
+        // `loop { br 0 }`; the explicit branch makes every iteration consume
+        // Wasmtime fuel rather than relying on host-side timing.
+        vec![0, 0x03, 0x40, 0x0c, 0, 0x0b, 0x0b]
+    }
+
+    fn start_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            empty_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            infinite_loop_body(),
+        ])
+    }
+
+    fn root_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            infinite_loop_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
+    }
+
+    fn child_fuel_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            // `_start`: ask the closed host ABI for one child and discard its
+            // positive TID. The child entry below then burns its own slice.
+            vec![0, 0x41, 0, 0x10, 1, 0x1a, 0x0b],
+            i32_zero_body(),
+            infinite_loop_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
+    }
+
+    fn fuel_rejection_fixture() -> Vec<u8> {
+        threaded_code_fixture([
+            // `_start`: the first child consumes the only configured child
+            // slice; the second must receive `-1` before it gets a TID,
+            // Store, Instance, or JoinHandle.
+            vec![0, 0x41, 0, 0x10, 1, 0x1a, 0x41, 0, 0x10, 1, 0x1a, 0x0b],
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            yield_body(),
+        ])
     }
 }
 

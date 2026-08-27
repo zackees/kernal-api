@@ -5,7 +5,7 @@
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
@@ -967,16 +967,25 @@ fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecu
     if offset < 0 || offset % 4 != 0 || shared_range(memory, offset, 64).is_none() {
         return Err(SketchExecutionError::ValidationReportInvalid);
     }
-    let words: Option<Vec<u32>> = (0..16)
-        .map(|word| read_shared_u32(memory, offset.saturating_add(word * 4)))
-        .collect();
+    // SAFETY: the checked offset is four-byte aligned, every 4-byte word lies
+    // in the live SharedMemory range, and host access to this concurrent guest
+    // record is atomic-only. AtomicU32 has the required alignment and no view
+    // or reference escapes this function.
+    let load = |word: i32, ordering| -> Option<u32> {
+        let cells = shared_range(memory, offset.checked_add(word.checked_mul(4)?)?, 4)?;
+        let pointer = cells.as_ptr().cast::<AtomicU32>();
+        Some(unsafe { (&*pointer).load(ordering) })
+    };
+    // The guest stores ready with Release after all record fields; acquire it
+    // before copying the remaining words.
+    if load(3, Ordering::Acquire) != Some(1) {
+        return Err(SketchExecutionError::ValidationReportInvalid);
+    }
+    let words: Option<Vec<u32>> = (0..16).map(|word| load(word, Ordering::Relaxed)).collect();
     let Some(words) = words else {
         return Err(SketchExecutionError::ValidationReportInvalid);
     };
-    // ready is Release-written by the guest after all fields. Load it first
-    // with Acquire before accepting the remaining atomic record words.
-    if words[3] != 1
-        || words[0] != 0x4b_52_56_31
+    if words[0] != 0x4b_52_56_31
         || words[1] != 1
         || words[2] != 64
         || words[4] != 2

@@ -190,10 +190,11 @@ impl RuntimeHandle {
             inner: self.inner.spawn_blocking(operation),
         }
     }
-    pub(crate) fn identity_for_wasm(&self) -> usize {
-        // Keep the backend ID private. Its numeric representation is only a
-        // private diagnostic seam; equality always uses Tokio's live ID.
-        self.inner.id().as_u64().get() as usize
+    pub(crate) fn same_runtime_for_wasm(&self, other: &Self) -> bool {
+        // `tokio::runtime::Id` deliberately has no public numeric conversion.
+        // Preserve it as opaque backend identity and compare only through
+        // Tokio's equality semantics; never hash, truncate, or expose it.
+        self.inner.id() == other.inner.id()
     }
 }
 

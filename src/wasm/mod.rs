@@ -524,10 +524,9 @@ impl AdmittedSketch {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
         let (prepared, root) = self.prepare_threaded_root_with_permit()?;
-        prepared
-            .controller
-            .runtime_identity
-            .store(runtime.identity_for_wasm(), Ordering::Release);
+        if let Ok(mut identity) = prepared.controller.runtime_identity.lock() {
+            *identity = Some(runtime.clone());
+        }
         let _store_observation = CounterObservation::new(
             Arc::clone(&prepared.controller.execution_ledger),
             LedgerCounter::Stores,
@@ -649,7 +648,7 @@ impl AdmittedSketch {
             }),
             kernel_yield_count: AtomicU64::new(0),
             runtime_handle_count: AtomicU64::new(0),
-            runtime_identity: AtomicUsize::new(0),
+            runtime_identity: Mutex::new(None),
             runtime_identity_mismatches: AtomicU64::new(0),
             last_root_remaining_fuel: AtomicU64::new(0),
             last_child_remaining_fuel: AtomicU64::new(0),
@@ -1105,7 +1104,7 @@ struct ThreadController {
     prelink: OnceLock<Arc<InstancePre<ThreadStoreState>>>,
     kernel_yield_count: AtomicU64,
     runtime_handle_count: AtomicU64,
-    runtime_identity: AtomicUsize,
+    runtime_identity: Mutex<Option<crate::async_engine::RuntimeHandle>>,
     runtime_identity_mismatches: AtomicU64,
     // Bounded private terminal telemetry. No Store or raw trap crosses the
     // facade; #42 only needs to retain the last execution's accounting.
@@ -1388,13 +1387,14 @@ fn define_closed_imports(
                     controller
                         .runtime_handle_count
                         .fetch_add(1, Ordering::Relaxed);
-                    let actual = caller
-                        .data()
-                        .runtime
-                        .as_ref()
-                        .expect("checked runtime")
-                        .identity_for_wasm();
-                    if controller.runtime_identity.load(Ordering::Acquire) != actual {
+                    let actual = caller.data().runtime.as_ref().expect("checked runtime");
+                    let matches = controller
+                        .runtime_identity
+                        .lock()
+                        .ok()
+                        .and_then(|identity| identity.as_ref().cloned())
+                        .is_none_or(|expected| actual.same_runtime_for_wasm(&expected));
+                    if !matches {
                         controller
                             .runtime_identity_mismatches
                             .fetch_add(1, Ordering::Relaxed);

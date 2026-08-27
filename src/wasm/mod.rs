@@ -5,12 +5,14 @@
 //! a fresh private store; no Wasmtime handle appears in the public API.
 
 #[cfg(feature = "wasm-sketch-worker")]
+mod worker;
+#[cfg(feature = "wasm-sketch-worker")]
 #[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
 mod worker_protocol;
 #[cfg(feature = "wasm-sketch-worker")]
-mod worker;
-#[cfg(feature = "wasm-sketch-worker")]
-pub use worker::{SketchWorkerConfig, SketchWorkerFailure, SketchWorkerStopReason, SketchWorkerTerminal};
+pub use worker::{
+    SketchWorkerConfig, SketchWorkerFailure, SketchWorkerStopReason, SketchWorkerTerminal,
+};
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -526,10 +528,13 @@ pub struct AdmittedSketch {
     profile: SketchAdmissionProfile,
     validation: bool,
     #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
     worker_source: Arc<[u8]>,
     #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
     worker_compiler_config: SketchCompilerConfig,
     #[cfg(feature = "wasm-sketch-worker")]
+    #[allow(dead_code)] // Retained for the phase-D worker supervisor.
     worker_policy: SketchModulePolicy,
     prepared_root: std::sync::Mutex<Option<Arc<PreparedThreadedRoot>>>,
     // A unit-only observation belongs to the admitted sketch, not the cached

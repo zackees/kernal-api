@@ -316,7 +316,9 @@ impl WorkerChild {
         self.stdout.take()
     }
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner.as_mut().map_or(Ok(None), |inner| inner.try_wait())
+        self.inner
+            .as_mut()
+            .map_or(Ok(None), |inner| inner.try_wait())
     }
 
     /// Close the control writer before hard containment, then reap within the
@@ -376,7 +378,9 @@ impl WorkerControl {
     }
 
     pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner.as_mut().map_or(Ok(None), |inner| inner.try_wait())
+        self.inner
+            .as_mut()
+            .map_or(Ok(None), |inner| inner.try_wait())
     }
 
     /// Force containment and reap on a caller-selected blocking lane.  A

@@ -859,11 +859,9 @@ fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError>
         Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Terminate, source: io::Error::last_os_error() })
     } else { None };
     let reap = reap_only(process);
-    if reap.is_none() {
-        // A process that already exited between Job close and this retry can
-        // reject TerminateProcess; successful reaping is still success.
-        return None;
-    }
+    // A process that already exited between Job close and this retry can
+    // reject TerminateProcess; successful reaping is still success.
+    reap.as_ref()?;
     terminate.or(reap)
 }
 
@@ -1417,13 +1415,15 @@ mod daemon_flag_tests {
             ])
             .env("KERNAL_API_STRICT_WORKER_MARKER", &marker.path);
         STRICT_WORKER_FORCE_ASSIGN_DENIED.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = spawn_strict_contained_worker(
+        let error = match spawn_strict_contained_worker(
             &mut command,
             crate::platform::process::SpawnStdio::default(),
             crate::platform::process::SyncEnvironment::Inherit,
             StrictWorkerLimits::default(),
-        )
-        .expect_err("injected assignment denial");
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("injected assignment denial unexpectedly spawned a worker"),
+        };
         assert_eq!(error.stage(), StrictWorkerSpawnStage::AssignJob);
         assert!(
             !marker.path.exists(),

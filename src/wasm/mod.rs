@@ -830,6 +830,9 @@ fn preflight_threaded_rust(
     if !["atomics", "bulk-memory", "mutable-globals"]
         .iter()
         .all(|feature| features.contains(*feature))
+        || ["simd128", "relaxed-simd", "memory64"]
+            .iter()
+            .any(|feature| features.contains(*feature))
     {
         return Err(SketchModuleError::TargetFeaturesMismatch);
     }
@@ -840,14 +843,16 @@ fn preflight_threaded_rust(
         ("wasi_thread_start", ExternalKind::Func),
         (ENTRY, ExternalKind::Func),
     ];
-    if exports.len() != allowed.len()
-        || !exports
-            .iter()
-            .all(|(name, kind, _)| allowed.contains(&(name.as_str(), *kind)))
-    {
+    if exports.len() != allowed.len() {
         return Err(SketchModuleError::ExportNotAllowed {
             name: exports.first().map(|e| e.0.clone()).unwrap_or_default(),
         });
+    }
+    if let Some((name, _, _)) = exports
+        .iter()
+        .find(|(name, kind, _)| !allowed.contains(&(name.as_str(), *kind)))
+    {
+        return Err(SketchModuleError::ExportNotAllowed { name: name.clone() });
     }
     let mut by_name = std::collections::BTreeMap::new();
     for (name, _, index) in exports {

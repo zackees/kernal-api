@@ -555,7 +555,7 @@ fn supervise(
     // A malicious worker may write Terminal immediately after HelloAck. Keep
     // exactly one bounded pending frame, but never accept it until the parent
     // observed a successful complete upload.
-    let mut early_terminal = None;
+    let mut execute_acked = false;
     let mut selected = None;
     let mut grace_deadline = None;
     loop {
@@ -598,11 +598,7 @@ fn supervise(
                 }
             }
         }
-        let received = early_terminal
-            .take()
-            .map(Ok)
-            .or_else(|| read_rx.try_recv().ok());
-        if let Some(result) = received {
+        if let Ok(result) = read_rx.try_recv() {
             let message = match result {
                 Ok(message) => message,
                 Err(()) => match control.try_wait() {
@@ -641,20 +637,10 @@ fn supervise(
                     }
                     upload_sent = true;
                 }
-                message @ Message::Terminal { .. } if hello_acked && !upload_complete => {
-                    if early_terminal.is_some() {
-                        return force_join_result(
-                            sketch,
-                            &mut control,
-                            write_tx,
-                            writer,
-                            reader,
-                            SketchWorkerFailure::Protocol,
-                        );
-                    }
-                    early_terminal = Some(message);
+                Message::ExecuteAck { request_id } if hello_acked && upload_sent && upload_complete && !execute_acked && request_id == id => {
+                    execute_acked = true;
                 }
-                Message::Terminal { .. } if hello_acked => {
+                Message::Terminal { .. } if hello_acked && execute_acked => {
                     let mapped = map_terminal(message, id);
                     let mapped = match mapped {
                         Ok(value) => value,

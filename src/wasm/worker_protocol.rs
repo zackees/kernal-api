@@ -25,6 +25,7 @@ pub(super) enum Kind {
     ExecuteEnd = 5,
     Cancel = 6,
     Terminal = 7,
+    ExecuteAck = 8,
 }
 
 impl TryFrom<u8> for Kind {
@@ -38,6 +39,7 @@ impl TryFrom<u8> for Kind {
             5 => Ok(Self::ExecuteEnd),
             6 => Ok(Self::Cancel),
             7 => Ok(Self::Terminal),
+            8 => Ok(Self::ExecuteAck),
             _ => Err(ProtocolError::UnknownKind),
         }
     }
@@ -224,6 +226,7 @@ pub(super) enum Message {
     HelloAck {
         request_id: u64,
     },
+    ExecuteAck { request_id: u64 },
     ExecuteStart {
         request_id: u64,
         module_len: u64,
@@ -254,6 +257,7 @@ impl Message {
         match self {
             Self::Hello { request_id }
             | Self::HelloAck { request_id }
+            | Self::ExecuteAck { request_id }
             | Self::ExecuteEnd { request_id }
             | Self::Cancel { request_id } => *request_id,
             Self::ExecuteStart { request_id, .. }
@@ -265,6 +269,7 @@ impl Message {
         match self {
             Self::Hello { .. } => Kind::Hello,
             Self::HelloAck { .. } => Kind::HelloAck,
+            Self::ExecuteAck { .. } => Kind::ExecuteAck,
             Self::ExecuteStart { .. } => Kind::ExecuteStart,
             Self::ModuleChunk { .. } => Kind::ModuleChunk,
             Self::ExecuteEnd { .. } => Kind::ExecuteEnd,
@@ -283,6 +288,7 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     match message {
         Message::Hello { .. }
         | Message::HelloAck { .. }
+        | Message::ExecuteAck { .. }
         | Message::ExecuteEnd { .. }
         | Message::Cancel { .. } => {}
         Message::ExecuteStart {
@@ -370,6 +376,7 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
     let message = match kind {
         Kind::Hello => Message::Hello { request_id },
         Kind::HelloAck => Message::HelloAck { request_id },
+        Kind::ExecuteAck => Message::ExecuteAck { request_id },
         Kind::ExecuteStart => {
             let module_len = take_u64(&mut input)?;
             let metadata = take_metadata(&mut input)?;

@@ -68,6 +68,7 @@ fn run_with_io<R: io::Read, W: io::Write>(
             break module;
         }
     };
+    write_message(output, &Message::ExecuteAck { request_id }).map_err(protocol_text)?;
     Ok(Some((request_id, metadata, module)))
 }
 

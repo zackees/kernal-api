@@ -107,14 +107,21 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
     let outcome = runtime.run(async {
         sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
     });
-    assert_eq!(
-        outcome.expect("the second spawn must be rejected without a reservation leak"),
-        ThreadedRootOutcome::Started,
-    );
+    match outcome.expect("the second spawn must be rejected without a reservation leak") {
+        ThreadedRootOutcome::StartedWithThreadRejections(summary) => {
+            assert_eq!(summary.capacity(), 1);
+            assert_eq!(summary.closing(), 0);
+        }
+        outcome => panic!("unexpected root outcome: {outcome:?}"),
+    }
     let repeated = runtime.run(async {
         sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
     });
-    assert_eq!(repeated, Ok(ThreadedRootOutcome::Started));
+    assert!(matches!(
+        repeated,
+        Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary))
+            if summary.capacity() == 1 && summary.closing() == 0
+    ));
 }
 
 #[test]

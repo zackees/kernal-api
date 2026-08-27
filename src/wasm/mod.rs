@@ -296,6 +296,7 @@ impl AdmittedSketch {
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
         let children = prepared.controller.join_completed();
+        let rejections = prepared.controller.take_thread_spawn_rejections();
         // Finalization always drains children, but the root call is the
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
@@ -308,7 +309,7 @@ impl AdmittedSketch {
         } else {
             Ok(())
         };
-        resolve_threaded_result(outcome, children, report)
+        resolve_threaded_result(outcome, children, report, rejections)
     }
     fn prepare_threaded_root(&self) -> Result<Arc<PreparedThreadedRoot>, SketchExecutionError> {
         let mut prepared = self
@@ -336,6 +337,8 @@ impl AdmittedSketch {
                 live: 0,
                 closing: false,
                 maximum: self.max_guest_threads,
+                capacity_rejections: 0,
+                closing_rejections: 0,
                 handles: Vec::new(),
                 // At most `maximum` spawns are accepted before the controller
                 // closes, so this facade report remains absolutely bounded.
@@ -438,8 +441,32 @@ impl SketchSharedMemory {
 pub enum ThreadedRootOutcome {
     /// The module start completed without requesting process exit.
     Started,
+    /// The root completed, but bounded guest thread-spawn requests were
+    /// rejected. The guest ABI receives `-1`; this carries the typed host
+    /// accounting without exposing a backend error.
+    StartedWithThreadRejections(ThreadSpawnRejectionSummary),
     /// The module requested the normal `proc_exit(0)` completion path.
     Exited,
+    /// The root requested normal process exit after bounded thread rejections.
+    ExitedWithThreadRejections(ThreadSpawnRejectionSummary),
+}
+
+/// Bounded, facade-owned accounting for guest `wasi::thread-spawn` rejections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThreadSpawnRejectionSummary {
+    capacity: u32,
+    closing: u32,
+}
+impl ThreadSpawnRejectionSummary {
+    pub fn capacity(self) -> u32 {
+        self.capacity
+    }
+    pub fn closing(self) -> u32 {
+        self.closing
+    }
+    pub fn is_empty(self) -> bool {
+        self.capacity == 0 && self.closing == 0
+    }
 }
 
 /// Bounded failures from private threaded-root setup and start execution.
@@ -501,6 +528,8 @@ struct Workers {
     live: usize,
     closing: bool,
     maximum: usize,
+    capacity_rejections: u32,
+    closing_rejections: u32,
     handles: Vec<JoinHandle<()>>,
     // Completion is inherently concurrent; retain the guest TID so reporting
     // is deterministic rather than depending on native scheduler order.
@@ -595,6 +624,19 @@ impl ThreadController {
             Err(SketchExecutionError::ChildOutcomes { outcomes: report })
         }
     }
+
+    fn take_thread_spawn_rejections(&self) -> ThreadSpawnRejectionSummary {
+        let Ok(mut workers) = self.workers.lock() else {
+            return ThreadSpawnRejectionSummary::default();
+        };
+        let summary = ThreadSpawnRejectionSummary {
+            capacity: workers.capacity_rejections,
+            closing: workers.closing_rejections,
+        };
+        workers.capacity_rejections = 0;
+        workers.closing_rejections = 0;
+        summary
+    }
 }
 
 struct PreparedThreadedRoot {
@@ -665,12 +707,18 @@ fn define_closed_imports(
                 let controller = Arc::clone(&caller.data().controller);
                 let runtime = caller.data().runtime.clone();
                 let tid = match controller.workers.lock() {
-                    Ok(mut w)
-                        if !w.closing
-                            && w.live < w.maximum
-                            && w.accepted < w.maximum
-                            && w.next_tid <= 0x1fff_ffff =>
-                    {
+                    Ok(mut w) => {
+                        if w.closing {
+                            w.closing_rejections = w.closing_rejections.saturating_add(1);
+                            return THREAD_SPAWN_REJECTED;
+                        }
+                        if w.live >= w.maximum
+                            || w.accepted >= w.maximum
+                            || w.next_tid > 0x1fff_ffff
+                        {
+                            w.capacity_rejections = w.capacity_rejections.saturating_add(1);
+                            return THREAD_SPAWN_REJECTED;
+                        }
                         let tid = w.next_tid;
                         w.next_tid += 1;
                         w.accepted += 1;
@@ -714,7 +762,9 @@ fn define_closed_imports(
                     };
                     if let Ok(mut w) = child.workers.lock() {
                         w.live = w.live.saturating_sub(1);
-                        w.outcomes.push((tid, outcome));
+                        if w.outcomes.len() < w.maximum {
+                            w.outcomes.push((tid, outcome));
+                        }
                     }
                 });
                 match spawned {
@@ -1484,6 +1534,7 @@ fn resolve_threaded_result(
     root: Result<ThreadedRootOutcome, SketchExecutionError>,
     children: Result<(), SketchExecutionError>,
     report: Result<(), SketchExecutionError>,
+    rejections: ThreadSpawnRejectionSummary,
 ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
     // All callers already drained children before this pure precedence step.
     // Root remains primary; ordered child aggregation is next; report schema
@@ -1491,7 +1542,15 @@ fn resolve_threaded_result(
     let outcome = root?;
     children?;
     report?;
-    Ok(outcome)
+    Ok(match outcome {
+        ThreadedRootOutcome::Started if !rejections.is_empty() => {
+            ThreadedRootOutcome::StartedWithThreadRejections(rejections)
+        }
+        ThreadedRootOutcome::Exited if !rejections.is_empty() => {
+            ThreadedRootOutcome::ExitedWithThreadRejections(rejections)
+        }
+        outcome => outcome,
+    })
 }
 
 #[cfg(test)]
@@ -1520,6 +1579,7 @@ mod result_precedence_tests {
                 Err(SketchExecutionError::NonzeroExit { code: 7 }),
                 Err(child_error()),
                 Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
             ),
             Err(SketchExecutionError::NonzeroExit { code: 7 }),
         );
@@ -1528,6 +1588,7 @@ mod result_precedence_tests {
                 Ok(ThreadedRootOutcome::Started),
                 Err(child_error()),
                 Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
             ),
             Err(child_error()),
         );
@@ -1536,8 +1597,30 @@ mod result_precedence_tests {
                 Ok(ThreadedRootOutcome::Started),
                 Ok(()),
                 Err(SketchExecutionError::ValidationReportInvalid),
+                ThreadSpawnRejectionSummary::default(),
             ),
             Err(SketchExecutionError::ValidationReportInvalid),
+        );
+    }
+
+    #[test]
+    fn thread_rejection_summary_surfaces_only_after_primary_success() {
+        let summary = ThreadSpawnRejectionSummary {
+            capacity: 1,
+            closing: 0,
+        };
+        assert_eq!(
+            resolve_threaded_result(Ok(ThreadedRootOutcome::Started), Ok(()), Ok(()), summary,),
+            Ok(ThreadedRootOutcome::StartedWithThreadRejections(summary)),
+        );
+        assert_eq!(
+            resolve_threaded_result(
+                Err(SketchExecutionError::NonzeroExit { code: 7 }),
+                Ok(()),
+                Ok(()),
+                summary,
+            ),
+            Err(SketchExecutionError::NonzeroExit { code: 7 }),
         );
     }
 }

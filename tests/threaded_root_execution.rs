@@ -18,7 +18,9 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
         .expect("runtime");
 
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("root execution"),
@@ -30,7 +32,9 @@ fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handl
         "root execution must not compile again"
     );
     let repeated = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         repeated.expect("repeated root execution"),
@@ -54,7 +58,8 @@ fn synthetic_profile_cannot_prepare_or_allocate_a_threaded_root() {
         .expect("runtime");
     let error = runtime.run(async {
         sketch
-            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
             .expect_err("synthetic execution must fail before preparation")
     });
     assert_eq!(error, SketchExecutionError::ThreadedProfileRequired);
@@ -72,7 +77,9 @@ fn proc_exit_zero_is_a_controlled_root_completion() {
         .expect("runtime");
 
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("normal proc_exit"),
@@ -92,7 +99,8 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
     let sketch = compiler.admit(&bytes, policy).expect("admission");
     let error = runtime.run(async {
         sketch
-            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
             .expect_err("nonzero proc exit")
     });
     assert_eq!(error, SketchExecutionError::NonzeroExit { code: 7 });
@@ -105,7 +113,9 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         .expect("one child cap");
     let sketch = compiler.admit(&bytes, policy).expect("admission");
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     match outcome.expect("the second spawn must be rejected without a reservation leak") {
         ThreadedRootOutcome::StartedWithThreadRejections(summary) => {
@@ -115,7 +125,9 @@ fn proc_exit_nonzero_and_thread_spawn_rejection_are_semantic() {
         outcome => panic!("unexpected root outcome: {outcome:?}"),
     }
     let repeated = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert!(matches!(
         repeated,
@@ -135,7 +147,9 @@ fn fd_write_rejects_an_out_of_bounds_iovec_before_writing() {
         .build()
         .expect("runtime");
     let outcome = runtime.run(async {
-        sketch.execute_threaded_root(RuntimeHandle::current().expect("runtime handle")).await
+        sketch
+            .execute_threaded_root(RuntimeHandle::current().expect("runtime handle"))
+            .await
     });
     assert_eq!(
         outcome.expect("invalid iovec is contained"),

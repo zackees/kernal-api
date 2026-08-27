@@ -160,9 +160,7 @@ impl RuntimeHandle {
     /// Obtain the current runtime handle.
     pub fn current() -> Result<Self, NoRuntime> {
         tokio::runtime::Handle::try_current()
-            .map(|inner| Self {
-                inner,
-            })
+            .map(|inner| Self { inner })
             .map_err(|_| NoRuntime)
     }
 

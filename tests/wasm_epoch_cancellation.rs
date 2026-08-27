@@ -20,11 +20,17 @@ fn epoch_limits_are_bounded_and_cancellation_is_facade_owned() {
         .expect("epoch limits are part of compiler execution policy");
     assert_eq!(config.execution_limits().epoch_limits(), limits);
 
-    let runtime = RuntimeBuilder::current_thread().enable_all().build().expect("runtime");
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
     runtime.run(async {
         let first = kernal_api::async_engine::RuntimeHandle::current().expect("current runtime");
         let second = kernal_api::async_engine::RuntimeHandle::current().expect("same runtime");
-        assert_eq!(first, second, "current handles retain live-runtime identity");
+        assert_eq!(
+            first, second,
+            "current handles retain live-runtime identity"
+        );
         let task = first.launch_blocking(|| 7_u8);
         assert_eq!(task.await.expect("blocking task"), 7);
     });

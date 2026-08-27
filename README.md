@@ -52,6 +52,8 @@ types. Optional features keep consumers from linking tooling they do not use:
   backend name is diagnostic metadata, not the application API)
 - `symbolize` for the worker wire/client API; `symbolize-worker` builds the
   isolated `kernal-symbolize` parser executable
+- `wasm-sketch-host` for opt-in core-Wasm sketch admission; the real threaded
+  Rust artifact fixture remains source-only under `guests/threaded-smoke`
 - `full` for diagnostic executables that need the entire surface
 
 The library never installs a global allocator or subscriber by surprise.

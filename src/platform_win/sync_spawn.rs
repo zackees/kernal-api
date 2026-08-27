@@ -584,16 +584,22 @@ impl StrictWorkerChild {
     pub(crate) fn pid(&self) -> u32 { self.pid }
     pub(crate) fn try_wait(&self) -> io::Result<Option<i32>> { self.inner.process.as_ref().map_or(Ok(None), try_wait_inner) }
     pub(crate) fn wait(&self) -> io::Result<i32> { self.inner.process.as_ref().ok_or_else(|| io::Error::other("worker handle absent")).and_then(wait_inner) }
-    pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> { self.inner.process.as_ref().and_then(terminate_and_reap) }
-    fn shutdown(&mut self) {
-        if let Some(process) = self.inner.process.as_ref() { let _ = terminate_and_reap(process); }
-        // Job is closed after the direct worker has reaped; KILL_ON_JOB_CLOSE
-        // covers its ordinary CreateProcess descendants.
+    /// Idempotent strict shutdown. Closing the Job is the tree termination
+    /// action; `OwnedHandle::Drop` cannot report CloseHandle failure.
+    pub(crate) fn terminate_and_reap(&mut self) -> Option<StrictWorkerCleanupError> {
+        self.shutdown()
+    }
+    fn shutdown(&mut self) -> Option<StrictWorkerCleanupError> {
+        // KILL_ON_JOB_CLOSE must happen before waiting: it terminates the
+        // worker and ordinary CreateProcess descendants as one containment
+        // action. Repeated calls observe taken handles and are harmless.
         drop(self.inner.job.take());
+        let cleanup = self.inner.process.as_ref().and_then(reap_only);
         drop(self.inner.process.take());
+        cleanup
     }
 }
-impl Drop for StrictWorkerChild { fn drop(&mut self) { self.shutdown(); } }
+impl Drop for StrictWorkerChild { fn drop(&mut self) { let _ = self.shutdown(); } }
 
 /// Spawn a worker suspended, attach it to a strict kill-on-close Job Object
 /// without BREAKAWAY_OK, then resume. `ERROR_ACCESS_DENIED` while assigning
@@ -622,7 +628,10 @@ pub(crate) fn spawn_strict_contained_worker(
     let resumed = unsafe { ResumeThread(thread.as_raw()) };
     if !strict_resume_count_is_valid(resumed) {
         let source = if resumed == u32::MAX { io::Error::last_os_error() } else { io::Error::other("strict worker suspend count was not one") };
-        let cleanup = terminate_and_reap(&process);
+        // Assignment succeeded, so Job close kills the complete contained
+        // tree before direct-worker reaping.
+        drop(job);
+        let cleanup = reap_only(&process);
         return Err(StrictWorkerSpawnError { stage: StrictWorkerSpawnStage::Resume, source, cleanup });
     }
     drop(thread);
@@ -647,6 +656,13 @@ fn terminate_and_reap(process: &OwnedHandle) -> Option<StrictWorkerCleanupError>
     if let Some(error) = terminate { return Some(error); }
     if let Some(error) = reap {
         return Some(error);
+    }
+    None
+}
+
+fn reap_only(process: &OwnedHandle) -> Option<StrictWorkerCleanupError> {
+    if unsafe { WaitForSingleObject(process.as_raw(), INFINITE) } != WAIT_OBJECT_0 {
+        return Some(StrictWorkerCleanupError { stage: StrictWorkerSpawnStage::Reap, source: io::Error::last_os_error() });
     }
     None
 }

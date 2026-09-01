@@ -21,6 +21,8 @@ package and repository identity on crates.io, PyPI, and GitHub.
 - Linux, macOS, and Windows
 - x86-64 and ARM64
 - `kernal_api::async_engine`, backed by exactly Tokio 1.53.1 in this release
+- `kernal_api::hash`, with kernel-owned BLAKE3 byte, reader, and file digest
+  operations
 
 The async facade also owns cooperative cancellation plus separate connection
 and transfer-progress timeout policies. A connection is bounded by a fixed

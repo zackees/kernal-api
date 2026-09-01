@@ -23,6 +23,7 @@ fn implementation_crates_are_not_publicly_reexported() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let forbidden = [
         "pub use addr2line",
+        "pub use blake3",
         "pub use console_api",
         "pub use console_subscriber",
         "pub use crash_handler",

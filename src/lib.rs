@@ -15,6 +15,9 @@ use std::process::ExitStatus;
 
 mod process_adapter;
 
+/// Kernel-owned BLAKE3 content hashing for bytes, readers, and files.
+pub mod hash;
+
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 

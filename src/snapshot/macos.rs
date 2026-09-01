@@ -396,40 +396,37 @@ mod tests {
     }
 
     fn snapshot_sees_every_spawned_thread_and_resumes_them_in_helper() {
-        eprintln!("Mach snapshot helper: start");
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
         let (tid_sender, tid_receiver) = mpsc::channel();
         let mut workers = Vec::new();
-        for worker_number in 0..3 {
-            eprintln!("Mach snapshot helper: spawn worker {worker_number}");
+        for _ in 0..3 {
             let stop = Arc::clone(&stop);
             let progress = Arc::clone(&progress);
             let tid_sender = tid_sender.clone();
             workers.push(std::thread::spawn(move || {
-                eprintln!("Mach snapshot helper: worker {worker_number} boot");
                 let self_thread = unsafe { mach_thread_self() };
-                eprintln!("Mach snapshot helper: worker {worker_number} got Mach port");
                 let os_tid = os_thread_id(self_thread).expect("worker must have an OS thread id");
-                eprintln!("Mach snapshot helper: worker {worker_number} got tid {os_tid}");
                 unsafe {
                     mach_port_deallocate(mach_task_self(), self_thread);
                 }
                 tid_sender.send(os_tid).unwrap();
-                eprintln!("Mach snapshot helper: worker {worker_number} sent tid");
                 while !stop.load(Ordering::SeqCst) {
                     progress.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }));
-            eprintln!("Mach snapshot helper: spawned worker {worker_number}");
         }
         drop(tid_sender);
-        let expected_tids: Vec<_> = tid_receiver.iter().collect();
-        eprintln!("Mach snapshot helper: workers ready: {expected_tids:?}");
+        let expected_tids: Vec<_> = (0..workers.len())
+            .map(|_| {
+                tid_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("worker must publish its OS thread id")
+            })
+            .collect();
 
         let snapshot = capture_controlled_threads(&expected_tids);
-        eprintln!("Mach snapshot helper: controlled capture returned");
         let before = progress.load(Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(2);
         while progress.load(Ordering::SeqCst) == before && Instant::now() < deadline {
@@ -437,11 +434,9 @@ mod tests {
         }
 
         stop.store(true, Ordering::SeqCst);
-        eprintln!("Mach snapshot helper: stopping workers");
         for worker in workers {
             worker.join().unwrap();
         }
-        eprintln!("Mach snapshot helper: workers joined");
         let snapshot = snapshot.expect("capture");
         for expected_tid in expected_tids {
             assert!(
@@ -454,7 +449,6 @@ mod tests {
             );
         }
         assert!(progress.load(Ordering::SeqCst) > before);
-        eprintln!("Mach snapshot helper: complete");
     }
 
     /// Exercise real Mach suspend/register-capture/resume only on the workers
@@ -476,7 +470,6 @@ mod tests {
             if !expected_tids.contains(&os_tid) {
                 continue;
             }
-            eprintln!("Mach snapshot helper: suspend {os_tid}");
             let started = Instant::now();
             let Some(mut suspension) = Suspension::new(thread) else {
                 dropped = dropped.saturating_add(1);
@@ -484,7 +477,6 @@ mod tests {
             };
             let regs = thread_registers(thread);
             suspension.resume()?;
-            eprintln!("Mach snapshot helper: resumed {os_tid}");
             let pause = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             match regs {
                 Some(regs) => {

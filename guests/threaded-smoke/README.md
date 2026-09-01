@@ -5,10 +5,13 @@ This is a standalone, source-only Rust 1.95 fixture for
 checked-in lockfile, but no Wasm binary or build output.
 
 It imports `kernal-api:v1::kernel-yield`, creates and joins two ordinary Rust
-child threads, and exercises `Arc<AtomicU32>`, `Mutex`, `mpsc`, and a
-deterministic `DashMap` result. Its public manifest is deliberately exact: no
-validation metadata or report export expands the `threaded-rust-v1` admission
-surface. The root instance enters `_start` once; each child instance enters
+child threads, and exercises `Arc<AtomicU32>`, `Mutex`, `mpsc`, TLS, and a
+deterministic `DashMap` result. It publishes that bounded result through a
+versioned atomics-only record in the imported shared memory; the host locates
+the initialized record privately, so no guest export is added. Its public
+manifest is deliberately exact: no validation metadata or report export
+expands the `threaded-rust-v1` admission surface. The root instance enters
+`_start` once; each child instance enters
 `wasi_thread_start(tid, arg)` once. It deliberately performs no output,
 environment, filesystem, network, clock, or randomness operations.
 

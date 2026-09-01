@@ -21,14 +21,7 @@ jobs:
         with:
           lfs: true
       - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
-      - if: runner.os != 'Windows'
-        run: soldr cargo test --locked --all-features
-      - if: runner.os == 'Windows'
-        # Temporary quarantine for source-line assertions: zackees/soldr#2148.
-        run: >-
-          soldr cargo test --locked --all-features --
-          --skip a_real_pdb_yields_file_and_line_for_this_crates_code
-          --skip real_addresses_resolve_to_files_and_lines_when_asked
+      - run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings

@@ -9,7 +9,7 @@ use crate::platform::process::{DescendantEvent, DescendantMonitorStop, ProcessSn
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(50);
 const STOP_EVENT_IDENT: libc::uintptr_t = libc::uintptr_t::MAX;
 
-type Identity = (u64, u64);
+type Identity = crate::platform::process::ProcessIdentity;
 
 struct Kqueue(libc::c_int);
 
@@ -39,22 +39,22 @@ pub fn start_descendant_monitor(
 
 fn process_identity(pid: u32) -> Option<Identity> {
     super::process_snapshot_for_pid(pid)
-        .map(|snapshot| (snapshot.start_time_a, snapshot.start_time_b))
+        .map(|snapshot| snapshot.identity)
 }
 
-fn descendants(root_pid: u32) -> HashMap<u32, u32> {
+fn descendants(root_pid: u32) -> HashMap<Identity, u32> {
     descendants_of(root_pid, &super::process_snapshot())
 }
 
 /// Map of live descendant pid -> immediate parent pid, from the same
 /// process snapshot that already carries each entry's `parent_pid`.
-fn descendants_of(root_pid: u32, snapshots: &[ProcessSnapshot]) -> HashMap<u32, u32> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+fn descendants_of(root_pid: u32, snapshots: &[ProcessSnapshot]) -> HashMap<Identity, u32> {
+    let mut children: HashMap<u32, Vec<Identity>> = HashMap::new();
     for snapshot in snapshots {
         children
             .entry(snapshot.parent_pid)
             .or_default()
-            .push(snapshot.pid);
+            .push(snapshot.identity);
     }
     let mut result = HashMap::new();
     let mut stack = vec![root_pid];
@@ -62,7 +62,7 @@ fn descendants_of(root_pid: u32, snapshots: &[ProcessSnapshot]) -> HashMap<u32, 
         if let Some(child_pids) = children.get(&pid) {
             for &child in child_pids {
                 if result.insert(child, pid).is_none() {
-                    stack.push(child);
+                    stack.push(child.pid());
                 }
             }
         }
@@ -70,7 +70,7 @@ fn descendants_of(root_pid: u32, snapshots: &[ProcessSnapshot]) -> HashMap<u32, 
     result
 }
 
-fn snapshot(root_pid: u32, expected: Identity) -> Option<HashMap<u32, u32>> {
+fn snapshot(root_pid: u32, expected: Identity) -> Option<HashMap<Identity, u32>> {
     let before = process_identity(root_pid);
     let descendants = descendants(root_pid);
     verified_snapshot(expected, before, descendants, process_identity(root_pid))
@@ -79,9 +79,9 @@ fn snapshot(root_pid: u32, expected: Identity) -> Option<HashMap<u32, u32>> {
 fn verified_snapshot(
     expected: Identity,
     before: Option<Identity>,
-    descendants: HashMap<u32, u32>,
+    descendants: HashMap<Identity, u32>,
     after: Option<Identity>,
-) -> Option<HashMap<u32, u32>> {
+) -> Option<HashMap<Identity, u32>> {
     (before == Some(expected) && after == Some(expected)).then_some(descendants)
 }
 
@@ -105,15 +105,15 @@ fn pump_loop(
                 trigger_stop_event(notifier_queue.0);
             });
     }
-    let mut known = HashMap::new();
+    let mut known: HashMap<Identity, u32> = HashMap::new();
     loop {
         if stop.is_stopped() {
             emit(DescendantEvent::Completed);
             return;
         }
         let Some(current) = snapshot(root_pid, root_identity) else {
-            for pid in known.into_keys() {
-                emit(DescendantEvent::Exited(pid));
+            for identity in known.into_keys() {
+                emit(DescendantEvent::Exited(identity.pid()));
             }
             // Wake and retire the queue notifier before the last Arc<Kqueue>
             // can be dropped. The notifier itself also owns an Arc, so the
@@ -122,23 +122,23 @@ fn pump_loop(
             emit(DescendantEvent::Completed);
             return;
         };
-        for (&pid, &parent_pid) in &current {
-            if !known.contains_key(&pid) {
+        for (&identity, &parent_pid) in &current {
+            if !known.contains_key(&identity) {
                 emit(DescendantEvent::Started {
-                    pid,
+                    pid: identity.pid(),
                     parent_pid: Some(parent_pid),
                 });
             }
         }
-        for &pid in known.keys() {
-            if !current.contains_key(&pid) {
-                emit(DescendantEvent::Exited(pid));
+        for &identity in known.keys() {
+            if !current.contains_key(&identity) {
+                emit(DescendantEvent::Exited(identity.pid()));
             }
         }
         if let Some(queue) = queue.as_ref() {
             register_process_hint(queue.0, root_pid);
-            for &pid in current.keys() {
-                register_process_hint(queue.0, pid);
+            for identity in current.keys() {
+                register_process_hint(queue.0, identity.pid());
             }
         }
         known = current;
@@ -254,10 +254,8 @@ mod tests {
 
     fn process(pid: u32, parent_pid: u32, start_time_b: u64) -> ProcessSnapshot {
         ProcessSnapshot {
-            pid,
+            identity: crate::platform::process::ProcessIdentity::from_native(pid, [100, start_time_b]),
             parent_pid,
-            start_time_a: 100,
-            start_time_b,
         }
     }
 
@@ -265,12 +263,12 @@ mod tests {
         root_pid: u32,
         expected: Identity,
         snapshots: &[ProcessSnapshot],
-    ) -> Option<HashMap<u32, u32>> {
+    ) -> Option<HashMap<Identity, u32>> {
         snapshots
             .iter()
-            .find(|snapshot| snapshot.pid == root_pid)
+            .find(|snapshot| snapshot.identity.pid() == root_pid)
             .and_then(|snapshot| {
-                ((snapshot.start_time_a, snapshot.start_time_b) == expected)
+                (snapshot.identity == expected)
                     .then(|| descendants_of(root_pid, snapshots))
             })
     }
@@ -286,7 +284,13 @@ mod tests {
         ];
         assert_eq!(
             descendants_of(100, &snapshots),
-            [(200, 100), (201, 200), (300, 100)].into_iter().collect()
+            [
+                (process(200, 100, 2).identity, 100),
+                (process(201, 200, 3).identity, 200),
+                (process(300, 100, 4).identity, 100),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
@@ -302,25 +306,27 @@ mod tests {
         assert!(snapshots.len() > 5);
         assert!(snapshots
             .iter()
-            .any(|snapshot| snapshot.pid == std::process::id()));
+            .any(|snapshot| snapshot.identity.pid() == std::process::id()));
     }
 
     #[test]
     fn reused_root_pid_identity_mismatch_terminates_snapshot() {
-        let expected = (100, 1);
+        let expected = crate::platform::process::ProcessIdentity::from_native(100, [100, 1]);
         let recycled = [process(100, 0, 99), process(200, 100, 2)];
         assert_eq!(descendants_if_root_matches(100, expected, &recycled), None);
     }
 
     #[test]
     fn root_identity_change_after_walk_rejects_mixed_snapshot() {
-        let expected = (100, 1);
-        let recycled = (100, 99);
+        let expected = crate::platform::process::ProcessIdentity::from_native(100, [100, 1]);
+        let recycled = crate::platform::process::ProcessIdentity::from_native(100, [100, 99]);
         assert_eq!(
             verified_snapshot(
                 expected,
                 Some(expected),
-                [(42, 7)].into_iter().collect(),
+                [(crate::platform::process::ProcessIdentity::from_native(42, [100, 7]), 7)]
+                    .into_iter()
+                    .collect(),
                 Some(recycled),
             ),
             None

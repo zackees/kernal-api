@@ -12,8 +12,10 @@ fn capability_environment_signals_and_observer_matrix_are_complete() {
     let pairs = vec![("A".into(), "1".into()), ("A".into(), "2".into())];
     assert_eq!(canonical_environment_pairs(pairs.clone()), pairs);
     assert!(monitor_console_windows(Duration::ZERO).is_empty());
-    assert!(process_snapshot().is_empty());
-    assert!(process_snapshot_for_pid(std::process::id()).is_none());
+    assert!(process_snapshot()
+        .iter()
+        .any(|snapshot| snapshot.identity.pid() == std::process::id()));
+    assert!(process_snapshot_for_pid(std::process::id()).is_some());
     assert!(!parent_has_console());
 
     let capability = exact_trace_capability();

@@ -21,10 +21,7 @@ pub use autostart::{
 
 #[path = "platform_macos/process_inspect.rs"]
 pub(crate) mod process_inspect;
-pub use process_inspect::{
-    process_executable_path, process_force_kill, process_same_executable_path,
-    process_signal_terminate, ProcessLiveness,
-};
+pub use process_inspect::{process_same_executable_path, ProcessLiveness};
 
 #[path = "platform_macos/raw_write.rs"]
 pub(crate) mod raw_write;
@@ -412,8 +409,11 @@ pub use cmdline::read_process_cmdline;
 #[path = "platform/process_tree.rs"]
 mod process_tree;
 
-pub fn kill_tree(pid: u32, timeout: std::time::Duration) -> io::Result<u32> {
-    process_tree::kill_tree(pid, timeout, |_pid, process| Ok(process.start_time()))
+pub(crate) fn kill_tree_identity(
+    identity: crate::platform::process::ProcessIdentity,
+    timeout: std::time::Duration,
+) -> Result<u32, crate::platform::process::ProcessIdentityActionError> {
+    process_tree::kill_tree(identity, timeout, capture_process_identity, force_kill_identity)
 }
 
 pub fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -476,7 +476,7 @@ pub fn soft_terminate_process_group(pid: u32) -> io::Result<()> {
 const PROC_ALL_PIDS: u32 = 1;
 const PROC_PIDTBSDINFO: libc::c_int = 3;
 
-pub fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
+pub(crate) fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
     let size = unsafe { libc::proc_listpids(PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
     if size <= 0 {
         return Vec::new();
@@ -504,7 +504,7 @@ pub fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
         .collect()
 }
 
-pub fn process_snapshot_for_pid(pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
+pub(crate) fn process_snapshot_for_pid(pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let written = unsafe {
         libc::proc_pidinfo(
@@ -517,12 +517,61 @@ pub fn process_snapshot_for_pid(pid: u32) -> Option<crate::platform::process::Pr
     };
     (written as usize == std::mem::size_of::<libc::proc_bsdinfo>()).then_some(
         crate::platform::process::ProcessSnapshot {
-            pid: info.pbi_pid,
+            identity: crate::platform::process::ProcessIdentity::from_native(
+                info.pbi_pid,
+                [info.pbi_start_tvsec, info.pbi_start_tvusec],
+            ),
             parent_pid: info.pbi_ppid,
-            start_time_a: info.pbi_start_tvsec,
-            start_time_b: info.pbi_start_tvusec,
         },
     )
+}
+
+pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::ProcessIdentityCapture {
+    use crate::platform::process::{ProcessIdentityCapture as Capture, ProcessIdentityUnavailable};
+    if pid == 0 {
+        return Capture::Error(io::Error::new(io::ErrorKind::InvalidInput, "PID zero has no process identity"));
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut libc::c_void,
+            std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int,
+        )
+    };
+    if written as usize == std::mem::size_of::<libc::proc_bsdinfo>() {
+        return Capture::Found(crate::platform::process::ProcessIdentity::from_native(
+            info.pbi_pid,
+            [info.pbi_start_tvsec, info.pbi_start_tvusec],
+        ));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ESRCH) => Capture::Exited,
+        Some(libc::EPERM) | Some(libc::EACCES) => Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied),
+        _ => Capture::Error(error),
+    }
+}
+
+pub(crate) fn force_kill_identity(
+    _identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    // `proc_pidinfo` can identify a process but does not yield a signalable
+    // lifetime handle. A query followed by kill(pid) can race PID reuse, so
+    // refuse until this host has an exact native termination capability.
+    Err(crate::platform::process::ProcessIdentityActionError::Unavailable(
+        crate::platform::process::ProcessIdentityUnavailable::Unsupported,
+    ))
+}
+
+pub(crate) fn signal_terminate_identity(
+    _identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    Err(crate::platform::process::ProcessIdentityActionError::Unavailable(
+        crate::platform::process::ProcessIdentityUnavailable::Unsupported,
+    ))
 }
 
 /// Mark inherited descriptors close-on-exec without breaking std's exec-error pipe.

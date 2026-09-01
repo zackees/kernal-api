@@ -21,10 +21,7 @@ pub use autostart::{
 
 #[path = "platform_linux/process_inspect.rs"]
 pub(crate) mod process_inspect;
-pub use process_inspect::{
-    process_executable_path, process_force_kill, process_same_executable_path,
-    process_signal_terminate, ProcessLiveness,
-};
+pub use process_inspect::{process_same_executable_path, ProcessLiveness};
 
 #[path = "platform_linux/raw_write.rs"]
 pub(crate) mod raw_write;
@@ -387,8 +384,11 @@ pub use cmdline::read_process_cmdline;
 #[path = "platform/process_tree.rs"]
 mod process_tree;
 
-pub fn kill_tree(pid: u32, timeout: std::time::Duration) -> io::Result<u32> {
-    process_tree::kill_tree(pid, timeout, |_pid, process| Ok(process.start_time()))
+pub(crate) fn kill_tree_identity(
+    identity: crate::platform::process::ProcessIdentity,
+    timeout: std::time::Duration,
+) -> Result<u32, crate::platform::process::ProcessIdentityActionError> {
+    process_tree::kill_tree(identity, timeout, capture_process_identity, force_kill_identity)
 }
 
 pub fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -559,12 +559,121 @@ pub fn soft_terminate_process_group(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-pub fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
-    Vec::new()
+#[cfg(test)]
+pub(crate) fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter_map(process_snapshot_for_pid)
+        .collect()
 }
 
-pub fn process_snapshot_for_pid(_pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
-    None
+#[cfg(test)]
+pub(crate) fn process_snapshot_for_pid(pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (parent_pid, start_ticks) = parse_proc_stat(&stat)?;
+    Some(crate::platform::process::ProcessSnapshot {
+        identity: crate::platform::process::ProcessIdentity::from_native(pid, [start_ticks, 0]),
+        parent_pid,
+    })
+}
+
+/// Capture the Linux boot-relative `/proc/<pid>/stat` start-tick key. It is
+/// deliberately never converted into a wall-clock time or fabricated on a
+/// partial read.
+pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::ProcessIdentityCapture {
+    use crate::platform::process::{ProcessIdentityCapture as Capture, ProcessIdentityUnavailable};
+
+    if pid == 0 {
+        return Capture::Error(io::Error::new(io::ErrorKind::InvalidInput, "PID zero has no process identity"));
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match parse_proc_stat(&stat) {
+            Some((_parent, start_ticks)) => Capture::Found(
+                crate::platform::process::ProcessIdentity::from_native(pid, [start_ticks, 0]),
+            ),
+            None => Capture::Error(io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat")),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Capture::Exited,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied)
+        }
+        Err(error) => Capture::Error(error),
+    }
+}
+
+pub(crate) fn force_kill_identity(
+    identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    signal_identity(identity, libc::SIGKILL)
+}
+
+pub(crate) fn signal_terminate_identity(
+    identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    signal_identity(identity, libc::SIGTERM)
+}
+
+fn signal_identity(
+    identity: crate::platform::process::ProcessIdentity,
+    signal: libc::c_int,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    use crate::platform::process::{
+        ProcessIdentityAction as Action, ProcessIdentityActionError as Error,
+        ProcessIdentityCapture as Capture, ProcessIdentityUnavailable,
+    };
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // pidfd pins one process instance. A second generation check after the
+    // fd opens, followed by pidfd_send_signal, cannot hit a recycled PID.
+    let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.pid() as libc::pid_t, 0_u32) };
+    if raw_fd < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(Action::AlreadyExited),
+            Some(libc::EPERM) | Some(libc::EACCES) => Err(Error::Unavailable(ProcessIdentityUnavailable::PermissionDenied)),
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => Err(Error::Unavailable(ProcessIdentityUnavailable::Unsupported)),
+            _ => Err(Error::Host(error)),
+        };
+    }
+    let pid_fd = unsafe { OwnedFd::from_raw_fd(raw_fd as i32) };
+    match capture_process_identity(identity.pid()) {
+        Capture::Found(current) if current == identity => {}
+        Capture::Found(_) => return Err(Error::StaleIdentity),
+        Capture::Exited => return Ok(Action::AlreadyExited),
+        Capture::Unavailable(reason) => return Err(Error::Unavailable(reason)),
+        Capture::Error(error) => return Err(Error::Host(error)),
+    }
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pid_fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0_u32,
+        )
+    };
+    if result == 0 {
+        Ok(Action::Performed)
+    } else if io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+        Ok(Action::AlreadyExited)
+    } else {
+        Err(Error::Host(io::Error::last_os_error()))
+    }
+}
+
+fn parse_proc_stat(stat: &str) -> Option<(u32, u64)> {
+    // `comm` is parenthesized and may contain spaces or ')' characters; only
+    // the final ')' starts the fixed-position fields after it.
+    let suffix = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = suffix.split_ascii_whitespace();
+    let _state = fields.next()?; // field 3
+    let parent_pid = fields.next()?.parse().ok()?; // field 4
+    let start_ticks = fields.nth(17)?.parse().ok()?; // field 22
+    Some((parent_pid, start_ticks))
 }
 
 /// Mark inherited descriptors close-on-exec without breaking std's exec-error pipe.

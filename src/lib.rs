@@ -581,7 +581,10 @@ impl std::fmt::Display for BoundedProcessError {
         match self {
             Self::TimedOut => formatter.write_str("bounded process timed out"),
             Self::OutputLimitExceeded { limit } => {
-                write!(formatter, "captured process output exceeded the {limit}-byte limit")
+                write!(
+                    formatter,
+                    "captured process output exceeded the {limit}-byte limit"
+                )
             }
             Self::Spawn(error) | Self::Io(error) => error.fmt(formatter),
         }
@@ -800,12 +803,8 @@ mod tests {
     #[test]
     fn bounded_command_timeout_hard_kills_and_reaps_promptly() {
         let started = Instant::now();
-        let error = run_bounded_command(
-            slow_command(),
-            Some(Duration::from_millis(100)),
-            1024,
-        )
-        .expect_err("slow command must time out after hard cleanup");
+        let error = run_bounded_command(slow_command(), Some(Duration::from_millis(100)), 1024)
+            .expect_err("slow command must time out after hard cleanup");
 
         assert!(matches!(error, BoundedProcessError::TimedOut));
         assert!(
@@ -923,13 +922,10 @@ mod tests {
                 *ticker_at_for_task.lock().expect("ticker lock") = Some(started.elapsed());
             });
 
-            let error = run_bounded_command_async(
-                slow_command(),
-                Some(Duration::from_millis(100)),
-                1024,
-            )
-            .await
-            .expect_err("slow command must time out through the blocking lane");
+            let error =
+                run_bounded_command_async(slow_command(), Some(Duration::from_millis(100)), 1024)
+                    .await
+                    .expect_err("slow command must time out through the blocking lane");
 
             assert!(matches!(
                 error,

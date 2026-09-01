@@ -8,9 +8,8 @@ pub use crate::{
     parent_has_console, prepare_capture_reader, process_snapshot, process_snapshot_for_pid,
     set_process_name, shell_command, soft_terminate_process_group, spawn_sync, spawn_sync_daemon,
     start_descendant_monitor, start_exact_trace, sync_child_native_handle, trampoline_exit_code,
-    unix_mark_extra_fds_close_on_exec, CaptureCancellation, PlatformChild, PlatformEmergencySignal,
-    PlatformLifecycle, PlatformOutput, PlatformStdin, SpawnSpec, StreamMode, TracedChild,
-    WindowsJobHandle,
+    unix_mark_extra_fds_close_on_exec, CaptureCancellation, PlatformChild, ProcessCaptureError,
+    ProcessOutput, SpawnSpec, StreamMode, TracedChild, WindowsJobHandle,
 };
 
 /// Host-neutral command options selected by the caller before spawning.

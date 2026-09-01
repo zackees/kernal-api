@@ -4,7 +4,6 @@ use crate::platform::process::{
     ProcessCommandConfig, UnixSignalKind,
 };
 use std::io::Write as _;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -78,8 +77,6 @@ fn capability_environment_signals_and_observer_matrix_are_complete() {
 
     let absent = i32::MAX as u32;
     assert!(soft_terminate_process_group(absent).is_ok());
-    assert!(signal_process(absent).is_ok());
-    assert!(signal_process_group(absent).is_ok());
     assert!(unix_signal_process(absent, UnixSignalKind::Kill).is_err());
     assert!(unix_signal_process_group(i32::MAX, UnixSignalKind::Terminate).is_err());
     assert!(unix_set_priority(absent, 0).is_err());
@@ -207,45 +204,4 @@ fn reviewed_command_configuration_executes_on_short_lived_children() {
     configure_sync_contained_command(&mut contained).unwrap();
     assert!(contained.status().unwrap().success());
 
-    let mut tokio_command = Command::new("/bin/true");
-    configure_compat_tokio_command(&mut tokio_command, false, false).unwrap();
-    configure_command(&mut tokio_command, true, true).unwrap();
-}
-
-#[test]
-fn tokio_configuration_and_live_signal_helpers_reach_the_os() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let mut command = Command::new("/bin/sleep");
-        command
-            .arg("30")
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-        configure_compat_tokio_command(&mut command, false, true).unwrap();
-        let mut child = command.spawn().unwrap();
-        after_compat_tokio_spawn(&child, true)
-            .expect("containment must be reported, not assumed");
-        unix_signal_process(child.id().unwrap(), UnixSignalKind::Terminate).unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .expect("signalled child did not exit within cleanup deadline")
-            .unwrap();
-        assert!(!status.success());
-
-        let mut grouped = Command::new("/bin/sleep");
-        grouped.arg("30").kill_on_drop(true);
-        configure_command(&mut grouped, true, false).unwrap();
-        let mut child = grouped.spawn().unwrap();
-        after_spawn(&child, false).expect("a no-op must still succeed");
-        let pid = child.id().unwrap();
-        unix_signal_process_group(pid as i32, UnixSignalKind::Terminate).unwrap();
-        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
-            .await
-            .expect("signalled process group did not exit within cleanup deadline")
-            .unwrap();
-        assert!(!status.success());
-    });
 }

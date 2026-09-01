@@ -262,8 +262,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 
-use tokio::process::{Child, Command};
-
 use crate::SpawnSpec;
 
 #[path = "platform_macos_descendants.rs"]
@@ -616,77 +614,6 @@ pub fn unix_signal_process_group(pid: i32, signal: crate::platform::process::Uni
 }
 pub fn unix_signal_raw(signal: crate::platform::process::UnixSignalKind) -> i32 {
     match signal { crate::platform::process::UnixSignalKind::Interrupt => libc::SIGINT, crate::platform::process::UnixSignalKind::Terminate => libc::SIGTERM, crate::platform::process::UnixSignalKind::Kill => libc::SIGKILL }
-}
-
-#[cfg(test)]
-pub fn configure_compat_tokio_command(
-    command: &mut Command,
-    _show_console: bool,
-    kill_when_owner_dies: bool,
-) -> io::Result<()> {
-    configure_command(command, false, kill_when_owner_dies)
-}
-
-/// Nothing to do on this host: the kqueue supervisor is installed in `pre_exec`, before the child
-/// ever runs, so nothing remains to do once it has.
-#[cfg(test)]
-pub fn after_compat_tokio_spawn(
-    _child: &Child,
-    _kill_when_owner_dies: bool,
-) -> io::Result<()> {
-    Ok(())
-}
-
-pub(crate) fn configure_command(
-    command: &mut Command,
-    create_process_group: bool,
-    kill_when_owner_dies: bool,
-) -> io::Result<()> {
-    let owner_pid = unsafe { libc::getpid() };
-    configure_command_for_owner(
-        command,
-        create_process_group,
-        kill_when_owner_dies,
-        owner_pid,
-    )
-}
-
-fn configure_command_for_owner(
-    command: &mut Command,
-    create_process_group: bool,
-    kill_when_owner_dies: bool,
-    owner_pid: libc::pid_t,
-) -> io::Result<()> {
-    if create_process_group {
-        command.process_group(0);
-    }
-    if kill_when_owner_dies {
-        // SAFETY: the closure and supervisor use only libc operations that do
-        // not acquire process-global Rust state after Tokio forks the child.
-        unsafe {
-            command.pre_exec(move || install_owner_death_supervisor(owner_pid));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn after_spawn(_child: &Child, _kill_when_owner_dies: bool) -> io::Result<()> {
-    Ok(())
-}
-
-pub(crate) fn signal_process(pid: u32) -> io::Result<()> {
-    unix_kill(pid as i32, libc::SIGKILL)
-}
-
-pub(crate) fn signal_process_group(pid: u32) -> io::Result<()> {
-    unix_kill(-(pid as i32), libc::SIGTERM)
-}
-
-fn unix_kill(target: i32, signal: i32) -> io::Result<()> {
-    let result = unsafe { libc::kill(target, signal) };
-    if result == 0 { return Ok(()); }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) }
 }
 
 pub(crate) fn shell_spec(command: &OsStr) -> SpawnSpec {

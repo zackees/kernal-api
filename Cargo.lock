@@ -1208,6 +1208,7 @@ dependencies = [
  "portable-pty",
  "prost",
  "prost-types",
+ "running-process",
  "serde",
  "serde_json",
  "sha2",
@@ -1851,6 +1852,38 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "running-process"
+version = "4.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd80808893f5ee0f7bc7a67e80dab33639baf8490ff2bc951523bce39a9b5d42"
+dependencies = [
+ "libc",
+ "running-process-platform-internal",
+ "sysinfo",
+ "thiserror 2.0.20",
+ "tokio",
+ "winapi",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "running-process-platform-internal"
+version = "4.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5db7e27774c0464625c303241bee03cfa7456d871357d4f178849eff206a9346"
+dependencies = [
+ "libc",
+ "png",
+ "sysinfo",
+ "thiserror 2.0.20",
+ "tokio",
+ "widestring",
+ "winapi",
+ "windows-sys 0.61.2",
+ "x11rb",
 ]
 
 [[package]]

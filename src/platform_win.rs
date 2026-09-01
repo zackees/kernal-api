@@ -315,16 +315,10 @@ use std::io;
 use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;
-use std::sync::OnceLock;
 
-use tokio::process::{Child, Command};
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_HANDLE};
 use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-    SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-};
-use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+use windows_sys::Win32::System::Threading::OpenProcess;
 
 use crate::SpawnSpec;
 
@@ -466,28 +460,6 @@ pub fn unix_signal_process(_pid: u32, _signal: crate::platform::process::UnixSig
 pub fn unix_signal_process_group(_pid: i32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
 pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 { 0 }
 
-#[cfg(test)]
-pub fn configure_compat_tokio_command(
-    command: &mut Command,
-    show_console: bool,
-    _kill_when_owner_dies: bool,
-) -> io::Result<()> {
-    let flags = compat_tokio_creation_flags(show_console);
-    if flags != 0 {
-        command.creation_flags(flags);
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn compat_tokio_creation_flags(show_console: bool) -> u32 {
-    if show_console {
-        0
-    } else {
-        0x0800_0000 // CREATE_NO_WINDOW
-    }
-}
-
 fn process_start_key(pid: sysinfo::Pid, _process: &sysinfo::Process) -> io::Result<u64> {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
     use windows_sys::Win32::System::Threading::{
@@ -511,93 +483,8 @@ fn process_start_key(pid: sysinfo::Pid, _process: &sysinfo::Process) -> io::Resu
     Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
 }
 
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-pub(crate) fn configure_command(
-    command: &mut Command,
-    create_process_group: bool,
-    _kill_when_owner_dies: bool,
-) -> io::Result<()> {
-    if create_process_group {
-        command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-    }
-    Ok(())
-}
-
-pub(crate) fn after_spawn(child: &Child, kill_when_owner_dies: bool) -> io::Result<()> {
-    if kill_when_owner_dies {
-        assign(child.raw_handle())
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn signal_process(pid: u32) -> io::Result<()> {
-    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-    if handle.is_null() {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) { Ok(()) } else { Err(error) };
-    }
-    let terminated = unsafe { TerminateProcess(handle, 1) };
-    let termination_error = if terminated == 0 { Some(io::Error::last_os_error()) } else { None };
-    unsafe { CloseHandle(handle) };
-    termination_error.map_or(Ok(()), Err)
-}
-
-pub(crate) fn signal_process_group(pid: u32) -> io::Result<()> {
-    if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) } != 0 {
-        return Ok(());
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) { Ok(()) } else { Err(error) }
-}
-
 pub(crate) fn shell_spec(command: &OsStr) -> SpawnSpec {
     SpawnSpec::new("cmd.exe").arg("/C").arg(command)
-}
-
-struct Job(HANDLE);
-unsafe impl Send for Job {}
-unsafe impl Sync for Job {}
-
-static JOB: OnceLock<Option<Job>> = OnceLock::new();
-
-fn create() -> Option<Job> {
-    unsafe {
-        let handle = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if handle.is_null() { return None; }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if SetInformationJobObject(handle, JobObjectExtendedLimitInformation, &info as *const _ as *const _, std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32) == 0 { return None; }
-        Some(Job(handle))
-    }
-}
-
-/// Place a freshly spawned child in the owner-death job.
-///
-/// Every step here used to fail silently, which is the wrong shape for this
-/// operation: a caller passes `kill_when_owner_dies: true` precisely because
-/// it does not want the child to outlive it, and a caller that is told
-/// nothing cannot tell containment from its absence. All three failures are
-/// now reported.
-fn assign(child: Option<HANDLE>) -> io::Result<()> {
-    let Some(child) = child else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot contain a child that exposes no process handle",
-        ));
-    };
-    let Some(job) = JOB.get_or_init(create).as_ref() else {
-        return Err(io::Error::other(
-            "owner-death job object could not be created",
-        ));
-    };
-    // SAFETY: `job.0` is the process-wide job handle and `child` is the
-    // handle Tokio/std owns for the child just spawned.
-    if unsafe { AssignProcessToJobObject(job.0, child) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 #[path = "platform_win/sync_spawn.rs"]
 mod sync_spawn;
@@ -611,18 +498,7 @@ pub(crate) use sync_spawn::{
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{compat_tokio_creation_flags, configure_compat_tokio_command};
     use std::ffi::OsStr;
-
-    #[test]
-    fn tokio_spawn_owns_console_creation_flags() {
-        assert_eq!(compat_tokio_creation_flags(false), 0x0800_0000);
-        assert_eq!(compat_tokio_creation_flags(true), 0);
-
-        let mut command = tokio::process::Command::new("cmd.exe");
-        configure_compat_tokio_command(&mut command, false, false)
-            .expect("command configuration must succeed");
-    }
 
     #[test]
     fn shell_command_preserves_round_trippable_cmd_quoting_contract() {

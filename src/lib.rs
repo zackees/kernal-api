@@ -11,10 +11,9 @@ use std::cfg_select;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::PathBuf;
-use std::process::{ExitStatus, Output, Stdio};
+use std::process::ExitStatus;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+mod process_adapter;
 
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
@@ -296,16 +295,6 @@ pub enum StreamMode {
     Null,
 }
 
-impl StreamMode {
-    fn apply(self) -> Stdio {
-        match self {
-            Self::Inherit => Stdio::inherit(),
-            Self::Piped => Stdio::piped(),
-            Self::Null => Stdio::null(),
-        }
-    }
-}
-
 /// Typed spawn description accepted by the blessed process boundary.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -383,7 +372,7 @@ impl SpawnSpec {
     /// Put the child in its own process group.
     ///
     /// This is what makes a group-wide soft signal addressable at all:
-    /// [`PlatformEmergencySignal::terminate_group_soft`] is a no-op without
+    /// [`PlatformChild::terminate_group_soft`] is a no-op without
     /// it, because on POSIX the negative-PID signal would otherwise reach the
     /// caller's own group, and on Windows `GenerateConsoleCtrlEvent` only
     /// routes to children spawned with `CREATE_NEW_PROCESS_GROUP`. It also
@@ -405,282 +394,131 @@ impl SpawnSpec {
     }
 
     /// Spawn using the canonical asynchronous platform operation.
+    ///
+    /// The private native substrate owns process creation, containment, and
+    /// owner-death installation. This facade retains the semantic command
+    /// description and never exposes the substrate's child or runtime types.
     pub async fn spawn(self) -> io::Result<PlatformChild> {
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(current_dir) = self.current_dir.as_deref() {
-            command.current_dir(current_dir);
-        }
-        if self.clear_env {
-            command.env_clear();
-        }
-        for (key, value) in &self.env {
-            command.env(key, value);
-        }
-        command
-            .stdin(self.stdin.apply())
-            .stdout(self.stdout.apply())
-            .stderr(self.stderr.apply());
-        platform_imp::configure_command(
-            &mut command,
-            self.create_process_group,
-            self.kill_when_owner_dies,
-        )?;
-
-        let child = command.spawn()?;
-        platform_imp::after_spawn(&child, self.kill_when_owner_dies)?;
-        Ok(PlatformChild::new(child, self.create_process_group))
+        process_adapter::spawn(self).await
     }
 }
 
 /// Owned child handle returned by [`SpawnSpec::spawn`].
 pub struct PlatformChild {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: Option<ChildStdout>,
-    stderr: Option<ChildStderr>,
-    signal: PlatformEmergencySignal,
+    inner: process_adapter::ProcessAdapter,
 }
 
 impl PlatformChild {
-    fn new(mut child: Child, own_process_group: bool) -> Self {
-        let signal = PlatformEmergencySignal {
-            pid: child.id(),
-            own_process_group,
-        };
-        Self {
-            stdin: child.stdin.take(),
-            stdout: child.stdout.take(),
-            stderr: child.stderr.take(),
-            child,
-            signal,
-        }
+    pub(crate) fn new(inner: process_adapter::ProcessAdapter) -> Self {
+        Self { inner }
     }
 
-    /// Return the operating-system process identifier, if available.
+    /// Return the operating-system process identifier while this handle has
+    /// not observed a terminal lifecycle result.
+    ///
+    /// A successful [`Self::wait`] or [`Self::kill`] clears this value so a
+    /// completed child PID is not presented as a reusable live identity.
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.inner.pid()
     }
 
     /// Wait for completion without capturing output.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
+        self.inner.wait().await
     }
 
     /// Terminate the child and wait for its exit.
     pub async fn kill(&mut self) -> io::Result<()> {
-        self.child.kill().await
+        self.inner.kill().await
     }
 
-    /// Capture piped stdout and stderr while waiting for the child.
-    pub async fn wait_with_output(self) -> io::Result<Output> {
-        let Self {
-            mut child,
-            stdin,
-            stdout,
-            stderr,
-            ..
-        } = self;
-        // Match Tokio's `Child::wait_with_output` contract: one-shot output
-        // closes an owned stdin pipe so a child waiting for EOF can finish.
-        drop(stdin);
-        let (status, stdout, stderr) = tokio::try_join!(
-            child.wait(),
-            read_owned_to_end(stdout),
-            read_owned_to_end(stderr),
-        )?;
-        Ok(Output {
-            status,
-            stdout,
-            stderr,
-        })
+    /// Request graceful termination for the child-owned process group.
+    ///
+    /// Returns `Ok(false)` unless [`SpawnSpec::create_process_group`] was
+    /// enabled, or when the child has already exited.
+    pub async fn terminate_group_soft(&self) -> io::Result<bool> {
+        self.inner.terminate_group_soft().await
     }
 
-    /// Write bytes to piped stdin and flush them.
+    /// Write bytes to piped stdin.
     pub async fn write_stdin(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let stdin = self.stdin.as_mut().ok_or_else(stdin_not_piped)?;
-        stdin.write_all(bytes).await?;
-        stdin.flush().await
+        self.inner.write_stdin(bytes).await
     }
 
     /// Close the piped stdin handle, delivering EOF to the child.
     ///
-    /// This operation is idempotent. Closing an inherited or null stdin is
-    /// also a no-op because there is no owned pipe to close.
-    pub fn close_stdin(&mut self) {
-        drop(self.stdin.take());
+    /// The substrate makes a successful close idempotent. An inherited or
+    /// null stdin reports that no writable child pipe exists.
+    pub async fn close_stdin(&mut self) -> io::Result<()> {
+        self.inner.close_stdin().await
     }
 
-    /// Read all bytes from piped stdout without waiting for process exit.
-    pub async fn read_stdout_to_end(&mut self) -> io::Result<Vec<u8>> {
-        let stdout = self.stdout.as_mut().ok_or_else(stdout_not_piped)?;
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).await?;
-        Ok(bytes)
-    }
-
-    /// Read all bytes from piped stderr without waiting for process exit.
-    pub async fn read_stderr_to_end(&mut self) -> io::Result<Vec<u8>> {
-        let stderr = self.stderr.as_mut().ok_or_else(stderr_not_piped)?;
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).await?;
-        Ok(bytes)
-    }
-
-    /// Split this child into sealed actor capabilities.
+    /// Capture piped stdout and stderr after the child exits, retaining at
+    /// most one aggregate byte limit in the returned [`ProcessOutput`].
     ///
-    /// The lifecycle wait handle, emergency termination handle, input pipe,
-    /// and output readers are deliberately separate so the actor can keep
-    /// accepting control commands while an asynchronous exit wait is pending.
-    pub fn into_actor_parts(
-        self,
-    ) -> (
-        PlatformLifecycle,
-        PlatformEmergencySignal,
-        Option<PlatformStdin>,
-        Option<PlatformOutput>,
-        Option<PlatformOutput>,
-    ) {
-        (
-            PlatformLifecycle { child: self.child },
-            self.signal,
-            self.stdin.map(|stdin| PlatformStdin { stdin }),
-            self.stdout.map(PlatformOutput::stdout),
-            self.stderr.map(PlatformOutput::stderr),
-        )
+    /// The limit covers both returned streams together: on success,
+    /// `stdout.len() + stderr.len()` is at most `limit`. Excess bytes are not
+    /// returned, and the completed capture returns
+    /// [`ProcessCaptureError::OutputLimitExceeded`] without partial output.
+    /// The running-process 4.10.9 actor separately keeps a fixed 16 MiB
+    /// diagnostic output log while draining. That log evicts older records,
+    /// is not configurable through this substrate API, and is independent of
+    /// this method's returned-output limit.
+    /// This operation waits for both streams to reach EOF and the child to
+    /// exit naturally; it does not terminate a child merely because retained
+    /// output reached the limit.
+    pub async fn wait_with_output_bounded(
+        mut self,
+        limit: usize,
+    ) -> Result<ProcessOutput, ProcessCaptureError> {
+        self.inner.capture_bounded(limit).await
     }
 }
 
-/// Opaque exit-wait capability owned by a process actor.
-pub struct PlatformLifecycle {
-    child: Child,
+/// Status-preserving result of bounded child-output capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutput {
+    /// The operating system's unmodified child status.
+    pub status: ExitStatus,
+    /// Bytes captured from stdout.
+    pub stdout: Vec<u8>,
+    /// Bytes captured from stderr.
+    pub stderr: Vec<u8>,
 }
 
-impl PlatformLifecycle {
-    /// Wait asynchronously for the child to exit.
-    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait().await
-    }
+/// Failure returned by [`PlatformChild::wait_with_output_bounded`].
+#[derive(Debug)]
+pub enum ProcessCaptureError {
+    /// The returned stdout/stderr pair would have exceeded its shared limit.
+    OutputLimitExceeded {
+        /// Aggregate stdout/stderr capture limit.
+        limit: usize,
+    },
+    /// Waiting for or capturing from the started child failed.
+    Io(io::Error),
 }
 
-/// Opaque, non-reap-capable emergency termination capability.
-///
-/// It can be used while the actor has a pending wait on
-/// [`PlatformLifecycle`], but it cannot observe or consume the exit result.
-pub struct PlatformEmergencySignal {
-    pid: Option<u32>,
-    own_process_group: bool,
-}
-
-impl PlatformEmergencySignal {
-    /// Request immediate termination without waiting for process reaping.
-    pub fn kill(&self) -> io::Result<()> {
-        platform_imp::signal_process(self.target()?)
-    }
-
-    /// Ask the child's whole process group to shut down gracefully.
-    ///
-    /// Returns `Ok(false)` when the child was not spawned with
-    /// [`SpawnSpec::create_process_group`]: there is no group to address, and
-    /// signalling anyway would hit the caller's own group on POSIX or the
-    /// caller's console on Windows. A child that has already exited is also
-    /// `Ok` -- the soft step's only job is to give a live child a chance to
-    /// clean up before a hard kill, so a dead target is a success.
-    pub fn terminate_group_soft(&self) -> io::Result<bool> {
-        if !self.own_process_group {
-            return Ok(false);
-        }
-        platform_imp::signal_process_group(self.target()?).map(|()| true)
-    }
-
-    fn target(&self) -> io::Result<u32> {
-        self.pid.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "child process no longer has an emergency signal target",
-            )
-        })
-    }
-}
-
-/// Opaque piped stdin capability owned by a process actor.
-pub struct PlatformStdin {
-    stdin: ChildStdin,
-}
-
-impl PlatformStdin {
-    /// Write and flush bytes to the child stdin pipe.
-    pub async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.stdin.write_all(bytes).await?;
-        self.stdin.flush().await
-    }
-}
-
-/// Opaque stdout or stderr reader owned by a process actor.
-pub struct PlatformOutput {
-    reader: OutputReader,
-}
-
-enum OutputReader {
-    Stdout(ChildStdout),
-    Stderr(ChildStderr),
-}
-
-impl PlatformOutput {
-    fn stdout(stdout: ChildStdout) -> Self {
-        Self {
-            reader: OutputReader::Stdout(stdout),
-        }
-    }
-
-    fn stderr(stderr: ChildStderr) -> Self {
-        Self {
-            reader: OutputReader::Stderr(stderr),
-        }
-    }
-
-    /// Drain this output endpoint to EOF without blocking a runtime worker.
-    pub async fn read_to_end(self) -> io::Result<Vec<u8>> {
-        match self.reader {
-            OutputReader::Stdout(stdout) => read_owned_to_end(Some(stdout)).await,
-            OutputReader::Stderr(stderr) => read_owned_to_end(Some(stderr)).await,
-        }
-    }
-
-    /// Read the next asynchronous chunk from this output endpoint.
-    ///
-    /// The caller owns the buffer and therefore controls the amount of data
-    /// retained at each read. EOF is reported as `Ok(0)`.
-    pub async fn read_chunk(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        match &mut self.reader {
-            OutputReader::Stdout(stdout) => stdout.read(buffer).await,
-            OutputReader::Stderr(stderr) => stderr.read(buffer).await,
+impl std::fmt::Display for ProcessCaptureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutputLimitExceeded { limit } => {
+                write!(
+                    formatter,
+                    "captured process output exceeded the {limit}-byte limit"
+                )
+            }
+            Self::Io(error) => error.fmt(formatter),
         }
     }
 }
 
-fn stdin_not_piped() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "child stdin is not piped")
-}
-
-fn stdout_not_piped() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "child stdout is not piped")
-}
-
-fn stderr_not_piped() -> io::Error {
-    io::Error::new(io::ErrorKind::BrokenPipe, "child stderr is not piped")
-}
-
-async fn read_owned_to_end<R>(reader: Option<R>) -> io::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let Some(mut reader) = reader else {
-        return Ok(Vec::new());
-    };
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
-    Ok(bytes)
+impl std::error::Error for ProcessCaptureError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::OutputLimitExceeded { .. } => None,
+            Self::Io(error) => Some(error),
+        }
+    }
 }
 
 /// Build a shell command using the host platform's supported shell.
@@ -690,7 +528,12 @@ pub fn shell_spec(command: impl AsRef<OsStr>) -> SpawnSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_spec, SpawnSpec, StreamMode};
+    use super::{
+        run_bounded_command, run_bounded_command_async, shell_spec, BoundedProcessAsyncError,
+        BoundedProcessError, SpawnSpec, StreamMode,
+    };
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     fn fixture_command() -> SpawnSpec {
         #[cfg(windows)]
@@ -711,7 +554,7 @@ mod tests {
             .spawn()
             .await
             .expect("spawn")
-            .wait_with_output()
+            .wait_with_output_bounded(1024)
             .await
             .expect("wait with output");
 
@@ -734,7 +577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_output_closes_owned_stdin() {
+    async fn bounded_output_closes_owned_stdin() {
         #[cfg(windows)]
         let spec = shell_spec("more > nul & echo done");
         #[cfg(not(windows))]
@@ -748,7 +591,7 @@ mod tests {
                 .spawn()
                 .await
                 .expect("spawn")
-                .wait_with_output(),
+                .wait_with_output_bounded(1024),
         )
         .await
         .expect("stdin is closed for one-shot output")
@@ -760,5 +603,178 @@ mod tests {
             b"done".as_slice()
         };
         assert_eq!(output.stdout, expected);
+    }
+
+    fn nonzero_capture_command() -> SpawnSpec {
+        #[cfg(windows)]
+        {
+            shell_spec("echo bounded-stdout & echo bounded-stderr 1>&2 & exit /b 7")
+        }
+        #[cfg(not(windows))]
+        {
+            shell_spec("printf bounded-stdout; printf bounded-stderr >&2; exit 7")
+        }
+    }
+
+    fn slow_command() -> SpawnSpec {
+        #[cfg(windows)]
+        {
+            shell_spec("ping 127.0.0.1 -n 31 > nul")
+        }
+        #[cfg(not(windows))]
+        {
+            shell_spec("sleep 30")
+        }
+    }
+
+    fn overflow_command() -> SpawnSpec {
+        #[cfg(windows)]
+        {
+            shell_spec("for /L %i in (1,1,1000000000) do @echo x")
+        }
+        #[cfg(not(windows))]
+        {
+            shell_spec("yes x")
+        }
+    }
+
+    #[test]
+    fn bounded_command_preserves_separate_streams_and_raw_nonzero_exit() {
+        let output = run_bounded_command(
+            nonzero_capture_command(),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .expect("bounded nonzero command completes");
+
+        assert_eq!(output.exit.raw_code(), 7);
+        assert!(!output.exit.is_success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("bounded-stdout"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("bounded-stderr"));
+    }
+
+    #[test]
+    fn bounded_command_timeout_hard_kills_and_reaps_promptly() {
+        let started = Instant::now();
+        let error = run_bounded_command(
+            slow_command(),
+            Some(Duration::from_millis(100)),
+            1024,
+        )
+        .expect_err("slow command must time out after hard cleanup");
+
+        assert!(matches!(error, BoundedProcessError::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout cleanup was not bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn bounded_command_overflow_hard_kills_and_reaps_promptly() {
+        let started = Instant::now();
+        let error = run_bounded_command(overflow_command(), Some(Duration::from_secs(2)), 16)
+            .expect_err("unbounded output must exceed the aggregate capture limit");
+
+        assert!(matches!(
+            error,
+            BoundedProcessError::OutputLimitExceeded { limit: 16 }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "overflow cleanup was not bounded: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_timeout_cancels_readers_held_by_an_escaped_descendant() {
+        let started = Instant::now();
+        let error = run_bounded_command(
+            shell_spec("setsid sh -c 'sleep 3' & sleep 30"),
+            Some(Duration::from_millis(100)),
+            1024,
+        )
+        .expect_err("outer process must time out");
+
+        assert!(matches!(error, BoundedProcessError::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "escaped descendant retained bounded-capture readers for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn bounded_command_reports_a_missing_program_as_a_facade_io_error() {
+        let error = run_bounded_command(
+            SpawnSpec::new("kernal-api-bounded-program-that-does-not-exist"),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .expect_err("missing program must fail before capture");
+
+        assert!(matches!(error, BoundedProcessError::Io(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_preserves_non_utf8_program_args_and_environment() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let output = run_bounded_command(
+            SpawnSpec::new(std::ffi::OsString::from_vec(b"/bin/sh".to_vec()))
+                .arg("-c")
+                .arg("printf %s \"$KERNAL_API_BOUNDED_BYTES\"")
+                .env(
+                    std::ffi::OsString::from_vec(b"KERNAL_API_BOUNDED_BYTES".to_vec()),
+                    std::ffi::OsString::from_vec(b"value-\xff".to_vec()),
+                ),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .expect("non-UTF-8 command inputs are preserved");
+
+        assert_eq!(output.stdout, b"value-\xff");
+    }
+
+    #[test]
+    fn bounded_command_async_uses_the_current_runtime_blocking_lane() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.run(async {
+            let started = Instant::now();
+            let ticker_at = Arc::new(Mutex::new(None));
+            let ticker_at_for_task = Arc::clone(&ticker_at);
+            let _ticker = crate::async_engine::launch(async move {
+                crate::async_engine::sleep(Duration::from_millis(20)).await;
+                *ticker_at_for_task.lock().expect("ticker lock") = Some(started.elapsed());
+            });
+
+            let error = run_bounded_command_async(
+                slow_command(),
+                Some(Duration::from_millis(100)),
+                1024,
+            )
+            .await
+            .expect_err("slow command must time out through the blocking lane");
+
+            assert!(matches!(
+                error,
+                BoundedProcessAsyncError::Bounded(BoundedProcessError::TimedOut)
+            ));
+            let tick = ticker_at
+                .lock()
+                .expect("ticker lock")
+                .expect("current-thread runtime must keep driving the ticker");
+            assert!(
+                tick < Duration::from_millis(80),
+                "blocking command occupied the current-thread runtime for {tick:?}"
+            );
+        });
     }
 }

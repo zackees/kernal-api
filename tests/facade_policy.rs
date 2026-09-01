@@ -48,6 +48,53 @@ fn implementation_crates_are_not_publicly_reexported() {
 }
 
 #[test]
+fn process_substrate_is_exact_feature_minimal_and_private() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains(
+            "running-process = { version = \"=4.10.9\", default-features = false, features = [\"kernel-substrate\"] }"
+        ),
+        "the process substrate must stay pinned to the released feature-minimal contract"
+    );
+
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        !lib.contains("tokio::process"),
+        "the migrated process facade must not retain a Tokio child fallback"
+    );
+    assert!(
+        !lib.contains("configure_command("),
+        "the migrated process facade must not retain native spawn configuration"
+    );
+    let adapter = std::fs::read_to_string(root.join("src/process_adapter.rs"))
+        .expect("read private process adapter");
+    for mapping in [
+        ".create_process_group(spec.create_process_group)",
+        ".kill_when_owner_dies(spec.kill_when_owner_dies)",
+    ] {
+        assert!(
+            adapter.contains(mapping),
+            "the private adapter must preserve SpawnSpec's {mapping} policy"
+        );
+    }
+
+    for path in rust_sources(&root.join("src")) {
+        let source = std::fs::read_to_string(&path).expect("read Rust source");
+        for line in source.lines() {
+            let line = line.trim_start();
+            if line.starts_with("pub ") {
+                assert!(
+                    !line.contains("running_process"),
+                    "{} exposes a running-process type in {line:?}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn json_is_confined_to_the_external_firefox_export() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for path in rust_sources(&root) {

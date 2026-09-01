@@ -105,7 +105,7 @@ fn pump_loop(
                 trigger_stop_event(notifier_queue.0);
             });
     }
-    let mut known = HashMap::new();
+    let mut known: HashMap<Identity, u32> = HashMap::new();
     loop {
         if stop.is_stopped() {
             emit(DescendantEvent::Completed);

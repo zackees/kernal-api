@@ -9,29 +9,13 @@ use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-#[repr(C, align(4))]
-struct ValidationRecord {
-    words: [AtomicU32; 16],
-}
-
-static REPORT: ValidationRecord = ValidationRecord {
-    words: [const { AtomicU32::new(0) }; 16],
-};
-
-// Retained verbatim as the validation-profile custom section. The ordinary
-// threaded profile deliberately has no such extra metadata/export surface.
-#[used]
-#[link_section = "kernal-api.profile"]
-static VALIDATION_PROFILE: [u8; 32] = *b"threaded-core-wasm-validation-v1";
-
 #[link(wasm_import_module = "kernal-api:v1")]
 extern "C" {
     #[link_name = "kernel-yield"]
     fn kernel_yield();
 }
 
-/// Explicit result marker for artifact inspection. The current #25 admission
-/// profile is expected to reject this real std-thread guest before compiling it.
+/// Explicit result marker for public artifact inspection.
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
     let counter = Arc::new(AtomicU32::new(0));
@@ -66,19 +50,8 @@ pub extern "C" fn kernal_api_run() -> u32 {
     let channel_total: u32 = rx.iter().sum();
     let map_sum: u32 = map.iter().map(|entry| *entry.value()).sum();
     let mutex_total = *totals.lock().expect("mutex");
-    let values = [0x4b_52_56_31, 1, 64, 0, 2, joined, counter.load(Ordering::SeqCst), mutex_total,
-        channel_total, map.len() as u32, map_sum, 2, 0, 0, 0, 0];
-    for (word, value) in REPORT.words.iter().zip(values) {
-        word.store(value, Ordering::Relaxed);
-    }
-    REPORT.words[3].store(1, Ordering::Release);
     unsafe { kernel_yield() };
-    joined
-}
-
-#[export_name = "kernal-api-threaded-validation-report-v1"]
-pub extern "C" fn validation_report() -> i32 {
-    REPORT.words.as_ptr() as usize as i32
+    joined + counter.load(Ordering::SeqCst) + mutex_total + channel_total + map_sum
 }
 
 fn main() {

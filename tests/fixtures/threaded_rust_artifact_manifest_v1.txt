@@ -1,0 +1,43 @@
+threaded-artifact-manifest-v1
+export name=__main_void kind=function index=52 type=Some(10)
+export name=_start kind=function index=12 type=Some(1)
+export name=kernal-api-run kind=function index=39 type=Some(10)
+export name=memory kind=memory index=0 type=None
+export name=wasi_thread_start kind=function index=315 type=Some(3)
+import module=env name=memory kind=memory initial=17 maximum=Some(16384) shared=true memory64=false page-size-log2=None
+import module=kernal-api:v1 name=kernel-yield kind=function type=1
+import module=wasi name=thread-spawn kind=function type=2
+import module=wasi_snapshot_preview1 name=clock_time_get kind=function type=8
+import module=wasi_snapshot_preview1 name=environ_get kind=function type=6
+import module=wasi_snapshot_preview1 name=environ_sizes_get kind=function type=6
+import module=wasi_snapshot_preview1 name=fd_write kind=function type=9
+import module=wasi_snapshot_preview1 name=proc_exit kind=function type=0
+import module=wasi_snapshot_preview1 name=sched_yield kind=function type=10
+start function index=11 type=Some(1)
+type index=0 kind=function params=[I32] results=[]
+type index=1 kind=function params=[] results=[]
+type index=10 kind=function params=[] results=[I32]
+type index=11 kind=function params=[I32, I32, I32, I64] results=[I32]
+type index=12 kind=function params=[I32, I32, I64, I32] results=[]
+type index=13 kind=function params=[I32, I32, I32, I64, I32] results=[]
+type index=14 kind=function params=[I32, I32, I32, I32, I32, I32, I32] results=[]
+type index=15 kind=function params=[I32, I32, I32, I32, I32] results=[]
+type index=16 kind=function params=[I32, I32, I32, I32, I32, I32] results=[]
+type index=17 kind=function params=[] results=[I64]
+type index=18 kind=function params=[I64, I32] results=[I32]
+type index=19 kind=function params=[I32, I64, I32] results=[]
+type index=2 kind=function params=[I32] results=[I32]
+type index=20 kind=function params=[I32, I32, I32, I32, I32] results=[I32]
+type index=21 kind=function params=[I32, I64, I32, I64, I32] results=[]
+type index=22 kind=function params=[I32, I32, I32, I32, I32, I32, I32, I32] results=[]
+type index=23 kind=function params=[I32, I32, I32, I32, I32, I32] results=[I32]
+type index=24 kind=function params=[I32, I32, I32, I32, I32, I32, I32] results=[I32]
+type index=25 kind=function params=[I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32] results=[I32]
+type index=26 kind=function params=[I32, I64, I64, I64, I64] results=[]
+type index=3 kind=function params=[I32, I32] results=[]
+type index=4 kind=function params=[I32, I32, I32, I32] results=[]
+type index=5 kind=function params=[I32, I32, I32] results=[I32]
+type index=6 kind=function params=[I32, I32] results=[I32]
+type index=7 kind=function params=[I32, I32, I32] results=[]
+type index=8 kind=function params=[I32, I64, I32] results=[I32]
+type index=9 kind=function params=[I32, I32, I32, I32] results=[I32]

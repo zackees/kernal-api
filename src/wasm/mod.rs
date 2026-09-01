@@ -788,6 +788,8 @@ impl AdmittedSketch {
             execution_ledger: Arc::clone(&self.execution_ledger),
             epoch_broker: Arc::clone(&self.epoch_broker),
             session: Mutex::new(SessionState::default()),
+            #[cfg(test)]
+            threaded_smoke_report: Mutex::new(None),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -1290,6 +1292,8 @@ struct ThreadController {
     epoch_broker: Arc<EpochBroker>,
     session: Mutex<SessionState>,
     workers: Mutex<Workers>,
+    #[cfg(test)]
+    threaded_smoke_report: Mutex<Option<[u32; 12]>>,
 }
 
 #[derive(Default)]
@@ -2347,6 +2351,12 @@ fn define_closed_imports(
                 if result != ERRNO_SUCCESS {
                     return result;
                 }
+                #[cfg(test)]
+                if let Some(report) = capture_threaded_smoke_report(memory, _iovecs, _iovecs_len) {
+                    if let Ok(mut slot) = caller.data().controller.threaded_smoke_report.lock() {
+                        *slot = Some(report);
+                    }
+                }
                 write_shared(memory, written, &0_u32.to_le_bytes())
             },
         )
@@ -3099,6 +3109,51 @@ mod threaded_root_observation_tests {
             0,
             "root execution permit must be released after completion"
         );
+        let prepared = sketch
+            .prepared_root
+            .lock()
+            .expect("prepared session")
+            .as_ref()
+            .expect("root execution prepared one session")
+            .clone();
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared observation");
+        assert_eq!(observation.preparations, 1);
+        // The root yields after joining and both child closures yield.
+        assert_eq!(observation.kernel_yields, 3);
+        assert_eq!(observation.supplied_runtime_handles, 3);
+        assert_eq!(observation.runtime_identity_mismatches, 0);
+        assert_eq!(observation.accepted_child_registrations, 0);
+        assert_eq!(observation.live_threads, 0);
+        assert_eq!(observation.queued_join_handles, 0);
+        assert_eq!(
+            *prepared
+                .controller
+                .threaded_smoke_report
+                .lock()
+                .expect("threaded smoke report"),
+            Some([
+                0x4b52_5331, // magic
+                1,           // schema version
+                48,          // bounded record size
+                1,           // ready, acquired before remaining fields
+                2,
+                2,
+                2,
+                2,
+                2,
+                2,
+                12,
+                0,
+            ]),
+            "root and both children must publish the shared atomic result"
+        );
+        let snapshot = sketch.execution_limits_snapshot();
+        assert_eq!(snapshot.live_guest_threads(), 0);
+        assert_eq!(snapshot.live_stores(), 0);
+        assert_eq!(snapshot.live_instances(), 0);
+        assert_eq!(snapshot.active_epoch_registrations(), 0);
     }
 
     #[test]
@@ -3624,13 +3679,21 @@ fn validate_iovecs(memory: &SharedMemory, iovecs: i32, iovecs_len: i32) -> i32 {
 }
 
 fn read_shared_u32(memory: &SharedMemory, offset: i32) -> Option<u32> {
+    read_shared_u32_with_ordering(memory, offset, Ordering::Relaxed)
+}
+
+fn read_shared_u32_with_ordering(
+    memory: &SharedMemory,
+    offset: i32,
+    ordering: Ordering,
+) -> Option<u32> {
     let cells = shared_range(memory, offset, 4)?;
     let mut bytes = [0_u8; 4];
     for (destination, cell) in bytes.iter_mut().zip(cells) {
         // SAFETY: UnsafeCell<u8> has AtomicU8-compatible alignment and belongs
         // to the live SharedMemory. This module's host-side shared-byte access
         // invariant is atomic-only; AtomicU8 avoids a plain concurrent load.
-        *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+        *destination = unsafe { AtomicU8::from_ptr(cell.get()) }.load(ordering);
     }
     Some(u32::from_le_bytes(bytes))
 }
@@ -3688,6 +3751,43 @@ fn validate_report(memory: &SharedMemory, offset: i32) -> Result<(), SketchExecu
         return Err(SketchExecutionError::ValidationReportInvalid);
     }
     Ok(())
+}
+
+#[cfg(test)]
+fn capture_threaded_smoke_report(
+    memory: &SharedMemory,
+    iovecs: i32,
+    iovecs_len: i32,
+) -> Option<[u32; 12]> {
+    const MAGIC: u32 = 0x4b52_5331; // "KRS1"
+    const VERSION: u32 = 1;
+    const BYTES: u32 = 48;
+    const WORDS: usize = 12;
+    if iovecs_len != 1 {
+        return None;
+    }
+    let record_offset = read_shared_u32(memory, iovecs)?;
+    if read_shared_u32(memory, iovecs.checked_add(4)?)? != BYTES || record_offset > i32::MAX as u32
+    {
+        return None;
+    }
+    let record_offset = record_offset as i32;
+    let word = |index: usize, ordering| {
+        let offset = record_offset.checked_add(i32::try_from(index * 4).ok()?)?;
+        load_shared_atomic_u32(shared_range(memory, offset, 4)?, ordering)
+    };
+    if word(0, Ordering::Relaxed) != Some(MAGIC)
+        || word(1, Ordering::Relaxed) != Some(VERSION)
+        || word(2, Ordering::Relaxed) != Some(BYTES)
+        || word(3, Ordering::Acquire) != Some(1)
+    {
+        return None;
+    }
+    let mut report = [0_u32; WORDS];
+    for (index, value) in report.iter_mut().enumerate() {
+        *value = word(index, Ordering::Relaxed)?;
+    }
+    Some(report)
 }
 
 #[cfg(test)]

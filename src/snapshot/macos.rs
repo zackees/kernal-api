@@ -354,7 +354,6 @@ mod tests {
     use std::time::Duration;
 
     const SNAPSHOT_HELPER_ENV: &str = "KERNAL_API_MACOS_SNAPSHOT_HELPER";
-    const CONTROLLED_STACK_BYTES: usize = 4096;
 
     #[test]
     fn snapshot_sees_every_spawned_thread_and_resumes_them() {
@@ -421,12 +420,7 @@ mod tests {
         drop(tid_sender);
         let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
-        let snapshot = capture_controlled_threads(
-            &SnapshotConfig {
-                max_stack_bytes: CONTROLLED_STACK_BYTES,
-            },
-            &expected_tids,
-        );
+        let snapshot = capture_controlled_threads(&expected_tids);
         let before = progress.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(2);
         while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {
@@ -451,17 +445,14 @@ mod tests {
         assert!(progress.load(Ordering::Relaxed) > before);
     }
 
-    /// Exercise the real Mach suspend/read/resume path only on the workers
-    /// owned by this regression. Suspending arbitrary libtest/runtime threads
-    /// makes the harness collateral state of a test that is meant to prove the
-    /// controlled workers resume.
-    fn capture_controlled_threads(
-        config: &SnapshotConfig,
-        expected_tids: &[u64],
-    ) -> Result<Snapshot, SnapshotError> {
+    /// Exercise real Mach suspend/register-capture/resume only on the workers
+    /// owned by this regression. Reading another thread's VM is separately
+    /// covered by `capture`; it can wait indefinitely in a hosted test process
+    /// despite a small read bound. This probe proves the suspension invariant
+    /// without making arbitrary libtest/runtime threads collateral state.
+    fn capture_controlled_threads(expected_tids: &[u64]) -> Result<Snapshot, SnapshotError> {
         let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let thread_list = ThreadList::enumerate()?;
-        let mut scratch = vec![0u8; config.max_stack_bytes];
         let mut samples = Vec::with_capacity(expected_tids.len());
         let mut dropped = 0u32;
         let mut pause_nanos = 0u64;
@@ -473,8 +464,27 @@ mod tests {
             if !expected_tids.contains(&os_tid) {
                 continue;
             }
-            match capture_thread(thread_list.task, thread, config, &mut scratch)? {
-                Some((sample, pause)) => {
+            let started = Instant::now();
+            let Some(mut suspension) = Suspension::new(thread) else {
+                dropped = dropped.saturating_add(1);
+                continue;
+            };
+            let regs = thread_registers(thread);
+            suspension.resume()?;
+            let pause = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            match regs {
+                Some(regs) => {
+                    let sample = ThreadSample {
+                        os_tid,
+                        stack_pointer: regs.sp,
+                        instruction_pointer: regs.ip,
+                        frame_pointer: regs.fp,
+                        link_register: regs.lr,
+                        stack_bytes: Vec::new(),
+                        truncated: false,
+                        kind: CaptureKind::RawContext,
+                        frames: Vec::new(),
+                    };
                     samples.push(sample);
                     pause_nanos = pause_nanos.saturating_add(pause);
                 }

@@ -81,7 +81,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: matrix.legacy_cargo
+        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: ${{ !matrix.legacy_cargo }}
+        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        with:
+          # Native Apple SDK preparation has no archive payload to cache.
+          cache: false
+          cross-targets: ${{ matrix.target }}
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
         run: >-
           soldr cargo build

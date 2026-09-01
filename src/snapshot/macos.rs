@@ -34,6 +34,7 @@ struct ThreadList {
     list: thread_act_array_t,
     count: mach_msg_type_number_t,
     self_thread: thread_act_t,
+    self_tid: Option<u64>,
 }
 
 impl ThreadList {
@@ -48,11 +49,13 @@ impl ThreadList {
                 code: result,
             });
         }
+        let self_thread = unsafe { mach_thread_self() };
         Ok(Self {
             task,
             list,
             count,
-            self_thread: unsafe { mach_thread_self() },
+            self_tid: os_thread_id(self_thread),
+            self_thread,
         })
     }
 
@@ -61,7 +64,13 @@ impl ThreadList {
         threads
             .iter()
             .copied()
-            .filter(|thread| *thread != self.self_thread)
+            .filter(|thread| match self.self_tid {
+                // `task_threads` and `mach_thread_self` can hold distinct send
+                // rights for the same thread. Comparing their port names alone
+                // can therefore fail to exclude the caller and self-suspend it.
+                Some(self_tid) => os_thread_id(*thread) != Some(self_tid),
+                None => *thread != self.self_thread,
+            })
     }
 }
 
@@ -344,8 +353,49 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
+    const SNAPSHOT_HELPER_ENV: &str = "KERNAL_API_MACOS_SNAPSHOT_HELPER";
+
     #[test]
     fn snapshot_sees_every_spawned_thread_and_resumes_them() {
+        if std::env::var_os(SNAPSHOT_HELPER_ENV).is_some() {
+            snapshot_sees_every_spawned_thread_and_resumes_them_in_helper();
+            return;
+        }
+
+        let test_binary = std::env::current_exe().expect("locate test binary");
+        let mut helper = std::process::Command::new(test_binary)
+            .arg("--exact")
+            .arg("snapshot::macos::tests::snapshot_sees_every_spawned_thread_and_resumes_them")
+            .arg("--nocapture")
+            .env(SNAPSHOT_HELPER_ENV, "1")
+            .spawn()
+            .expect("spawn isolated Mach snapshot helper");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            match helper.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = helper.kill();
+                    let _ = helper.wait();
+                    panic!("isolated Mach snapshot helper exceeded its 20-second timeout");
+                }
+                Err(error) => {
+                    let _ = helper.kill();
+                    let _ = helper.wait();
+                    panic!("wait for isolated Mach snapshot helper: {error}");
+                }
+            }
+        };
+        assert!(
+            status.success(),
+            "isolated Mach snapshot helper failed: {status}"
+        );
+    }
+
+    fn snapshot_sees_every_spawned_thread_and_resumes_them_in_helper() {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
         let (tid_sender, tid_receiver) = mpsc::channel();
@@ -361,26 +411,33 @@ mod tests {
                     mach_port_deallocate(mach_task_self(), self_thread);
                 }
                 tid_sender.send(os_tid).unwrap();
-                while !stop.load(Ordering::Relaxed) {
-                    progress.fetch_add(1, Ordering::Relaxed);
-                    std::hint::spin_loop();
+                while !stop.load(Ordering::SeqCst) {
+                    progress.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }));
         }
         drop(tid_sender);
-        let expected_tids: Vec<_> = tid_receiver.iter().collect();
+        let expected_tids: Vec<_> = (0..workers.len())
+            .map(|_| {
+                tid_receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("worker must publish its OS thread id")
+            })
+            .collect();
 
-        let snapshot = capture(&SnapshotConfig::default()).expect("capture");
-        let before = progress.load(Ordering::Relaxed);
+        let snapshot = capture_controlled_threads(&expected_tids);
+        let before = progress.load(Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {
+        while progress.load(Ordering::SeqCst) == before && Instant::now() < deadline {
             std::thread::yield_now();
         }
 
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
         for worker in workers {
             worker.join().unwrap();
         }
+        let snapshot = snapshot.expect("capture");
         for expected_tid in expected_tids {
             assert!(
                 snapshot
@@ -391,7 +448,66 @@ mod tests {
                 snapshot.stats
             );
         }
-        assert!(progress.load(Ordering::Relaxed) > before);
+        assert!(progress.load(Ordering::SeqCst) > before);
+    }
+
+    /// Exercise real Mach suspend/register-capture/resume only on the workers
+    /// owned by this regression. Reading another thread's VM is separately
+    /// covered by `capture`; it can wait indefinitely in a hosted test process
+    /// despite a small read bound. This probe proves the suspension invariant
+    /// without making arbitrary libtest/runtime threads collateral state.
+    fn capture_controlled_threads(expected_tids: &[u64]) -> Result<Snapshot, SnapshotError> {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let thread_list = ThreadList::enumerate()?;
+        let mut samples = Vec::with_capacity(expected_tids.len());
+        let mut dropped = 0u32;
+        let mut pause_nanos = 0u64;
+
+        for thread in thread_list.siblings() {
+            let Some(os_tid) = os_thread_id(thread) else {
+                continue;
+            };
+            if !expected_tids.contains(&os_tid) {
+                continue;
+            }
+            let started = Instant::now();
+            let Some(mut suspension) = Suspension::new(thread) else {
+                dropped = dropped.saturating_add(1);
+                continue;
+            };
+            let regs = thread_registers(thread);
+            suspension.resume()?;
+            let pause = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+            match regs {
+                Some(regs) => {
+                    let sample = ThreadSample {
+                        os_tid,
+                        stack_pointer: regs.sp,
+                        instruction_pointer: regs.ip,
+                        frame_pointer: regs.fp,
+                        link_register: regs.lr,
+                        stack_bytes: Vec::new(),
+                        truncated: false,
+                        kind: CaptureKind::RawContext,
+                        frames: Vec::new(),
+                    };
+                    samples.push(sample);
+                    pause_nanos = pause_nanos.saturating_add(pause);
+                }
+                None => dropped = dropped.saturating_add(1),
+            }
+        }
+
+        Ok(Snapshot {
+            stats: SnapshotStats {
+                threads_total: expected_tids.len() as u32,
+                threads_captured: samples.len() as u32,
+                threads_dropped: dropped,
+                pause_nanos,
+            },
+            threads: samples,
+            frames_resolved: false,
+        })
     }
 
     #[test]

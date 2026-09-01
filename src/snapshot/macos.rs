@@ -411,8 +411,8 @@ mod tests {
                     mach_port_deallocate(mach_task_self(), self_thread);
                 }
                 tid_sender.send(os_tid).unwrap();
-                while !stop.load(Ordering::Relaxed) {
-                    progress.fetch_add(1, Ordering::Relaxed);
+                while !stop.load(Ordering::SeqCst) {
+                    progress.fetch_add(1, Ordering::SeqCst);
                     std::hint::spin_loop();
                 }
             }));
@@ -421,13 +421,13 @@ mod tests {
         let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
         let snapshot = capture_controlled_threads(&expected_tids);
-        let before = progress.load(Ordering::Relaxed);
+        let before = progress.load(Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {
+        while progress.load(Ordering::SeqCst) == before && Instant::now() < deadline {
             std::thread::yield_now();
         }
 
-        stop.store(true, Ordering::Relaxed);
+        stop.store(true, Ordering::SeqCst);
         for worker in workers {
             worker.join().unwrap();
         }
@@ -442,7 +442,7 @@ mod tests {
                 snapshot.stats
             );
         }
-        assert!(progress.load(Ordering::Relaxed) > before);
+        assert!(progress.load(Ordering::SeqCst) > before);
     }
 
     /// Exercise real Mach suspend/register-capture/resume only on the workers

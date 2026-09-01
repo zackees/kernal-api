@@ -64,12 +64,12 @@ jobs:
       - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
         with:
           toolchain: 1.95.0
-      - name: Build the source-only threaded guest and validate admission (Unix)
+      - name: Build the source-only threaded guest and validate root execution (Unix)
         if: runner.os != 'Windows'
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
         run: bash scripts/build-threaded-smoke.sh
-      - name: Build the source-only threaded guest and validate admission (Windows)
+      - name: Build the source-only threaded guest and validate root execution (Windows)
         if: runner.os == 'Windows'
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke

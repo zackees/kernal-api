@@ -46,7 +46,7 @@ try {
         Copy-Item -LiteralPath $built -Destination $artifact
     }
     $env:KERNAL_API_THREADED_ARTIFACT_WASM = $artifact
-    soldr --no-cache $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_the_public_profile
+    soldr --no-cache $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
 }
 finally {
     if ($hadPrevious) {

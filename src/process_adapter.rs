@@ -1,11 +1,17 @@
 //! Private bridge from facade process semantics to the native substrate.
 
 use std::io;
-use std::process::ExitStatus;
+use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
-use running_process::{AsyncProcess, AsyncProcessBuilder, AsyncStdio, ProcessError};
+use running_process::{
+    run_std_command_bounded, AsyncProcess, AsyncProcessBuilder, AsyncStdio, ProcessError,
+};
 
-use crate::{PlatformChild, ProcessCaptureError, ProcessOutput, SpawnSpec, StreamMode};
+use crate::{
+    BoundedProcessError, BoundedProcessExit, BoundedProcessOutput, PlatformChild,
+    ProcessCaptureError, ProcessOutput, SpawnSpec, StreamMode,
+};
 
 /// Private child state from the selected native substrate.
 pub(crate) struct ProcessAdapter {
@@ -41,6 +47,40 @@ pub(crate) async fn spawn(spec: SpawnSpec) -> io::Result<PlatformChild> {
         process,
         pid: Some(pid),
     }))
+}
+
+/// Run a one-shot command through the private bounded native substrate.
+///
+/// `Command` is deliberately assembled here, rather than at the facade
+/// boundary, so native command state and the selected substrate remain
+/// implementation details. The substrate owns containment, pipe capture, and
+/// timeout/overflow cleanup.
+pub(crate) fn run_bounded(
+    spec: SpawnSpec,
+    timeout: Option<Duration>,
+    output_limit: usize,
+) -> Result<BoundedProcessOutput, BoundedProcessError> {
+    let command = std_command(spec);
+    run_std_command_bounded(command, timeout, output_limit)
+        .map(|output| BoundedProcessOutput {
+            exit: BoundedProcessExit::from_raw_code(output.exit_code),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+        .map_err(bounded_process_error)
+}
+
+fn std_command(spec: SpawnSpec) -> Command {
+    let mut command = Command::new(spec.program);
+    command.args(spec.args);
+    if let Some(current_dir) = spec.current_dir {
+        command.current_dir(current_dir);
+    }
+    if spec.clear_env {
+        command.env_clear();
+    }
+    command.envs(spec.env);
+    command
 }
 
 impl ProcessAdapter {
@@ -119,6 +159,18 @@ fn process_capture_error(error: ProcessError) -> ProcessCaptureError {
             ProcessCaptureError::OutputLimitExceeded { limit }
         }
         error => ProcessCaptureError::Io(process_error_to_io(error)),
+    }
+}
+
+fn bounded_process_error(error: ProcessError) -> BoundedProcessError {
+    match error {
+        ProcessError::Timeout => BoundedProcessError::TimedOut,
+        ProcessError::OutputLimitExceeded { limit } => {
+            BoundedProcessError::OutputLimitExceeded { limit }
+        }
+        ProcessError::Spawn(error) => BoundedProcessError::Spawn(error),
+        ProcessError::Io(error) => BoundedProcessError::Io(error),
+        error => BoundedProcessError::Io(process_error_to_io(error)),
     }
 }
 

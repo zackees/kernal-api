@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "collected_on": "2026-09-01",
+  "host": {
+    "system": "Linux",
+    "release": "6.18.48",
+    "machine": "x86_64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.95.0 (59807616e 2026-04-14)",
+    "soldr": "soldr 0.9.11"
+  },
+  "protocol": "../README.md",
+  "feature_set": "--locked --no-default-features (feature-minimal process/host facade)",
+  "repeat": 3,
+  "clean_state": "A fresh --target-dir was used for every clean sample. Soldr cache was intentionally retained and each build's actual session hit/miss data is recorded; this measures a clean Cargo artifact build with normal developer cache reuse.",
+  "historical_baseline": {
+    "revision": "f745dcff4e2874170b779c510c698258aee90055",
+    "source": "parent of 2cb0bb2; pre-running-process adapter",
+    "organization": "one cohesive kernal-api package",
+    "comparison_limit": "This is a real pre-adapter substrate baseline, not a physical-packaging comparator: f745dcf..1218953 also changed facade and platform code.",
+    "samples": {
+      "clean_critical_path_seconds": [10.16, 9.48, 9.75],
+      "incremental_critical_path_seconds": [2.25, 2.24, 2.23],
+      "clean_peak_rss_kib": [91180, 91180, 91180],
+      "incremental_peak_rss_kib": [91052, 91076, 91156],
+      "clean_debug_output_bytes": [217765779, 217765776, 217765777],
+      "package_archive_bytes": 485820,
+      "clean_cache": [
+        {"compilations": 82, "hits": 68, "misses": 9, "hit_rate": 0.8831168831168831, "time_saved_ms": 54467},
+        {"compilations": 82, "hits": 68, "misses": 9, "hit_rate": 0.8831168831168831, "time_saved_ms": 54169},
+        {"compilations": 82, "hits": 68, "misses": 9, "hit_rate": 0.8831168831168831, "time_saved_ms": 55816}
+      ],
+      "incremental_cache": [
+        {"compilations": 1, "hits": 0, "misses": 1, "hit_rate": 0.0, "time_saved_ms": 468},
+        {"compilations": 1, "hits": 0, "misses": 1, "hit_rate": 0.0, "time_saved_ms": 481},
+        {"compilations": 1, "hits": 0, "misses": 1, "hit_rate": 0.0, "time_saved_ms": 475}
+      ]
+    }
+  },
+  "adapter_candidate": {
+    "revision": "1218953ee1059e3a94134ad05114937ab1ed4197",
+    "source": "origin/main at measurement start; includes the running-process adapter",
+    "organization": "one cohesive kernal-api package",
+    "samples": {
+      "clean_critical_path_seconds": [10.98, 9.78, 10.99],
+      "incremental_critical_path_seconds": [0.66, 0.81, 0.77],
+      "clean_peak_rss_kib": [91196, 91184, 91204],
+      "incremental_peak_rss_kib": [91116, 91180, 91036],
+      "clean_debug_output_bytes": [226928083, 226928079, 226928079],
+      "package_archive_bytes": 492213,
+      "clean_cache": [
+        {"compilations": 86, "hits": 68, "misses": 13, "hit_rate": 0.8395061728395061, "time_saved_ms": 54985},
+        {"compilations": 86, "hits": 70, "misses": 11, "hit_rate": 0.8641975308641975, "time_saved_ms": 57947},
+        {"compilations": 86, "hits": 70, "misses": 11, "hit_rate": 0.8641975308641975, "time_saved_ms": 59163}
+      ],
+      "incremental_cache": [
+        {"compilations": 1, "hits": 1, "misses": 0, "hit_rate": 1.0, "time_saved_ms": 878},
+        {"compilations": 1, "hits": 1, "misses": 0, "hit_rate": 1.0, "time_saved_ms": 878},
+        {"compilations": 1, "hits": 1, "misses": 0, "hit_rate": 1.0, "time_saved_ms": 874}
+      ]
+    }
+  },
+  "decision": {
+    "selected_organization": "one cohesive feature-gated kernal-api package",
+    "reason": "The historical baseline observes that the adapter revision adds 1.23 seconds to the median clean critical path (10.98 seconds versus 9.75 seconds), while peak RSS is effectively unchanged (91196 KiB versus 91180 KiB) and its representative incremental path improves (0.77 seconds versus 2.24 seconds) with 100% cache reuse. Because those revisions are not identical-facade packaging candidates, these values are substrate-migration context, not proof that a split would help. No cohesive implementation-only split candidate exists; creating one solely to manufacture a comparison would be speculative. The existing single package is therefore retained until a real candidate can be compared under the protocol.",
+    "private_crates_selected": [],
+    "release_amalgamation_selected": false,
+    "amalgamation_note": "Not adopted; deterministic archive and extracted-archive verification are required by the protocol before reconsideration."
+  }
+}

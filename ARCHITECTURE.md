@@ -215,6 +215,28 @@ incremental rebuild, cache reuse, or feature isolation. A release amalgamation
 is also an optimization to prove, not a permanent architectural requirement.
 Optional features must omit their dependency trees when disabled.
 
+### Current compilation-boundary decision (issue #3)
+
+The selected organization remains one cohesive `kernal-api` package with
+feature-gated modules. The current record in
+`benchmarks/compilation-boundaries/results/` records the current package and a
+real pre-adapter historical baseline (`f745dcff4e2874170b779c510c698258aee90055`)
+using the checked-in protocol. The baseline quantifies the substrate migration;
+it is not a packaging A/B comparison because the intervening revisions also
+evolved facade and platform code. It records clean and representative
+incremental critical-path time, peak RSS where the host provides it, Soldr
+cache snapshots, debug output size, and packaged archive size.
+
+No change has demonstrated a cohesive implementation-only unit whose split
+would pay for another compilation boundary. Therefore no private crate and no
+release amalgamation is adopted. A later split proposal must compare its shape
+with the same facade and feature set under this protocol; a private crate must
+be `publish = false` and remain behind facade-owned types. An amalgamation
+additionally requires deterministic archives and archive-extracted verification
+before it can replace ordinary Cargo packaging. Dependency isolation is
+continuously proved with feature RED -> GREEN checks in
+`ci/check_compilation_boundary_dependencies.py`.
+
 Do not create speculative abstraction crates or traits such as a generic
 `kernal-api-data` layer without multiple real implementations. Initially,
 hashing, mapped files, file locks, databases, networking, HTTP services, and GUI

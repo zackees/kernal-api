@@ -53,6 +53,14 @@ jobs:
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
 
+  compilation-boundary-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - run: uv run --no-project ci/check_compilation_boundary_dependencies.py
+
   supported-targets:
     strategy:
       fail-fast: false

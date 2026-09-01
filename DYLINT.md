@@ -39,3 +39,11 @@ facade with behavior and compatibility tests, migrate the client call sites,
 then enable the strict ban for that client workspace. Temporary migration
 branches may carry both dependencies, but released code has no alternate
 runtime, network stack, process layer, or broker path behind a fallback.
+
+The `kernal_api::hash` BLAKE3 facade landed in #8 before any first-party
+client has migrated its content-hashing call sites. `blake3` is therefore not
+yet in the owned implementation set: enabling that direct-dependency ban now
+would block a client before its migration branch can consume the facade. Add
+it with normal, aliased, target, build, and test dependency fixtures when the
+first such client migration is ready; its released branch must not retain the
+legacy direct dependency.

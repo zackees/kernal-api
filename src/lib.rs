@@ -521,6 +521,136 @@ impl std::error::Error for ProcessCaptureError {
     }
 }
 
+/// Status-preserving output from [`run_bounded_command`].
+///
+/// This is a one-shot operation: the private substrate starts a contained
+/// child, captures both output streams, and reaps it before returning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedProcessOutput {
+    /// Raw child termination result represented without a platform handle.
+    pub exit: BoundedProcessExit,
+    /// Bytes captured from stdout.
+    pub stdout: Vec<u8>,
+    /// Bytes captured from stderr.
+    pub stderr: Vec<u8>,
+}
+
+/// Platform-neutral raw termination result for a bounded command.
+///
+/// A normal exit is its native exit code. On Unix, signal termination is the
+/// negative signal number, matching the private substrate's exact contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundedProcessExit {
+    raw_code: i32,
+}
+
+impl BoundedProcessExit {
+    pub(crate) fn from_raw_code(raw_code: i32) -> Self {
+        Self { raw_code }
+    }
+
+    /// Return the unmodified native exit code.
+    pub fn raw_code(self) -> i32 {
+        self.raw_code
+    }
+
+    /// Whether the command exited successfully.
+    pub fn is_success(self) -> bool {
+        self.raw_code == 0
+    }
+}
+
+/// Failure returned by [`run_bounded_command`].
+#[derive(Debug)]
+pub enum BoundedProcessError {
+    /// The command exceeded its requested wall-clock timeout and was cleaned up.
+    TimedOut,
+    /// Captured stdout and stderr exceeded their shared byte limit.
+    OutputLimitExceeded {
+        /// Aggregate stdout/stderr capture limit.
+        limit: usize,
+    },
+    /// The command could not be started.
+    Spawn(io::Error),
+    /// Capturing, waiting for, or cleaning up the command failed.
+    Io(io::Error),
+}
+
+impl std::fmt::Display for BoundedProcessError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => formatter.write_str("bounded process timed out"),
+            Self::OutputLimitExceeded { limit } => {
+                write!(formatter, "captured process output exceeded the {limit}-byte limit")
+            }
+            Self::Spawn(error) | Self::Io(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BoundedProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TimedOut | Self::OutputLimitExceeded { .. } => None,
+            Self::Spawn(error) | Self::Io(error) => Some(error),
+        }
+    }
+}
+
+/// Failure returned by [`run_bounded_command_async`].
+#[derive(Debug)]
+pub enum BoundedProcessAsyncError {
+    /// The bounded command failed.
+    Bounded(BoundedProcessError),
+    /// The canonical async engine could not join its blocking-lane task.
+    Task(async_engine::TaskError),
+}
+
+impl std::fmt::Display for BoundedProcessAsyncError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bounded(error) => error.fmt(formatter),
+            Self::Task(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BoundedProcessAsyncError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Bounded(error) => Some(error),
+            Self::Task(error) => Some(error),
+        }
+    }
+}
+
+/// Run a contained one-shot command with bounded capture.
+///
+/// The limit covers stdout and stderr together. Timeout and output-limit
+/// failures request hard cleanup before this function returns.
+pub fn run_bounded_command(
+    spec: SpawnSpec,
+    timeout: Option<std::time::Duration>,
+    output_limit: usize,
+) -> Result<BoundedProcessOutput, BoundedProcessError> {
+    process_adapter::run_bounded(spec, timeout, output_limit)
+}
+
+/// Run [`run_bounded_command`] on the canonical async engine's blocking lane.
+///
+/// This keeps the current runtime responsive without constructing a second
+/// runtime or exposing its implementation types.
+pub async fn run_bounded_command_async(
+    spec: SpawnSpec,
+    timeout: Option<std::time::Duration>,
+    output_limit: usize,
+) -> Result<BoundedProcessOutput, BoundedProcessAsyncError> {
+    async_engine::launch_blocking(move || run_bounded_command(spec, timeout, output_limit))
+        .await
+        .map_err(BoundedProcessAsyncError::Task)?
+        .map_err(BoundedProcessAsyncError::Bounded)
+}
+
 /// Build a shell command using the host platform's supported shell.
 pub fn shell_spec(command: impl AsRef<OsStr>) -> SpawnSpec {
     platform_imp::shell_spec(command.as_ref())
@@ -653,6 +783,20 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stderr).contains("bounded-stderr"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_preserves_raw_signal_exit() {
+        let output = run_bounded_command(
+            shell_spec("kill -TERM $$"),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .expect("signal-terminated command completes");
+
+        assert_eq!(output.exit.raw_code(), -libc::SIGTERM);
+        assert!(!output.exit.is_success());
+    }
+
     #[test]
     fn bounded_command_timeout_hard_kills_and_reaps_promptly() {
         let started = Instant::now();
@@ -716,7 +860,7 @@ mod tests {
         )
         .expect_err("missing program must fail before capture");
 
-        assert!(matches!(error, BoundedProcessError::Io(_)));
+        assert!(matches!(error, BoundedProcessError::Spawn(_)));
     }
 
     #[cfg(target_os = "linux")]
@@ -738,6 +882,28 @@ mod tests {
         .expect("non-UTF-8 command inputs are preserved");
 
         assert_eq!(output.stdout, b"value-\xff");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_preserves_working_directory() {
+        let directory = tempfile::tempdir().expect("temporary working directory");
+        let output = run_bounded_command(
+            SpawnSpec::new("/bin/sh")
+                .arg("-c")
+                .arg("pwd")
+                .current_dir(directory.path()),
+            Some(Duration::from_secs(2)),
+            1024,
+        )
+        .expect("command with explicit working directory");
+
+        assert_eq!(
+            std::str::from_utf8(&output.stdout)
+                .expect("pwd emits a UTF-8 path")
+                .trim_end(),
+            directory.path().to_string_lossy()
+        );
     }
 
     #[test]

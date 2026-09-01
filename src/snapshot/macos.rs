@@ -420,7 +420,7 @@ mod tests {
         drop(tid_sender);
         let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
-        let snapshot = capture(&SnapshotConfig::default());
+        let snapshot = capture_controlled_threads(&SnapshotConfig::default(), &expected_tids);
         let before = progress.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(2);
         while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {
@@ -443,6 +443,49 @@ mod tests {
             );
         }
         assert!(progress.load(Ordering::Relaxed) > before);
+    }
+
+    /// Exercise the real Mach suspend/read/resume path only on the workers
+    /// owned by this regression. Suspending arbitrary libtest/runtime threads
+    /// makes the harness collateral state of a test that is meant to prove the
+    /// controlled workers resume.
+    fn capture_controlled_threads(
+        config: &SnapshotConfig,
+        expected_tids: &[u64],
+    ) -> Result<Snapshot, SnapshotError> {
+        let _capture = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let thread_list = ThreadList::enumerate()?;
+        let mut scratch = vec![0u8; config.max_stack_bytes];
+        let mut samples = Vec::with_capacity(expected_tids.len());
+        let mut dropped = 0u32;
+        let mut pause_nanos = 0u64;
+
+        for thread in thread_list.siblings() {
+            let Some(os_tid) = os_thread_id(thread) else {
+                continue;
+            };
+            if !expected_tids.contains(&os_tid) {
+                continue;
+            }
+            match capture_thread(thread_list.task, thread, config, &mut scratch)? {
+                Some((sample, pause)) => {
+                    samples.push(sample);
+                    pause_nanos = pause_nanos.saturating_add(pause);
+                }
+                None => dropped = dropped.saturating_add(1),
+            }
+        }
+
+        Ok(Snapshot {
+            stats: SnapshotStats {
+                threads_total: expected_tids.len() as u32,
+                threads_captured: samples.len() as u32,
+                threads_dropped: dropped,
+                pause_nanos,
+            },
+            threads: samples,
+            frames_resolved: false,
+        })
     }
 
     #[test]

@@ -21,10 +21,7 @@ pub use autostart::{
 
 #[path = "platform_win/process_inspect.rs"]
 pub(crate) mod process_inspect;
-pub use process_inspect::{
-    process_executable_path, process_force_kill, process_same_executable_path,
-    process_signal_terminate, ProcessLiveness,
-};
+pub use process_inspect::{process_same_executable_path, ProcessLiveness};
 
 #[path = "platform_win/raw_write.rs"]
 pub(crate) mod raw_write;
@@ -355,8 +352,11 @@ pub use cmdline::read_process_cmdline;
 #[path = "platform/process_tree.rs"]
 mod process_tree;
 
-pub fn kill_tree(pid: u32, timeout: std::time::Duration) -> io::Result<u32> {
-    process_tree::kill_tree(pid, timeout, process_start_key)
+pub(crate) fn kill_tree_identity(
+    identity: crate::platform::process::ProcessIdentity,
+    timeout: std::time::Duration,
+) -> Result<u32, crate::platform::process::ProcessIdentityActionError> {
+    process_tree::kill_tree(identity, timeout, capture_process_identity, force_kill_identity)
 }
 
 pub fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -417,12 +417,101 @@ pub fn soft_terminate_process_group(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-pub fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
+#[cfg(test)]
+pub(crate) fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
+    // Windows process enumeration is intentionally not used as an identity
+    // source: Toolhelp gives a PID but no creation key. Consumers that need an
+    // exact identity resolve each PID through GetProcessTimes instead.
     Vec::new()
 }
 
-pub fn process_snapshot_for_pid(_pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
+#[cfg(test)]
+pub(crate) fn process_snapshot_for_pid(_pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
     None
+}
+
+pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::ProcessIdentityCapture {
+    use crate::platform::process::{ProcessIdentityCapture as Capture, ProcessIdentityUnavailable};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return Capture::Error(io::Error::new(io::ErrorKind::InvalidInput, "PID zero has no process identity"));
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Capture::Exited,
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied),
+            _ => Capture::Error(error),
+        };
+    }
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let error = (ok == 0).then(io::Error::last_os_error);
+    unsafe { CloseHandle(handle) };
+    match error {
+        None => Capture::Found(crate::platform::process::ProcessIdentity::from_native(
+            pid,
+            [(u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime), 0],
+        )),
+        Some(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied)
+        }
+        Some(error) => Capture::Error(error),
+    }
+}
+
+pub(crate) fn force_kill_identity(
+    identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    use crate::platform::process::{ProcessIdentityAction as Action, ProcessIdentityActionError as Error, ProcessIdentityCapture as Capture};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
+    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+
+    // Query and terminate through the same owned handle. Windows keeps the
+    // process object (and therefore its PID generation) pinned while it is
+    // open, so no PID can be recycled between revalidation and termination.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, identity.pid()) };
+    if handle.is_null() {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(Action::AlreadyExited),
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Err(Error::Unavailable(crate::platform::process::ProcessIdentityUnavailable::PermissionDenied)),
+            _ => Err(Error::Host(error)),
+        };
+    }
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let queried = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let key = [(u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime), 0];
+    if queried == 0 {
+        let error = io::Error::last_os_error();
+        unsafe { CloseHandle(handle) };
+        return Err(Error::Host(error));
+    }
+    if !identity.has_native_key(key) {
+        unsafe { CloseHandle(handle) };
+        return Err(Error::StaleIdentity);
+    }
+    let ok = unsafe { TerminateProcess(handle, 1) };
+    let error = (ok == 0).then(io::Error::last_os_error);
+    unsafe { CloseHandle(handle) };
+    error.map_or(Ok(Action::Performed), |error| Err(Error::Host(error)))
+}
+
+pub(crate) fn signal_terminate_identity(
+    _identity: crate::platform::process::ProcessIdentity,
+) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
+    Err(crate::platform::process::ProcessIdentityActionError::Unavailable(
+        crate::platform::process::ProcessIdentityUnavailable::Unsupported,
+    ))
 }
 
 /// Windows compatibility stub for the Unix post-fork descriptor hook.

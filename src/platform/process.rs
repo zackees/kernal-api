@@ -5,9 +5,9 @@ pub use crate::{
     capture_reader_done, compat_shell_command, configure_exact_trace, configure_process_command,
     configure_sync_contained_command, configure_sync_daemon_command, configure_trampoline_command,
     current_executable_build_id, exact_trace_capability, exit_code, monitor_console_windows,
-    parent_has_console, prepare_capture_reader, process_snapshot, process_snapshot_for_pid,
-    set_process_name, shell_command, soft_terminate_process_group, spawn_sync, spawn_sync_daemon,
-    start_descendant_monitor, start_exact_trace, sync_child_native_handle, trampoline_exit_code,
+    parent_has_console, prepare_capture_reader, set_process_name, shell_command,
+    soft_terminate_process_group, spawn_sync, spawn_sync_daemon, start_descendant_monitor,
+    start_exact_trace, sync_child_native_handle, trampoline_exit_code,
     unix_mark_extra_fds_close_on_exec, CaptureCancellation, PlatformChild, ProcessCaptureError,
     ProcessOutput, SpawnSpec, StreamMode, TracedChild, WindowsJobHandle,
 };
@@ -170,15 +170,219 @@ pub struct ConsoleWindowInfo {
     pub hwnd: u64,
 }
 
-/// A platform-owned identity record used when observing a process tree.
-/// The timestamp fields are opaque host-native creation-time components and
-/// must only be compared for equality.
+/// One live process instance, rather than merely an address in the PID table.
+///
+/// The creation key is deliberately opaque. It is a Windows `FILETIME`, Linux
+/// `/proc` start-tick value, or macOS `proc_bsdinfo` timestamp depending on
+/// the host, and is meaningful only for equality during this boot session.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ProcessIdentity {
+    pid: u32,
+    creation_key: [u64; 2],
+}
+
+impl ProcessIdentity {
+    pub(crate) const fn from_native(pid: u32, creation_key: [u64; 2]) -> Self {
+        Self { pid, creation_key }
+    }
+
+    /// The process-table address paired with this identity.
+    pub const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn has_native_key(self, creation_key: [u64; 2]) -> bool {
+        self.creation_key == creation_key
+    }
+}
+
+/// A process was not observable well enough to capture a safe identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ProcessSnapshot {
-    pub pid: u32,
-    pub parent_pid: u32,
-    pub start_time_a: u64,
-    pub start_time_b: u64,
+pub enum ProcessIdentityUnavailable {
+    /// The host denied access to the native creation key.
+    PermissionDenied,
+    /// This target does not provide the required native observation primitive.
+    Unsupported,
+}
+
+/// The outcome of resolving a PID to a generation-safe process identity.
+#[derive(Debug)]
+pub enum ProcessIdentityCapture {
+    /// A live process and its exact creation generation.
+    Found(ProcessIdentity),
+    /// No process currently owns this PID. This is not an identity.
+    Exited,
+    /// The process may exist, but the host could not obtain its creation key.
+    Unavailable(ProcessIdentityUnavailable),
+    /// The host failed while obtaining the creation key.
+    Error(std::io::Error),
+}
+
+/// The result of an action addressed by [`ProcessIdentity`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessIdentityAction {
+    /// The action was delivered to the exact process instance.
+    Performed,
+    /// The original process has already exited. No replacement was touched.
+    AlreadyExited,
+}
+
+/// Why a generation-safe action was refused.
+#[derive(Debug)]
+pub enum ProcessIdentityActionError {
+    /// The PID is now owned by a different process instance.
+    StaleIdentity,
+    /// The host could no longer obtain an identity safely.
+    Unavailable(ProcessIdentityUnavailable),
+    /// The host failed before it could act.
+    Host(std::io::Error),
+}
+
+impl std::fmt::Display for ProcessIdentityActionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StaleIdentity => f.write_str("process PID was reused by a different instance"),
+            Self::Unavailable(reason) => write!(f, "process identity is unavailable: {reason:?}"),
+            Self::Host(error) => write!(f, "process identity action failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessIdentityActionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Host(error) => Some(error),
+            Self::StaleIdentity | Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Capture a process identity from the host's strongest native creation key.
+///
+/// Callers must retain this value, not only its [`ProcessIdentity::pid`], for
+/// any deferred inspection or mutation.
+pub fn capture_identity(pid: u32) -> ProcessIdentityCapture {
+    crate::platform_imp::capture_process_identity(pid)
+}
+
+/// Forcibly terminate exactly `identity`.
+///
+/// The host resolves the PID and creation key immediately before signaling.
+/// A replacement PID produces [`ProcessIdentityActionError::StaleIdentity`]
+/// and is never signaled.
+pub fn force_kill(
+    identity: ProcessIdentity,
+) -> Result<ProcessIdentityAction, ProcessIdentityActionError> {
+    crate::platform_imp::force_kill_identity(identity)
+}
+
+/// Ask exactly `identity` to terminate gracefully where the host supports it.
+pub fn signal_terminate(
+    identity: ProcessIdentity,
+) -> Result<ProcessIdentityAction, ProcessIdentityActionError> {
+    crate::platform_imp::signal_terminate_identity(identity)
+}
+
+/// Terminate the observed process and every discovered descendant.
+///
+/// Every discovered PID is captured as a [`ProcessIdentity`] and revalidated
+/// before each signal attempt; a recycled member is skipped rather than
+/// becoming a target.
+pub fn kill_tree(
+    identity: ProcessIdentity,
+    timeout: std::time::Duration,
+) -> Result<u32, ProcessIdentityActionError> {
+    crate::platform_imp::kill_tree_identity(identity, timeout)
+}
+
+#[cfg(test)]
+pub(crate) fn act_on_current_identity(
+    identity: ProcessIdentity,
+    capture: impl FnOnce(u32) -> ProcessIdentityCapture,
+    action: impl FnOnce() -> Result<(), std::io::Error>,
+) -> Result<ProcessIdentityAction, ProcessIdentityActionError> {
+    match capture(identity.pid()) {
+        ProcessIdentityCapture::Found(current) if current == identity => action()
+            .map(|()| ProcessIdentityAction::Performed)
+            .map_err(ProcessIdentityActionError::Host),
+        ProcessIdentityCapture::Found(_) => Err(ProcessIdentityActionError::StaleIdentity),
+        ProcessIdentityCapture::Exited => Ok(ProcessIdentityAction::AlreadyExited),
+        ProcessIdentityCapture::Unavailable(reason) => {
+            Err(ProcessIdentityActionError::Unavailable(reason))
+        }
+        ProcessIdentityCapture::Error(error) => Err(ProcessIdentityActionError::Host(error)),
+    }
+}
+
+/// Private snapshot material for native tree discovery. It never crosses the
+/// facade boundary; public callers use [`ProcessIdentity`] instead.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProcessSnapshot {
+    pub(crate) identity: ProcessIdentity,
+    pub(crate) parent_pid: u32,
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn recycled_pid_is_refused_and_never_touches_the_replacement() {
+        let original = ProcessIdentity::from_native(41, [10, 0]);
+        let replacement = ProcessIdentity::from_native(41, [11, 0]);
+        let touched = Cell::new(false);
+        let outcome = act_on_current_identity(
+            original,
+            |_| ProcessIdentityCapture::Found(replacement),
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            outcome,
+            Err(ProcessIdentityActionError::StaleIdentity)
+        ));
+        assert!(
+            !touched.get(),
+            "the replacement process must never be touched"
+        );
+    }
+
+    #[test]
+    fn an_exited_identity_is_idempotent_without_attempting_a_mutation() {
+        let identity = ProcessIdentity::from_native(41, [10, 0]);
+        let touched = Cell::new(false);
+        let outcome = act_on_current_identity(
+            identity,
+            |_| ProcessIdentityCapture::Exited,
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Ok(ProcessIdentityAction::AlreadyExited)));
+        assert!(!touched.get());
+    }
+
+    #[test]
+    fn matching_identity_performs_the_requested_action() {
+        let identity = ProcessIdentity::from_native(41, [10, 0]);
+        let touched = Cell::new(false);
+        let outcome = act_on_current_identity(
+            identity,
+            |_| ProcessIdentityCapture::Found(identity),
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Ok(ProcessIdentityAction::Performed)));
+        assert!(touched.get());
+    }
 }
 
 /// Environment base selected by the shared caller for a synchronous spawn.
@@ -796,7 +1000,7 @@ pub enum UnixSignalKind {
 }
 
 pub use crate::{
-    kill_tree, unix_set_priority, unix_signal_process, unix_signal_process_group, unix_signal_raw,
+    unix_set_priority, unix_signal_process, unix_signal_process_group, unix_signal_raw,
 };
 
 /// What this host installed so a child outlives its owner no longer than it
@@ -920,11 +1124,7 @@ impl std::error::Error for ProcessInspectError {
     }
 }
 
-pub use crate::{
-    process_executable_path as executable_path, process_force_kill as force_kill,
-    process_same_executable_path as same_executable_path,
-    process_signal_terminate as signal_terminate, ProcessLiveness,
-};
+pub use crate::{process_same_executable_path as same_executable_path, ProcessLiveness};
 
 /// A standing request from the host that this process shut down.
 ///

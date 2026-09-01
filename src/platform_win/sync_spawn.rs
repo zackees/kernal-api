@@ -1648,7 +1648,11 @@ mod daemon_flag_tests {
         }
 
         fn wait_for_text(&self) -> String {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // A nested libtest process can take longer than the usual process
+            // startup budget when GitHub's Windows workers are contended. This
+            // is a readiness bound only; the containment assertions retain
+            // their tighter five-second shutdown bounds.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 if let Ok(text) = std::fs::read_to_string(&self.path) {
                     return text;

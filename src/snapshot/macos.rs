@@ -344,8 +344,46 @@ mod tests {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
+    const SNAPSHOT_HELPER_ENV: &str = "KERNAL_API_MACOS_SNAPSHOT_HELPER";
+
     #[test]
     fn snapshot_sees_every_spawned_thread_and_resumes_them() {
+        if std::env::var_os(SNAPSHOT_HELPER_ENV).is_some() {
+            snapshot_sees_every_spawned_thread_and_resumes_them_in_helper();
+            return;
+        }
+
+        let test_binary = std::env::current_exe().expect("locate test binary");
+        let mut helper = std::process::Command::new(test_binary)
+            .arg("--exact")
+            .arg("snapshot::macos::tests::snapshot_sees_every_spawned_thread_and_resumes_them")
+            .arg("--nocapture")
+            .env(SNAPSHOT_HELPER_ENV, "1")
+            .spawn()
+            .expect("spawn isolated Mach snapshot helper");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            match helper.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = helper.kill();
+                    let _ = helper.wait();
+                    panic!("isolated Mach snapshot helper exceeded its 20-second timeout");
+                }
+                Err(error) => {
+                    let _ = helper.kill();
+                    let _ = helper.wait();
+                    panic!("wait for isolated Mach snapshot helper: {error}");
+                }
+            }
+        };
+        assert!(status.success(), "isolated Mach snapshot helper failed: {status}");
+    }
+
+    fn snapshot_sees_every_spawned_thread_and_resumes_them_in_helper() {
         let stop = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(AtomicU64::new(0));
         let (tid_sender, tid_receiver) = mpsc::channel();
@@ -370,7 +408,7 @@ mod tests {
         drop(tid_sender);
         let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
-        let snapshot = capture(&SnapshotConfig::default()).expect("capture");
+        let snapshot = capture(&SnapshotConfig::default());
         let before = progress.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(2);
         while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {
@@ -381,6 +419,7 @@ mod tests {
         for worker in workers {
             worker.join().unwrap();
         }
+        let snapshot = snapshot.expect("capture");
         for expected_tid in expected_tids {
             assert!(
                 snapshot

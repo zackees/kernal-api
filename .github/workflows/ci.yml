@@ -89,6 +89,8 @@ jobs:
         with:
           lfs: true
       - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: ${{ !matrix.legacy_cargo }}
+        run: soldr rustup target add ${{ matrix.target }}
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
         run: >-
           soldr cargo build

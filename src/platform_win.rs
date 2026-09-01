@@ -417,19 +417,6 @@ pub fn soft_terminate_process_group(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn process_snapshot() -> Vec<crate::platform::process::ProcessSnapshot> {
-    // Windows process enumeration is intentionally not used as an identity
-    // source: Toolhelp gives a PID but no creation key. Consumers that need an
-    // exact identity resolve each PID through GetProcessTimes instead.
-    Vec::new()
-}
-
-#[cfg(test)]
-pub(crate) fn process_snapshot_for_pid(_pid: u32) -> Option<crate::platform::process::ProcessSnapshot> {
-    None
-}
-
 pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::ProcessIdentityCapture {
     use crate::platform::process::{ProcessIdentityCapture as Capture, ProcessIdentityUnavailable};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
@@ -469,7 +456,7 @@ pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::Pr
 pub(crate) fn force_kill_identity(
     identity: crate::platform::process::ProcessIdentity,
 ) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
-    use crate::platform::process::{ProcessIdentityAction as Action, ProcessIdentityActionError as Error, ProcessIdentityCapture as Capture};
+    use crate::platform::process::{ProcessIdentityAction as Action, ProcessIdentityActionError as Error};
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
     use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
 
@@ -548,28 +535,6 @@ pub fn unix_signal_process(_pid: u32, _signal: crate::platform::process::UnixSig
 pub fn unix_signal_process_group(_pid: i32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
 pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 { 0 }
 
-fn process_start_key(pid: sysinfo::Pid, _process: &sysinfo::Process) -> io::Result<u64> {
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid.as_u32()) };
-    if handle.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
-    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
-    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
-    let mut user: FILETIME = unsafe { std::mem::zeroed() };
-    let queried = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    let query_error = if queried == 0 { Some(io::Error::last_os_error()) } else { None };
-    unsafe { CloseHandle(handle); }
-    if let Some(error) = query_error {
-        return Err(error);
-    }
-    Ok((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
-}
 
 pub(crate) fn shell_spec(command: &OsStr) -> SpawnSpec {
     SpawnSpec::new("cmd.exe").arg("/C").arg(command)

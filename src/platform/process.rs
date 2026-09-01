@@ -317,7 +317,7 @@ pub(crate) fn act_on_current_identity(
 
 /// Private snapshot material for native tree discovery. It never crosses the
 /// facade boundary; public callers use [`ProcessIdentity`] instead.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessSnapshot {
     pub(crate) identity: ProcessIdentity,

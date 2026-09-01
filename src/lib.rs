@@ -902,7 +902,9 @@ mod tests {
             std::str::from_utf8(&output.stdout)
                 .expect("pwd emits a UTF-8 path")
                 .trim_end(),
-            directory.path().to_string_lossy()
+            std::fs::canonicalize(directory.path())
+                .expect("temporary working directory remains available")
+                .to_string_lossy()
         );
     }
 

@@ -354,6 +354,7 @@ mod tests {
     use std::time::Duration;
 
     const SNAPSHOT_HELPER_ENV: &str = "KERNAL_API_MACOS_SNAPSHOT_HELPER";
+    const CONTROLLED_STACK_BYTES: usize = 4096;
 
     #[test]
     fn snapshot_sees_every_spawned_thread_and_resumes_them() {
@@ -420,7 +421,12 @@ mod tests {
         drop(tid_sender);
         let expected_tids: Vec<_> = tid_receiver.iter().collect();
 
-        let snapshot = capture_controlled_threads(&SnapshotConfig::default(), &expected_tids);
+        let snapshot = capture_controlled_threads(
+            &SnapshotConfig {
+                max_stack_bytes: CONTROLLED_STACK_BYTES,
+            },
+            &expected_tids,
+        );
         let before = progress.load(Ordering::Relaxed);
         let deadline = Instant::now() + Duration::from_secs(2);
         while progress.load(Ordering::Relaxed) == before && Instant::now() < deadline {

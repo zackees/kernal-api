@@ -27,12 +27,9 @@ have an async runtime to do that work. It must never depend on `kernal-api`.
 architecture it depends on `running-process`, selects shared implementation
 versions, adds facilities such as hashing and profiling, and turns backend
 behavior into stable application contracts. The phase-1 bounded process adapter
-is implemented on the `feat/running-process-adapter` migration branch with a
-private local path to the unreleased upstream owner-death operation. It is
-deliberately not a release-ready dependency: the release workflow blocks
-registry packaging and publication until the matching exact upstream registry
-version is published and the migration-only path is removed. First-party
-applications eventually depend on `kernal-api` only.
+uses the exact published `running-process` 4.10.10 release with only its
+`kernel-substrate` feature. First-party applications eventually depend on
+`kernal-api` only.
 
 This one-way graph resolves the async/process cycle without creating a smaller
 "base" facade that would merely move the same boundary elsewhere.

@@ -68,14 +68,14 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { path = \"/home/niteris/dev/kernal-api-extern/running-process-watchdog/crates/running-process\", version = \"=4.10.9\", default-features = false, features = [\"kernel-substrate\"] }"
+            "running-process = { version = \"=4.10.10\", default-features = false, features = [\"kernel-substrate\"] }"
         ),
-        "the migration branch must retain the exact temporary running-process path, pin, and minimal feature set"
+        "the facade must retain the exact published running-process pin and minimal feature set"
     );
     assert!(
         manifest
-            .contains("# MIGRATION-ONLY: exercises the unreleased bounded owner-death addition."),
-        "the temporary process substrate must be visibly marked migration-only"
+            .contains("# Exact first-party pre-1.0 pin."),
+        "the released process substrate must retain its exact first-party pin rationale"
     );
 
     let release_workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml"))

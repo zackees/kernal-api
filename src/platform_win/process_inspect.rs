@@ -88,6 +88,7 @@ impl Drop for ProcessLiveness {
 }
 
 /// Resolve the on-disk image a running process was started from.
+#[allow(dead_code)] // Kept private pending an identity-addressed inspect facade.
 pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
     // SAFETY: see `ProcessLiveness::open`.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -118,6 +119,7 @@ pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
 /// This host has no signal that asks. Terminating without asking is a
 /// different operation with different consequences for the target, so it is
 /// reported as unsupported rather than quietly substituted.
+#[allow(dead_code)] // PID-only mutation remains private and is not a facade operation.
 pub fn process_signal_terminate(_pid: u32) -> Result<(), ProcessInspectError> {
     Err(ProcessInspectError::stated(
         ProcessInspectErrorKind::Unsupported,
@@ -126,6 +128,7 @@ pub fn process_signal_terminate(_pid: u32) -> Result<(), ProcessInspectError> {
 }
 
 /// Stop a process without asking.
+#[allow(dead_code)] // PID-only mutation remains private and is not a facade operation.
 pub fn process_force_kill(pid: u32) -> Result<(), ProcessInspectError> {
     // SAFETY: see `ProcessLiveness::open`.
     let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };

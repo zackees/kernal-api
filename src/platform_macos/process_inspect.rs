@@ -65,6 +65,7 @@ impl ProcessLiveness {
 /// `proc_pidpath` asks about one process. The obvious alternative -- walking
 /// every process on the host and picking the matching one -- answers the same
 /// question at a cost that grows with everything else running.
+#[allow(dead_code)] // Kept private pending an identity-addressed inspect facade.
 pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
     let mut buffer = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer and its true length are passed together, and the
@@ -87,15 +88,18 @@ pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
 }
 
 /// Ask a process to stop.
+#[allow(dead_code)] // PID-only mutation remains private and is not a facade operation.
 pub fn process_signal_terminate(pid: u32) -> Result<(), ProcessInspectError> {
     signal(pid, libc::SIGTERM)
 }
 
 /// Stop a process without asking.
+#[allow(dead_code)] // PID-only mutation remains private and is not a facade operation.
 pub fn process_force_kill(pid: u32) -> Result<(), ProcessInspectError> {
     signal(pid, libc::SIGKILL)
 }
 
+#[allow(dead_code)]
 fn signal(pid: u32, signal: libc::c_int) -> Result<(), ProcessInspectError> {
     let native_pid = validate_pid(pid)?;
     // SAFETY: `native_pid` is in range and the signal number is a constant.

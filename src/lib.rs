@@ -904,7 +904,7 @@ mod tests {
                 .trim_end(),
             std::fs::canonicalize(directory.path())
                 .expect("temporary working directory remains available")
-                .to_string_lossy()
+                .to_string_lossy(),
         );
     }
 

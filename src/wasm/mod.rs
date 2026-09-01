@@ -3035,48 +3035,40 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
-    fn supplied_validation_artifact_executes_the_private_validation_lane() {
-        let Ok(path) = std::env::var("KERNAL_API_THREADED_VALIDATION_WASM") else {
+    fn supplied_threaded_artifact_admits_the_public_profile() {
+        // #31 is the closed precompile-admission slice. Execution, stores,
+        // linking, and native thread scheduling are intentionally covered by
+        // their later capability-specific tests rather than this artifact gate.
+        let Ok(path) = std::env::var("KERNAL_API_THREADED_ARTIFACT_WASM") else {
             // The real Rust guest is assembled only by the explicit diagnostic
             // workflow; normal unit runs remain source-only.
             return;
         };
-        let bytes = std::fs::read(path).expect("read validation artifact");
+        let bytes = std::fs::read(path).expect("read threaded artifact");
+        let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
+        assert_eq!(
+            manifest,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/threaded_rust_artifact_manifest_v1.txt"
+            ))
+        );
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
         let sketch = compiler
             .admit(
                 &bytes,
-                SketchModulePolicy::threaded_rust_validation_v1_for_test(
-                    bytes.len() + 1,
-                    THREADED_RUST_MAX_PAGES,
-                )
-                .expect("policy"),
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy"),
             )
-            .expect("validation artifact admission");
-        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let handle = runtime.handle();
-        assert_eq!(
-            runtime.run(async { sketch.execute_threaded_root(handle).await }),
-            Ok(ThreadedRootOutcome::Started)
-        );
+            .expect("public threaded artifact admission");
         assert_eq!(compiler.compiled_module_count(), 1);
         assert_eq!(
-            sketch.root_execution_observation_for_test(),
-            Some(RootExecutionObservation {
-                preparations: 1,
-                // One root `_start` call and the two Rust std-thread entries
-                // each invoke the closed kernel-yield import.
-                kernel_yields: 3,
-                supplied_runtime_handles: 3,
-                runtime_identity_mismatches: 0,
-                accepted_child_registrations: 0,
-                live_threads: 0,
-                queued_join_handles: 0,
-                ..RootExecutionObservation::default()
-            })
+            sketch.shared_memory().minimum_pages(),
+            THREADED_RUST_INITIAL_PAGES
+        );
+        assert_eq!(
+            sketch.shared_memory().maximum_pages(),
+            THREADED_RUST_MAX_PAGES
         );
     }
 
@@ -4054,8 +4046,8 @@ impl std::error::Error for SketchModuleError {}
 /// Deterministically describes the semantic sections of an untrusted Wasm
 /// artifact for the threaded-smoke RED test. This is intentionally an
 /// inspection seam, not a loader or an execution API.
-#[doc(hidden)]
-pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, SketchModuleError> {
+#[cfg(test)]
+fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, SketchModuleError> {
     let mut facts = Vec::new();
     let mut types = Vec::<TypeEntry>::new();
     let mut imported_function_types = Vec::<u32>::new();
@@ -4128,11 +4120,10 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
                 }
             }
             Payload::StartSection { func, .. } => start = Some(func),
-            Payload::CustomSection(section) => facts.push(format!(
-                "custom name={} bytes={}",
-                bounded(section.name()),
-                section.data().len(),
-            )),
+            // Custom-section acceptance remains part of admission. Its byte
+            // count is intentionally not part of this ABI manifest: compiler
+            // name metadata is not semantic and varies across supported hosts.
+            Payload::CustomSection(_) => {}
             _ => {}
         }
     }
@@ -4159,6 +4150,7 @@ pub fn threaded_artifact_manifest_for_test(bytes: &[u8]) -> Result<String, Sketc
     ))
 }
 
+#[cfg(test)]
 fn import_kind(import: TypeRef) -> String {
     match import {
         TypeRef::Func(index) | TypeRef::FuncExact(index) => format!("function type={index}"),
@@ -4176,6 +4168,7 @@ fn import_kind(import: TypeRef) -> String {
     }
 }
 
+#[cfg(test)]
 fn memory_fact(
     prefix: &str,
     initial: u64,
@@ -4189,6 +4182,7 @@ fn memory_fact(
     )
 }
 
+#[cfg(test)]
 fn external_kind(kind: ExternalKind) -> &'static str {
     match kind {
         ExternalKind::Func => "function",

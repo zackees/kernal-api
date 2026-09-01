@@ -316,9 +316,8 @@ use std::io::Read;
 use std::os::windows::io::AsRawHandle;
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_HANDLE};
+use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
 use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
-use windows_sys::Win32::System::Threading::OpenProcess;
 
 use crate::SpawnSpec;
 

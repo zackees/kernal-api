@@ -260,19 +260,25 @@ fn real_worker_sequential_stress_leaves_no_parent_state() {
 mod failure_proof {
     use super::*;
     use std::fs;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use std::process::Command;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::Instant;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     const MARKER: &str = "KERNAL_API_WASM_WORKER_IDENTITY_MARKER";
     const RESULT: &str = "KERNAL_API_WASM_WORKER_FAILURE_RESULT";
     const RELEASE: &str = "KERNAL_API_WASM_WORKER_FAILURE_RELEASE";
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     struct Artifacts {
         root: std::path::PathBuf,
         marker: std::path::PathBuf,
         result: std::path::PathBuf,
         release: std::path::PathBuf,
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl Artifacts {
         fn new() -> Self {
             let unique = format!(
@@ -293,18 +299,21 @@ mod failure_proof {
             }
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl Drop for Artifacts {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[derive(Clone, Copy)]
     struct Identity {
         pid: u32,
         a: u64,
         b: u64,
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn decode_marker(path: &std::path::Path) -> Option<Identity> {
         let text = fs::read_to_string(path).ok()?;
         let mut lines = text.lines();
@@ -317,6 +326,7 @@ mod failure_proof {
         };
         lines.next().is_none().then_some(value)
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn wait_for_marker(path: &std::path::Path) -> Identity {
         let deadline = Instant::now() + OUTER_BOUND;
         while Instant::now() < deadline {
@@ -329,7 +339,9 @@ mod failure_proof {
         }
         panic!("worker identity marker was not published")
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     struct InnerChild(Option<std::process::Child>);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl InnerChild {
         fn wait_success(&mut self) {
             let deadline = Instant::now() + OUTER_BOUND;
@@ -345,6 +357,7 @@ mod failure_proof {
             self.0 = None;
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     impl Drop for InnerChild {
         fn drop(&mut self) {
             let Some(child) = self.0.as_mut() else {
@@ -360,6 +373,7 @@ mod failure_proof {
             }
         }
     }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn launch(inner: &str, files: &Artifacts) -> InnerChild {
         let worker = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
         assert!(worker.is_absolute(), "real worker path must be absolute");

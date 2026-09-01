@@ -401,22 +401,28 @@ mod tests {
         let progress = Arc::new(AtomicU64::new(0));
         let (tid_sender, tid_receiver) = mpsc::channel();
         let mut workers = Vec::new();
-        for _ in 0..3 {
+        for worker_number in 0..3 {
+            eprintln!("Mach snapshot helper: spawn worker {worker_number}");
             let stop = Arc::clone(&stop);
             let progress = Arc::clone(&progress);
             let tid_sender = tid_sender.clone();
             workers.push(std::thread::spawn(move || {
+                eprintln!("Mach snapshot helper: worker {worker_number} boot");
                 let self_thread = unsafe { mach_thread_self() };
+                eprintln!("Mach snapshot helper: worker {worker_number} got Mach port");
                 let os_tid = os_thread_id(self_thread).expect("worker must have an OS thread id");
+                eprintln!("Mach snapshot helper: worker {worker_number} got tid {os_tid}");
                 unsafe {
                     mach_port_deallocate(mach_task_self(), self_thread);
                 }
                 tid_sender.send(os_tid).unwrap();
+                eprintln!("Mach snapshot helper: worker {worker_number} sent tid");
                 while !stop.load(Ordering::SeqCst) {
                     progress.fetch_add(1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(1));
                 }
             }));
+            eprintln!("Mach snapshot helper: spawned worker {worker_number}");
         }
         drop(tid_sender);
         let expected_tids: Vec<_> = tid_receiver.iter().collect();

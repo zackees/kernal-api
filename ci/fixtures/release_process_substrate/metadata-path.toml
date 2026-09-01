@@ -1,0 +1,6 @@
+[package]
+name = "metadata-only"
+version = "0.1.0"
+
+[package.metadata.compiler-cache]
+running-process = { path = "../metadata-only-running-process" }

@@ -1,0 +1,6 @@
+[dependencies]
+git-process = { package = "running-process", version = "=4.10.9", git = "https://example.invalid/running-process" }
+caret-process = { package = "running-process", version = "4.10.9" }
+wrong-process = { package = "running-process", version = "=4.10.8" }
+zero-process = { package = "running-process", version = "=0.0.0" }
+missing-process = { package = "running-process" }

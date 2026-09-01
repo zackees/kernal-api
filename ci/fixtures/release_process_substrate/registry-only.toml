@@ -1,0 +1,9 @@
+[workspace.dependencies]
+running-process = { version = "=4.10.9", default-features = false, features = ["kernel-substrate"] }
+process-substrate = { package = "running-process", version = "=4.10.9" }
+
+[target.'cfg(unix)'.build-dependencies]
+"running-process" = "=4.10.9"
+
+[patch.crates-io]
+serde = { version = "=1.0.0" }

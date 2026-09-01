@@ -3035,10 +3035,13 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
-    fn supplied_threaded_artifact_admits_the_public_profile() {
-        // #31 is the closed precompile-admission slice. Execution, stores,
-        // linking, and native thread scheduling are intentionally covered by
-        // their later capability-specific tests rather than this artifact gate.
+    fn supplied_threaded_artifact_admits_and_executes_the_public_profile() {
+        // This is deliberately supplied by the explicit diagnostic workflow:
+        // ordinary source-only test runs must neither build a cross-target
+        // guest nor turn a missing Soldr materialization into a false green.
+        // When present, however, this is the end-to-end acceptance proof for
+        // #34: admission is followed by the private root path, not merely a
+        // fixture-shaped prelink.
         let Ok(path) = std::env::var("KERNAL_API_THREADED_ARTIFACT_WASM") else {
             // The real Rust guest is assembled only by the explicit diagnostic
             // workflow; normal unit runs remain source-only.
@@ -3069,6 +3072,32 @@ mod threaded_root_observation_tests {
         assert_eq!(
             sketch.shared_memory().maximum_pages(),
             THREADED_RUST_MAX_PAGES
+        );
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = runtime.run(async {
+            sketch
+                .execute_threaded_root(
+                    crate::async_engine::RuntimeHandle::current().expect("handle"),
+                )
+                .await
+        });
+        assert_eq!(
+            outcome,
+            Ok(ThreadedRootOutcome::Started),
+            "the real closed-profile artifact must return from its Wasmtime start through the private root path"
+        );
+        assert_eq!(
+            compiler.compiled_module_count(),
+            1,
+            "execution must reuse admission compilation"
+        );
+        assert_eq!(
+            sketch.execution_limits_snapshot().active_root_executions(),
+            0,
+            "root execution permit must be released after completion"
         );
     }
 

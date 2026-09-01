@@ -413,7 +413,7 @@ mod tests {
                 tid_sender.send(os_tid).unwrap();
                 while !stop.load(Ordering::SeqCst) {
                     progress.fetch_add(1, Ordering::SeqCst);
-                    std::hint::spin_loop();
+                    std::thread::sleep(Duration::from_millis(1));
                 }
             }));
         }

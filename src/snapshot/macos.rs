@@ -34,6 +34,7 @@ struct ThreadList {
     list: thread_act_array_t,
     count: mach_msg_type_number_t,
     self_thread: thread_act_t,
+    self_tid: Option<u64>,
 }
 
 impl ThreadList {
@@ -48,11 +49,13 @@ impl ThreadList {
                 code: result,
             });
         }
+        let self_thread = unsafe { mach_thread_self() };
         Ok(Self {
             task,
             list,
             count,
-            self_thread: unsafe { mach_thread_self() },
+            self_tid: os_thread_id(self_thread),
+            self_thread,
         })
     }
 
@@ -61,7 +64,13 @@ impl ThreadList {
         threads
             .iter()
             .copied()
-            .filter(|thread| *thread != self.self_thread)
+            .filter(|thread| match self.self_tid {
+                // `task_threads` and `mach_thread_self` can hold distinct send
+                // rights for the same thread. Comparing their port names alone
+                // can therefore fail to exclude the caller and self-suspend it.
+                Some(self_tid) => os_thread_id(*thread) != Some(self_tid),
+                None => *thread != self.self_thread,
+            })
     }
 }
 
@@ -380,7 +389,10 @@ mod tests {
                 }
             }
         };
-        assert!(status.success(), "isolated Mach snapshot helper failed: {status}");
+        assert!(
+            status.success(),
+            "isolated Mach snapshot helper failed: {status}"
+        );
     }
 
     fn snapshot_sees_every_spawned_thread_and_resumes_them_in_helper() {

@@ -195,7 +195,8 @@ pub fn ipc_broker_v2_runtime_dir() -> std::path::PathBuf {
 }
 #[cfg(feature = "ipc-async")]
 pub use ipc::{
-    AsyncListener as IpcAsyncListener, AsyncStream as IpcAsyncStream,
+    AsyncListener as IpcAsyncListener, AsyncReadHalf as IpcAsyncReadHalf,
+    AsyncStream as IpcAsyncStream, AsyncWriteHalf as IpcAsyncWriteHalf,
     IntoAsyncListener as IpcIntoAsyncListener, IntoAsyncStream as IpcIntoAsyncStream,
 };
 

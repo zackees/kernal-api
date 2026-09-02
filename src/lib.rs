@@ -309,7 +309,8 @@ pub fn legacy_duplicate_handle(
 
 #[cfg(feature = "ipc-async")]
 pub use platform_imp::{
-    IpcAsyncListener, IpcAsyncStream, IpcIntoAsyncListener, IpcIntoAsyncStream,
+    IpcAsyncListener, IpcAsyncReadHalf, IpcAsyncStream, IpcAsyncWriteHalf, IpcIntoAsyncListener,
+    IpcIntoAsyncStream,
 };
 
 #[cfg(feature = "pty")]

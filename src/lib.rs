@@ -15,7 +15,8 @@ use std::process::ExitStatus;
 
 mod process_adapter;
 
-/// Kernel-owned BLAKE3 content hashing for bytes, readers, and files.
+/// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
+/// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
 /// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an

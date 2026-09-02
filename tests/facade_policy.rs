@@ -43,6 +43,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use crash_handler",
         "pub use framehop",
         "pub use interprocess",
+        "pub use memmap2",
         "pub use mimalloc_pprof",
         "pub use pdb_addr2line",
         "pub use portable_pty",

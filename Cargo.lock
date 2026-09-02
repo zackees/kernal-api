@@ -1229,6 +1229,7 @@ dependencies = [
  "libc",
  "lzma-rs",
  "mach2",
+ "memmap2",
  "mimalloc-pprof",
  "object 0.36.7",
  "pdb",

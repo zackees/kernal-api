@@ -10,7 +10,8 @@ use interprocess::local_socket::prelude::*;
 #[cfg(feature = "ipc-async")]
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, PeerCreds, ToNsName};
-use interprocess::TryClone;
+use interprocess::os::windows::named_pipe::{pipe_mode, DuplexPipeStream};
+use interprocess::{ConnectWaitMode, TryClone};
 #[cfg(feature = "ipc-async")]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -36,16 +37,63 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Whether this endpoint's target is present on the host.
+    ///
+    /// A named pipe has no filesystem entry to inspect. An instance exists
+    /// only while the process that created it holds it open, and the kernel
+    /// takes the name back when that process exits, so existence is answered
+    /// by the same probe as staleness and `true` here also means a server is
+    /// live. Nothing survives that server for [`Endpoint::retire`] to remove.
     pub fn target_exists(&self) -> io::Result<bool> {
-        Ok(false)
+        self.probe_server_instance()
     }
 
     pub fn ensure_parent_exists(&self) -> io::Result<()> {
         Ok(())
     }
 
+    /// Whether the endpoint has no server behind it and may be taken over.
+    ///
+    /// Only a probe that answered "no server instance" reports stale. A probe
+    /// that failed for any other reason leaves the question open, and an open
+    /// question is not a licence to take a live endpoint over.
     pub fn is_stale(&self) -> bool {
-        false
+        matches!(self.probe_server_instance(), Ok(false))
+    }
+
+    /// Classify one connect attempt against this pipe name.
+    ///
+    /// `CreateFileW` reports `ERROR_FILE_NOT_FOUND` when no server instance
+    /// exists, which the transport surfaces as [`io::ErrorKind::NotFound`] --
+    /// the same classification the filesystem-backed hosts key off.
+    ///
+    /// The attempt carries a zero connect timeout so that exactly one
+    /// `CreateFileW` is issued, and it asks the named-pipe API for that
+    /// directly: the local-socket layer this module otherwise uses hard-codes
+    /// an unbounded wait and drops any wait mode handed to it. An unbounded
+    /// wait would spin until a busy instance frees up, which the caller has no
+    /// way to bring about -- only the server's next accept clears an instance
+    /// -- so a liveness question against a server that is alive but wedged
+    /// would never come back. With the attempt bounded, `ERROR_PIPE_BUSY`
+    /// arrives as [`io::ErrorKind::TimedOut`] instead, and a busy instance is
+    /// itself proof that a server holds the name.
+    ///
+    /// A server observes a successful probe as a connection that never sends
+    /// a byte and clears it on its next accept, so a caller that only wants
+    /// liveness should probe once rather than ask both predicates.
+    fn probe_server_instance(&self) -> io::Result<bool> {
+        let attempt = DuplexPipeStream::<pipe_mode::Bytes>::connect_by_path_with_wait_mode(
+            pipe_path(&self.0),
+            ConnectWaitMode::Timeout(std::time::Duration::ZERO),
+        );
+        match attempt {
+            Ok(_stream) => Ok(true),
+            Err(error) => match error.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Ok(false),
+                io::ErrorKind::TimedOut => Ok(true),
+                _ => Err(error),
+            },
+        }
     }
 
     /// Allocate a unique endpoint for a caller-owned test or probe.
@@ -66,6 +114,19 @@ fn name(path: &str) -> io::Result<interprocess::local_socket::Name<'_>> {
         .unwrap_or(path)
         .to_ns_name::<GenericNamespaced>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+/// Spell this address the way the transport spells it to the kernel.
+///
+/// [`name`] hands a namespaced name to the local-socket layer, which prepends
+/// the local pipe prefix on the way to `CreateFileW`. A probe that calls the
+/// named-pipe API directly has to prepend it here instead, and has to strip
+/// the same prefix first so that both spellings name one pipe.
+fn pipe_path(path: &str) -> String {
+    format!(
+        r"\\.\pipe\{}",
+        path.strip_prefix(r"\\.\pipe\").unwrap_or(path)
+    )
 }
 
 pub fn select_endpoint_address(

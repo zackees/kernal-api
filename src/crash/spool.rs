@@ -175,8 +175,19 @@ fn default_owner_root() -> PathBuf {
 pub(crate) fn create_sink(
     metadata: &CrashMetadata,
 ) -> io::Result<(File, PathBuf, [u8; RECORD_SIZE])> {
-    let dir = spool_dir();
-    create_private_dir(&dir)?;
+    create_sink_in(&spool_dir(), metadata)
+}
+
+/// Split from [`create_sink`] so the reap can be tested without `set_var`.
+pub(crate) fn create_sink_in(
+    dir: &Path,
+    metadata: &CrashMetadata,
+) -> io::Result<(File, PathBuf, [u8; RECORD_SIZE])> {
+    create_private_dir(dir)?;
+    // Arming is the natural point to pay for one directory read: a sink whose
+    // owner exited through `std::process::exit` never ran `CrashGuard::drop`
+    // and would otherwise stay here forever (#97).
+    reap_abandoned_sinks(dir);
     let now = unix_ms();
     let path = dir.join(format!(
         "pending-{}-{now}-{:016x}.rpcrash",
@@ -195,6 +206,78 @@ pub(crate) fn create_sink(
     let mut record = [0u8; RECORD_SIZE];
     initialize(&mut record, metadata);
     Ok((file, path, record))
+}
+
+/// Remove sinks their owner can no longer write to (#97).
+///
+/// The rule is deliberately timid, because losing a real crash record is a far
+/// worse outcome than keeping an empty file for one more run. A sink is
+/// removed only when the PID in its name is provably gone *and* the file is
+/// short of a whole record. Liveness is settled first: a process observed dead
+/// cannot have written anything afterwards, whereas reading the size first
+/// would let a live process crash into the sink between the two observations.
+///
+/// Everything ambiguous stays: an unreadable directory, a name this crate did
+/// not write, a PID that is alive or that the host declines to answer for, a
+/// PID the host has since reissued, a full-length record waiting for a reader,
+/// and a `.rpcrash.draining` file a drainer is part-way through converting.
+fn reap_abandoned_sinks(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(pid) = sink_owner_pid(&path) else {
+            continue;
+        };
+        if !owner_is_gone(pid) {
+            continue;
+        }
+        // Only now is the size meaningful: nothing more can be appended.
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() || metadata.len() >= RECORD_SIZE as u64 {
+            continue;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// The PID out of a `pending-<pid>-<ms>-<suffix>.rpcrash` name this crate wrote.
+///
+/// The suffix must match exactly, so a `.rpcrash.draining` file — or anything
+/// else sharing the directory — is simply not ours to reason about. The PID
+/// segment is checked digit by digit rather than handed straight to `parse`,
+/// which would accept a leading `+`.
+fn sink_owner_pid(path: &Path) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let (pid, _) = name
+        .strip_prefix("pending-")?
+        .strip_suffix(".rpcrash")?
+        .split_once('-')?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let pid = pid.parse::<u32>().ok()?;
+    (pid != 0).then_some(pid)
+}
+
+/// Whether the host says that PID names no process that can still run.
+///
+/// The number is never cast into a signalling call here; `ProcessLiveness`
+/// owns that validation, and a handle it hands back pins the identity, so an
+/// exit observed through the handle is the owner's exit and not a reissued
+/// PID's. Only an outright "no such process" counts as gone — a refusal, an
+/// unsupported host primitive, and a PID outside this host's range are all
+/// answers this reap treats as "still alive, leave it alone".
+fn owner_is_gone(pid: u32) -> bool {
+    use crate::platform::process::ProcessInspectErrorKind;
+
+    match crate::ProcessLiveness::open(pid) {
+        Ok(handle) => !handle.is_alive(),
+        Err(error) => matches!(error.kind, ProcessInspectErrorKind::NotFound),
+    }
 }
 
 fn random_suffix() -> u64 {
@@ -711,5 +794,84 @@ mod tests {
         let linked = root.path().join("linked");
         symlink(&private, &linked).unwrap();
         assert!(create_private_dir(&linked).is_err());
+    }
+
+    /// A PID this host has finished with, obtained the only way that proves
+    /// it: run a process to completion and collect it.
+    fn exited_pid() -> u32 {
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        child.wait().expect("collect");
+        pid
+    }
+
+    /// Arming reclaims the sink of an owner that exited without dropping its
+    /// guard, and nothing else in the directory (#97).
+    #[test]
+    fn arming_reaps_only_an_incomplete_sink_whose_owner_is_gone() {
+        let dead = exited_pid();
+        let root = tempfile::tempdir().unwrap();
+        // Owner-private, exactly as `create_sink` insists on finding it.
+        let dir = root.path().join("probe-spool");
+        create_private_dir(&dir).expect("spool directory");
+        let write = |name: &str, len: usize| {
+            let path = dir.join(name);
+            std::fs::write(&path, vec![0u8; len]).unwrap();
+            path
+        };
+
+        let abandoned = write(&format!("pending-{dead}-1-000000000000000a.rpcrash"), 0);
+        let survivors = [
+            // A live owner's sink, incomplete only because it has not crashed.
+            write(
+                &format!("pending-{}-2-000000000000000b.rpcrash", std::process::id()),
+                0,
+            ),
+            // A whole record: the owner is gone because it crashed and wrote.
+            write(
+                &format!("pending-{dead}-3-000000000000000c.rpcrash"),
+                RECORD_SIZE,
+            ),
+            // A drainer's in-progress conversion, which this crate does not own.
+            write(
+                &format!("pending-{dead}-4-000000000000000d.rpcrash.draining"),
+                0,
+            ),
+            // Names this crate did not write, so no PID can be read out of them.
+            write("pending-not-a-pid-5-000000000000000e.rpcrash", 0),
+            write(&format!("pending-+{dead}-6-000000000000000f.rpcrash"), 0),
+            write("pending-0-7-0000000000000010.rpcrash", 0),
+            write(&format!("pending-{dead}.rpcrash"), 0),
+            write("crash-report.txt", 0),
+        ];
+
+        let metadata = CrashMetadata {
+            app_class: "a".into(),
+            app_name: "b".into(),
+            app_version: "c".into(),
+            instance_name: String::new(),
+            creation_time_ms: 1,
+            cwd: "/test".into(),
+        };
+        let (_file, fresh, _record) = create_sink_in(&dir, &metadata).expect("sink");
+
+        assert!(!abandoned.exists(), "a dead owner's empty sink must go");
+        for survivor in survivors {
+            assert!(
+                survivor.exists(),
+                "must be left alone: {}",
+                survivor.display()
+            );
+        }
+        assert!(fresh.exists(), "this process's own sink must survive");
     }
 }

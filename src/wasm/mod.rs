@@ -1545,6 +1545,10 @@ struct EpochBroker {
     engine: Arc<Engine>,
     limits: SketchEpochLimits,
     state: Mutex<EpochBrokerState>,
+    // Completed ticks, so a test can wait for the exact tick it asserts about
+    // instead of sleeping for one and hoping the host scheduled it.
+    #[cfg(test)]
+    ticks: AtomicU64,
 }
 struct EpochBrokerState {
     runtime: Option<crate::async_engine::RuntimeHandle>,
@@ -1576,6 +1580,8 @@ impl EpochBroker {
                 generation: 0,
                 ticker: None,
             }),
+            #[cfg(test)]
+            ticks: AtomicU64::new(0),
         }
     }
     fn register_root(
@@ -1697,7 +1703,15 @@ impl EpochBroker {
                 return;
             }
             self.engine.increment_epoch();
+            // Released after this tick published every terminal winner, so a
+            // test that observes the count then reads a winner sees this tick.
+            #[cfg(test)]
+            self.ticks.fetch_add(1, Ordering::Release);
         }
+    }
+    #[cfg(test)]
+    fn ticks(&self) -> u64 {
+        self.ticks.load(Ordering::Acquire)
     }
     fn active_registrations(&self) -> usize {
         self.state
@@ -1803,9 +1817,14 @@ mod epoch_broker_tests {
         std::fs::read_to_string(marker).is_ok_and(|text| text == "entered")
     }
 
+    /// The tick interval is short so a broker tick is observable, but the
+    /// wall-clock deadline is inert: these tests assert that a registration
+    /// stays runnable, and must not also race the deadline that would
+    /// legitimately end it. A test that wants the deadline to fire builds its
+    /// own limits.
     fn compiler_with_epochs(maximum: usize) -> SketchCompiler {
         let limits =
-            SketchEpochLimits::new(Duration::from_millis(5), Duration::from_millis(1), maximum)
+            SketchEpochLimits::new(Duration::from_secs(3600), Duration::from_millis(1), maximum)
                 .expect("limits");
         SketchCompiler::new(
             SketchCompilerConfig::default()
@@ -1817,6 +1836,9 @@ mod epoch_broker_tests {
 
     #[test]
     fn registrations_are_per_store_bounded_and_last_generation_is_joined() {
+        // The helper's deadline is inert, so the only way this root's winner
+        // may leave `EPOCH_PENDING` below is a child release wrongly
+        // publishing logical completion.
         let compiler = compiler_with_epochs(2);
         let runtime = crate::async_engine::RuntimeBuilder::current_thread()
             .enable_all()
@@ -1843,13 +1865,37 @@ mod epoch_broker_tests {
                 Err(SketchExecutionError::EpochRegistrationLimitExceeded)
             ));
             drop(child);
+            // Release is synchronous with the registration: the count drops
+            // inside `Drop`, without waiting on the ticker.
+            assert_eq!(
+                compiler
+                    .execution_limits_snapshot()
+                    .active_epoch_registrations(),
+                1
+            );
             // A child Store's normal release must not publish logical
-            // completion. The root remains runnable across a broker tick.
-            crate::async_engine::sleep(Duration::from_millis(2)).await;
-            assert_eq!(root.logical().winner.load(Ordering::Acquire), EPOCH_PENDING);
-            if let Some(ticker) = root.finish() {
-                let _ = ticker.await;
+            // completion. Wait for the exact broker tick that the assertion
+            // below is about rather than sleeping for the length of one.
+            let before = compiler.epoch_broker.ticks();
+            let tick_deadline = Instant::now() + Duration::from_secs(5);
+            while compiler.epoch_broker.ticks() == before && Instant::now() < tick_deadline {
+                crate::async_engine::sleep(compiler.epoch_broker.limits.tick_interval()).await;
             }
+            assert!(
+                compiler.epoch_broker.ticks() > before,
+                "the broker must tick over the surviving root registration"
+            );
+            assert_eq!(root.logical().winner.load(Ordering::Acquire), EPOCH_PENDING);
+            let ticker = root.finish().expect("the last release returns its ticker");
+            // The final release is also synchronous: the ledger reads zero
+            // before the ticker task is joined, not because of it.
+            assert_eq!(
+                compiler
+                    .execution_limits_snapshot()
+                    .active_epoch_registrations(),
+                0
+            );
+            let _ = ticker.await;
             assert_eq!(
                 compiler
                     .execution_limits_snapshot()

@@ -101,19 +101,21 @@ pub fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Take an exclusive advisory lock without waiting.
-pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
+/// Take or wait for a lock on the whole file, with the given `LockFileEx`
+/// flags. Private: every public lock entry point below is one flag
+/// combination of this call.
+fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result<()> {
     use std::mem;
     use std::os::windows::io::AsRawHandle as _;
     use winapi::um::fileapi::LockFileEx;
-    use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, OVERLAPPED};
+    use winapi::um::minwinbase::OVERLAPPED;
     use winapi::um::winnt::HANDLE;
 
     let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
     let result = unsafe {
         LockFileEx(
             file.as_raw_handle() as HANDLE,
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            flags,
             0,
             u32::MAX,
             u32::MAX,
@@ -127,7 +129,40 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
-/// Release a lock taken by [`try_lock_exclusive`].
+/// Take an exclusive advisory lock without waiting.
+pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
+    use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+
+    lock_file(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)
+}
+
+/// Take an exclusive advisory lock, waiting until it is available.
+pub fn lock_exclusive(file: &File) -> io::Result<()> {
+    use winapi::um::minwinbase::LOCKFILE_EXCLUSIVE_LOCK;
+
+    lock_file(file, LOCKFILE_EXCLUSIVE_LOCK)
+}
+
+/// Take a shared advisory lock, waiting until it is available.
+///
+/// A `LockFileEx` call without `LOCKFILE_EXCLUSIVE_LOCK` set is what this
+/// host spells "shared" -- there is no separate shared-lock flag.
+pub fn lock_shared(file: &File) -> io::Result<()> {
+    lock_file(file, 0)
+}
+
+/// Take a shared advisory lock without waiting.
+///
+/// Returns immediately when an exclusive holder has it; the caller decides
+/// whether that is a conflict worth retrying, via [`is_lock_conflict`].
+pub fn try_lock_shared(file: &File) -> io::Result<()> {
+    use winapi::um::minwinbase::LOCKFILE_FAIL_IMMEDIATELY;
+
+    lock_file(file, LOCKFILE_FAIL_IMMEDIATELY)
+}
+
+/// Release a lock taken by [`try_lock_exclusive`], [`try_lock_shared`],
+/// [`lock_exclusive`], or [`lock_shared`].
 pub fn unlock(file: &File) -> io::Result<()> {
     use std::mem;
     use std::os::windows::io::AsRawHandle as _;
@@ -157,6 +192,65 @@ pub fn is_lock_conflict(error: &io::Error) -> bool {
     use winapi::shared::winerror::ERROR_LOCK_VIOLATION;
 
     error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32)
+}
+
+/// Set the modification time of the file at `path`, without disturbing its
+/// access or creation time.
+///
+/// Opened with only `FILE_WRITE_ATTRIBUTES`, not the read/write access a
+/// plain open would request: Windows denies an attribute-only change to a
+/// handle opened for full write access to a file this process has marked
+/// read-only, but grants it to a handle that only asked for attributes --
+/// and content-addressed cache entries are commonly left read-only. From
+/// there this is the same stable `File::set_modified` every caller of this
+/// crate could use directly; the access mode is the only part that needed
+/// deciding per host.
+pub fn set_file_mtime(
+    path: &Path,
+    seconds_since_unix_epoch: i64,
+    nanoseconds: u32,
+) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winnt::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+    };
+
+    let time = unix_time_to_system_time(seconds_since_unix_epoch, nanoseconds)?;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)?;
+    file.set_modified(time)
+}
+
+/// Convert a Unix-epoch second/nanosecond pair to [`std::time::SystemTime`],
+/// reporting out-of-range input rather than silently wrapping it.
+fn unix_time_to_system_time(
+    seconds_since_unix_epoch: i64,
+    nanoseconds: u32,
+) -> io::Result<std::time::SystemTime> {
+    use std::time::{Duration, SystemTime};
+
+    let out_of_range = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "modification time is out of range for this host's clock",
+        )
+    };
+
+    if seconds_since_unix_epoch >= 0 {
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::new(seconds_since_unix_epoch as u64, nanoseconds))
+            .ok_or_else(out_of_range)
+    } else {
+        let magnitude = seconds_since_unix_epoch
+            .checked_neg()
+            .ok_or_else(out_of_range)? as u64;
+        SystemTime::UNIX_EPOCH
+            .checked_sub(Duration::new(magnitude, 0))
+            .and_then(|time| time.checked_add(Duration::new(0, nanoseconds)))
+            .ok_or_else(out_of_range)
+    }
 }
 
 /// Encode `path` as the bytes this host uses to spell it.

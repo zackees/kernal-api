@@ -49,7 +49,7 @@ use std::fs::File;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -317,7 +317,7 @@ impl Runtime {
         let sampler = if sampler_disabled {
             None
         } else {
-            Some(match start_sampler(&shared) {
+            Some(match start_sampler(&shared, SAMPLE_INTERVAL) {
                 Ok(sampler) => sampler,
                 Err(error) => {
                     #[cfg(windows)]
@@ -426,11 +426,14 @@ impl Runtime {
     }
 }
 
-fn start_sampler(shared: &Arc<Shared>) -> io::Result<JoinHandle<()>> {
+/// How often the sampler refreshes the bounded pre-crash snapshot.
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
+
+fn start_sampler(shared: &Arc<Shared>, cadence: Duration) -> io::Result<JoinHandle<()>> {
     let sampler_state = Arc::clone(shared);
     std::thread::Builder::new()
         .name("rp-crash-sampler".into())
-        .spawn(move || sampler_loop(sampler_state))
+        .spawn(move || sampler_loop(sampler_state, cadence))
 }
 
 struct RegistrationState {
@@ -470,7 +473,7 @@ impl Drop for Runtime {
         uninstall_macos_abort_chain();
         self.handler_armed.store(false, Ordering::Release);
         handler.take();
-        self.shared.stop.store(true, Ordering::Release);
+        self.shared.request_stop();
         if let Some(handle) = self.sampler.take() {
             let _ = handle.join();
         }
@@ -599,6 +602,12 @@ struct Shared {
     stop: AtomicBool,
     sample_ready: AtomicBool,
     sample_thread_count: AtomicUsize,
+    // Teardown wakes the sampler out of its cadence wait instead of letting
+    // process exit pay for a sleep it cannot interrupt. `stop_wait` guards the
+    // `stop` transition itself, so a request can never land between the
+    // sampler's check and its wait. The fatal callback touches neither.
+    stop_wait: Mutex<()>,
+    stop_signal: Condvar,
     file: File,
     pid: u32,
 }
@@ -621,9 +630,41 @@ impl Shared {
             stop: AtomicBool::new(false),
             sample_ready: AtomicBool::new(false),
             sample_thread_count: AtomicUsize::new(0),
+            stop_wait: Mutex::new(()),
+            stop_signal: Condvar::new(),
             file,
             pid: std::process::id(),
         }
+    }
+
+    /// Ask the sampler to stop and wake it out of its cadence wait.
+    fn request_stop(&self) {
+        let _wait = match self.stop_wait.lock() {
+            Ok(wait) => wait,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        self.stop.store(true, Ordering::Release);
+        self.stop_signal.notify_all();
+    }
+
+    /// Park until `cadence` elapses or teardown asks the sampler to stop, and
+    /// report whether a stop was requested. A spurious wakeup only shortens a
+    /// cadence tick, which the loop handles by sampling again.
+    fn wait_for_stop(&self, cadence: Duration) -> bool {
+        let wait = match self.stop_wait.lock() {
+            Ok(wait) => wait,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if self.stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let (wait, _timeout) = match self.stop_signal.wait_timeout(wait, cadence) {
+            Ok(result) => result,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let stopped = self.stop.load(Ordering::Acquire);
+        drop(wait);
+        stopped
     }
 
     fn set_metadata(&self, generation: u64, metadata: &CrashMetadata) {
@@ -1054,7 +1095,7 @@ fn with_platform_fields<R>(
     })
 }
 
-fn sampler_loop(shared: Arc<Shared>) {
+fn sampler_loop(shared: Arc<Shared>, cadence: Duration) {
     while !shared.stop.load(Ordering::Acquire) {
         if !shared.reading.load(Ordering::Acquire) {
             let sample = capture_sample();
@@ -1084,7 +1125,11 @@ fn sampler_loop(shared: Arc<Shared>) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        // Teardown signals the wait, so process exit never has to sit out a
+        // cadence tick it cannot interrupt.
+        if shared.wait_for_stop(cadence) {
+            break;
+        }
     }
 }
 
@@ -1455,5 +1500,37 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
         assert_eq!(status, 0, "child touched inherited crash state");
         drop(guard);
+    }
+
+    #[test]
+    fn shutdown_wakes_the_sampler_instead_of_waiting_out_its_cadence() {
+        let _state = process_state();
+        let (file, path, template) = spool::create_sink(&metadata("sampler-shutdown")).unwrap();
+        let shared = Arc::new(Shared::new(file, template));
+        // A capture in progress is what the sampler skips, so the thread parks
+        // in the cadence wait instead of resolving a snapshot. The cadence is
+        // far longer than the teardown ceiling below, so a sampler that slept
+        // it out could not pass.
+        shared.reading.store(true, Ordering::Release);
+        let cadence = Duration::from_secs(30);
+        let sampler = start_sampler(&shared, cadence).unwrap();
+        // Not an assertion: this only gives the thread time to reach the wait
+        // so an uninterruptible sleep reproduces as a failure rather than a
+        // race against the loop's own stop check.
+        std::thread::sleep(Duration::from_millis(100));
+
+        shared.request_stop();
+        let start = std::time::Instant::now();
+        sampler.join().unwrap();
+        let teardown = start.elapsed();
+        assert!(
+            teardown < Duration::from_secs(5),
+            "sampler teardown waited out its cadence instead of being woken ({teardown:?})"
+        );
+
+        // The spool file is owned by `Shared`; Windows only deletes it once
+        // every handle is gone.
+        drop(shared);
+        let _ = std::fs::remove_file(&path);
     }
 }

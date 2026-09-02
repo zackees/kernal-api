@@ -1,0 +1,101 @@
+name: macOS x86_64 tests
+
+# Intel macOS test execution on GitHub-hosted Linux runners.
+#
+# The product is cross-compiled on Linux through Soldr's own toolchain (bundled
+# LLVM plus the managed macOS SDK) and only *executed* in a macOS guest, so the
+# guest needs no Rust toolchain, no Xcode CLT and no Homebrew -- just the
+# `cargo-nextest` binary. Measured locally: 25 test binaries, 103 files,
+# ~112 MB archive, ~85 s, producing real Mach-O (cf fa ed fe 07 00 00 01).
+#
+# Why this exists: `rust-native` runs on `macos-latest`, which is now ARM, so
+# it covers aarch64-apple-darwin. x86_64-apple-darwin was built in
+# `supported-targets` and executed nowhere, leaving 11 `target_arch` branches
+# in src/snapshot/unwind.rs and 4 in src/crash/mod.rs unverified on Intel.
+#
+# Why a prebaked guest image: dockur/macos has no unattended install path and
+# Docker-OSX's prebuilt `:auto` tag no longer exists on Docker Hub. The macOS
+# install is therefore done once, out of band, and published to GHCR by
+# `macos-x64-bake.yml`. CI only ever *pulls* a ready guest -- which is also
+# what makes this fit a hosted runner, since there is no persistent state
+# between runs.
+
+on:
+  schedule:
+    # Nightly. Boot plus a single-core-ish guest makes this a correctness
+    # gate, not a per-PR loop.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'nextest filter expression (optional)'
+        required: false
+        type: string
+
+concurrency:
+  group: macos-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  intel-macos-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GUEST_IMAGE: ghcr.io/${{ github.repository }}/macos-x64-guest:ventura
+      SSH_PORT: '2222'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+
+      # A hosted runner ships ~14 GB of disk; the guest image plus its expanded
+      # disk needs considerably more. This reclaims ~30 GB in a few minutes.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          large-packages: true
+          docker-images: false
+          swap-storage: true
+
+      # /dev/kvm exists on hosted Linux runners but is not world-accessible.
+      # See the 2024-04-02 Actions changelog.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          echo "kvm ok"
+
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        with:
+          cache: false
+          cross-targets: x86_64-apple-darwin
+
+      - name: Cross-build Intel test binaries on Linux
+        run: ci/macos-x64/build-archive.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Start the prebaked macOS guest
+        run: ci/macos-x64/guest.sh start
+
+      - name: Execute the archive inside the guest
+        env:
+          NEXTEST_FILTER: ${{ inputs.filter }}
+        run: ci/macos-x64/run-in-guest.sh
+
+      - name: Guest logs on failure
+        if: failure()
+        run: docker logs --tail 200 kernal-macos-x86 || true
+
+      - name: Stop the guest
+        if: always()
+        run: ci/macos-x64/guest.sh stop

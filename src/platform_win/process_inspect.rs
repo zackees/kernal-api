@@ -3,7 +3,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HANDLE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
@@ -50,15 +50,28 @@ impl std::fmt::Debug for ProcessLiveness {
 
 impl ProcessLiveness {
     /// Take a reference to `pid`, failing if no such process is running.
+    ///
+    /// A refusal is not an absence. This host reports a PID it has never
+    /// issued, or has finished with, as `ERROR_INVALID_PARAMETER`; every other
+    /// failure -- most of all `ERROR_ACCESS_DENIED` for a process this one may
+    /// not query -- describes a process that exists and is reported as a host
+    /// failure, so a caller cannot read "I was refused" as "it is gone".
     pub fn open(pid: u32) -> Result<Self, ProcessInspectError> {
         // SAFETY: the call takes access flags, an inherit flag, and a PID by
         // value; the returned handle is checked before use.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
-            return Err(ProcessInspectError::stated(
-                ProcessInspectErrorKind::NotFound,
-                "no such process",
-            ));
+            let source = io::Error::last_os_error();
+            if source.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Err(ProcessInspectError::stated(
+                    ProcessInspectErrorKind::NotFound,
+                    "no such process",
+                ));
+            }
+            return Err(ProcessInspectError {
+                kind: ProcessInspectErrorKind::Host,
+                source,
+            });
         }
         Ok(Self { pid, handle })
     }

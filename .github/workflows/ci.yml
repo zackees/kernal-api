@@ -63,8 +63,14 @@ jobs:
   # and nothing else. (`threaded-rust-artifact` still builds on macOS; it is
   # an execution smoke test for the host wasm path rather than a
   # cross-compilation lane, so it is left alone here.)
+  # Suppressed by default. Apple-hosted runners are held off until the
+  # repository variable `ENABLE_MACOS_RUNNERS` is set to `true`; the job stays
+  # defined and reports as skipped, so re-enabling is a variable flip rather
+  # than a workflow edit. `macos-arm-archive` above still runs on Linux, so the
+  # aarch64-apple-darwin clippy and test-archive coverage is unaffected.
   macos-arm-tests:
     needs: macos-arm-archive
+    if: vars.ENABLE_MACOS_RUNNERS == 'true'
     runs-on: macos-latest
     steps:
       # The workspace is still needed: tests that resolve paths relative to
@@ -132,7 +138,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # macOS leaves the matrix unless `ENABLE_MACOS_RUNNERS` is `true`, so
+        # the Apple lane is suppressed without deleting it.
+        os: >-
+          ${{ vars.ENABLE_MACOS_RUNNERS == 'true'
+          && fromJSON('["ubuntu-latest", "macos-latest", "windows-latest"]')
+          || fromJSON('["ubuntu-latest", "windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -172,8 +183,9 @@ jobs:
             legacy_cargo: true
           # Apple targets cross-compile on Linux through Soldr's own toolchain
           # (its bundled LLVM plus the managed macOS SDK), so neither Apple
-          # build lane needs a macOS runner. The only macOS runner left in this
-          # workflow is `rust-native`, which executes the aarch64 tests.
+          # build lane needs a macOS runner. The only Apple-hosted lanes left in
+          # this workflow are `macos-arm-tests` and the macOS entry of
+          # `threaded-rust-artifact`, both gated off by `ENABLE_MACOS_RUNNERS`.
           - os: ubuntu-latest
             target: x86_64-apple-darwin
             legacy_cargo: false

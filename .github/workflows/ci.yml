@@ -85,10 +85,21 @@ jobs:
         # `cargo-nextest` is a cargo subcommand shim: invoked directly it
         # still expects `nextest` as its first argument, otherwise it parses
         # the next token as a cargo subcommand and fails.
+        #
+        # The excluded binaries are source-inspection policy tests: they read
+        # this crate's own source through `env!("CARGO_MANIFEST_DIR")`, which
+        # is baked in at compile time and therefore still points at the Linux
+        # builder's path. `--workspace-remap` cannot rewrite a compile-time
+        # constant. Nothing is lost by skipping them here -- they assert on
+        # source text, which is identical on every host, and `rust-native
+        # (ubuntu-latest)` already runs them. A new policy test of this shape
+        # will fail this lane loudly until it is added to the list.
         run: >-
           cargo-nextest nextest run
           --archive-file kernal-arm64.tar.zst
           --workspace-remap .
+          -E 'not (binary(daemon_frame_v1) or binary(daemon_identity)
+          or binary(version_policy) or binary(facade_policy))'
 
   each-feature:
     runs-on: ubuntu-latest

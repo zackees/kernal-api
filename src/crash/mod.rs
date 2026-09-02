@@ -6,6 +6,38 @@
 //! callback copies only the raw platform context into that preallocated
 //! record and emits it with one OS write before returning `Handled(false)` so
 //! the previously installed application handler still runs.
+//!
+//! ## Migrating from a direct `crash-handler` dependency (#72)
+//!
+//! A client that previously called `crash_handler::CrashHandler::attach` with
+//! `crash_handler::make_crash_event` finds none of that vocabulary here.
+//! `kernal_api::crash` replaces it with a facade-owned surface that is
+//! stricter than a design that hands the client a callback: no client code
+//! runs in signal or structured-exception context at all. The fatal path
+//! copies only fixed-size platform fields into a preallocated record and
+//! performs one bounded OS write; every other step — decoding, labeling,
+//! formatting a human-readable report — happens later in ordinary
+//! (non-signal) context via [`spool::parse`]. This sidesteps the exact
+//! async-signal-unsafety tradeoff (allocating to format a report from inside
+//! the handler) that a backend-callback design has to accept.
+//!
+//! | Direct `crash-handler` vocabulary | `kernal_api::crash` replacement |
+//! | --- | --- |
+//! | `CrashHandler::attach` + `make_crash_event` + `CrashEventResult::Handled(false)` | [`install`] |
+//! | The `CrashGuard` returned by a hand-rolled `install(bin_stem)` wrapping `Option<CrashHandler>` | [`CrashGuard`] |
+//! | `&CrashContext` read out of the fatal callback | [`spool::RawCrashReport`], decoded from the spool file via [`spool::parse`] outside signal context |
+//! | Per-platform `context_label(&CrashContext)` (`ctx.siginfo.ssi_signo`, `ctx.exception.kind`, `ctx.exception_pointers`) | [`spool::RawCrashReport::fault_code`] — see that field's docs for the platform-specific caveats before writing a label decoder |
+//! | Per-platform `context_summary(&CrashContext)` (`si_addr`, `tid`/`thread`/`thread_id`) | [`spool::RawCrashReport::fault_address`] and [`spool::RawCrashReport::tid`] |
+//! | A caller-chosen binary stem interpolated into every dump filename | [`spool::CrashMetadata::app_name`] (and `app_class`/`instance_name`/`app_version`), registered once via [`install`] |
+//!
+//! `kernal_api::crash` does not format a human-readable text report; it spools
+//! a fixed-layout binary record ([`spool::RECORD_SIZE`] bytes) to an
+//! owner-private directory ([`spool::spool_dir`]) and lets a normal-context
+//! reader turn that into whatever report shape the application wants by
+//! calling [`spool::parse`]. A client that previously wrote its own text dump
+//! synchronously from inside the signal handler instead reads pending
+//! `.rpcrash` records at a convenient later point (for example, at the next
+//! process start, mirroring how it already checks for previous crash dumps).
 
 #![allow(unsafe_code)]
 

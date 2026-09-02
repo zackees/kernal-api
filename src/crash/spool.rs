@@ -102,7 +102,27 @@ pub struct RawCrashReport {
     pub pid: u32,
     /// Faulting OS thread id.
     pub tid: u64,
-    /// Signal or exception code.
+    /// Signal or exception code, in the faulting platform's own namespace.
+    ///
+    /// The namespace is platform-specific and is not itself recorded, so a
+    /// reader must already know which OS produced the record (normally true,
+    /// since a spool file is read on the host that wrote it):
+    ///
+    /// - Linux/Android: the raw `siginfo_t.ssi_signo` value (e.g. `11` for
+    ///   `SIGSEGV`).
+    /// - Windows: the NTSTATUS `ExceptionCode`, sign-extended from the
+    ///   backing `crash-context` crate's `i32` field rather than kept as the
+    ///   positive `u32` bit pattern — `STATUS_ACCESS_VIOLATION` (`0xC0000005`)
+    ///   arrives as `-1073741819`, not `0xC000_0005`. A decoder must compare
+    ///   against `fault_code as i32 as u32` (or the pre-computed negative
+    ///   constant), not the positive hex literal.
+    /// - macOS: **not a single namespace.** A hardware/Mach fault reports the
+    ///   Mach exception kind (e.g. `6` for `EXC_BREAKPOINT`), but the SIGABRT
+    ///   predecessor-chain path (see `handle_abort` and the module-level
+    ///   abort-chain functions) reports the raw Unix signal number instead
+    ///   (`6` for `SIGABRT`, which collides numerically with
+    ///   `EXC_BREAKPOINT`). A label decoder for macOS records cannot
+    ///   distinguish the two from `fault_code` alone.
     pub fault_code: i64,
     /// Best-effort fault address.
     pub fault_address: u64,

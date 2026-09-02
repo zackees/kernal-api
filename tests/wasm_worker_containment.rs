@@ -32,8 +32,21 @@ const CONTAINMENT_DEADLINE: Duration = Duration::from_secs(1);
 const FAILURE_PROOF_DEADLINE: Duration = Duration::from_secs(30);
 const GRACE: Duration = Duration::from_secs(1);
 
+/// Locate the worker executable in a way that survives a cross-built archive.
+///
+/// `env!("CARGO_BIN_EXE_…")` is resolved at compile time, so a test archive
+/// built on one host carries that host's absolute path and the worker cannot
+/// be spawned anywhere else. nextest exports `NEXTEST_BIN_EXE_<name>` at run
+/// time for exactly this case, so prefer it and fall back to the compile-time
+/// path for an ordinary `cargo test` run.
+fn worker_executable() -> PathBuf {
+    std::env::var_os("NEXTEST_BIN_EXE_kernal-wasm-worker")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker")))
+}
+
 fn worker_config() -> SketchWorkerConfig {
-    let executable = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
+    let executable = worker_executable();
     assert!(
         executable.is_absolute(),
         "Cargo supplied an absolute worker path"
@@ -375,7 +388,7 @@ mod failure_proof {
     }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn launch(inner: &str, files: &Artifacts) -> InnerChild {
-        let worker = PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker"));
+        let worker = worker_executable();
         assert!(worker.is_absolute(), "real worker path must be absolute");
         InnerChild(Some(
             Command::new(std::env::current_exe().expect("test executable"))

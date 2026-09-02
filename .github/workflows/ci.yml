@@ -13,8 +13,12 @@ jobs:
   rust-native:
     strategy:
       fail-fast: false
+      # macOS is deliberately absent. Apple compilation happens on Linux
+      # through Soldr's cross toolchain; `macos-arm-tests` below runs the
+      # aarch64 tests from a prebuilt archive, so the Apple runner is held
+      # only for the execution window rather than for a full compile.
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -26,6 +30,76 @@ jobs:
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - run: soldr cargo fmt --all -- --check
+
+  # Compile the aarch64-apple-darwin test binaries on Linux. Nothing here
+  # needs a Mac: Soldr carries its own LLVM and macOS SDK, and clippy is a
+  # compile-time check that runs fine against a cross target.
+  macos-arm-archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        with:
+          cache: false
+          cross-targets: aarch64-apple-darwin
+      - run: >-
+          soldr cargo clippy
+          --locked --all-features --all-targets
+          --target aarch64-apple-darwin -- --deny warnings
+      - run: >-
+          soldr cargo nextest archive
+          --target aarch64-apple-darwin --all-features
+          --archive-file kernal-arm64.tar.zst
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernal-arm64-tests
+          path: kernal-arm64.tar.zst
+          retention-days: 1
+
+  # This job does not compile. It unpacks prebuilt Mach-O test binaries and
+  # runs them, so the 10x-billed Apple hardware is held for the test duration
+  # and nothing else. (`threaded-rust-artifact` still builds on macOS; it is
+  # an execution smoke test for the host wasm path rather than a
+  # cross-compilation lane, so it is left alone here.)
+  macos-arm-tests:
+    needs: macos-arm-archive
+    runs-on: macos-latest
+    steps:
+      # The workspace is still needed: tests that resolve paths relative to
+      # the manifest directory are remapped onto this checkout below.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kernal-arm64-tests
+      - name: Install cargo-nextest
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf https://get.nexte.st/latest/mac \
+            | tar zxf - -C "$HOME/.cargo/bin"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run the aarch64 tests from the prebuilt archive
+        # `cargo-nextest` is a cargo subcommand shim: invoked directly it
+        # still expects `nextest` as its first argument, otherwise it parses
+        # the next token as a cargo subcommand and fails.
+        #
+        # The excluded binaries are source-inspection policy tests: they read
+        # this crate's own source through `env!("CARGO_MANIFEST_DIR")`, which
+        # is baked in at compile time and therefore still points at the Linux
+        # builder's path. `--workspace-remap` cannot rewrite a compile-time
+        # constant. Nothing is lost by skipping them here -- they assert on
+        # source text, which is identical on every host, and `rust-native
+        # (ubuntu-latest)` already runs them. A new policy test of this shape
+        # will fail this lane loudly until it is added to the list.
+        run: >-
+          cargo-nextest nextest run
+          --archive-file kernal-arm64.tar.zst
+          --workspace-remap .
+          -E 'not (binary(daemon_frame_v1) or binary(daemon_identity)
+          or binary(version_policy) or binary(facade_policy))'
 
   each-feature:
     runs-on: ubuntu-latest
@@ -96,10 +170,14 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             legacy_cargo: true
-          - os: macos-latest
+          # Apple targets cross-compile on Linux through Soldr's own toolchain
+          # (its bundled LLVM plus the managed macOS SDK), so neither Apple
+          # build lane needs a macOS runner. The only macOS runner left in this
+          # workflow is `rust-native`, which executes the aarch64 tests.
+          - os: ubuntu-latest
             target: x86_64-apple-darwin
             legacy_cargo: false
-          - os: macos-latest
+          - os: ubuntu-latest
             target: aarch64-apple-darwin
             legacy_cargo: false
           - os: windows-latest
@@ -118,7 +196,7 @@ jobs:
       - if: ${{ !matrix.legacy_cargo }}
         uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
         with:
-          # Native Apple SDK preparation has no archive payload to cache.
+          # Apple SDK preparation has no archive payload to cache.
           cache: false
           cross-targets: ${{ matrix.target }}
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'

@@ -73,8 +73,7 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
         "the facade must retain the exact published running-process pin and minimal feature set"
     );
     assert!(
-        manifest
-            .contains("# Exact first-party pre-1.0 pin."),
+        manifest.contains("# Exact first-party pre-1.0 pin."),
         "the released process substrate must retain its exact first-party pin rationale"
     );
 

@@ -2070,7 +2070,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.9"
+version = "4.10.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d49ccdbfa59730688bbbeca9c9f3f4ee4c8976e38e9e5929fee8128bbd046db"
 dependencies = [
  "blake3",
  "getrandom 0.4.3",
@@ -2090,7 +2092,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.9"
+version = "4.10.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2c944cf400635eebd05ece53fb38786005602e4f99f8ecbab45f2df0ea17194"
 dependencies = [
  "blake3",
  "dirs",
@@ -2108,7 +2112,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.9"
+version = "4.10.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "effd1ab4c1415bac2e5e854fbb24b13a58e9f17ccba49da4a2ed87ba9d9c58f6"
 dependencies = [
  "prost",
  "prost-build",

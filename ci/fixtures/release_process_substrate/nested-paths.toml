@@ -1,0 +1,17 @@
+[workspace.dependencies]
+running-process = { path = "../running-process" }
+
+[target.'cfg(unix)'.dependencies]
+"running-process" = { path = "../target-running-process" }
+
+[build-dependencies]
+process-substrate = { package = "running-process", path = "../build-running-process" }
+
+[dev-dependencies]
+running-process = { path = "../dev-running-process" }
+
+[patch.crates-io]
+running-process = { path = "../patched-running-process" }
+
+[replace]
+"running-process:4.10.9" = { path = "../replaced-running-process" }

@@ -12,7 +12,22 @@ env:
   SOURCE_DATE_EPOCH: "0"
 
 jobs:
+  release-guard:
+    if: startsWith(github.event.release.tag_name, 'v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          lfs: true
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Reject migration-only running-process paths
+        run: >-
+          uv run --no-project --with tomli==2.2.1 python
+          ci/check_release_process_substrate.py
+
   validate-and-package:
+    needs: release-guard
     if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     environment: release
@@ -57,6 +72,7 @@ jobs:
           if-no-files-found: error
 
   symbolizer-workers:
+    needs: release-guard
     if: startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
@@ -104,7 +120,7 @@ jobs:
           if-no-files-found: error
 
   publish-crates:
-    needs: validate-and-package
+    needs: [release-guard, validate-and-package]
     runs-on: ubuntu-latest
     environment: release
     steps:

@@ -1,0 +1,2 @@
+[dependencies]
+process-substrate = { package = "running-process", path = "../running-process" }

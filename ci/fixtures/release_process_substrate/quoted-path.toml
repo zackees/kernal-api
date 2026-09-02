@@ -1,0 +1,2 @@
+[dependencies]
+"running-process" = { path = "../running-process" }

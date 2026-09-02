@@ -26,9 +26,10 @@ have an async runtime to do that work. It must never depend on `kernal-api`.
 `kernal-api` is the higher semantic facade used by applications. In the target
 architecture it depends on `running-process`, selects shared implementation
 versions, adds facilities such as hashing and profiling, and turns backend
-behavior into stable application contracts. The current implementation has not
-yet landed that dependency; phase 1 below establishes it. First-party
-applications eventually depend on `kernal-api` only.
+behavior into stable application contracts. The phase-1 bounded process adapter
+uses the exact published `running-process` 4.10.10 release with only its
+`kernel-substrate` feature. First-party applications eventually depend on
+`kernal-api` only.
 
 This one-way graph resolves the async/process cycle without creating a smaller
 "base" facade that would merely move the same boundary elsewhere.

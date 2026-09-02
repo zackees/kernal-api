@@ -18,6 +18,38 @@ mod process_adapter;
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files.
 pub mod hash;
 
+/// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an
+/// existing daemon endpoint.
+///
+/// This opt-in surface preserves the native substrate's frozen v1 wire while
+/// deliberately leaving endpoint naming, product payload protocols, and
+/// daemon lifecycle policy to the application.
+#[cfg(feature = "daemon-identity")]
+pub mod daemon_identity;
+
+/// Facade-owned frozen v1 daemon-frame envelope codec.
+///
+/// This opt-in surface preserves the shared frame bytes while leaving endpoint
+/// selection, product payload identifiers, and connection policy to callers.
+#[cfg(feature = "daemon-frame-v1")]
+pub mod daemon_frame_v1;
+
+/// Facade-owned frozen v1 daemon-registration records and persistence.
+///
+/// This opt-in surface retains the established v1 manifest and service-
+/// definition bytes while leaving endpoints, broker client policy, and daemon
+/// lifecycle policy to applications.
+#[cfg(feature = "daemon-registration")]
+pub mod daemon_registration;
+
+/// Facade-owned frozen v2 service-definition registration and persistence.
+///
+/// This opt-in surface retains the established v2 path, validation, private
+/// directory, and non-atomic persistence behavior while leaving v1 records,
+/// broker negotiation, transport, identity, and runtime policy to callers.
+#[cfg(feature = "daemon-registration-v2")]
+pub mod daemon_registration_v2;
+
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 
@@ -294,6 +326,69 @@ pub enum StreamMode {
     Null,
 }
 
+/// Relative scheduling intent for one spawned process.
+///
+/// These are semantic bands, not Unix niceness or Windows priority-class
+/// constants. The private substrate maps each band at launch, preserving the
+/// product distinction between low and idle background work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProcessPriority {
+    /// Prefer this work in the host's non-realtime foreground band.
+    High,
+    /// Preserve the host's ordinary process scheduling policy.
+    #[default]
+    Normal,
+    /// Defer this work behind ordinary foreground activity.
+    Low,
+    /// Run only when the host has no more urgent work.
+    Idle,
+}
+
+impl ProcessPriority {
+    /// Translate semantic priority into the selected substrate's existing
+    /// launch policy. These values are private implementation details: Unix
+    /// treats them as nice levels while Windows maps their bands to process
+    /// priority classes.
+    pub(crate) const fn substrate_nice(self) -> Option<i32> {
+        match self {
+            // The substrate consumes a portable niceness hint. Its Windows
+            // mapping is intentionally different from Unix's numeric scale:
+            // -15 selects HIGH, +1 BELOW_NORMAL, and +15 IDLE.
+            Self::High => {
+                #[cfg(windows)]
+                {
+                    Some(-15)
+                }
+                #[cfg(not(windows))]
+                {
+                    Some(-5)
+                }
+            }
+            Self::Normal => None,
+            Self::Low => {
+                #[cfg(windows)]
+                {
+                    Some(1)
+                }
+                #[cfg(not(windows))]
+                {
+                    Some(10)
+                }
+            }
+            Self::Idle => {
+                #[cfg(windows)]
+                {
+                    Some(15)
+                }
+                #[cfg(not(windows))]
+                {
+                    Some(19)
+                }
+            }
+        }
+    }
+}
+
 /// Typed spawn description accepted by the blessed process boundary.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -307,6 +402,7 @@ pub struct SpawnSpec {
     stderr: StreamMode,
     create_process_group: bool,
     kill_when_owner_dies: bool,
+    priority: ProcessPriority,
 }
 
 impl SpawnSpec {
@@ -323,6 +419,7 @@ impl SpawnSpec {
             stderr: StreamMode::Inherit,
             create_process_group: false,
             kill_when_owner_dies: false,
+            priority: ProcessPriority::Normal,
         }
     }
 
@@ -376,6 +473,10 @@ impl SpawnSpec {
     /// caller's own group, and on Windows `GenerateConsoleCtrlEvent` only
     /// routes to children spawned with `CREATE_NEW_PROCESS_GROUP`. It also
     /// detaches the child from the parent's console Ctrl+C, so it is opt-in.
+    /// It enables only [`PlatformChild::terminate_group_soft`] and
+    /// [`ProcessSession::terminate_group_soft`]; direct kill, drop cleanup,
+    /// and owner-death remain direct-child operations rather than a promise of
+    /// descendant-tree containment.
     pub fn create_process_group(mut self, create: bool) -> Self {
         self.create_process_group = create;
         self
@@ -383,12 +484,23 @@ impl SpawnSpec {
 
     /// Kill this child when the spawning process exits unexpectedly.
     ///
-    /// Linux uses `PR_SET_PDEATHSIG(SIGTERM)`. Windows assigns the child to a
-    /// process-wide kill-on-close Job Object. macOS forks a kqueue supervisor
-    /// before exec and reports spawn success only after its owner and child
-    /// watches are registered.
+    /// Linux uses `PR_SET_PDEATHSIG(SIGTERM)` and macOS uses a kqueue
+    /// supervisor. Those Unix mechanisms cover the direct child only; they
+    /// are not process-tree containment. Windows uses its native kill-on-close
+    /// Job Object policy. The opt-in group is for explicit soft termination,
+    /// not a portable tree-cleanup promise. Use a separately contained
+    /// operation when tree containment is required.
     pub fn kill_when_owner_dies(mut self, kill: bool) -> Self {
         self.kill_when_owner_dies = kill;
+        self
+    }
+
+    /// Select the semantic scheduling band for the spawned process.
+    ///
+    /// The mapping stays private so callers do not need to conditionalize on
+    /// Unix niceness versus Windows process priority classes.
+    pub fn priority(mut self, priority: ProcessPriority) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -399,6 +511,19 @@ impl SpawnSpec {
     /// description and never exposes the substrate's child or runtime types.
     pub async fn spawn(self) -> io::Result<PlatformChild> {
         process_adapter::spawn(self).await
+    }
+
+    /// Start a bounded streaming process session.
+    ///
+    /// This session owns direct-child lifecycle observation independently from
+    /// its bounded stdout/stderr queue. Configure streams as [`StreamMode::Piped`]
+    /// to receive their typed output events. The same optional child-owned
+    /// process group and owner-death policy selected on this `SpawnSpec` are
+    /// forwarded to the private native substrate. Session kill and drop policy
+    /// target the direct child only; a descendant that retains a pipe is
+    /// reported as output abandonment after grace rather than killed.
+    pub async fn spawn_session(self, options: ProcessSessionOptions) -> io::Result<ProcessSession> {
+        process_adapter::spawn_session(self, options).await
     }
 }
 
@@ -474,6 +599,228 @@ impl PlatformChild {
     }
 }
 
+/// Post-exit output-drain policy for [`ProcessSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessPostExitDrain {
+    /// Preserve strict historical EOF behavior, even when a descendant holds
+    /// an inherited output pipe after the direct child has exited.
+    WaitForEof,
+    /// Abandon a still-pending pipe read after this cumulative post-exit
+    /// budget. Buffered bytes remain observable and bounded queue delivery
+    /// does not consume the budget.
+    AbandonAfter(std::time::Duration),
+}
+
+/// Explicit bounds and terminal-owner policy for [`ProcessSession`].
+///
+/// The output queue is lossless: a full queue applies backpressure to the
+/// matching child pipe instead of discarding compiler output. The post-exit
+/// drain policy limits only a pending pipe read after direct-child exit;
+/// delivery blocked by the bounded queue does not spend that budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessSessionOptions {
+    /// Maximum queued stdout/stderr chunks before the session applies
+    /// backpressure. Must be greater than zero.
+    pub max_queued_chunks: usize,
+    /// Maximum bytes in one stdin or output chunk. Must be greater than zero.
+    pub max_chunk_bytes: usize,
+    /// Pipe-read behavior after direct-child exit.
+    pub post_exit_drain: ProcessPostExitDrain,
+    /// Whether dropping the terminal session owner terminates and reaps the
+    /// direct child. This does not target descendants. `false` detaches
+    /// delivery while the private owner drains output and reaps naturally.
+    pub kill_on_drop: bool,
+}
+
+impl Default for ProcessSessionOptions {
+    fn default() -> Self {
+        Self {
+            max_queued_chunks: 256,
+            max_chunk_bytes: 8 * 1024,
+            post_exit_drain: ProcessPostExitDrain::AbandonAfter(std::time::Duration::from_millis(
+                250,
+            )),
+            kill_on_drop: true,
+        }
+    }
+}
+
+/// One lossless output payload from a [`ProcessSession`].
+///
+/// The distinct variants keep stdout and stderr typed at the facade boundary;
+/// callers never receive a raw pipe or a backend stream identifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessOutputChunk {
+    /// Bytes read from the child's stdout pipe.
+    Stdout(Vec<u8>),
+    /// Bytes read from the child's stderr pipe.
+    Stderr(Vec<u8>),
+}
+
+impl ProcessOutputChunk {
+    /// Borrow the chunk's raw bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Stdout(bytes) | Self::Stderr(bytes) => bytes,
+        }
+    }
+}
+
+/// Portable details for an output-stream I/O failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessOutputFault {
+    kind: std::io::ErrorKind,
+    message: String,
+    raw_os_error: Option<i32>,
+}
+
+impl ProcessOutputFault {
+    pub(crate) fn new(
+        kind: std::io::ErrorKind,
+        message: String,
+        raw_os_error: Option<i32>,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            raw_os_error,
+        }
+    }
+
+    /// Portable category of the failed stream operation.
+    #[must_use]
+    pub const fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+
+    /// The underlying I/O failure text, preserved for durable diagnostics.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Native operating-system error, when the stream operation exposed one.
+    #[must_use]
+    pub const fn raw_os_error(&self) -> Option<i32> {
+        self.raw_os_error
+    }
+}
+
+/// Terminal state for one [`ProcessSession`] output stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessOutputCompletion {
+    /// Stdout reached EOF normally.
+    StdoutEof,
+    /// Stderr reached EOF normally.
+    StderrEof,
+    /// Stdout remained open after direct-child exit and the configured grace
+    /// elapsed, so the facade explicitly closed its reader.
+    StdoutAbandoned,
+    /// Stderr remained open after direct-child exit and the configured grace
+    /// elapsed, so the facade explicitly closed its reader.
+    StderrAbandoned,
+    /// Stdout reading ended with an I/O fault.
+    StdoutError(ProcessOutputFault),
+    /// Stderr reading ended with an I/O fault.
+    StderrError(ProcessOutputFault),
+}
+
+/// One output event from a [`ProcessSession`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessOutputEvent {
+    /// A bounded stdout or stderr payload.
+    Chunk(ProcessOutputChunk),
+    /// A stream completed, was explicitly abandoned after grace, or failed.
+    Completion(ProcessOutputCompletion),
+}
+
+/// Terminal-owner facade for a bounded streaming child process.
+///
+/// Lifecycle controls do not wait on stdout, stderr, or stdin work. In
+/// particular, [`Self::wait`] returns when the direct child is reaped even if
+/// a descendant retains an inherited output pipe; that pipe later reports an
+/// abandonment completion after [`ProcessSessionOptions::post_exit_drain`].
+/// Direct kill and drop policy likewise address only the direct child; they do
+/// not promise descendant-tree cleanup.
+pub struct ProcessSession {
+    inner: process_adapter::ProcessSessionAdapter,
+}
+
+impl ProcessSession {
+    pub(crate) fn new(inner: process_adapter::ProcessSessionAdapter) -> Self {
+        Self { inner }
+    }
+
+    /// Return the direct child's launch-bound numeric identifier.
+    ///
+    /// It is diagnostic only. Every lifecycle operation remains bound to the
+    /// private child identity rather than addressing this reusable number.
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.inner.pid()
+    }
+
+    /// Receive the next bounded output event.
+    ///
+    /// `None` means every configured output stream has completed, been
+    /// abandoned, or detached. A slow caller backpressures the child pipes;
+    /// it never causes unreported output eviction.
+    ///
+    /// Only one output receive may be active at a time. It is otherwise
+    /// independent from lifecycle controls, so callers may await direct-child
+    /// exit, kill, or CPU time while this receive waits on a descendant-held
+    /// pipe.
+    pub async fn next_output(&self) -> Option<ProcessOutputEvent> {
+        self.inner.next_output().await
+    }
+
+    /// Wait only for the direct child to exit and be reaped.
+    ///
+    /// This is independent from output completion, so it remains observable
+    /// when descendants retain inherited pipe ends.
+    pub async fn wait(&self) -> io::Result<ProcessSessionExit> {
+        self.inner.wait().await
+    }
+
+    /// Observe whether the direct child has already been reaped.
+    pub async fn poll(&self) -> io::Result<Option<ProcessSessionExit>> {
+        self.inner.poll().await
+    }
+
+    /// Hard-terminate and reap the direct child without waiting for output
+    /// delivery or a blocked stdin writer. This does not target descendants;
+    /// an inherited descendant pipe is explicitly abandoned after grace.
+    pub async fn kill(&self) -> io::Result<()> {
+        self.inner.kill().await
+    }
+
+    /// Request graceful termination for the child-owned process group.
+    ///
+    /// Returns `false` unless [`SpawnSpec::create_process_group`] was enabled,
+    /// or when the direct child has already exited.
+    pub async fn terminate_group_soft(&self) -> io::Result<bool> {
+        self.inner.terminate_group_soft().await
+    }
+
+    /// Queue one bounded stdin payload and flush it to the child's piped
+    /// stdin. A payload larger than `max_chunk_bytes` returns `InvalidInput`.
+    pub async fn write_stdin(&self, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_stdin(bytes).await
+    }
+
+    /// Close piped stdin, delivering EOF to the direct child.
+    pub async fn close_stdin(&self) -> io::Result<()> {
+        self.inner.close_stdin().await
+    }
+
+    /// Sample direct-child CPU time when the host can still prove its launch
+    /// identity. Unsupported or no-longer-observable processes return `None`.
+    pub async fn cpu_time(&self) -> io::Result<Option<std::time::Duration>> {
+        self.inner.cpu_time().await
+    }
+}
+
 /// Status-preserving result of bounded child-output capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessOutput {
@@ -544,20 +891,81 @@ pub struct BoundedProcessExit {
 }
 
 impl BoundedProcessExit {
-    pub(crate) fn from_raw_code(raw_code: i32) -> Self {
+    pub(crate) const fn new(raw_code: i32) -> Self {
         Self { raw_code }
     }
 
     /// Return the unmodified native exit code.
-    pub fn raw_code(self) -> i32 {
+    pub const fn raw_code(self) -> i32 {
         self.raw_code
     }
 
     /// Whether the command exited successfully.
-    pub fn is_success(self) -> bool {
+    pub const fn is_success(self) -> bool {
         self.raw_code == 0
     }
 }
+
+/// Facade-owned native session termination result.
+///
+/// This deliberately differs from [`BoundedProcessExit`], the legacy one-shot
+/// bounded-run code. Session clients retain both structured exit/signal
+/// meaning and every bit of the native status word, which is needed to
+/// classify Windows process failures without exposing `ExitStatus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessSessionExit {
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    native_status: u32,
+}
+
+impl ProcessSessionExit {
+    pub(crate) const fn from_native(
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        native_status: u32,
+    ) -> Self {
+        Self {
+            exit_code,
+            signal,
+            native_status,
+        }
+    }
+
+    /// Return the ordinary process exit code, if the process was not killed
+    /// by a Unix signal.
+    #[must_use]
+    pub const fn exit_code(self) -> Option<i32> {
+        self.exit_code
+    }
+
+    /// Return the Unix terminating signal when the host reported one.
+    ///
+    /// Windows and ordinary exits return `None`.
+    #[must_use]
+    pub const fn signal(self) -> Option<i32> {
+        self.signal
+    }
+
+    /// Return the unmodified host-native status word.
+    ///
+    /// On Windows this is the exact `DWORD` process exit status. On Unix this
+    /// is the native wait-status word. It is intentionally `u32` so every
+    /// Windows status bit survives signed integer conversion.
+    #[must_use]
+    pub const fn native_status(self) -> u32 {
+        self.native_status
+    }
+
+    /// Whether the process completed successfully.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
+        matches!(self.exit_code, Some(0))
+    }
+}
+
+/// Backward-compatible spelling for the one-shot bounded command exit.
+pub type ProcessExit = BoundedProcessExit;
 
 /// Failure returned by [`run_bounded_command`].
 #[derive(Debug)]
@@ -578,11 +986,11 @@ pub enum BoundedProcessError {
 impl std::fmt::Display for BoundedProcessError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TimedOut => formatter.write_str("bounded process timed out"),
+            Self::TimedOut => formatter.write_str("bounded command timed out"),
             Self::OutputLimitExceeded { limit } => {
                 write!(
                     formatter,
-                    "captured process output exceeded the {limit}-byte limit"
+                    "bounded command output exceeded the {limit}-byte limit"
                 )
             }
             Self::Spawn(error) | Self::Io(error) => error.fmt(formatter),
@@ -602,7 +1010,7 @@ impl std::error::Error for BoundedProcessError {
 /// Failure returned by [`run_bounded_command_async`].
 #[derive(Debug)]
 pub enum BoundedProcessAsyncError {
-    /// The bounded command failed.
+    /// The one-shot command returned a semantic bounded-process error.
     Bounded(BoundedProcessError),
     /// The canonical async engine could not join its blocking-lane task.
     Task(async_engine::TaskError),
@@ -628,25 +1036,28 @@ impl std::error::Error for BoundedProcessAsyncError {
 
 /// Run a contained one-shot command with bounded capture.
 ///
-/// The limit covers stdout and stderr together. Timeout and output-limit
-/// failures request hard cleanup before this function returns.
+/// The limit covers stdout and stderr together. A [`std::time::Duration`]
+/// requests a deadline; `None` preserves the pre-existing no-deadline API.
+/// Timeout and output-limit failures request hard cleanup before return.
 pub fn run_bounded_command(
     spec: SpawnSpec,
-    timeout: Option<std::time::Duration>,
+    timeout: impl Into<Option<std::time::Duration>>,
     output_limit: usize,
 ) -> Result<BoundedProcessOutput, BoundedProcessError> {
-    process_adapter::run_bounded(spec, timeout, output_limit)
+    process_adapter::run_bounded(spec, timeout.into(), output_limit)
 }
 
 /// Run [`run_bounded_command`] on the canonical async engine's blocking lane.
 ///
 /// This keeps the current runtime responsive without constructing a second
-/// runtime or exposing its implementation types.
+/// runtime or exposing its implementation types. The timeout accepts either a
+/// required [`std::time::Duration`] or `Option<Duration>` for compatibility.
 pub async fn run_bounded_command_async(
     spec: SpawnSpec,
-    timeout: Option<std::time::Duration>,
+    timeout: impl Into<Option<std::time::Duration>>,
     output_limit: usize,
 ) -> Result<BoundedProcessOutput, BoundedProcessAsyncError> {
+    let timeout = timeout.into();
     async_engine::launch_blocking(move || run_bounded_command(spec, timeout, output_limit))
         .await
         .map_err(BoundedProcessAsyncError::Task)?
@@ -662,9 +1073,13 @@ pub fn shell_spec(command: impl AsRef<OsStr>) -> SpawnSpec {
 mod tests {
     use super::{
         run_bounded_command, run_bounded_command_async, shell_spec, BoundedProcessAsyncError,
-        BoundedProcessError, SpawnSpec, StreamMode,
+        BoundedProcessError, BoundedProcessOutput, ProcessPriority, SpawnSpec, StreamMode,
     };
+    #[cfg(target_os = "linux")]
+    use std::process::{Command, Stdio};
     use std::sync::{Arc, Mutex};
+    #[cfg(target_os = "linux")]
+    use std::thread;
     use std::time::{Duration, Instant};
 
     fn fixture_command() -> SpawnSpec {
@@ -676,6 +1091,23 @@ mod tests {
         {
             shell_spec("printf async-platform-internal")
         }
+    }
+
+    #[test]
+    fn semantic_priority_bands_have_exact_private_substrate_mappings() {
+        #[cfg(windows)]
+        assert_eq!(ProcessPriority::High.substrate_nice(), Some(-15));
+        #[cfg(not(windows))]
+        assert_eq!(ProcessPriority::High.substrate_nice(), Some(-5));
+        assert_eq!(ProcessPriority::Normal.substrate_nice(), None);
+        #[cfg(windows)]
+        assert_eq!(ProcessPriority::Low.substrate_nice(), Some(1));
+        #[cfg(not(windows))]
+        assert_eq!(ProcessPriority::Low.substrate_nice(), Some(10));
+        #[cfg(windows)]
+        assert_eq!(ProcessPriority::Idle.substrate_nice(), Some(15));
+        #[cfg(not(windows))]
+        assert_eq!(ProcessPriority::Idle.substrate_nice(), Some(19));
     }
 
     #[tokio::test]
@@ -771,10 +1203,128 @@ mod tests {
     }
 
     #[test]
+    fn bounded_command_requires_a_duration_deadline() {
+        let _: fn(SpawnSpec, Duration, usize) -> Result<BoundedProcessOutput, BoundedProcessError> =
+            run_bounded_command;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn helper_test_name(name: &str) -> String {
+        match module_path!().split_once("::") {
+            Some((_crate_root, module)) => format!("{module}::{name}"),
+            None => name.to_owned(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_bounded_owner_death_child() {
+        if std::env::var("KERNAL_API_BOUNDED_OWNER_DEATH_HELPER")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+
+        let result = run_bounded_command(
+            shell_spec("echo $$ > \"$KERNAL_API_BOUNDED_OWNER_DEATH_PID_FILE\"; exec sleep 30")
+                .kill_when_owner_dies(true),
+            Duration::from_secs(120),
+            4096,
+        );
+        assert!(
+            matches!(result, Err(BoundedProcessError::TimedOut)),
+            "helper must run to its deadline unless the owner dies: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_command_forwards_owner_death_to_the_native_runner() {
+        let temporary = tempfile::tempdir().expect("temporary pid directory");
+        let pid_file = temporary.path().join("bounded-owner-death.pid");
+        let mut owner = Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg(helper_test_name("helper_bounded_owner_death_child"))
+            .arg("--nocapture")
+            .env("KERNAL_API_BOUNDED_OWNER_DEATH_HELPER", "1")
+            .env("KERNAL_API_BOUNDED_OWNER_DEATH_PID_FILE", &pid_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn bounded owner helper");
+
+        let startup_deadline = Instant::now() + Duration::from_secs(5);
+        let child_pid = loop {
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break pid
+                    .trim()
+                    .parse::<u32>()
+                    .expect("helper wrote a numeric child pid");
+            }
+            if let Some(status) = owner.try_wait().expect("check helper") {
+                panic!("bounded owner exited before reporting its child pid: {status}");
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "bounded owner did not report a child pid"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        owner.kill().expect("kill bounded owner");
+        owner.wait().expect("reap bounded owner");
+
+        let death_deadline = Instant::now() + Duration::from_secs(5);
+        while linux_pid_is_running(child_pid) {
+            assert!(
+                Instant::now() < death_deadline,
+                "bounded child {child_pid} survived owner death"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_pid_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit_once(") ")
+                    .and_then(|(_, tail)| tail.as_bytes().first().copied());
+                state != Some(b'Z')
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => {
+                (unsafe { libc::kill(pid as libc::pid_t, 0) == 0 })
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_strengthens_a_disabled_group_policy_for_containment() {
+        let output = run_bounded_command(
+            shell_spec("pgid=$(ps -o pgid= -p $$ | tr -d '[:space:]'); test \"$pgid\" = \"$$\"")
+                .create_process_group(false),
+            Duration::from_secs(2),
+            1024,
+        )
+        .expect("bounded capture must strengthen group containment");
+
+        assert!(output.exit.is_success());
+    }
+
+    #[test]
     fn bounded_command_preserves_separate_streams_and_raw_nonzero_exit() {
         let output = run_bounded_command(
-            nonzero_capture_command(),
-            Some(Duration::from_secs(2)),
+            nonzero_capture_command()
+                .stdin(StreamMode::Inherit)
+                .stdout(StreamMode::Inherit)
+                .stderr(StreamMode::Null),
+            Duration::from_secs(2),
             1024,
         )
         .expect("bounded nonzero command completes");
@@ -787,13 +1337,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bounded_command_preserves_raw_signal_exit() {
+    fn bounded_command_preserves_cwd_clear_env_and_environment_overrides() {
+        let temporary_directory = tempfile::tempdir().expect("temporary cwd");
+        let expected_cwd = temporary_directory.path().to_string_lossy();
         let output = run_bounded_command(
-            shell_spec("kill -TERM $$"),
-            Some(Duration::from_secs(2)),
+            SpawnSpec::new("/bin/sh")
+                .arg("-c")
+                .arg("pwd; /usr/bin/env")
+                .current_dir(temporary_directory.path())
+                .clear_env(true)
+                .env("KERNAL_API_BOUNDED_OVERRIDE", "expected-value"),
+            Duration::from_secs(2),
             1024,
         )
-        .expect("signal-terminated command completes");
+        .expect("cwd and environment configuration are preserved");
+
+        let environment = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
+        let mut lines = environment.lines();
+        assert_eq!(lines.next(), Some(expected_cwd.as_ref()));
+        assert!(lines.any(|line| line == "KERNAL_API_BOUNDED_OVERRIDE=expected-value"));
+        assert!(
+            !environment.lines().any(|line| line.starts_with("HOME=")),
+            "env_clear must remove the inherited HOME variable: {environment}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_preserves_the_negative_signal_exit_code() {
+        let output = run_bounded_command(shell_spec("kill -TERM $$"), Duration::from_secs(2), 1024)
+            .expect("signalled command completes");
 
         assert_eq!(output.exit.raw_code(), -libc::SIGTERM);
         assert!(!output.exit.is_success());
@@ -802,7 +1375,7 @@ mod tests {
     #[test]
     fn bounded_command_timeout_hard_kills_and_reaps_promptly() {
         let started = Instant::now();
-        let error = run_bounded_command(slow_command(), Some(Duration::from_millis(100)), 1024)
+        let error = run_bounded_command(slow_command(), Duration::from_millis(100), 1024)
             .expect_err("slow command must time out after hard cleanup");
 
         assert!(matches!(error, BoundedProcessError::TimedOut));
@@ -814,9 +1387,9 @@ mod tests {
     }
 
     #[test]
-    fn bounded_command_overflow_hard_kills_and_reaps_promptly() {
+    fn bounded_command_overflow_requests_hard_kill_and_returns_promptly() {
         let started = Instant::now();
-        let error = run_bounded_command(overflow_command(), Some(Duration::from_secs(2)), 16)
+        let error = run_bounded_command(overflow_command(), Duration::from_secs(2), 16)
             .expect_err("unbounded output must exceed the aggregate capture limit");
 
         assert!(matches!(
@@ -830,13 +1403,29 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn bounded_command_applies_the_capture_limit_across_both_streams() {
+        let error = run_bounded_command(
+            shell_spec("printf 123456; printf abcdef >&2"),
+            Duration::from_secs(2),
+            10,
+        )
+        .expect_err("six stdout bytes plus six stderr bytes must exceed one aggregate limit");
+
+        assert!(matches!(
+            error,
+            BoundedProcessError::OutputLimitExceeded { limit: 10 }
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_command_timeout_cancels_readers_held_by_an_escaped_descendant() {
         let started = Instant::now();
         let error = run_bounded_command(
             shell_spec("setsid sh -c 'sleep 3' & sleep 30"),
-            Some(Duration::from_millis(100)),
+            Duration::from_millis(100),
             1024,
         )
         .expect_err("outer process must time out");
@@ -849,11 +1438,33 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_command_reports_a_missing_program_as_a_facade_io_error() {
+    fn bounded_command_overflow_cancels_readers_held_by_an_escaped_descendant() {
+        let started = Instant::now();
+        let error = run_bounded_command(
+            shell_spec("setsid sh -c 'sleep 3' & yes x"),
+            Duration::from_secs(2),
+            16,
+        )
+        .expect_err("overflowing parent must not wait for an escaped pipe holder");
+
+        assert!(matches!(
+            error,
+            BoundedProcessError::OutputLimitExceeded { limit: 16 }
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "escaped descendant retained bounded-capture readers for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn bounded_command_reports_a_missing_program_as_a_facade_spawn_error() {
         let error = run_bounded_command(
             SpawnSpec::new("kernal-api-bounded-program-that-does-not-exist"),
-            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
             1024,
         )
         .expect_err("missing program must fail before capture");
@@ -874,7 +1485,7 @@ mod tests {
                     std::ffi::OsString::from_vec(b"KERNAL_API_BOUNDED_BYTES".to_vec()),
                     std::ffi::OsString::from_vec(b"value-\xff".to_vec()),
                 ),
-            Some(Duration::from_secs(2)),
+            Duration::from_secs(2),
             1024,
         )
         .expect("non-UTF-8 command inputs are preserved");
@@ -921,10 +1532,9 @@ mod tests {
                 *ticker_at_for_task.lock().expect("ticker lock") = Some(started.elapsed());
             });
 
-            let error =
-                run_bounded_command_async(slow_command(), Some(Duration::from_millis(100)), 1024)
-                    .await
-                    .expect_err("slow command must time out through the blocking lane");
+            let error = run_bounded_command_async(slow_command(), Duration::from_millis(100), 1024)
+                .await
+                .expect_err("slow command must time out through the blocking lane");
 
             assert!(matches!(
                 error,

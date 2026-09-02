@@ -3,13 +3,14 @@
 #[cfg(unix)]
 use std::time::Duration;
 
+#[cfg(unix)]
+use kernal_api::ProcessPostExitDrain;
+
 #[cfg(target_os = "linux")]
 use kernal_api::run_bounded_command;
 #[cfg(target_os = "linux")]
 use kernal_api::ProcessOutputCompletion;
-use kernal_api::{
-    shell_spec, ProcessPostExitDrain, ProcessPriority, ProcessSessionOptions, SpawnSpec, StreamMode,
-};
+use kernal_api::{shell_spec, ProcessPriority, ProcessSessionOptions, SpawnSpec, StreamMode};
 #[cfg(unix)]
 use kernal_api::{ProcessOutputChunk, ProcessOutputEvent};
 

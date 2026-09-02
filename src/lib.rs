@@ -1339,7 +1339,13 @@ mod tests {
     #[test]
     fn bounded_command_preserves_cwd_clear_env_and_environment_overrides() {
         let temporary_directory = tempfile::tempdir().expect("temporary cwd");
-        let expected_cwd = temporary_directory.path().to_string_lossy();
+        // macOS exposes /var as a symlink to /private/var, and `pwd` reports
+        // the resolved path. Compare the canonical form so the assertion
+        // reflects directory identity rather than that implementation detail.
+        let expected_cwd = std::fs::canonicalize(temporary_directory.path())
+            .expect("canonical temporary cwd")
+            .to_string_lossy()
+            .into_owned();
         let output = run_bounded_command(
             SpawnSpec::new("/bin/sh")
                 .arg("-c")
@@ -1354,7 +1360,7 @@ mod tests {
 
         let environment = String::from_utf8(output.stdout).expect("fixture output is UTF-8");
         let mut lines = environment.lines();
-        assert_eq!(lines.next(), Some(expected_cwd.as_ref()));
+        assert_eq!(lines.next(), Some(expected_cwd.as_str()));
         assert!(lines.any(|line| line == "KERNAL_API_BOUNDED_OVERRIDE=expected-value"));
         assert!(
             !environment.lines().any(|line| line.starts_with("HOME=")),

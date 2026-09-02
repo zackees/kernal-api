@@ -6,10 +6,8 @@ native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
 `running-process` phase-1 adapter is implemented on the
-`feat/running-process-adapter` migration branch, but is not releasable yet: it
-depends on an explicit local path to an unreleased upstream bounded
-owner-death capability. A release requires the matching upstream exact
-registry version and removal of that migration-only path.
+`feat/running-process-adapter` migration branch and uses the exact published
+`running-process` 4.10.10 registry release without exposing backend types.
 
 In the target architecture, applications use `kernal-api`; they do not use
 `running-process` or Tokio directly. The permanent dependency direction and
@@ -47,9 +45,8 @@ direct use of implementation crates owned by this package.
 
 The current base crate contains the async process/host facade. On the phase-1
 migration branch, its bounded process adapter privately uses
-`running-process` without exposing backend types; that branch remains blocked
-from packaging until the matching upstream exact release is available. Optional
-features keep consumers from linking tooling they do not use:
+`running-process` 4.10.10 without exposing backend types. Optional features
+keep consumers from linking tooling they do not use:
 
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
 - `snapshot` for cooperative thread capture and deferred unwinding

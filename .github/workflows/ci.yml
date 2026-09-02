@@ -82,8 +82,11 @@ jobs:
             | tar zxf - -C "$HOME/.cargo/bin"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run the aarch64 tests from the prebuilt archive
+        # `cargo-nextest` is a cargo subcommand shim: invoked directly it
+        # still expects `nextest` as its first argument, otherwise it parses
+        # the next token as a cargo subcommand and fails.
         run: >-
-          cargo-nextest run
+          cargo-nextest nextest run
           --archive-file kernal-arm64.tar.zst
           --workspace-remap .
 

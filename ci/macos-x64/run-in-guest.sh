@@ -14,4 +14,4 @@ scp -P "$PORT" $SSH_OPTS "$ARCHIVE" "$USER_@$HOST_:~/kernal-x64.tar.zst"
 
 # shellcheck disable=SC2029  # deliberate remote-side expansion
 ssh -p "$PORT" $SSH_OPTS "$USER_@$HOST_" \
-  "cargo-nextest run --archive-file ~/kernal-x64.tar.zst ${NEXTEST_FILTER:+-E '${NEXTEST_FILTER}'}"
+  "cargo-nextest nextest run --archive-file ~/kernal-x64.tar.zst ${NEXTEST_FILTER:+-E '${NEXTEST_FILTER}'}"

@@ -25,11 +25,13 @@ dylint_linting::declare_late_lint! {
 
 const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "addr2line",
+    "blake3",
     "console_api",
     "console_subscriber",
     "crash_handler",
     "framehop",
     "interprocess",
+    "memmap2",
     "mimalloc_pprof",
     "pdb_addr2line",
     "portable_pty",

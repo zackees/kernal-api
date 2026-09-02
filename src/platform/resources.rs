@@ -10,11 +10,13 @@
 //! Nothing in these signatures names an errno or a Win32 code.
 
 pub use crate::{
+    resources_available_space as available_space,
     resources_fd_exhaustion_error as fd_exhaustion_error,
     resources_inode_capacity as inode_capacity,
     resources_signals_fd_exhaustion as signals_fd_exhaustion,
     resources_signals_storage_exhaustion as signals_storage_exhaustion,
     resources_storage_exhaustion_error as storage_exhaustion_error,
+    resources_total_space as total_space,
 };
 
 /// How many inodes a filesystem has, and how many are still available.
@@ -86,5 +88,19 @@ mod tests {
                 "free inodes cannot exceed the table"
             );
         }
+    }
+
+    /// Space available to this caller never exceeds the volume's total
+    /// capacity, and a real filesystem never reports zero total bytes.
+    #[test]
+    fn space_probes_are_coherent_for_an_existing_directory() {
+        let directory = std::env::temp_dir();
+        let total = total_space(&directory).expect("total space must succeed");
+        let available = available_space(&directory).expect("available space must succeed");
+        assert!(total > 0, "a mounted filesystem is never zero bytes");
+        assert!(
+            available <= total,
+            "available space cannot exceed total capacity"
+        );
     }
 }

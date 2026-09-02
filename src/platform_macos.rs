@@ -6,11 +6,13 @@ pub(crate) mod autostart;
 #[path = "platform_macos/resources.rs"]
 pub(crate) mod resources;
 pub use resources::{
+    available_space as resources_available_space,
     fd_exhaustion_error as resources_fd_exhaustion_error,
     inode_capacity as resources_inode_capacity,
     signals_fd_exhaustion as resources_signals_fd_exhaustion,
     signals_storage_exhaustion as resources_signals_storage_exhaustion,
     storage_exhaustion_error as resources_storage_exhaustion_error,
+    total_space as resources_total_space,
 };
 
 pub use autostart::{
@@ -61,8 +63,11 @@ pub use fs::{
     user_config_dir as fs_user_config_dir,
     user_data_dir as fs_user_data_dir, encode_path_bytes as fs_encode_path_bytes,
     file_identity as fs_file_identity, is_lock_conflict as fs_is_lock_conflict,
+    lock_exclusive as fs_lock_exclusive, lock_shared as fs_lock_shared,
     open_lock_file as fs_open_lock_file, path_identity as fs_path_identity,
-    try_lock_exclusive as fs_try_lock_exclusive, unlock as fs_unlock,
+    set_file_mtime as fs_set_file_mtime,
+    try_lock_exclusive as fs_try_lock_exclusive, try_lock_shared as fs_try_lock_shared,
+    unlock as fs_unlock,
     user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };

@@ -142,8 +142,9 @@ pub use platform_imp::{process_can_replace_current_image, process_replace_curren
 pub use platform_imp::{process_same_executable_path, ProcessLiveness};
 
 pub use platform_imp::{
-    resources_fd_exhaustion_error, resources_inode_capacity, resources_signals_fd_exhaustion,
-    resources_signals_storage_exhaustion, resources_storage_exhaustion_error,
+    resources_available_space, resources_fd_exhaustion_error, resources_inode_capacity,
+    resources_signals_fd_exhaustion, resources_signals_storage_exhaustion,
+    resources_storage_exhaustion_error, resources_total_space,
 };
 
 pub use platform_imp::{
@@ -153,8 +154,9 @@ pub use platform_imp::{
 #[cfg(feature = "fs")]
 pub use platform_imp::{
     fs_create_private_file, fs_decode_path_bytes, fs_encode_path_bytes, fs_file_identity,
-    fs_is_lock_conflict, fs_open_lock_file, fs_path_identity, fs_replace_file, fs_sync_directory,
-    fs_try_lock_exclusive, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
+    fs_is_lock_conflict, fs_lock_exclusive, fs_lock_shared, fs_open_lock_file, fs_path_identity,
+    fs_replace_file, fs_set_file_mtime, fs_sync_directory, fs_try_lock_exclusive,
+    fs_try_lock_shared, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
     fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
 };
 

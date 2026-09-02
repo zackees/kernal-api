@@ -65,3 +65,42 @@ pub fn inode_capacity(path: &Path) -> io::Result<Option<InodeCapacity>> {
         free: stats.f_favail as u64,
     }))
 }
+
+/// Total capacity, in bytes, of the filesystem containing `path`.
+pub fn total_space(path: &Path) -> io::Result<u64> {
+    let stats = probe_statvfs(path)?;
+    // fsblkcnt_t and the block-size fields are u64 on Linux but narrower on
+    // macOS; keep explicit casts so both hosts share this body.
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stats.f_blocks as u64 * stats.f_frsize as u64)
+}
+
+/// Space available to this (unprivileged) caller, in bytes, on the
+/// filesystem containing `path`.
+///
+/// This is `f_bavail`, not `f_bfree`: the two differ by the blocks a host
+/// reserves for its superuser, and a caller sizing a write cares about what
+/// it can actually use, not what is free in the abstract.
+pub fn available_space(path: &Path) -> io::Result<u64> {
+    let stats = probe_statvfs(path)?;
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stats.f_bavail as u64 * stats.f_frsize as u64)
+}
+
+/// `statvfs` the filesystem containing `path`, for [`total_space`] and
+/// [`available_space`].
+fn probe_statvfs(path: &Path) -> io::Result<libc::statvfs> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: an all-zero `statvfs` is a valid one; the call fills it.
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c_path` is a NUL-terminated path alive for the call, and
+    // `stats` is valid writable storage of exactly the expected type.
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(stats)
+}

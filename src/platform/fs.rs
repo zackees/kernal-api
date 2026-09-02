@@ -1,10 +1,22 @@
-//! Runtime-artifact identity, permissions, secure-open, replacement, and directory primitives.
+//! Runtime-artifact identity, permissions, secure-open, replacement, and
+//! directory primitives, plus advisory locking, modification-time, reflink
+//! copy, parallel directory walking, and glob matching.
 //!
 //! Callers name the *role* a directory plays for their product -- ephemeral
 //! runtime artifacts, persistent state, per-run scratch. Which location on this
 //! host plays that role, and how two accounts are kept apart there, is decided
 //! here. Callers still own their own layout beneath it: leaf names, extensions,
 //! and subdirectories are product conventions, not host mechanics.
+//!
+//! The rest of this module is one capability, not several, even though it
+//! groups locking, timestamps, copying, walking, and matching: every one of
+//! them is a place the supported hosts genuinely diverge (advisory-lock
+//! semantics, reflink support, filesystem-specific mtime granularity) and a
+//! wrapper crate exists only to paper over that divergence. Locking and
+//! modification-time setting are implemented natively per host, matching the
+//! rest of this file; reflink copy, parallel walking, and glob matching wrap
+//! a maintained backend privately, because there is no std equivalent and a
+//! hand-rolled reflink ioctl is not something to get wrong silently.
 
 /// A descriptor the caller already owns and has asked us to write to.
 ///
@@ -41,11 +53,522 @@ pub use crate::{
     fs_encode_path_bytes as encode_path_bytes, fs_file_identity as file_identity,
     fs_is_lock_conflict as is_lock_conflict, fs_open_lock_file as open_lock_file,
     fs_path_identity as path_identity, fs_replace_file as replace_file,
-    fs_sync_directory as sync_directory, fs_try_lock_exclusive as try_lock_exclusive,
-    fs_unlock as unlock, fs_user_config_dir as user_config_dir, fs_user_data_dir as user_data_dir,
-    fs_user_run_data_root as user_run_data_root, fs_user_runtime_dir as user_runtime_dir,
-    fs_user_state_dir as user_state_dir, FsFileIdentity as FileIdentity,
+    fs_sync_directory as sync_directory, fs_user_config_dir as user_config_dir,
+    fs_user_data_dir as user_data_dir, fs_user_run_data_root as user_run_data_root,
+    fs_user_runtime_dir as user_runtime_dir, fs_user_state_dir as user_state_dir,
+    FsFileIdentity as FileIdentity,
 };
+
+#[cfg(feature = "fs")]
+use std::fs::File;
+#[cfg(feature = "fs")]
+use std::io;
+#[cfg(feature = "fs")]
+use std::path::{Path, PathBuf};
+#[cfg(feature = "fs")]
+use std::sync::Arc;
+#[cfg(feature = "fs")]
+use std::time::SystemTime;
+
+// ---------------------------------------------------------------------------
+// Advisory locking
+// ---------------------------------------------------------------------------
+
+/// An advisory lock held on an open file, released automatically when this
+/// guard drops.
+///
+/// Holding this guard *is* what "the lock is held" means in this module:
+/// there is deliberately no bare `lock`/`unlock` pair here that a caller
+/// could call out of balance and get wrong. Release is best-effort -- a
+/// failure releasing an
+/// advisory lock cannot be reported from a destructor, and on every supported
+/// host closing the underlying file descriptor also releases the lock, so a
+/// failed explicit unlock here is not a stuck lock, just a redundant release
+/// that did not need to happen.
+///
+/// Advisory locks exclude other advisory-lock holders only, never a process
+/// that opens and reads or writes the file without locking it -- that is true
+/// on every supported host and is what "advisory" means throughout this
+/// module.
+#[cfg(feature = "fs")]
+#[derive(Debug)]
+pub struct FileLock<'file> {
+    file: &'file File,
+}
+
+#[cfg(feature = "fs")]
+impl<'file> FileLock<'file> {
+    fn new(file: &'file File) -> Self {
+        Self { file }
+    }
+}
+
+#[cfg(feature = "fs")]
+impl Drop for FileLock<'_> {
+    fn drop(&mut self) {
+        let _ = crate::fs_unlock(self.file);
+    }
+}
+
+/// Take an exclusive advisory lock, waiting until it is available.
+///
+/// The returned guard releases the lock when dropped.
+///
+/// # Errors
+///
+/// Returns an error if the host lock call fails for a reason other than
+/// waiting for the lock.
+#[cfg(feature = "fs")]
+pub fn lock_exclusive(file: &File) -> io::Result<FileLock<'_>> {
+    crate::fs_lock_exclusive(file)?;
+    Ok(FileLock::new(file))
+}
+
+/// Take a shared advisory lock, waiting until it is available.
+///
+/// The returned guard releases the lock when dropped.
+///
+/// # Errors
+///
+/// Returns an error if the host lock call fails for a reason other than
+/// waiting for the lock.
+#[cfg(feature = "fs")]
+pub fn lock_shared(file: &File) -> io::Result<FileLock<'_>> {
+    crate::fs_lock_shared(file)?;
+    Ok(FileLock::new(file))
+}
+
+/// Take an exclusive advisory lock without waiting.
+///
+/// Returns immediately when another holder has it; the caller decides
+/// whether that is a conflict worth retrying, via [`is_lock_conflict`].
+///
+/// # Errors
+///
+/// Returns an error if another holder has the lock (see
+/// [`is_lock_conflict`]), or if the host lock call fails for another reason.
+#[cfg(feature = "fs")]
+pub fn try_lock_exclusive(file: &File) -> io::Result<FileLock<'_>> {
+    crate::fs_try_lock_exclusive(file)?;
+    Ok(FileLock::new(file))
+}
+
+/// Take a shared advisory lock without waiting.
+///
+/// Returns immediately when an exclusive holder has it; the caller decides
+/// whether that is a conflict worth retrying, via [`is_lock_conflict`].
+///
+/// # Errors
+///
+/// Returns an error if an exclusive holder has the lock (see
+/// [`is_lock_conflict`]), or if the host lock call fails for another reason.
+#[cfg(feature = "fs")]
+pub fn try_lock_shared(file: &File) -> io::Result<FileLock<'_>> {
+    crate::fs_try_lock_shared(file)?;
+    Ok(FileLock::new(file))
+}
+
+// ---------------------------------------------------------------------------
+// Modification time
+// ---------------------------------------------------------------------------
+
+/// A filesystem modification time, independent of any host's on-disk
+/// representation.
+///
+/// This is a Unix-epoch second and a nanosecond remainder, not
+/// [`SystemTime`]: an on-disk mtime is fundamentally that pair (a filesystem
+/// can legitimately record a time before 1970 as a negative second count),
+/// and going through `SystemTime`'s own epoch arithmetic for every
+/// construction and every host's native call would risk losing precision or
+/// failing on values a filesystem can actually hold. A value only ever moves
+/// between [`Metadata`](std::fs::Metadata) (via
+/// [`from_last_modification_time`](FileTime::from_last_modification_time))
+/// and a file (via [`set_file_mtime`]); nothing in this facade needs to read
+/// a `FileTime` apart from that round trip.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FileTime {
+    seconds_since_unix_epoch: i64,
+    nanoseconds: u32,
+}
+
+#[cfg(feature = "fs")]
+impl FileTime {
+    /// Construct a modification time from a Unix-epoch second count and a
+    /// nanosecond remainder.
+    ///
+    /// `seconds_since_unix_epoch` may be negative, for a time before 1970,
+    /// matching what an on-disk mtime can legitimately encode.
+    pub fn from_unix_time(seconds_since_unix_epoch: i64, nanoseconds: u32) -> Self {
+        Self {
+            seconds_since_unix_epoch,
+            nanoseconds,
+        }
+    }
+
+    /// Construct a modification time from [`SystemTime`], such as
+    /// [`Metadata::modified`](std::fs::Metadata::modified).
+    pub fn from_system_time(time: SystemTime) -> Self {
+        match time.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(duration) => Self {
+                seconds_since_unix_epoch: duration.as_secs() as i64,
+                nanoseconds: duration.subsec_nanos(),
+            },
+            Err(before_epoch) => {
+                let duration = before_epoch.duration();
+                let subsec = duration.subsec_nanos();
+                let (seconds, nanoseconds) = if subsec == 0 {
+                    (-(duration.as_secs() as i64), 0)
+                } else {
+                    (-(duration.as_secs() as i64) - 1, 1_000_000_000 - subsec)
+                };
+                Self {
+                    seconds_since_unix_epoch: seconds,
+                    nanoseconds,
+                }
+            }
+        }
+    }
+
+    /// The current modification time, as this host's clock reports it now.
+    pub fn now() -> Self {
+        Self::from_system_time(SystemTime::now())
+    }
+
+    /// The modification time already recorded in `metadata`, such as from
+    /// [`std::fs::metadata`] or [`std::fs::symlink_metadata`].
+    ///
+    /// Infallible: unlike [`Metadata::modified`](std::fs::Metadata::modified),
+    /// this reads the raw host field directly rather than going through a
+    /// conversion that can report the host as not supporting mtimes at all,
+    /// which none of Linux, macOS, or Windows fail to.
+    pub fn from_last_modification_time(metadata: &std::fs::Metadata) -> Self {
+        last_modification_time(metadata)
+    }
+}
+
+#[cfg(all(feature = "fs", unix))]
+fn last_modification_time(metadata: &std::fs::Metadata) -> FileTime {
+    use std::os::unix::fs::MetadataExt as _;
+
+    FileTime {
+        seconds_since_unix_epoch: metadata.mtime(),
+        nanoseconds: metadata.mtime_nsec().clamp(0, 999_999_999) as u32,
+    }
+}
+
+#[cfg(all(feature = "fs", windows))]
+fn last_modification_time(metadata: &std::fs::Metadata) -> FileTime {
+    use std::os::windows::fs::MetadataExt as _;
+
+    windows_file_time_to_unix(metadata.last_write_time())
+}
+
+/// Windows-epoch (1601-01-01) 100-nanosecond ticks, converted to a Unix-epoch
+/// second/nanosecond pair. Shared by [`last_modification_time`]; kept here
+/// rather than duplicated per host because the conversion itself does not
+/// diverge -- only which raw field a host hands it does.
+#[cfg(all(feature = "fs", windows))]
+fn windows_file_time_to_unix(ticks: u64) -> FileTime {
+    /// 100-nanosecond ticks between the Windows epoch (1601-01-01) and the
+    /// Unix epoch (1970-01-01).
+    const WINDOWS_TO_UNIX_EPOCH_TICKS: i64 = 116_444_736_000_000_000;
+
+    let ticks = ticks as i64 - WINDOWS_TO_UNIX_EPOCH_TICKS;
+    let seconds_since_unix_epoch = ticks.div_euclid(10_000_000);
+    let remainder_ticks = ticks.rem_euclid(10_000_000);
+    FileTime {
+        seconds_since_unix_epoch,
+        nanoseconds: (remainder_ticks * 100) as u32,
+    }
+}
+
+/// Set the modification time of the file at `path`, without disturbing its
+/// access time.
+///
+/// # Errors
+///
+/// Returns an error if the caller lacks permission to change the file's
+/// timestamps, if `path` does not exist, or if `time` is out of range for
+/// this host's clock.
+#[cfg(feature = "fs")]
+pub fn set_file_mtime(path: &Path, time: FileTime) -> io::Result<()> {
+    crate::fs_set_file_mtime(path, time.seconds_since_unix_epoch, time.nanoseconds)
+}
+
+// ---------------------------------------------------------------------------
+// Copy
+// ---------------------------------------------------------------------------
+
+/// How [`copy_file`] moved the bytes.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The destination shares the source's data blocks (copy-on-write); no
+    /// file content was duplicated on disk.
+    Reflinked,
+    /// The filesystem, or this particular pair of paths, does not support a
+    /// reflink here, so this many bytes were duplicated instead.
+    Copied {
+        /// The number of bytes written to `destination`.
+        bytes: u64,
+    },
+}
+
+/// Copy `source` to `destination`, preferring a reflink over a byte-for-byte
+/// copy.
+///
+/// A reflink shares data blocks copy-on-write instead of duplicating them, so
+/// it is near-instant and free of disk space until either copy is modified --
+/// but only some filesystems support it (btrfs, XFS with `reflink=1`, APFS,
+/// ReFS on Windows Server, and a few others), and both paths generally need
+/// to be on the same volume. Where a reflink is not possible this transparently
+/// falls back to a full byte copy, and [`CopyOutcome`] tells the caller which
+/// one actually happened -- a caller that specifically needs the cheap path
+/// can detect the expensive one rather than assume.
+///
+/// # Errors
+///
+/// Returns an error if neither a reflink nor a byte copy could complete, such
+/// as `source` not existing or a permissions failure on `destination`.
+#[cfg(feature = "fs")]
+pub fn copy_file(source: &Path, destination: &Path) -> io::Result<CopyOutcome> {
+    match reflink_copy::reflink_or_copy(source, destination)? {
+        None => Ok(CopyOutcome::Reflinked),
+        Some(bytes) => Ok(CopyOutcome::Copied { bytes }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel directory walk
+// ---------------------------------------------------------------------------
+
+/// One entry yielded by a [`DirectoryWalk`].
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    path: PathBuf,
+    depth: usize,
+    is_directory: bool,
+    is_file: bool,
+    is_symbolic_link: bool,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryEntry {
+    /// The absolute path of this entry.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Depth of this entry relative to the walk's root, which is depth `0`.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Whether this entry is a directory.
+    pub fn is_directory(&self) -> bool {
+        self.is_directory
+    }
+
+    /// Whether this entry is a regular file.
+    pub fn is_file(&self) -> bool {
+        self.is_file
+    }
+
+    /// Whether this entry is a symbolic link that was not followed.
+    ///
+    /// Never true when the walk that produced it followed symbolic links --
+    /// in that case this entry describes the link's target instead.
+    pub fn is_symbolic_link(&self) -> bool {
+        self.is_symbolic_link
+    }
+
+    /// Re-read this entry's metadata from disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the entry no longer exists or cannot be read.
+    pub fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        std::fs::metadata(&self.path)
+    }
+}
+
+#[cfg(feature = "fs")]
+fn directory_entry_from_jwalk(entry: jwalk::DirEntry<((), ())>) -> DirectoryEntry {
+    let file_type = entry.file_type();
+    DirectoryEntry {
+        path: entry.path(),
+        depth: entry.depth(),
+        is_directory: file_type.is_dir(),
+        is_file: file_type.is_file(),
+        is_symbolic_link: file_type.is_symlink(),
+    }
+}
+
+/// The predicate a [`DirectoryWalk`] consults before descending into a
+/// directory. Shared, because the walk hands it to every worker thread that
+/// reads a directory, and named, because spelling it inline twice is the
+/// kind of type that stops being readable.
+#[cfg(feature = "fs")]
+type PruneDirectories = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
+
+/// A parallel directory-tree walk, configured before it runs.
+///
+/// Every option here defaults to what [`std::fs::read_dir`] itself would do
+/// for a single directory: hidden entries included, symbolic links not
+/// followed, no ordering guarantee, and nothing pruned.
+#[cfg(feature = "fs")]
+pub struct DirectoryWalk {
+    root: PathBuf,
+    follow_symbolic_links: bool,
+    include_hidden_entries: bool,
+    sorted: bool,
+    prune_directories: Option<PruneDirectories>,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryWalk {
+    /// Start configuring a walk rooted at `root`.
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            follow_symbolic_links: false,
+            include_hidden_entries: true,
+            sorted: false,
+            prune_directories: None,
+        }
+    }
+
+    /// Whether to follow symbolic links into their targets. Default: `false`.
+    pub fn follow_symbolic_links(mut self, follow: bool) -> Self {
+        self.follow_symbolic_links = follow;
+        self
+    }
+
+    /// Whether to include entries this host considers hidden. Default:
+    /// `true`.
+    pub fn include_hidden_entries(mut self, include: bool) -> Self {
+        self.include_hidden_entries = include;
+        self
+    }
+
+    /// Whether entries are yielded in a deterministic, sorted order.
+    /// Default: `false`, which is faster.
+    pub fn sorted(mut self, sorted: bool) -> Self {
+        self.sorted = sorted;
+        self
+    }
+
+    /// Skip descending into (and yielding) any directory for which `keep`
+    /// returns `false`.
+    ///
+    /// This is evaluated once per directory, before it is read, so a rejected
+    /// directory's contents are never touched -- the reason to use this
+    /// instead of filtering [`DirectoryWalk::walk`]'s output is exactly that
+    /// short-circuit, on a tree where the pruned subtrees (`.git`, `target`,
+    /// `node_modules`) can dwarf the rest.
+    pub fn prune_directories<F>(mut self, keep: F) -> Self
+    where
+        F: Fn(&Path) -> bool + Send + Sync + 'static,
+    {
+        let keep: PruneDirectories = Arc::new(keep);
+        self.prune_directories = Some(keep);
+        self
+    }
+
+    /// Run the walk, yielding entries as they are discovered.
+    ///
+    /// Each item is an error only for an individual entry this walk could not
+    /// read (a permissions failure, a race with something deleting the
+    /// tree); it does not end the walk.
+    pub fn walk(self) -> impl Iterator<Item = io::Result<DirectoryEntry>> {
+        let prune_directories = self.prune_directories;
+        let walker = jwalk::WalkDir::new(&self.root)
+            .follow_links(self.follow_symbolic_links)
+            .skip_hidden(!self.include_hidden_entries)
+            .sort(self.sorted)
+            .process_read_dir(move |_depth, _parent, _state, children| {
+                let Some(keep) = &prune_directories else {
+                    return;
+                };
+                children.retain(|entry| match entry {
+                    Ok(entry) if entry.file_type().is_dir() => keep(&entry.path()),
+                    _ => true,
+                });
+            });
+        walker.into_iter().map(|entry| {
+            entry
+                .map(directory_entry_from_jwalk)
+                .map_err(io::Error::from)
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Glob matching
+// ---------------------------------------------------------------------------
+
+/// A compiled set of glob patterns, matched together against one candidate
+/// path per call.
+///
+/// Build one with [`PatternSetBuilder`].
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug)]
+pub struct PatternSet(globset::GlobSet);
+
+#[cfg(feature = "fs")]
+impl PatternSet {
+    /// Whether `path` matches any pattern in this set.
+    pub fn is_match(&self, path: &Path) -> bool {
+        self.0.is_match(path)
+    }
+}
+
+/// Builds a [`PatternSet`] from glob patterns.
+///
+/// Patterns are validated together at [`PatternSetBuilder::build`] rather
+/// than one at a time as they are added, so a caller assembling a set from a
+/// product's own configuration gets one place to report a bad pattern.
+#[cfg(feature = "fs")]
+#[derive(Debug, Default)]
+pub struct PatternSetBuilder {
+    patterns: Vec<String>,
+}
+
+#[cfg(feature = "fs")]
+impl PatternSetBuilder {
+    /// Start with no patterns.
+    pub fn new() -> Self {
+        Self {
+            patterns: Vec::new(),
+        }
+    }
+
+    /// Add one glob pattern to the set.
+    pub fn add_pattern(mut self, pattern: &str) -> Self {
+        self.patterns.push(pattern.to_owned());
+        self
+    }
+
+    /// Compile the added patterns into a [`PatternSet`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any added pattern is not valid glob syntax.
+    pub fn build(self) -> io::Result<PatternSet> {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pattern in &self.patterns {
+            let glob = globset::Glob::new(pattern)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            builder.add(glob);
+        }
+        let set = builder
+            .build()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        Ok(PatternSet(set))
+    }
+}
 
 #[cfg(all(test, feature = "fs"))]
 mod tests {
@@ -142,16 +665,19 @@ mod tests {
         let first = open_lock_file(&path).expect("open first");
         let second = open_lock_file(&path).expect("open second");
 
-        try_lock_exclusive(&first).expect("first acquires");
+        let first_lock = try_lock_exclusive(&first).expect("first acquires");
         let conflict = try_lock_exclusive(&second).expect_err("second must be refused");
         assert!(
             is_lock_conflict(&conflict),
             "refusal must classify as a conflict, got {conflict:?}"
         );
 
-        unlock(&first).expect("release first");
-        try_lock_exclusive(&second).expect("second acquires after release");
-        unlock(&second).expect("release second");
+        // Dropping the guard is the only release mechanism this facade
+        // exposes; the second holder succeeding proves the drop actually
+        // released the lock, not just that the borrow ended.
+        drop(first_lock);
+        let second_lock = try_lock_exclusive(&second).expect("second acquires after release");
+        drop(second_lock);
 
         drop((first, second));
         let _ = std::fs::remove_dir_all(&dir);
@@ -265,5 +791,219 @@ mod tests {
         assert_eq!(user_runtime_dir(PRODUCT), user_runtime_dir(PRODUCT));
         assert_eq!(user_state_dir(PRODUCT), user_state_dir(PRODUCT));
         assert_eq!(user_run_data_root(PRODUCT), user_run_data_root(PRODUCT));
+    }
+
+    /// Any number of shared holders may coexist, but an exclusive request is
+    /// refused while one is outstanding, and admitted once every shared
+    /// holder has dropped.
+    #[test]
+    fn shared_locks_coexist_but_exclude_an_exclusive_request() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-lock-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("guard.lock");
+
+        let first = open_lock_file(&path).expect("open first");
+        let second = open_lock_file(&path).expect("open second");
+        let third = open_lock_file(&path).expect("open third");
+
+        let first_shared = try_lock_shared(&first).expect("first shared holder admitted");
+        let second_shared = try_lock_shared(&second).expect("second shared holder admitted");
+
+        let conflict =
+            try_lock_exclusive(&third).expect_err("exclusive must be refused while shared holds");
+        assert!(is_lock_conflict(&conflict));
+
+        drop(first_shared);
+        let conflict = try_lock_exclusive(&third)
+            .expect_err("exclusive must still be refused with one shared holder left");
+        assert!(is_lock_conflict(&conflict));
+
+        drop(second_shared);
+        let exclusive =
+            try_lock_exclusive(&third).expect("exclusive admitted once shared holders release");
+        drop(exclusive);
+
+        drop((first, second, third));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The blocking variants eventually acquire the lock a concurrent holder
+    /// releases, rather than failing immediately the way the `try_` variants
+    /// do -- this is the property that distinguishes the two families.
+    #[test]
+    fn blocking_lock_acquires_once_the_holder_releases() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-lock-blocking-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("guard.lock");
+
+        let first = open_lock_file(&path).expect("open first");
+        let second = open_lock_file(&path).expect("open second");
+
+        let held = try_lock_exclusive(&first).expect("first acquires");
+        drop(held);
+
+        // With no concurrent holder left, the blocking call must return
+        // immediately rather than actually block this test.
+        let acquired = lock_exclusive(&second).expect("blocking lock acquires");
+        drop(acquired);
+
+        drop((first, second));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A modification time survives the round trip from Unix seconds through
+    /// [`set_file_mtime`] and back out through
+    /// [`FileTime::from_last_modification_time`].
+    #[test]
+    fn a_unix_time_survives_the_round_trip_through_a_file() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-mtime-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("stamped");
+        std::fs::write(&path, b"payload").expect("write");
+
+        // A time with a sub-second remainder, comfortably before this test
+        // ever runs, so no host's mtime resolution rounds it away.
+        let stamped = FileTime::from_unix_time(1_700_000_000, 500_000_000);
+        set_file_mtime(&path, stamped).expect("set mtime");
+
+        let metadata = std::fs::metadata(&path).expect("read metadata back");
+        let read_back = FileTime::from_last_modification_time(&metadata);
+        assert_eq!(read_back, stamped);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`FileTime::from_system_time`] and [`FileTime::from_last_modification_time`]
+    /// agree, since a file's metadata is read through [`SystemTime`] itself.
+    #[test]
+    fn from_system_time_and_from_metadata_agree() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-mtime-agree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("stamped");
+        std::fs::write(&path, b"payload").expect("write");
+
+        let metadata = std::fs::metadata(&path).expect("read metadata");
+        let modified = metadata.modified().expect("host supports mtime");
+
+        assert_eq!(
+            FileTime::from_last_modification_time(&metadata),
+            FileTime::from_system_time(modified)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A time before the Unix epoch round-trips through [`SystemTime`]
+    /// without silently landing on the wrong side of it.
+    #[test]
+    fn a_time_before_the_unix_epoch_round_trips() {
+        // `epoch - 3600.25s` is `-3601` whole seconds plus a forward `0.75s`
+        // remainder: nanoseconds always advance from the second mark, they
+        // never subtract from it, so the second count floors.
+        let before_epoch = SystemTime::UNIX_EPOCH - std::time::Duration::new(3600, 250_000_000);
+        let converted = FileTime::from_system_time(before_epoch);
+        assert_eq!(converted, FileTime::from_unix_time(-3601, 750_000_000));
+    }
+
+    /// `now()` reports a time in the current era, not a zeroed or default
+    /// value -- a facade that silently returned the epoch would be a much
+    /// harder bug to notice than one that fails loudly.
+    #[test]
+    fn now_reports_a_recent_time() {
+        let now = FileTime::now();
+        // 2020-01-01T00:00:00Z. Anything before this is not "now" by any
+        // clock this crate supports.
+        assert!(now > FileTime::from_unix_time(1_577_836_800, 0));
+    }
+
+    /// [`copy_file`] produces a byte-identical destination whether the
+    /// filesystem gave it a reflink or fell back to a copy, and reports which
+    /// one happened.
+    #[test]
+    fn copy_file_reproduces_the_source_and_reports_its_strategy() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        let content = b"reflink or copy, the bytes must match";
+        std::fs::write(&source, content).expect("write source");
+
+        let outcome = copy_file(&source, &destination).expect("copy succeeds");
+        assert_eq!(
+            std::fs::read(&destination).expect("read destination"),
+            content
+        );
+        match outcome {
+            CopyOutcome::Reflinked => {}
+            CopyOutcome::Copied { bytes } => assert_eq!(bytes, content.len() as u64),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A walk finds every file under its root, and a pruned directory's
+    /// contents never appear at all.
+    #[test]
+    fn a_walk_finds_files_and_honours_pruning() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-walk-{}", std::process::id()));
+        let pruned = dir.join("pruned");
+        let kept = dir.join("kept");
+        std::fs::create_dir_all(&pruned).expect("create pruned dir");
+        std::fs::create_dir_all(&kept).expect("create kept dir");
+        std::fs::write(pruned.join("secret"), b"never seen").expect("write pruned file");
+        std::fs::write(kept.join("visible"), b"seen").expect("write kept file");
+        std::fs::write(dir.join("root_file"), b"seen too").expect("write root file");
+
+        let entries: Vec<DirectoryEntry> = DirectoryWalk::new(dir.clone())
+            .prune_directories(|path| {
+                path.file_name().and_then(|name| name.to_str()) != Some("pruned")
+            })
+            .walk()
+            .collect::<io::Result<Vec<_>>>()
+            .expect("walk succeeds");
+
+        let file_paths: Vec<&Path> = entries
+            .iter()
+            .filter(|entry| entry.is_file())
+            .map(DirectoryEntry::path)
+            .collect();
+        assert!(file_paths.contains(&kept.join("visible").as_path()));
+        assert!(file_paths.contains(&dir.join("root_file").as_path()));
+        assert!(
+            !file_paths.contains(&pruned.join("secret").as_path()),
+            "a pruned directory's contents must never be yielded"
+        );
+        assert!(
+            entries.iter().all(|entry| entry.path() != pruned.as_path()),
+            "a pruned directory itself must not be yielded either"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A set of glob patterns matches any path that satisfies at least one of
+    /// them, and rejects a path that satisfies none.
+    #[test]
+    fn a_pattern_set_matches_any_included_pattern() {
+        let set = PatternSetBuilder::new()
+            .add_pattern("*.rs")
+            .add_pattern("Cargo.toml")
+            .build()
+            .expect("valid patterns compile");
+
+        assert!(set.is_match(Path::new("src/lib.rs")));
+        assert!(set.is_match(Path::new("Cargo.toml")));
+        assert!(!set.is_match(Path::new("README.md")));
+    }
+
+    /// An invalid glob pattern is reported at build time, not accepted and
+    /// silently never matched.
+    #[test]
+    fn an_invalid_pattern_is_rejected_at_build() {
+        let error = PatternSetBuilder::new()
+            .add_pattern("[unterminated")
+            .build()
+            .expect_err("malformed glob syntax must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

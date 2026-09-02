@@ -107,11 +107,92 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
     }
 }
 
-/// Release a lock taken by [`try_lock_exclusive`].
+/// Take an exclusive advisory lock, waiting until it is available.
+pub fn lock_exclusive(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Take a shared advisory lock, waiting until it is available.
+pub fn lock_shared(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Take a shared advisory lock without waiting.
+///
+/// Returns immediately when an exclusive holder has it; the caller decides
+/// whether that is a conflict worth retrying, via [`is_lock_conflict`].
+pub fn try_lock_shared(file: &File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Release a lock taken by [`try_lock_exclusive`], [`try_lock_shared`],
+/// [`lock_exclusive`], or [`lock_shared`].
 pub fn unlock(file: &File) -> io::Result<()> {
     use std::os::unix::io::AsRawFd as _;
 
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Set the modification time of the file at `path`, without disturbing its
+/// access time.
+///
+/// This calls `utimensat` directly on the path rather than opening a file
+/// handle: the permission this needs is ownership of the file (or
+/// `CAP_FOWNER`), not a write-mode open, so this succeeds even on a file this
+/// process has marked read-only -- the state a content-addressed cache
+/// commonly leaves an entry in. `UTIME_OMIT` for the access-time slot is what
+/// leaves it untouched.
+pub fn set_file_mtime(
+    path: &Path,
+    seconds_since_unix_epoch: i64,
+    nanoseconds: u32,
+) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // On our supported 64-bit targets `time_t` already is `i64`; the
+    // cast stays for portability to a target where it is narrower.
+    #[allow(clippy::unnecessary_cast)]
+    let times = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: seconds_since_unix_epoch as libc::time_t,
+            tv_nsec: nanoseconds as _,
+        },
+    ];
+    // SAFETY: `c_path` is a NUL-terminated path alive for the call, and
+    // `times` is a valid two-element array of the expected type.
+    let result = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
     if result == 0 {
         Ok(())
     } else {

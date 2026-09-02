@@ -311,6 +311,86 @@ mod tests {
         endpoint.retire().expect("retire endpoint");
     }
 
+    // These four tests pin the exact connect-and-drop liveness probe that
+    // zccache's per-platform `probe_native` performs directly against
+    // `interprocess` today (three call sites, one per OS, identical body):
+    // resolve the endpoint name, attempt a blocking connect, and classify the
+    // result. `Stream::connect` and `Endpoint::is_stale` already give callers
+    // both forms of that probe without naming the backend transport crate.
+    #[test]
+    fn missing_endpoint_probe_reports_a_stable_not_found_or_refused_error() {
+        let endpoint = Endpoint::test("probe-missing").expect("test endpoint");
+
+        let error = Stream::connect(&endpoint).expect_err("missing endpoint must fail to connect");
+
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+        ));
+    }
+
+    // `Endpoint::is_stale` performs the same connect-and-classify probe as
+    // `missing_endpoint_probe_reports_a_stable_not_found_or_refused_error`,
+    // collapsed to a bool. It is Unix-only here because the Windows named-pipe
+    // backend does not yet implement it (it always reports `false`); Windows
+    // callers get the same liveness answer from `Stream::connect`'s error kind
+    // instead, which the portable test above already covers.
+    #[cfg(unix)]
+    #[test]
+    fn missing_endpoint_is_reported_stale() {
+        let endpoint = Endpoint::test("probe-missing-stale").expect("test endpoint");
+
+        assert!(endpoint.is_stale());
+    }
+
+    // A bound listener answers a probe connect through the kernel backlog
+    // with no accept required, so this stays single-threaded and
+    // deterministic (unlike the multi-connection test below).
+    #[cfg(unix)]
+    #[test]
+    fn bound_endpoint_is_not_reported_stale() {
+        let endpoint = Endpoint::test("probe-live-stale").expect("test endpoint");
+        let listener = Listener::bind(&endpoint).expect("bind");
+
+        assert!(!endpoint.is_stale());
+
+        drop(listener);
+    }
+
+    #[test]
+    fn live_endpoint_probe_succeeds_without_disturbing_a_later_accept() {
+        let endpoint = Endpoint::test("probe-live").expect("test endpoint");
+        let listener = Listener::bind(&endpoint).expect("bind");
+        let (probe_accepted_tx, probe_accepted_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            // One accept absorbs the probe connection; the second serves the
+            // ordinary connection made after the probe returns.
+            listener.accept().expect("accept probe connection");
+            probe_accepted_tx.send(()).expect("report probe accepted");
+            listener.accept().expect("accept later connection");
+        });
+
+        // The probe itself: connect, observe success, and let it go without
+        // ever exchanging a byte, exactly like zccache's `probe_native`.
+        let probe = Stream::connect(&endpoint).expect("probe connect");
+
+        // Wait for the server to absorb the probe before dropping it and
+        // dialing again. The probe is held until the accept lands because the
+        // Windows named-pipe listener treats a client that disconnects before
+        // `ConnectNamedPipe` runs as an empty connection: it clears that
+        // instance and keeps blocking, so the accept would never report.
+        // Waiting also guarantees the next server instance exists, since the
+        // listener only creates it inside `accept()`.
+        probe_accepted_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server accepted the probe connection");
+        drop(probe);
+
+        // The endpoint keeps serving ordinary connections after the probe.
+        let _client = Stream::connect(&endpoint).expect("connect after probe");
+        server.join().expect("server thread");
+    }
+
     #[test]
     fn sync_bind_accept_connect_and_peer_identity_round_trip() {
         let endpoint = Endpoint::test("sync-roundtrip").expect("test endpoint");

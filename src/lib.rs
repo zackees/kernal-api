@@ -158,6 +158,9 @@ pub use platform_imp::{
     fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
 };
 
+#[cfg(feature = "fs-watch")]
+pub use platform_imp::FsWatchWatcher;
+
 pub use platform_imp::{
     host_boot_id, host_current_process_privilege, host_environment_keys_are_case_insensitive,
     host_filesystem_device_id, host_hostname, host_login_environment, host_machine_id,

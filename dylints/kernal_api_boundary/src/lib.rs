@@ -33,6 +33,7 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "interprocess",
     "memmap2",
     "mimalloc_pprof",
+    "notify",
     "pdb_addr2line",
     "portable_pty",
     "running_process",

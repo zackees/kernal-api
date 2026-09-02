@@ -49,6 +49,10 @@ migration branch, its bounded process adapter privately uses
 keep consumers from linking tooling they do not use:
 
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
+- `fs-watch` for filesystem-change watcher construction and event
+  classification (created/modified/removed/renamed plus an explicit
+  overflow-or-lost-watch rescan signal); debouncing, ignore-lists, and
+  cache-invalidation policy stay with the application
 - `snapshot` for cooperative thread capture and deferred unwinding
 - `crash` for the one native crash-handler and bounded crash spool
 - `profile` for bounded CPU profiles and checked-in pprof encoding

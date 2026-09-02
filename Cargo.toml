@@ -30,6 +30,13 @@ required-features = ["wasm-sketch-worker"]
 [features]
 default = []
 fs = ["dep:dirs"]
+# Filesystem-change-notification primitive: watcher construction and event
+# classification only, not debouncing, ignore-lists, or cache-invalidation
+# policy. Linux and macOS privately adapt the exact-pinned `notify` release;
+# Windows never depends on `notify` at all -- it privately implements
+# `ReadDirectoryChangesW` watching with two fixes upstream `notify` 7.0.0
+# does not have. See `src/platform_win/fs_watch.rs` for the rationale.
+fs-watch = ["dep:notify"]
 ipc = ["dep:dirs", "dep:interprocess"]
 ipc-async = ["ipc", "interprocess/tokio", "tokio/net"]
 session-relay = ["ipc-async"]
@@ -109,6 +116,7 @@ full = [
   "conpty-sidecar",
   "crash",
   "fs",
+  "fs-watch",
   "ipc-async",
   "profile",
   "session-relay",
@@ -176,6 +184,12 @@ libc = "=0.2.189"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 object = { version = "=0.36.7", default-features = false, features = ["read", "std"], optional = true }
+# Linux and macOS carry no divergence from the published release -- the fork
+# zccache and soldr vendored exists only for the Windows fixes this crate
+# implements privately in `src/platform_win/fs_watch.rs` -- so this depends
+# on the exact upstream `notify` release directly. Default features are kept
+# so macOS retains its `macos_fsevent` backend.
+notify = { version = "=7.0.0", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

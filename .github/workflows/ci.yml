@@ -37,6 +37,7 @@ jobs:
           - conpty-sidecar
           - crash
           - fs
+          - fs-watch
           - ipc
           - ipc-async
           - profile

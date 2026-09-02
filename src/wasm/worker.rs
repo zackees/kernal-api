@@ -321,6 +321,36 @@ enum WriterEvent {
     Cancel(Result<(), ()>),
 }
 
+/// A worker whose pipe fails is usually a worker that is exiting: on every
+/// supported platform a child's descriptors close while it tears down, before
+/// the parent can observe its exit status.  This bound covers only that
+/// in-kernel transition, so a worker that closes its pipe yet keeps running is
+/// still forced and contained once it elapses.
+const EXIT_OBSERVATION_BOUND: Duration = Duration::from_secs(1);
+
+/// The parent-side protocol plumbing for one worker request: both helper
+/// threads and the channels carrying their results.  Keeping them together
+/// lets every terminal path drain what the worker already reported before it
+/// classifies the outcome.
+struct ProtocolLanes {
+    write_tx: std::sync::mpsc::Sender<WriterCommand>,
+    write_done_rx: std::sync::mpsc::Receiver<WriterEvent>,
+    read_rx: std::sync::mpsc::Receiver<Result<Message, ()>>,
+    writer: std::thread::JoinHandle<()>,
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl ProtocolLanes {
+    /// Close the writer lane and join both helpers.  Callers reach this only
+    /// once the worker is gone or contained, so the reader observes its pipe
+    /// EOF and finishes on its own.
+    fn close(self) {
+        let _ = self.write_tx.send(WriterCommand::Close);
+        let _ = self.writer.join();
+        let _ = self.reader.join();
+    }
+}
+
 /// Parent-side receive sequencing for one worker request.  This is deliberately
 /// separate from cancellation/deadline selection: it accepts only protocol
 /// facts, then the supervisor decides how to contain a rejected worker.
@@ -627,18 +657,19 @@ fn supervise(
             }
         }
     });
-    if write_tx
+    let lanes = ProtocolLanes {
+        write_tx,
+        write_done_rx,
+        read_rx,
+        writer,
+        reader,
+    };
+    if lanes
+        .write_tx
         .send(WriterCommand::Hello { request_id: id })
         .is_err()
     {
-        return force_join_result(
-            sketch,
-            &mut control,
-            write_tx,
-            writer,
-            reader,
-            SketchWorkerFailure::Protocol,
-        );
+        return force_join_result(sketch, &mut control, lanes, SketchWorkerFailure::Protocol);
     }
     let mut cancel_written = false;
     let mut cancel_queued = false;
@@ -651,29 +682,35 @@ fn supervise(
         }
         if let Some(trigger) = selected {
             if !receive_phase.upload_complete() {
-                return force_join_terminal(
-                    sketch,
-                    &mut control,
-                    write_tx,
-                    writer,
-                    reader,
-                    trigger,
-                );
+                return force_join_terminal(sketch, &mut control, lanes, trigger);
             }
         }
-        if let Ok(event) = write_done_rx.try_recv() {
+        if let Ok(event) = lanes.write_done_rx.try_recv() {
             match event {
                 WriterEvent::Hello(Ok(())) => {}
                 WriterEvent::Upload(result) => {
+                    // A failed write is a pipe fact, not a protocol fact: the
+                    // worker may already have died under it.  A rejected but
+                    // successful write is a real protocol violation.
+                    let write_failed = result.is_err();
                     if receive_phase.upload(result).is_err() {
-                        return force_join_result(
-                            sketch,
-                            &mut control,
-                            write_tx,
-                            writer,
-                            reader,
-                            SketchWorkerFailure::Protocol,
-                        );
+                        return if write_failed {
+                            pipe_failure_result(
+                                sketch,
+                                &mut control,
+                                lanes,
+                                &mut receive_phase,
+                                id,
+                                selected,
+                            )
+                        } else {
+                            force_join_result(
+                                sketch,
+                                &mut control,
+                                lanes,
+                                SketchWorkerFailure::Protocol,
+                            )
+                        };
                     }
                 }
                 WriterEvent::Cancel(Ok(())) => {
@@ -683,37 +720,35 @@ fn supervise(
                         Some(std::time::Instant::now() + config.cooperative_cancel_grace());
                 }
                 WriterEvent::Hello(Err(())) | WriterEvent::Cancel(Err(())) => {
-                    return force_join_result(
+                    return pipe_failure_result(
                         sketch,
                         &mut control,
-                        write_tx,
-                        writer,
-                        reader,
-                        SketchWorkerFailure::Protocol,
+                        lanes,
+                        &mut receive_phase,
+                        id,
+                        selected,
                     )
                 }
             }
         }
-        if let Ok(result) = read_rx.try_recv() {
+        if let Ok(result) = lanes.read_rx.try_recv() {
             let message = match result {
                 Ok(message) => message,
-                Err(()) => match control.try_wait() {
-                    Ok(Some(_)) => return exited_join_result(sketch, write_tx, writer, reader),
-                    Ok(None) | Err(_) => {
-                        return force_join_result(
-                            sketch,
-                            &mut control,
-                            write_tx,
-                            writer,
-                            reader,
-                            SketchWorkerFailure::Protocol,
-                        )
-                    }
-                },
+                Err(()) => {
+                    return pipe_failure_result(
+                        sketch,
+                        &mut control,
+                        lanes,
+                        &mut receive_phase,
+                        id,
+                        selected,
+                    )
+                }
             };
             match receive_phase.receive(message) {
                 Ok(ParentReceiveAction::QueueUpload) => {
-                    if write_tx
+                    if lanes
+                        .write_tx
                         .send(WriterCommand::Upload {
                             request_id: id,
                             source: sketch.worker_source(),
@@ -724,9 +759,7 @@ fn supervise(
                         return force_join_result(
                             sketch,
                             &mut control,
-                            write_tx,
-                            writer,
-                            reader,
+                            lanes,
                             SketchWorkerFailure::Protocol,
                         );
                     }
@@ -738,16 +771,7 @@ fn supervise(
                     let mapped = map_terminal(message, id);
                     let mapped = match mapped {
                         Ok(value) => value,
-                        Err(error) => {
-                            return force_join_result(
-                                sketch,
-                                &mut control,
-                                write_tx,
-                                writer,
-                                reader,
-                                error,
-                            )
-                        }
+                        Err(error) => return force_join_result(sketch, &mut control, lanes, error),
                     };
                     if matches!(
                         mapped,
@@ -757,16 +781,12 @@ fn supervise(
                     }
                     match control.reap_clean(Duration::from_secs(5)) {
                         Ok(crate::platform::process::WorkerNormalReap::Clean) => {
-                            let _ = write_tx.send(WriterCommand::Close);
-                            let _ = writer.join();
-                            let _ = reader.join();
+                            lanes.close();
                             sketch.worker_ledger.record_reaped();
                             return selected.map_or(mapped, SketchWorkerTerminal::Stopped);
                         }
                         Ok(crate::platform::process::WorkerNormalReap::Nonzero) => {
-                            let _ = write_tx.send(WriterCommand::Close);
-                            let _ = writer.join();
-                            let _ = reader.join();
+                            lanes.close();
                             sketch.worker_ledger.record_reaped();
                             return SketchWorkerTerminal::Failure(
                                 SketchWorkerFailure::UnexpectedExit,
@@ -776,9 +796,7 @@ fn supervise(
                             return force_join_result(
                                 sketch,
                                 &mut control,
-                                write_tx,
-                                writer,
-                                reader,
+                                lanes,
                                 SketchWorkerFailure::ContainmentCleanup,
                             )
                         }
@@ -788,50 +806,47 @@ fn supervise(
                     return force_join_result(
                         sketch,
                         &mut control,
-                        write_tx,
-                        writer,
-                        reader,
+                        lanes,
                         SketchWorkerFailure::Protocol,
                     )
                 }
             }
         }
         match control.try_wait() {
-            Ok(Some(_)) => return exited_join_result(sketch, write_tx, writer, reader),
+            Ok(Some(code)) => {
+                return exited_join_result(
+                    sketch,
+                    lanes,
+                    &mut receive_phase,
+                    id,
+                    selected,
+                    code == 0,
+                )
+            }
             Ok(None) => {}
             Err(_) => {
                 return force_join_result(
                     sketch,
                     &mut control,
-                    write_tx,
-                    writer,
-                    reader,
+                    lanes,
                     SketchWorkerFailure::UnexpectedExit,
                 )
             }
         }
         if let Some(trigger) = selected {
             if !receive_phase.upload_complete() {
-                return force_join_terminal(
-                    sketch,
-                    &mut control,
-                    write_tx,
-                    writer,
-                    reader,
-                    trigger,
-                );
+                return force_join_terminal(sketch, &mut control, lanes, trigger);
             }
             if !cancel_written && !cancel_queued && receive_phase.is_upload_queued() {
-                if write_tx
+                if lanes
+                    .write_tx
                     .send(WriterCommand::Cancel { request_id: id })
                     .is_err()
                 {
                     return force_join_result(
                         sketch,
                         &mut control,
-                        write_tx,
-                        writer,
-                        reader,
+                        lanes,
                         SketchWorkerFailure::Protocol,
                     );
                 }
@@ -842,14 +857,7 @@ fn supervise(
             if let Some(grace_deadline) = grace_deadline {
                 if std::time::Instant::now() >= grace_deadline {
                     sketch.worker_ledger.record_grace_expired();
-                    return force_join_terminal(
-                        sketch,
-                        &mut control,
-                        write_tx,
-                        writer,
-                        reader,
-                        trigger,
-                    );
+                    return force_join_terminal(sketch, &mut control, lanes, trigger);
                 }
             }
         }
@@ -960,19 +968,15 @@ fn force_pre_protocol_with_ledger(
 fn force_join_result(
     sketch: &AdmittedSketch,
     control: &mut ActiveOwnership,
-    tx: std::sync::mpsc::Sender<WriterCommand>,
-    writer: std::thread::JoinHandle<()>,
-    reader: std::thread::JoinHandle<()>,
+    lanes: ProtocolLanes,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
-    force_join_result_with_ledger(&sketch.worker_ledger, control, tx, writer, reader, failure)
+    force_join_result_with_ledger(&sketch.worker_ledger, control, lanes, failure)
 }
 fn force_join_result_with_ledger(
     ledger: &WorkerExecutionLedger,
     control: &mut ActiveOwnership,
-    tx: std::sync::mpsc::Sender<WriterCommand>,
-    writer: std::thread::JoinHandle<()>,
-    reader: std::thread::JoinHandle<()>,
+    lanes: ProtocolLanes,
     failure: SketchWorkerFailure,
 ) -> SketchWorkerTerminal {
     let (result, forced) = force_result(ledger, &mut *control, failure);
@@ -983,35 +987,119 @@ fn force_join_result_with_ledger(
         let ownership = control.take();
         control.cleanup.hand_off(CleanupJob {
             ownership,
-            writer_tx: Some(tx),
-            writer: Some(writer),
-            reader: Some(reader),
+            writer_tx: Some(lanes.write_tx),
+            writer: Some(lanes.writer),
+            reader: Some(lanes.reader),
         });
         return result;
     }
-    let _ = tx.send(WriterCommand::Close);
-    let _ = writer.join();
-    let _ = reader.join();
+    lanes.close();
     result
 }
+/// Classify a worker that has already been observed to exit.
+///
+/// The reader and writer helpers run concurrently with the supervisor loop, so
+/// a worker that reported its outcome and then exited can be observed as gone
+/// while that report is still in flight between the pipe and `read_rx`.
+/// Joining both helpers first and then draining what they delivered keeps a
+/// reported outcome from being demoted to `UnexpectedExit` purely because a
+/// helper thread lost a scheduling race.  A worker that exited nonzero or by
+/// signal remains an unexpected exit whatever it reported, as does a clean
+/// exit with no well-formed terminal report.
 fn exited_join_result(
     sketch: &AdmittedSketch,
-    tx: std::sync::mpsc::Sender<WriterCommand>,
-    writer: std::thread::JoinHandle<()>,
-    reader: std::thread::JoinHandle<()>,
+    lanes: ProtocolLanes,
+    receive_phase: &mut ParentReceivePhase,
+    request_id: u64,
+    selected: Option<SketchWorkerStopReason>,
+    clean_exit: bool,
 ) -> SketchWorkerTerminal {
-    let _ = tx.send(WriterCommand::Close);
+    let ProtocolLanes {
+        write_tx,
+        write_done_rx,
+        read_rx,
+        writer,
+        reader,
+    } = lanes;
+    let _ = write_tx.send(WriterCommand::Close);
     let _ = writer.join();
     let _ = reader.join();
     sketch.worker_ledger.record_reaped();
-    SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit)
+    // Both helpers have finished, so every message they ever produced is now
+    // queued.  Replay the writer results first: the receive phase defers an
+    // `ExecuteAck` until the upload it acknowledges is confirmed written.
+    while let Ok(event) = write_done_rx.try_recv() {
+        if let WriterEvent::Upload(result) = event {
+            if receive_phase.upload(result).is_err() {
+                return SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit);
+            }
+        }
+    }
+    let mut reported = None;
+    while let Ok(Ok(message)) = read_rx.try_recv() {
+        match receive_phase.receive(message) {
+            Ok(ParentReceiveAction::Terminal(message)) => {
+                reported = Some(message);
+                break;
+            }
+            // The worker is already gone, so an upload can no longer be
+            // queued; only its terminal report still carries information.
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    let Some(message) = reported.filter(|_| clean_exit) else {
+        return SketchWorkerTerminal::Failure(SketchWorkerFailure::UnexpectedExit);
+    };
+    match map_terminal(message, request_id) {
+        Ok(mapped) => {
+            if matches!(
+                mapped,
+                SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol)
+            ) {
+                sketch.worker_ledger.record_protocol_failure();
+            }
+            selected.map_or(mapped, SketchWorkerTerminal::Stopped)
+        }
+        Err(SketchWorkerFailure::Protocol) => {
+            sketch.worker_ledger.record_protocol_failure();
+            SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol)
+        }
+        Err(failure) => SketchWorkerTerminal::Failure(failure),
+    }
+}
+
+/// Classify a worker whose pipe failed, either as reader EOF or as a failed
+/// write.  A pipe failure is not itself a protocol fact: on every supported
+/// platform the child's descriptors close during process teardown, before its
+/// exit status becomes observable, so a single non-blocking `try_wait` here
+/// reports a dead worker as a live one and mislabels its death as
+/// `worker-protocol`.  Observe the exit within a bound first; only a worker
+/// that keeps the pipe closed while still running is a protocol violation.
+fn pipe_failure_result(
+    sketch: &AdmittedSketch,
+    control: &mut ActiveOwnership,
+    lanes: ProtocolLanes,
+    receive_phase: &mut ParentReceivePhase,
+    request_id: u64,
+    selected: Option<SketchWorkerStopReason>,
+) -> SketchWorkerTerminal {
+    match control.reap_clean(EXIT_OBSERVATION_BOUND) {
+        Ok(reap) => exited_join_result(
+            sketch,
+            lanes,
+            receive_phase,
+            request_id,
+            selected,
+            matches!(reap, crate::platform::process::WorkerNormalReap::Clean),
+        ),
+        Err(_) => force_join_result(sketch, control, lanes, SketchWorkerFailure::Protocol),
+    }
 }
 fn force_join_terminal(
     sketch: &AdmittedSketch,
     control: &mut ActiveOwnership,
-    tx: std::sync::mpsc::Sender<WriterCommand>,
-    writer: std::thread::JoinHandle<()>,
-    reader: std::thread::JoinHandle<()>,
+    lanes: ProtocolLanes,
     trigger: SketchWorkerStopReason,
 ) -> SketchWorkerTerminal {
     let (result, forced) = force_result(
@@ -1023,15 +1111,13 @@ fn force_join_terminal(
         let ownership = control.take();
         control.cleanup.hand_off(CleanupJob {
             ownership,
-            writer_tx: Some(tx),
-            writer: Some(writer),
-            reader: Some(reader),
+            writer_tx: Some(lanes.write_tx),
+            writer: Some(lanes.writer),
+            reader: Some(lanes.reader),
         });
         return result;
     }
-    let _ = tx.send(WriterCommand::Close);
-    let _ = writer.join();
-    let _ = reader.join();
+    lanes.close();
     match result {
         SketchWorkerTerminal::Failure(SketchWorkerFailure::ContainmentCleanup) => result,
         _ => SketchWorkerTerminal::ForcedContainment { trigger },
@@ -1287,12 +1373,18 @@ mod tests {
         });
         let reader = std::thread::spawn(|| {});
 
+        let (_write_done_tx, write_done_rx) = mpsc::channel();
+        let (_read_tx, read_rx) = mpsc::channel();
         let terminal = force_join_result_with_ledger(
             &ledger,
             &mut active,
-            writer_tx,
-            writer,
-            reader,
+            ProtocolLanes {
+                write_tx: writer_tx,
+                write_done_rx,
+                read_rx,
+                writer,
+                reader,
+            },
             SketchWorkerFailure::Protocol,
         );
         assert_eq!(

@@ -415,19 +415,7 @@ mod failure_proof {
             .expect("runtime");
         let actual =
             runtime.run(async { contained(&sketch, runtime.handle(), &config, None).await });
-        fs::write(
-            std::env::var_os(RESULT).expect("result"),
-            if actual
-                == SketchWorkerTerminal::Failure(
-                    kernal_api::wasm::SketchWorkerFailure::UnexpectedExit,
-                )
-            {
-                "unexpected-exit"
-            } else {
-                "wrong-terminal"
-            },
-        )
-        .expect("result");
+        fs::write(std::env::var_os(RESULT).expect("result"), actual.code()).expect("result");
         runtime.run(async { assert_clean(&compiler, &sketch).await });
     }
     fn inner_parent_death() {
@@ -478,15 +466,38 @@ mod failure_proof {
     }
 
     #[cfg(target_os = "linux")]
-    fn linux_identity(pid: u32) -> Option<Identity> {
+    fn linux_stat(pid: u32) -> Option<(Identity, char)> {
         let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let close = text.rfind(')')?;
         let fields: Vec<_> = text[close + 1..].split_whitespace().collect();
-        Some(Identity {
-            pid,
-            a: fields.get(19)?.parse().ok()?,
-            b: 0,
-        })
+        let state = fields.first()?.chars().next()?;
+        Some((
+            Identity {
+                pid,
+                a: fields.get(19)?.parse().ok()?,
+                b: 0,
+            },
+            state,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    fn linux_identity(pid: u32) -> Option<Identity> {
+        linux_stat(pid).map(|(identity, _)| identity)
+    }
+    /// Prove this exact worker is no longer executing.
+    ///
+    /// The armed pidfd has already signalled, which on Linux happens at
+    /// `exit_notify`: the process is dead but its `/proc` entry survives until
+    /// whoever inherited it collects the zombie.  When the inner harness dies
+    /// first that collector is init, so the entry can outlive the proof by an
+    /// arbitrary scheduling delay.  Accept a vanished entry, a reused PID, or
+    /// the `Z` state — a zombie owns no threads, no memory and no descriptors,
+    /// so containment is proven in every one of those three cases.  Any other
+    /// state is a live worker and still fails the proof.
+    #[cfg(target_os = "linux")]
+    fn exact_worker_stopped_running(identity: Identity) -> bool {
+        linux_stat(identity.pid)
+            .is_none_or(|(now, state)| now.a != identity.a || now.b != identity.b || state == 'Z')
     }
     #[cfg(target_os = "linux")]
     struct CloseOnlyPidFd(Option<i32>);
@@ -593,10 +604,9 @@ mod failure_proof {
         inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
-            "unexpected-exit"
+            "worker-unexpected-exit"
         );
-        assert!(linux_identity(identity.pid)
-            .is_none_or(|now| now.a != identity.a || now.b != identity.b));
+        assert!(exact_worker_stopped_running(identity));
     }
     #[cfg(target_os = "linux")]
     #[test]
@@ -611,8 +621,7 @@ mod failure_proof {
         fs::write(&files.release, "go").expect("release");
         inner.wait_success();
         fd.wait_gone();
-        assert!(linux_identity(identity.pid)
-            .is_none_or(|now| now.a != identity.a || now.b != identity.b));
+        assert!(exact_worker_stopped_running(identity));
     }
     #[cfg(target_os = "windows")]
     struct CloseOnlyWindowsHandle(Option<windows_sys::Win32::Foundation::HANDLE>);
@@ -728,7 +737,7 @@ mod failure_proof {
         inner.wait_success();
         assert_eq!(
             fs::read_to_string(&files.result).expect("result"),
-            "unexpected-exit"
+            "worker-unexpected-exit"
         );
     }
     #[cfg(target_os = "windows")]

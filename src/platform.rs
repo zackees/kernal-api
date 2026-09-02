@@ -6,6 +6,7 @@
 pub mod autostart;
 pub mod executable;
 pub mod fs;
+pub mod fs_watch;
 pub mod host;
 pub mod ipc;
 pub mod process;

@@ -67,6 +67,12 @@ pub use fs::{
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };
 
+#[cfg(feature = "fs-watch")]
+#[path = "platform_win/fs_watch.rs"]
+pub(crate) mod fs_watch;
+#[cfg(feature = "fs-watch")]
+pub use fs_watch::Watcher as FsWatchWatcher;
+
 #[path = "platform_win/executable.rs"]
 pub(crate) mod executable;
 pub use executable::{

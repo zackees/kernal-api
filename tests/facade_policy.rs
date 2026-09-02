@@ -45,6 +45,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use interprocess",
         "pub use memmap2",
         "pub use mimalloc_pprof",
+        "pub use notify",
         "pub use pdb_addr2line",
         "pub use portable_pty",
         "pub use running_process",

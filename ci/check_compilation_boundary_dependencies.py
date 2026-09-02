@@ -18,6 +18,7 @@ CASES = (
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),
     ("allocator", "mimalloc-pprof"),
+    ("fs-watch", "notify"),
 )
 
 

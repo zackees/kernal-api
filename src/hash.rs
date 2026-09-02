@@ -16,6 +16,14 @@ pub const BLAKE3_DIGEST_LENGTH: usize = 32;
 
 const READ_BUFFER_LENGTH: usize = 64 * 1024;
 
+/// Input size at or above which the memory-mapped path hashes in parallel.
+///
+/// Below this, thread hand-off costs more than it saves. The threshold matches
+/// the one first-party clients measured (~4x on a four-core runner for a 100 MB
+/// binary), so migrating onto this facade preserves their throughput rather
+/// than silently dropping to a single core.
+const PARALLEL_HASH_THRESHOLD_BYTES: u64 = 128 * 1024;
+
 /// An opaque, kernel-owned BLAKE3 content digest.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Blake3Digest([u8; BLAKE3_DIGEST_LENGTH]);
@@ -157,6 +165,16 @@ impl Blake3Hasher {
     }
 
     /// Feed more bytes into the running digest.
+    /// Hash `bytes` across the shared thread pool.
+    ///
+    /// Kept private: the facade decides when parallelism pays, so callers get
+    /// the fast path from [`Blake3ReadOptions::memory_map`] without having to
+    /// reason about a threshold themselves.
+    pub(crate) fn update_parallel(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.update_rayon(bytes);
+        self
+    }
+
     pub fn update(&mut self, bytes: &[u8]) -> &mut Self {
         self.0.update(bytes);
         self
@@ -434,7 +452,11 @@ fn blake3_file_memory_mapped(
         return Ok(None);
     };
     let mut hasher = Blake3Hasher::new();
-    hasher.update(&mapped);
+    if length >= PARALLEL_HASH_THRESHOLD_BYTES {
+        hasher.update_parallel(&mapped);
+    } else {
+        hasher.update(&mapped);
+    }
     Ok(Some(hasher.finalize()))
 }
 

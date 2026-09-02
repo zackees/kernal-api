@@ -132,13 +132,18 @@ full = [
 ]
 
 [dependencies]
-# `pure` is required, not a preference: blake3's build script compiles
-# `c/blake3_neon.c` through `cc` on aarch64 little-endian unless it is set, and
-# first-party clients cross-compile `aarch64-pc-windows-msvc` from Linux, where
-# that C build fails. This crate's own CI builds that triple natively on
-# Windows and so cannot catch the regression. `rayon` backs the parallel
-# memory-mapped hashing path; its global pool is constructed lazily, so a
-# consumer that never hashes a large file never builds one.
+# `rayon` backs the parallel memory-mapped hashing path; its global pool is
+# constructed lazily, so a consumer that never hashes a large file never builds
+# one.
+#
+# `pure` is deliberately NOT set, and the reasoning that says it should be is a
+# trap worth naming. blake3's build script compiles `c/blake3_neon.c` through
+# `cc` on aarch64 little-endian unless `pure` or `no_neon` is set, which looks
+# like it must break a Linux-hosted `aarch64-pc-windows-msvc` cross. Tested: it
+# does not. Soldr supplies its own clang and target SDKs, and
+# `check --target aarch64-pc-windows-msvc` completes with the NEON C compiled.
+# Setting `pure` would force x86_64 onto Rust intrinsics and disable AVX-512
+# for every consumer, to prevent a break that does not occur.
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 console-api = { version = "=0.9.0", optional = true }
 console-subscriber = { version = "=0.5.0", optional = true }

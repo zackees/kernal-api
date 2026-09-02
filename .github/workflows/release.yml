@@ -84,12 +84,18 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             extension: ""
-          - os: macos-latest
+          # The Apple workers cross-compile on Linux through Soldr's bundled
+          # LLVM and managed macOS SDK, exactly as CI's `supported-targets`
+          # builds its Apple lanes. No Apple-hosted runner is used and the
+          # release still ships both darwin workers.
+          - os: ubuntu-latest
             target: x86_64-apple-darwin
             extension: ""
-          - os: macos-latest
+            cross: true
+          - os: ubuntu-latest
             target: aarch64-apple-darwin
             extension: ""
+            cross: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: .exe
@@ -101,7 +107,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.release.tag_name }}
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: ${{ !matrix.cross }}
+        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - if: ${{ matrix.cross }}
+        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        with:
+          # Apple SDK preparation has no archive payload to cache.
+          cache: false
+          cross-targets: ${{ matrix.target }}
       - name: Build isolated worker
         run: >-
           soldr build

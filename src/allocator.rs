@@ -111,6 +111,16 @@ pub fn dump_to(path: impl AsRef<Path>) -> std::io::Result<()> {
     mimalloc_pprof::prof::dump_proto_file(path.as_ref())
 }
 
+/// Serialize the retained heap samples to an in-memory pprof protobuf buffer.
+///
+/// Use this when a caller needs the snapshot bytes directly — for example to
+/// hand them to an API response or an in-process test assertion — rather
+/// than writing them to disk first. Returns an empty buffer if the profiler
+/// failed to serialize the snapshot; it never returns an error.
+pub fn dump_to_vec() -> Vec<u8> {
+    mimalloc_pprof::prof::dump_proto_to_vec()
+}
+
 /// Create `directory` asynchronously and write a uniquely named pprof dump.
 pub async fn dump_in(directory: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     let directory = directory.as_ref();
@@ -145,4 +155,12 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.ends_with(".pb"));
     }
+
+    // `dump_to_vec` needs samples captured through mimalloc's allocator, which
+    // means a `#[global_allocator]` declaration. This lib unit-test binary has
+    // none (declaring one here would switch every other unit test in the
+    // crate onto mimalloc too), so that behavior is exercised instead by the
+    // dedicated `tests/allocator_heap_profile.rs` integration test, which
+    // mirrors the real zccache consumer: a separate final executable that
+    // installs `Allocator` as its global allocator before profiling.
 }

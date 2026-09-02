@@ -603,6 +603,108 @@ impl AsyncStream {
     pub fn peer_identity(&self) -> io::Result<PeerIdentity> {
         self.0.peer_creds().map(peer_identity)
     }
+
+    /// Read into `buffer`, returning the number of bytes read.
+    ///
+    /// This is an inherent method rather than a re-exported trait method, so
+    /// a caller never needs an extension-trait import to reach it.
+    pub async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt as _;
+
+        self.0.read(buffer).await
+    }
+
+    /// Read until `buffer` is completely filled.
+    ///
+    /// On success the return value equals `buffer.len()`; an end-of-stream
+    /// before `buffer` fills yields [`io::ErrorKind::UnexpectedEof`].
+    pub async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt as _;
+
+        self.0.read_exact(buffer).await
+    }
+
+    /// Write the entirety of `bytes`, retrying partial writes internally.
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.write_all(bytes).await
+    }
+
+    /// Flush any buffered writes to the underlying transport.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.flush().await
+    }
+
+    /// Shut down the write half of this stream, signaling end-of-stream to
+    /// the peer's reader.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.shutdown().await
+    }
+
+    /// Split this stream into an owned, facade-owned read half and write
+    /// half that may be driven concurrently or moved to separate tasks.
+    ///
+    /// Both halves keep their backing connection behind a private field, so
+    /// a caller that stores them never names the backend transport.
+    pub fn into_split(self) -> (AsyncReadHalf, AsyncWriteHalf) {
+        let (reader, writer) = tokio::io::split(self.0);
+        (AsyncReadHalf(reader), AsyncWriteHalf(writer))
+    }
+}
+
+/// The facade-owned read half produced by [`AsyncStream::into_split`].
+#[cfg(feature = "ipc-async")]
+pub struct AsyncReadHalf(tokio::io::ReadHalf<interprocess::local_socket::tokio::Stream>);
+
+#[cfg(feature = "ipc-async")]
+impl AsyncReadHalf {
+    /// Read into `buffer`, returning the number of bytes read.
+    pub async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt as _;
+
+        self.0.read(buffer).await
+    }
+
+    /// Read until `buffer` is completely filled.
+    pub async fn read_exact(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use tokio::io::AsyncReadExt as _;
+
+        self.0.read_exact(buffer).await
+    }
+}
+
+/// The facade-owned write half produced by [`AsyncStream::into_split`].
+#[cfg(feature = "ipc-async")]
+pub struct AsyncWriteHalf(tokio::io::WriteHalf<interprocess::local_socket::tokio::Stream>);
+
+#[cfg(feature = "ipc-async")]
+impl AsyncWriteHalf {
+    /// Write the entirety of `bytes`, retrying partial writes internally.
+    pub async fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.write_all(bytes).await
+    }
+
+    /// Flush any buffered writes to the underlying transport.
+    pub async fn flush(&mut self) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.flush().await
+    }
+
+    /// Shut down this write half, signaling end-of-stream to the peer's
+    /// reader.
+    pub async fn shutdown(&mut self) -> io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
+
+        self.0.shutdown().await
+    }
 }
 
 #[cfg(feature = "ipc-async")]

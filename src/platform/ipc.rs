@@ -266,7 +266,8 @@ pub fn broker_v1_endpoint_path(bare_name: &str) -> Result<String, EndpointNameTo
 
 #[cfg(feature = "ipc-async")]
 pub use crate::{
-    IpcAsyncListener as AsyncListener, IpcAsyncStream as AsyncStream,
+    IpcAsyncListener as AsyncListener, IpcAsyncReadHalf as AsyncReadHalf,
+    IpcAsyncStream as AsyncStream, IpcAsyncWriteHalf as AsyncWriteHalf,
     IpcIntoAsyncListener as IntoAsyncListener, IpcIntoAsyncStream as IntoAsyncStream,
 };
 
@@ -418,7 +419,6 @@ mod tests {
     #[tokio::test]
     async fn async_bind_accept_connect_and_peer_identity_round_trip() {
         use super::{AsyncListener, AsyncStream};
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let endpoint = Endpoint::test("async-roundtrip").expect("test endpoint");
         let listener = AsyncListener::bind(&endpoint).expect("bind");
@@ -437,6 +437,88 @@ mod tests {
         client.write_all(b"ping").await.expect("write request");
         let mut response = [0_u8; 4];
         client
+            .read_exact(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(&response, b"pong");
+        server.await.expect("server task");
+    }
+
+    // No `use tokio::io::{AsyncReadExt, AsyncWriteExt}` here: `AsyncStream`'s
+    // `read`/`read_exact`/`write_all`/`flush`/`shutdown` are inherent methods,
+    // so this test exercises the whole method set with no extension-trait
+    // import in scope, which is exactly what an external client now gets.
+    #[cfg(feature = "ipc-async")]
+    #[tokio::test]
+    async fn async_inherent_methods_round_trip_with_no_extension_trait_import() {
+        use super::{AsyncListener, AsyncStream};
+
+        let endpoint = Endpoint::test("async-inherent-roundtrip").expect("test endpoint");
+        let listener = AsyncListener::bind(&endpoint).expect("bind");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).await.expect("read request");
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").await.expect("write response");
+            stream.flush().await.expect("flush response");
+            stream.shutdown().await.expect("shutdown write half");
+        });
+
+        let mut client = AsyncStream::connect(&endpoint).await.expect("connect");
+        client.write_all(b"ping").await.expect("write request");
+        client.flush().await.expect("flush request");
+        // `read` may return a short read even over a live local connection,
+        // so fill the buffer in a loop rather than asserting one call
+        // returns all four bytes.
+        let mut response = [0_u8; 4];
+        let mut filled = 0;
+        while filled < response.len() {
+            let read = client
+                .read(&mut response[filled..])
+                .await
+                .expect("read response");
+            assert_ne!(read, 0, "peer closed before the full response arrived");
+            filled += read;
+        }
+        assert_eq!(&response, b"pong");
+        server.await.expect("server task");
+    }
+
+    // Proves `into_split` frees a caller from ever storing tokio's
+    // `ReadHalf`/`WriteHalf` itself (the leak zccache's `transport::mod`
+    // currently has): both halves here are facade-owned types with private
+    // fields, driven independently, still with no tokio import in scope.
+    #[cfg(feature = "ipc-async")]
+    #[tokio::test]
+    async fn async_into_split_round_trips_across_owned_halves() {
+        use super::{AsyncListener, AsyncStream};
+
+        let endpoint = Endpoint::test("async-split-roundtrip").expect("test endpoint");
+        let listener = AsyncListener::bind(&endpoint).expect("bind");
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            let (mut read_half, mut write_half) = stream.into_split();
+            let mut request = [0_u8; 4];
+            read_half
+                .read_exact(&mut request)
+                .await
+                .expect("read request");
+            assert_eq!(&request, b"ping");
+            write_half.write_all(b"pong").await.expect("write response");
+            write_half.flush().await.expect("flush response");
+            write_half.shutdown().await.expect("shutdown write half");
+        });
+
+        let client = AsyncStream::connect(&endpoint).await.expect("connect");
+        let (mut client_read, mut client_write) = client.into_split();
+        client_write
+            .write_all(b"ping")
+            .await
+            .expect("write request");
+        client_write.flush().await.expect("flush request");
+        let mut response = [0_u8; 4];
+        client_read
             .read_exact(&mut response)
             .await
             .expect("read response");

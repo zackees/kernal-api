@@ -1795,6 +1795,14 @@ mod epoch_broker_tests {
         }
     }
 
+    /// The readiness marker is complete only once it carries its full payload.
+    /// The child writes it with `File::create` + `write_all`, so the path
+    /// appears before the bytes do and a reader that polls the path alone can
+    /// observe an empty file.
+    fn marker_reports_entry(marker: &std::path::Path) -> bool {
+        std::fs::read_to_string(marker).is_ok_and(|text| text == "entered")
+    }
+
     fn compiler_with_epochs(maximum: usize) -> SketchCompiler {
         let limits =
             SketchEpochLimits::new(Duration::from_millis(5), Duration::from_millis(1), maximum)
@@ -1952,7 +1960,10 @@ mod epoch_broker_tests {
             marker,
         };
         let readiness_deadline = Instant::now() + Duration::from_secs(5);
-        while !guard.marker.exists() && Instant::now() < readiness_deadline {
+        // `File::create` publishes the marker path before its payload lands,
+        // so an existence poll can observe a torn, still-empty marker. Wait
+        // for the payload itself; the readiness bound is unchanged.
+        while !marker_reports_entry(&guard.marker) && Instant::now() < readiness_deadline {
             assert!(
                 guard
                     .child_mut()
@@ -1964,7 +1975,7 @@ mod epoch_broker_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(
-            guard.marker.exists(),
+            marker_reports_entry(&guard.marker),
             "child must reach the Wasm atomic.wait fixture before containment classification"
         );
         assert_eq!(
@@ -2026,7 +2037,8 @@ mod epoch_broker_tests {
             marker,
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !guard.marker.exists() && Instant::now() < deadline {
+        // See the atomic-wait proof: poll the payload, not the path.
+        while !marker_reports_entry(&guard.marker) && Instant::now() < deadline {
             assert!(
                 guard
                     .child_mut()
@@ -2038,7 +2050,7 @@ mod epoch_broker_tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         assert!(
-            guard.marker.exists(),
+            marker_reports_entry(&guard.marker),
             "child must enter the real Wasm host callback"
         );
         assert_eq!(

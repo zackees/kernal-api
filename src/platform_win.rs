@@ -44,8 +44,10 @@ pub use process_owner_death::{
 pub(crate) mod host;
 pub use host::{
     boot_id as host_boot_id, current_process_privilege as host_current_process_privilege,
+    current_user as host_current_user,
     environment_keys_are_case_insensitive as host_environment_keys_are_case_insensitive,
-    filesystem_device_id as host_filesystem_device_id, hostname as host_hostname,
+    filesystem_device_id as host_filesystem_device_id, home_dir as host_home_dir,
+    hostname as host_hostname, is_elevated as host_is_elevated,
     login_environment as host_login_environment, machine_id as host_machine_id,
     namespace_id as host_namespace_id, user_machine_identity as host_user_machine_identity,
     PrivilegedIdentity as HostPrivilegedIdentity,
@@ -81,9 +83,11 @@ pub use fs_watch::Watcher as FsWatchWatcher;
 #[path = "platform_win/executable.rs"]
 pub(crate) mod executable;
 pub use executable::{
-    file_name as executable_file_name,
+    file_name as executable_file_name, find_in_paths as executable_find_in_paths,
+    native_library_name as executable_native_library_name,
     sibling_of_current_image as executable_sibling_of_current_image,
-    EXECUTABLE_EXTENSION,
+    stem_matches as executable_stem_matches,
+    unlock_for_replacement as executable_unlock_for_replacement, EXECUTABLE_EXTENSION,
 };
 
 #[cfg(feature = "ipc")]

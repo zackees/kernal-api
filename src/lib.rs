@@ -148,7 +148,9 @@ pub use platform_imp::{
 };
 
 pub use platform_imp::{
-    executable_file_name, executable_sibling_of_current_image, EXECUTABLE_EXTENSION,
+    executable_file_name, executable_find_in_paths, executable_native_library_name,
+    executable_sibling_of_current_image, executable_stem_matches,
+    executable_unlock_for_replacement, EXECUTABLE_EXTENSION,
 };
 
 #[cfg(feature = "fs")]
@@ -164,9 +166,10 @@ pub use platform_imp::{
 pub use platform_imp::FsWatchWatcher;
 
 pub use platform_imp::{
-    host_boot_id, host_current_process_privilege, host_environment_keys_are_case_insensitive,
-    host_filesystem_device_id, host_hostname, host_login_environment, host_machine_id,
-    host_namespace_id, host_user_machine_identity, HostPrivilegedIdentity,
+    host_boot_id, host_current_process_privilege, host_current_user,
+    host_environment_keys_are_case_insensitive, host_filesystem_device_id, host_home_dir,
+    host_hostname, host_is_elevated, host_login_environment, host_machine_id, host_namespace_id,
+    host_user_machine_identity, HostPrivilegedIdentity,
 };
 
 pub use platform_imp::host_login_environment_block;

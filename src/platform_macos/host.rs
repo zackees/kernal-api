@@ -164,6 +164,38 @@ pub fn namespace_id() -> Option<String> {
     None
 }
 
+/// Best-effort login name for the user running this process.
+///
+/// Reads `$USER`, falling back to `$LOGNAME` when unset. Neither variable is
+/// guaranteed to be set -- a launchd agent can start a process with neither
+/// -- so a caller that needs an identity it can rely on should use
+/// [`user_machine_identity`] instead; this exists for the weaker case of
+/// wanting a display name.
+pub fn current_user() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
+}
+
+/// Best-effort home directory for the user running this process.
+///
+/// Reads `$HOME` only. A process whose session never set it has no answer
+/// here; a caller that needs a directory even then wants
+/// [`crate::fs_user_data_dir`] and its siblings, which synthesize a fallback
+/// path instead of reporting `None`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Whether this process holds host administrator privileges.
+///
+/// On this host that is exactly effective UID 0 -- there is no separate
+/// "elevated but not root" state the way Windows has one, so this is a thin
+/// restatement of [`current_process_privilege`].
+pub fn is_elevated() -> io::Result<bool> {
+    Ok(current_process_privilege()?.is_some())
+}
+
 // ---------------------------------------------------------------------------
 // Login environment
 // ---------------------------------------------------------------------------
@@ -317,6 +349,26 @@ mod tests {
             Some(PrivilegedIdentity::UnixRoot)
         );
         assert_eq!(privilege_from_effective_uid(1000), None);
+    }
+
+    /// Elevation is exactly root on this host, so it agrees with the
+    /// privilege probe in both directions.
+    #[test]
+    fn is_elevated_agrees_with_current_process_privilege() {
+        let elevated = is_elevated().expect("elevation check must succeed");
+        let privileged = current_process_privilege()
+            .expect("privilege lookup must succeed")
+            .is_some();
+        assert_eq!(elevated, privileged);
+    }
+
+    /// A test process resolves to some login name and home directory on a
+    /// normal macOS host -- `$USER`/`$HOME` are set by every login session
+    /// and by cargo's own test harness.
+    #[test]
+    fn current_user_and_home_dir_answer_on_a_normal_session() {
+        assert!(current_user().is_some_and(|name| !name.is_empty()));
+        assert!(home_dir().is_some_and(|dir| !dir.as_os_str().is_empty()));
     }
 
     /// The three string facts either answer or say they cannot; an empty

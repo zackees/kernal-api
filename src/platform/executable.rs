@@ -5,13 +5,29 @@
 //! running image, is a host mechanic and is decided here.
 
 pub use crate::{
-    executable_file_name as file_name,
-    executable_sibling_of_current_image as sibling_of_current_image, EXECUTABLE_EXTENSION,
+    executable_file_name as file_name, executable_find_in_paths as find_in_paths,
+    executable_native_library_name as native_library_name,
+    executable_sibling_of_current_image as sibling_of_current_image,
+    executable_stem_matches as stem_matches,
+    executable_unlock_for_replacement as unlock_for_replacement, EXECUTABLE_EXTENSION,
 };
+
+/// Finds a runnable host image using the process `PATH`.
+///
+/// Splits `PATH` into its component directories and delegates to
+/// [`find_in_paths`], so Windows' `PATHEXT` suffix search applies exactly as
+/// it does for an explicit directory list. An unset `PATH` reports nothing
+/// found rather than treating every directory as implicitly on it.
+pub fn find_on_path(name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let directories: Vec<_> = std::env::split_paths(&path).collect();
+    find_in_paths(name, &directories)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     /// The host decides the spelling; the caller never does.
     ///
@@ -50,5 +66,87 @@ mod tests {
     #[test]
     fn an_absent_sibling_is_none_not_a_missing_path() {
         assert!(sibling_of_current_image("rp-no-such-sibling-program").is_none());
+    }
+
+    /// The host always adds some dynamic-library suffix to a bare stem.
+    #[test]
+    fn native_library_name_carries_a_host_extension() {
+        let name = native_library_name(OsStr::new("clang"));
+        assert!(std::path::Path::new(&name).extension().is_some());
+    }
+
+    /// A stem that already carries an extension is returned unchanged, on
+    /// every host -- resolving `"clang.so"` from a package listing must never
+    /// grow a second suffix.
+    #[test]
+    fn native_library_name_is_idempotent_when_already_extended() {
+        assert_eq!(
+            native_library_name(OsStr::new("clang.so")),
+            OsStr::new("clang.so")
+        );
+    }
+
+    /// An explicit directory list finds the running image beside itself --
+    /// the same claim the sibling-image test above makes for
+    /// [`sibling_of_current_image`], restated for the lower-level primitive.
+    #[test]
+    fn find_in_paths_locates_the_current_image_beside_itself() {
+        let image = std::env::current_exe().expect("current executable image");
+        let directory = image.parent().expect("image directory").to_path_buf();
+        let name = image.file_name().expect("image file name");
+        assert_eq!(find_in_paths(name, &[directory]), Some(image));
+    }
+
+    /// A name absent from every candidate directory is reported as absent.
+    #[test]
+    fn find_in_paths_reports_absence_for_an_unknown_name() {
+        let directory = std::env::temp_dir();
+        assert_eq!(
+            find_in_paths(OsStr::new("rp-no-such-executable-xyz"), &[directory]),
+            None,
+        );
+    }
+
+    /// `find_on_path` never invents a match; a name nothing on `PATH` owns
+    /// stays absent. The positive case lives on [`find_in_paths`] instead --
+    /// mutating `PATH` here would race every other test in this process.
+    #[test]
+    fn find_on_path_reports_absence_for_an_unknown_name() {
+        assert!(find_on_path(OsStr::new("rp-no-such-executable-on-path-xyz")).is_none());
+    }
+
+    /// The comparison is host-neutral for two spellings that already agree in
+    /// case, which is the only claim that holds on every host.
+    #[test]
+    fn stem_matches_the_expected_program_name() {
+        assert!(stem_matches(
+            OsStr::new("/usr/bin/running-process"),
+            "running-process"
+        ));
+        assert!(!stem_matches(
+            OsStr::new("/usr/bin/other"),
+            "running-process"
+        ));
+    }
+
+    /// Relocating a running image never destroys it: the original path keeps
+    /// resolving to a file either way, and any litter this leaves behind
+    /// lives inside the scratch directory this test removes afterwards.
+    #[test]
+    fn unlock_for_replacement_matches_host_locking_semantics() {
+        let dir = std::env::temp_dir().join(format!(
+            "rp-executable-unlock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let image = dir.join(file_name("probe"));
+        std::fs::write(&image, b"image").expect("write image");
+
+        let relocated = unlock_for_replacement(&image).expect("unlock");
+        assert_eq!(relocated, cfg!(target_os = "windows"));
+        assert!(image.is_file(), "the original path must still be a file");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

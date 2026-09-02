@@ -9,14 +9,82 @@ use std::io;
 
 pub use crate::{
     host_boot_id as boot_id, host_current_process_privilege as current_process_privilege,
+    host_current_user as current_user,
     host_environment_keys_are_case_insensitive as environment_keys_are_case_insensitive,
-    host_filesystem_device_id as filesystem_device_id, host_hostname as hostname,
+    host_filesystem_device_id as filesystem_device_id, host_home_dir as home_dir,
+    host_hostname as hostname, host_is_elevated as is_elevated,
     host_login_environment as login_environment, host_machine_id as machine_id,
     host_namespace_id as namespace_id, host_user_machine_identity as user_machine_identity,
     HostPrivilegedIdentity as PrivilegedIdentity,
 };
 
 pub use crate::host_login_environment_block as login_environment_block;
+
+/// Logical concurrency this host exposes to this process.
+///
+/// A thin, host-neutral restatement of [`std::thread::available_parallelism`]
+/// -- kept on the facade so a caller sizing a thread pool from "how many CPUs
+/// does this host have" reads that intent from `platform::host` alongside the
+/// rest of what it already asks this module, rather than reaching past it for
+/// one `std::thread` call.
+pub fn available_parallelism() -> Option<usize> {
+    std::thread::available_parallelism()
+        .ok()
+        .map(std::num::NonZeroUsize::get)
+}
+
+/// Opaque raw host inputs a caller can hash to domain-separate a native CPU
+/// key.
+///
+/// Combines architecture, OS, and whichever of this machine's identity or
+/// this host's name is available, plus the CPU feature flags this process
+/// observes, into one string with no delimiter a caller needs to parse --
+/// they hash it, they do not read it apart. Composed entirely from facts this
+/// facade already reports elsewhere (see [`machine_id`] and [`hostname`]), so
+/// it needs no platform-specific code of its own; a raw process id is used
+/// only when neither of those answers, which keeps the material scoped to
+/// this machine rather than this one process wherever possible.
+pub fn cpu_identity_material() -> String {
+    let mut material = format!(
+        "arch={}\0os={}",
+        std::env::consts::ARCH,
+        std::env::consts::OS
+    );
+    if let Some(id) = machine_id() {
+        material.push_str("\0machine-id=");
+        material.push_str(&id);
+    } else if let Some(name) = hostname() {
+        material.push_str("\0hostname=");
+        material.push_str(&name);
+    } else {
+        material.push_str("\0pid=");
+        material.push_str(&std::process::id().to_string());
+    }
+    append_cpu_feature_material(&mut material);
+    material
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn append_cpu_feature_material(material: &mut String) {
+    for (name, present) in [
+        ("sse2", std::arch::is_x86_feature_detected!("sse2")),
+        ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::arch::is_x86_feature_detected!("avx")),
+        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+        ("avx512f", std::arch::is_x86_feature_detected!("avx512f")),
+        ("fma", std::arch::is_x86_feature_detected!("fma")),
+        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
+        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
+    ] {
+        if present {
+            material.push_str("\0feature=");
+            material.push_str(name);
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+fn append_cpu_feature_material(_material: &mut String) {}
 
 /// Resolve a machine identity from the first readable of `machine_id_paths`,
 /// falling back to a boot-scoped id.
@@ -79,6 +147,39 @@ mod tests {
         let first = current_process_privilege().expect("privilege lookup must succeed");
         let second = current_process_privilege().expect("repeat lookup must succeed");
         assert_eq!(first, second);
+    }
+
+    /// Elevation detection must always answer, whatever the answer turns out
+    /// to be -- the query itself failing is the only outcome a caller cannot
+    /// act on.
+    #[test]
+    fn is_elevated_answers_without_erroring() {
+        assert!(is_elevated().is_ok());
+    }
+
+    /// A CI test process has some login name and home directory, whatever the
+    /// host turns out to be.
+    #[test]
+    fn current_user_and_home_dir_answer_on_a_normal_session() {
+        assert!(current_user().is_some_and(|name| !name.is_empty()));
+        assert!(home_dir().is_some_and(|dir| !dir.as_os_str().is_empty()));
+    }
+
+    /// The material is never empty and is stable within one process, and it
+    /// carries the architecture and OS every caller composes it from.
+    #[test]
+    fn cpu_identity_material_is_present_and_stable() {
+        let first = cpu_identity_material();
+        assert!(!first.is_empty());
+        assert_eq!(first, cpu_identity_material());
+        assert!(first.contains(&format!("arch={}", std::env::consts::ARCH)));
+        assert!(first.contains(&format!("os={}", std::env::consts::OS)));
+    }
+
+    /// Every host this crate supports reports at least one logical CPU.
+    #[test]
+    fn available_parallelism_reports_at_least_one_cpu() {
+        assert!(available_parallelism().is_some_and(|count| count >= 1));
     }
 
     mod machine_id_sources {

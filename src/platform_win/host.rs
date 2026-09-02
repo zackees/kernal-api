@@ -642,6 +642,71 @@ fn parse_environment_block(block: &[u16]) -> Vec<(OsString, OsString)> {
 pub fn environment_keys_are_case_insensitive() -> bool {
     true
 }
+
+/// Best-effort login name for the user running this process.
+pub fn current_user() -> Option<String> {
+    std::env::var("USERNAME").ok()
+}
+
+/// Best-effort home directory for the user running this process.
+///
+/// Reads `%USERPROFILE%`, falling back to `%HOME%` for the rare shell that
+/// sets the Unix-style variable instead. A process whose environment sets
+/// neither has no answer here; a caller that needs a directory even then
+/// wants [`crate::fs_user_data_dir`] and its siblings, which synthesize a
+/// fallback path instead of reporting `None`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Whether this process's token carries UAC elevation.
+///
+/// This is a different question from [`current_process_privilege`]: a
+/// non-elevated interactive administrator session answers `None` there (the
+/// account is not LocalSystem) but `true` here, and a UAC-elevated ordinary
+/// user answers the opposite split. Both facts are real; a caller asking "can
+/// I write to `Program Files`" wants this one.
+pub fn is_elevated() -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: `token` is valid writable storage, and the pseudo-handle from
+    // GetCurrentProcess is owned by Windows and never closed here.
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if opened == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0_u32;
+    // SAFETY: `elevation` is live writable storage sized exactly to what
+    // TokenElevation queries write, and `token` is the handle opened above.
+    let queried = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    let query_error = io::Error::last_os_error();
+    // SAFETY: `token` is owned here and is not used again after this close.
+    unsafe {
+        CloseHandle(token);
+    }
+    if queried == 0 {
+        return Err(query_error);
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,6 +717,24 @@ mod tests {
         assert!(!is_local_system_sid(&[
             1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0
         ]));
+    }
+
+    /// A CI runner is never LocalSystem, so elevation and process privilege
+    /// answer independent questions here: privilege is `None` and elevation
+    /// is whatever the runner's own token carries, but the query itself must
+    /// always succeed.
+    #[test]
+    fn is_elevated_answers_without_erroring() {
+        assert!(is_elevated().is_ok());
+    }
+
+    /// A test process resolves to some login name and home directory on a
+    /// normal Windows session -- `%USERNAME%`/`%USERPROFILE%` are set by
+    /// every login session and by cargo's own test harness.
+    #[test]
+    fn current_user_and_home_dir_answer_on_a_normal_session() {
+        assert!(current_user().is_some_and(|name| !name.is_empty()));
+        assert!(home_dir().is_some_and(|dir| !dir.as_os_str().is_empty()));
     }
 
     /// The machine id must be the installation GUID, not a restatement of the

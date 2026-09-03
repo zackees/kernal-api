@@ -4,6 +4,11 @@
 //! the mechanism differs per host and the guarantee is what a consumer writes
 //! its cleanup against. The one place a host is named is the enforcement
 //! report, which exists precisely so a caller can tell the hosts apart.
+//!
+//! The release checks are the exception that proves it: what they assert is
+//! that a watch nobody can act on any more is gone, and the only honest way
+//! to ask that is to read the host's own descriptor table, so they are
+//! written against the host whose watch is a descriptor.
 
 use std::time::Duration;
 
@@ -13,6 +18,8 @@ use kernal_api::platform::process::{
     ProcessExitWatch, ProcessId, ProcessInspectErrorKind,
 };
 use kernal_api::{shell_spec, SpawnSpec, StreamMode};
+#[cfg(target_os = "linux")]
+use kernal_api::{ProcessPostExitDrain, ProcessSessionOptions};
 
 fn runtime() -> Runtime {
     RuntimeBuilder::current_thread()
@@ -299,4 +306,143 @@ fn a_bounded_run_refuses_an_owner_it_cannot_watch() {
             if error.kind() == std::io::ErrorKind::InvalidInput),
         "the refusal names the argument, not a timeout: {error}"
     );
+}
+
+/// A session is *designed* to be held past its child's exit -- that is what
+/// the post-exit drain is for -- so its owner watch has to stop when the
+/// child does rather than when the handle is finally dropped.
+///
+/// The pidfd is the observable, because on this host the watch *is* one:
+/// counting the descriptors that name the owner asks the kernel whether the
+/// watch is still open, rather than asking the facade to describe itself.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_that_waited_stops_watching_its_owner() {
+    let mut owner = command_that_runs_long()
+        .spawn()
+        .expect("spawn the nominated owner");
+    let owner_id = ProcessId::new(owner.id()).expect("pid in range");
+    assert_eq!(
+        open_watches_of(owner_id),
+        0,
+        "nothing watches the owner yet"
+    );
+
+    runtime().run(async {
+        let session = session_bound_to(owner_id, "exit 0").await;
+        assert_eq!(
+            open_watches_of(owner_id),
+            1,
+            "the binding must have opened the watch this test is about"
+        );
+
+        session
+            .wait()
+            .await
+            .expect("waiting on the exited child must succeed");
+        assert!(
+            watch_closes(owner_id).await,
+            "the child is gone, so its owner watch must be too -- while the \
+             session itself is still held open to drain output"
+        );
+
+        assert!(
+            session
+                .poll()
+                .await
+                .expect("poll the reaped child")
+                .is_some(),
+            "the session stays usable after releasing its watch"
+        );
+    });
+
+    owner.kill().expect("end the owner");
+    owner.wait().expect("reap the owner");
+}
+
+/// The other terminal path reaches the same answer: after a kill there is no
+/// child left for the owner's death to protect.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_session_that_killed_stops_watching_its_owner() {
+    let mut owner = command_that_runs_long()
+        .spawn()
+        .expect("spawn the nominated owner");
+    let owner_id = ProcessId::new(owner.id()).expect("pid in range");
+
+    runtime().run(async {
+        let session = session_bound_to(owner_id, LONG_RUNNING).await;
+        assert_eq!(
+            open_watches_of(owner_id),
+            1,
+            "the binding must have opened the watch this test is about"
+        );
+
+        session.kill().await.expect("kill the direct child");
+        assert!(
+            watch_closes(owner_id).await,
+            "a killed child leaves nothing for the owner watch to protect"
+        );
+    });
+
+    owner.kill().expect("end the owner");
+    owner.wait().expect("reap the owner");
+}
+
+/// A streaming session whose child is bound to `owner`.
+#[cfg(target_os = "linux")]
+async fn session_bound_to(owner: ProcessId, command: &str) -> kernal_api::ProcessSession {
+    shell_spec(command)
+        .stdin(StreamMode::Null)
+        .stdout(StreamMode::Piped)
+        .stderr(StreamMode::Piped)
+        .bind_lifetime(LifetimeOwner::Process(owner))
+        .spawn_session(ProcessSessionOptions {
+            max_queued_chunks: 2,
+            max_chunk_bytes: 64,
+            // The drain policy a supervisor holds a session longest under.
+            post_exit_drain: ProcessPostExitDrain::WaitForEof,
+            kill_on_drop: true,
+        })
+        .await
+        .expect("spawn a session bound to the owner")
+}
+
+/// Whether the owner watch closes, given the chance to.
+///
+/// Releasing cancels the watching task, and cancellation completes at that
+/// task's next scheduling turn rather than inside the release, so this yields
+/// rather than reading the descriptor table once and calling it settled.
+#[cfg(target_os = "linux")]
+async fn watch_closes(owner: ProcessId) -> bool {
+    for _ in 0..100 {
+        if open_watches_of(owner) == 0 {
+            return true;
+        }
+        kernal_api::async_engine::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// How many pidfds naming `pid` this process holds.
+///
+/// The descriptor's `fdinfo` names the process it was opened against, which
+/// is what separates an owner watch from the descriptors the substrate keeps
+/// for the child itself.
+#[cfg(target_os = "linux")]
+fn open_watches_of(pid: ProcessId) -> usize {
+    let watched = format!("Pid:\t{}", pid.get());
+    std::fs::read_dir("/proc/self/fd")
+        .expect("this host publishes its own descriptor table")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            std::fs::read_link(entry.path())
+                .is_ok_and(|target| target.as_os_str().as_encoded_bytes() == b"anon_inode:[pidfd]")
+        })
+        .filter(|entry| {
+            let fdinfo = std::path::Path::new("/proc/self/fdinfo").join(entry.file_name());
+            std::fs::read_to_string(fdinfo)
+                .is_ok_and(|info| info.lines().any(|line| line == watched))
+        })
+        .count()
 }

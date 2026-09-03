@@ -879,7 +879,14 @@ impl ProcessSession {
     /// This is independent from output completion, so it remains observable
     /// when descendants retain inherited pipe ends.
     pub async fn wait(&self) -> io::Result<ProcessSessionExit> {
-        self.inner.wait().await
+        let exit = self.inner.wait().await;
+        if exit.is_ok() {
+            // Nothing left to protect, and a session is meant to be held well
+            // past this while output drains -- so the owner watch would
+            // otherwise outlive the child by the whole drain.
+            self.lifetime.release();
+        }
+        exit
     }
 
     /// Observe whether the direct child has already been reaped.
@@ -891,7 +898,11 @@ impl ProcessSession {
     /// delivery or a blocked stdin writer. This does not target descendants;
     /// an inherited descendant pipe is explicitly abandoned after grace.
     pub async fn kill(&self) -> io::Result<()> {
-        self.inner.kill().await
+        let killed = self.inner.kill().await;
+        if killed.is_ok() {
+            self.lifetime.release();
+        }
+        killed
     }
 
     /// Request graceful termination for the child-owned process group.

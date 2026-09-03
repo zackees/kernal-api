@@ -2,6 +2,7 @@
 
 use std::io;
 use std::process::ExitStatus;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use running_process::{
@@ -41,22 +42,24 @@ pub(crate) struct ProcessSessionAdapter {
 
 /// What a spawn obtained for the caller's requested owner binding.
 ///
-/// The watcher handle lives here so that it is cancelled with the child
-/// handle that owns it: a watch nobody can act on any more is a pidfd and a
-/// task kept alive for nothing.
+/// The watcher handle lives here so that it is cancelled by the handle that
+/// owns it: at the terminal answer that leaves nothing to protect, and at the
+/// latest when that handle is dropped. A watch nobody can act on any more is
+/// a pidfd and a task kept alive for nothing.
 pub(crate) struct LifetimeBinding {
     enforcement: Option<LifetimeEnforcement>,
-    /// Held rather than read. Dropping a `Task` cancels it, which is exactly
+    /// Taken rather than read. Dropping a `Task` cancels it, which is exactly
     /// how the watch stops when the handle that could have acted on it does.
-    #[allow(dead_code, reason = "kept for its cancel-on-drop, never queried")]
-    watcher: Option<crate::async_engine::Task<()>>,
+    /// The lock is what lets a session release it: a session reaches the same
+    /// terminal answer as a child does, but holds only `&self` while doing it.
+    watcher: Mutex<Option<crate::async_engine::Task<()>>>,
 }
 
 impl LifetimeBinding {
     pub(crate) const fn unbound() -> Self {
         Self {
             enforcement: None,
-            watcher: None,
+            watcher: Mutex::new(None),
         }
     }
 
@@ -66,10 +69,33 @@ impl LifetimeBinding {
 
     /// Stop watching, because the child this was protecting has exited.
     ///
+    /// Idempotent, and safe to call while another caller is inside a
+    /// lifecycle method: the handle is taken out under the lock and cancelled
+    /// after it, so a second release finds nothing left to take and no drop
+    /// runs with the lock held. A poisoned lock is not a broken invariant
+    /// here -- an `Option` is either holding the watch or not -- so releasing
+    /// still releases.
+    ///
     /// The enforcement report is left alone: it records what the spawn
     /// obtained, which does not stop being true once the child is gone.
-    pub(crate) fn release(&mut self) {
-        self.watcher = None;
+    pub(crate) fn release(&self) {
+        drop(self.take_watcher());
+    }
+
+    fn take_watcher(&self) -> Option<crate::async_engine::Task<()>> {
+        self.watcher
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    /// Whether the owner watch is still held.
+    #[cfg(test)]
+    pub(crate) fn is_watching(&self) -> bool {
+        self.watcher
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
     }
 }
 
@@ -122,7 +148,7 @@ fn bind_lifetime(
     };
     LifetimeBinding {
         enforcement: Some(lifetime_enforcement_for(owner)),
-        watcher: watch.map(|watch| watch_owner(watch, child_pid)),
+        watcher: Mutex::new(watch.map(|watch| watch_owner(watch, child_pid))),
     }
 }
 
@@ -522,9 +548,60 @@ fn process_error_to_io(error: ProcessError) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::output_event;
+    use super::{output_event, LifetimeBinding};
+    use crate::async_engine::{launch, RuntimeBuilder};
     use crate::{ProcessOutputCompletion, ProcessOutputEvent};
     use running_process::{AsyncProcessSessionEvent, StreamKind};
+    use std::sync::Mutex;
+
+    /// A binding holding a watch that never finishes on its own, so that what
+    /// stops it is observably the release rather than the watched exit.
+    fn watching_binding() -> LifetimeBinding {
+        LifetimeBinding {
+            enforcement: None,
+            watcher: Mutex::new(Some(launch(std::future::pending::<()>()))),
+        }
+    }
+
+    /// The idempotence the release documents, since both terminal paths of a
+    /// child and of a session can reach it for the same child.
+    #[test]
+    fn releasing_a_binding_twice_leaves_the_watch_gone_rather_than_failing() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("facade runtime");
+
+        runtime.run(async {
+            let binding = watching_binding();
+            assert!(binding.is_watching());
+
+            binding.release();
+            assert!(!binding.is_watching());
+            binding.release();
+            assert!(!binding.is_watching());
+        });
+    }
+
+    /// Two callers releasing at once is the shape a session makes reachable:
+    /// its lifecycle methods hold `&self`, so nothing serializes them for it.
+    #[test]
+    fn releasing_from_two_callers_at_once_still_stops_the_watch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .expect("facade runtime");
+
+        runtime.run(async {
+            let binding = watching_binding();
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| binding.release());
+                }
+            });
+            assert!(!binding.is_watching());
+        });
+    }
 
     #[test]
     fn stream_fault_preserves_kind_message_and_native_error() {

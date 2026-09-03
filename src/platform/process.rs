@@ -1078,6 +1078,56 @@ pub struct ObserverBackend {
 }
 pub use crate::platform_imp::observer_backend;
 pub use crate::platform_imp::read_process_cmdline;
+/// Every open file the host is willing to name for one process, spelled the
+/// way that host spells it.
+///
+/// The answer is a point-in-time snapshot and not a stream: a descriptor can
+/// close, and another open, between the walk and the return. More
+/// importantly, the three hosts answer three different questions here, so a
+/// caller comparing these strings against a path it built itself has to know
+/// which question it asked.
+///
+/// On Linux every entry of `/proc/<pid>/fd` is reported, with the `readlink`
+/// target kept verbatim and decoded lossily. Anonymous kernel objects
+/// therefore sit beside real paths: `socket:[12345]`, `pipe:[67890]` and
+/// `anon_inode:...` appear as themselves, and a file unlinked since it was
+/// opened appears as `/its/path (deleted)`. An entry whose `readlink` fails
+/// -- the descriptor closed underneath the walk -- is skipped.
+///
+/// On macOS only vnode-backed descriptors are reported. The list from
+/// `proc_pidinfo(PROC_PIDLISTFDS)` is filtered to `PROX_FDTYPE_VNODE`, which
+/// covers regular files, directories and devices, and each survivor is
+/// resolved to an absolute POSIX path. Sockets, pipes, kqueues and every
+/// other descriptor kind are dropped with no marker of any kind, so "is
+/// anything still holding my socket?" is answered no here whatever the
+/// truth. A vnode whose path cannot be read, or whose path comes back empty,
+/// is dropped as well.
+///
+/// On Windows the system-wide handle table is filtered to the target
+/// process, each of its handles is duplicated into this process, and only
+/// those whose NT object *type* name is `File` are named. That type is
+/// broader than files on disk. The name is whatever
+/// `NtQueryObject(ObjectNameInformation)` returned, verbatim, which is a
+/// name in the NT object namespace rather than the DOS one:
+/// `\Device\HarddiskVolume3\Users\me\cache.db`, or `\Device\NamedPipe\...`
+/// for a pipe. Nothing on this path converts an NT device name to a drive
+/// letter, so a `C:\Users\me\cache.db` built from a `Path` never compares
+/// equal to anything returned here, and a caller that tests for its own file
+/// by string equality silently never finds it. A handle that cannot be
+/// duplicated, whose type cannot be read, or that comes back with an empty
+/// name is dropped rather than failing the whole snapshot.
+///
+/// # Errors
+///
+/// `pid == 0` is rejected as `InvalidInput` on all three hosts. Otherwise
+/// Linux needs only to read `/proc/<pid>/fd` and macOS only to be allowed
+/// `proc_pidinfo`, while Windows must first open the target with
+/// `PROCESS_DUP_HANDLE` and returns the operating system's error when it
+/// cannot -- so the same question can fail outright on Windows for a process
+/// the other two hosts answer for.
+///
+/// An `Ok` that is empty, or that omits a descriptor kind this host does not
+/// report, is indistinguishable from a truthful "nothing is open".
 pub use crate::platform_imp::read_process_file_handles;
 
 /// Platform-neutral Unix signal selectors used by the compatibility facade.

@@ -1,0 +1,16 @@
+error: `framehop::ModuleSectionInfo` is implemented for an exported kernal-api type; a client cannot call through this impl without importing the trait from `framehop` -- offer an inherent method or a facade-owned trait instead
+  --> $DIR/facade_owned_trait_impl.rs:18:1
+   |
+LL | impl framehop::ModuleSectionInfo<Vec<u8>> for FacadeStream {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(kernal_api_boundary)]` on by default
+
+error: `tokio::ToSocketAddrs` is implemented for an exported kernal-api type; a client cannot call through this impl without importing the trait from `tokio` -- offer an inherent method or a facade-owned trait instead
+  --> $DIR/facade_owned_trait_impl.rs:21:1
+   |
+LL | impl tokio::net::ToSocketAddrs for FacadeStream {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

@@ -14,4 +14,10 @@ pub mod task {
 
 pub mod io {
     pub trait AsyncRead {}
+
+    pub trait AsyncWrite {}
+}
+
+pub mod net {
+    pub trait ToSocketAddrs {}
 }

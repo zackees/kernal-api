@@ -116,6 +116,15 @@ jobs:
           - allocator
           - conpty-sidecar
           - crash
+          # The four daemon lanes are the frozen running-process substrates.
+          # Without them these features are compiled only inside
+          # `--all-features` on `rust-native`, where every other feature is
+          # present to supply whatever a missing gate would need -- exactly
+          # the coupling this matrix exists to catch.
+          - daemon-frame-v1
+          - daemon-identity
+          - daemon-registration
+          - daemon-registration-v2
           - fs
           - fs-watch
           - ipc
@@ -134,6 +143,35 @@ jobs:
       - run: >-
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
+
+  # Compile the two external facade consumers. Each is its own `[workspace]`
+  # that depends on this crate by path with `default-features = false`, so it
+  # resolves `kernal-api` the way an application does -- without this
+  # workspace's dev-dependencies, lints, or sibling features. `each-feature`
+  # above proves a feature compiles inside this workspace; only this lane
+  # proves the opt-in surface is nameable from outside it, where a public
+  # signature that needs a `running-process` type spelled out fails and
+  # nowhere else. Until this job existed the consumers were read only by the
+  # text scan in `tests/facade_policy.rs`, which compiles nothing.
+  #
+  # One job with two steps rather than a matrix: `setup-soldr` dominates the
+  # cost of a `cargo check` this small, and the step names already say which
+  # consumer broke. `--locked` is deliberate -- each consumer carries its own
+  # lock file, so a dependency change in this crate's manifest has to be
+  # reflected in both of them or this lane fails.
+  facade-consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - name: Check the external daemon-registration consumer
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tests/daemon-registration-consumer/Cargo.toml
+      - name: Check the external daemon-registration-v2 consumer
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
 
   threaded-rust-artifact:
     strategy:

@@ -3,3 +3,5 @@
 /.extern-repos/
 *.egg-info/
 __pycache__/
+# Separate workspaces: each builds into a target directory beside its manifest.
+/tests/*-consumer/target/

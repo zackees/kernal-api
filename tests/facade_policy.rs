@@ -326,6 +326,20 @@ fn daemon_registration_remains_opt_in_and_client_free() {
     );
     let consumer_source = std::fs::read_to_string(consumer_root.join("src/main.rs"))
         .expect("read external daemon-registration consumer source");
+    // A forbidden-substring loop is vacuously true on an emptied file, so
+    // require the calls this fixture claims to make. CI's `facade-consumers`
+    // job is what actually compiles it; this is only the backstop against the
+    // fixture being hollowed out.
+    for required in [
+        "use kernal_api::daemon_registration::",
+        "CacheManifestBuilder::new",
+        "ServiceDefinitionBuilder::shared_broker",
+    ] {
+        assert!(
+            consumer_source.contains(required),
+            "external consumer must still exercise {required:?}"
+        );
+    }
     for forbidden in ["running_process", "prost", "tokio", "platform"] {
         assert!(
             !consumer_source.contains(forbidden),
@@ -427,6 +441,18 @@ fn daemon_registration_v2_remains_opt_in_and_client_free() {
     );
     let consumer_source = std::fs::read_to_string(consumer_root.join("src/main.rs"))
         .expect("read external daemon-registration-v2 consumer source");
+    // Same backstop as the v1 consumer above: keep the emptied-fixture case
+    // from passing the forbidden-substring loop by default.
+    for required in [
+        "use kernal_api::daemon_registration_v2::",
+        "ServiceDefinitionBuilder::shared_broker",
+        "service_definition_path(",
+    ] {
+        assert!(
+            consumer_source.contains(required),
+            "external v2 consumer must still exercise {required:?}"
+        );
+    }
     for forbidden in ["running_process", "prost", "tokio", "platform"] {
         assert!(
             !consumer_source.contains(forbidden),

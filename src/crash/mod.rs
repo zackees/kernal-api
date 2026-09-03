@@ -29,6 +29,7 @@
 //! | Per-platform `context_label(&CrashContext)` (`ctx.siginfo.ssi_signo`, `ctx.exception.kind`, `ctx.exception_pointers`) | [`spool::RawCrashReport::fault_code`] — see that field's docs for the platform-specific caveats before writing a label decoder |
 //! | Per-platform `context_summary(&CrashContext)` (`si_addr`, `tid`/`thread`/`thread_id`) | [`spool::RawCrashReport::fault_address`] and [`spool::RawCrashReport::tid`] |
 //! | A caller-chosen binary stem interpolated into every dump filename | [`spool::CrashMetadata::app_name`] (and `app_class`/`instance_name`/`app_version`), registered once via [`install`] |
+//! | The backend error returned by a failed `attach` | [`InstallError::Handler`], carrying the classified [`HandlerError`] |
 //!
 //! `kernal_api::crash` does not format a human-readable text report; it spools
 //! a fixed-layout binary record ([`spool::RECORD_SIZE`] bytes) to an
@@ -78,7 +79,7 @@ pub enum InstallError {
     Spool(#[source] io::Error),
     /// The platform crash handler could not be attached.
     #[error("cannot attach native crash handler: {0}")]
-    Handler(#[source] crash_handler::Error),
+    Handler(#[source] HandlerError),
     /// The all-thread sampler could not be started.
     #[error("cannot start crash snapshot sampler: {0}")]
     Sampler(#[source] io::Error),
@@ -89,6 +90,56 @@ pub enum InstallError {
     /// A post-fork child must exec before installing its own crash runtime.
     #[error("crash capture was inherited across fork; exec before reinstalling")]
     ForkedProcess,
+}
+
+/// Why the platform refused to arm native crash interception.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandlerErrorKind {
+    /// Another crash handler already owns the process-wide slot.
+    AlreadyInstalled,
+    /// The handler's fixed-size scratch memory could not be reserved.
+    OutOfMemory,
+    /// The operating system rejected the attach.
+    Os,
+}
+
+/// Facade-owned detail behind [`InstallError::Handler`].
+///
+/// The attach failure is classified once, here, so a caller never names the
+/// native handler backend to tell "somebody else owns the slot" apart from a
+/// resource or OS failure.
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct HandlerError {
+    kind: HandlerErrorKind,
+    message: String,
+}
+
+impl HandlerError {
+    /// The classified reason the attach failed.
+    pub fn kind(&self) -> HandlerErrorKind {
+        self.kind
+    }
+
+    /// The platform's own rendering of the failure.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Classify a backend attach failure. Private: the argument type is the
+    /// backend vocabulary this error exists to keep off the public surface.
+    fn from_backend(error: crash_handler::Error) -> Self {
+        let kind = match &error {
+            crash_handler::Error::HandlerAlreadyInstalled => HandlerErrorKind::AlreadyInstalled,
+            crash_handler::Error::OutOfMemory => HandlerErrorKind::OutOfMemory,
+            crash_handler::Error::Io(_) => HandlerErrorKind::Os,
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Keeps the native handler and sampler armed.
@@ -498,7 +549,8 @@ fn attach_handler(shared: &Arc<Shared>) -> Result<CrashHandler, InstallError> {
             CrashEventResult::Handled(false)
         })
     };
-    let handler = CrashHandler::attach(event).map_err(InstallError::Handler)?;
+    let handler = CrashHandler::attach(event)
+        .map_err(|error| InstallError::Handler(HandlerError::from_backend(error)))?;
 
     #[cfg(windows)]
     if let Err(error) = install_windows_abort_chain(shared, previous_abort) {
@@ -1235,6 +1287,24 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn attach_failures_are_classified_into_facade_kinds() {
+        let already = HandlerError::from_backend(crash_handler::Error::HandlerAlreadyInstalled);
+        assert_eq!(already.kind(), HandlerErrorKind::AlreadyInstalled);
+        assert_eq!(
+            HandlerError::from_backend(crash_handler::Error::OutOfMemory).kind(),
+            HandlerErrorKind::OutOfMemory
+        );
+        let os =
+            HandlerError::from_backend(crash_handler::Error::Io(io::Error::from_raw_os_error(1)));
+        assert_eq!(os.kind(), HandlerErrorKind::Os);
+        assert!(!os.message().is_empty());
+        assert_eq!(
+            InstallError::Handler(already.clone()).to_string(),
+            format!("cannot attach native crash handler: {}", already.message())
+        );
     }
 
     #[test]

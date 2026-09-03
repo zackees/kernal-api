@@ -2,13 +2,17 @@
 
 extern crate rustc_errors;
 extern crate rustc_hir;
+extern crate rustc_middle;
 extern crate rustc_span;
 
 use rustc_errors::DiagDecorator;
-use rustc_hir::def::Res;
-use rustc_hir::{AmbigArg, Expr, ExprKind, Item, ItemKind, Ty, TyKind};
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
+use rustc_hir::{AmbigArg, Expr, ExprKind, ImplItem, Item, ItemKind, TraitItem, Ty, TyKind};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_middle::ty;
 use rustc_span::{FileName, RemapPathScopeComponents, Span};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 dylint_linting::declare_late_lint! {
@@ -18,6 +22,12 @@ dylint_linting::declare_late_lint! {
     /// `kernal-api`. Clients use facade-owned types and operations instead,
     /// which prevents dependency/version drift and backend vocabulary from
     /// escaping into application interfaces.
+    ///
+    /// Inside `kernal-api` itself the rule is the complementary one: a backend
+    /// may be used privately, but naming one in a public type position --
+    /// enum variant payload, public field, function parameter or return type,
+    /// alias, or bound -- puts backend vocabulary back into the application
+    /// interface just as surely as a `pub use` does.
     pub KERNAL_API_BOUNDARY,
     Deny,
     "require systems and async APIs owned by kernal-api to pass through its facades"
@@ -63,7 +73,7 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        if current_package_is_facade_owner() || is_boundary_source(cx, expr.span) {
+        if is_facade_owner(cx) || is_boundary_source(cx, expr.span) {
             return;
         }
         let def_id = match expr.kind {
@@ -80,7 +90,7 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
     }
 
     fn check_ty(&mut self, cx: &LateContext<'tcx>, ty: &'tcx Ty<'tcx, AmbigArg>) {
-        if current_package_is_facade_owner() || is_boundary_source(cx, ty.span) {
+        if is_facade_owner(cx) || is_boundary_source(cx, ty.span) {
             return;
         }
         let TyKind::Path(qpath) = ty.kind else {
@@ -92,7 +102,11 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if current_package_is_facade_owner() || is_boundary_source(cx, item.span) {
+        if is_facade_owner(cx) {
+            check_public_signature(cx, item.owner_id.def_id);
+            return;
+        }
+        if is_boundary_source(cx, item.span) {
             return;
         }
         let ItemKind::Use(path, _) = item.kind else {
@@ -104,6 +118,28 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
             }
         }
     }
+
+    fn check_impl_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx ImplItem<'tcx>) {
+        if !is_facade_owner(cx) {
+            return;
+        }
+        // A trait implementation restates a signature the trait already fixed,
+        // so the private adapters that convert into a backend type are not the
+        // facade choosing to speak backend vocabulary. Inherent methods are.
+        if matches!(
+            cx.tcx.def_kind(cx.tcx.local_parent(item.owner_id.def_id)),
+            DefKind::Impl { of_trait: true }
+        ) {
+            return;
+        }
+        check_public_signature(cx, item.owner_id.def_id);
+    }
+
+    fn check_trait_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx TraitItem<'tcx>) {
+        if is_facade_owner(cx) {
+            check_public_signature(cx, item.owner_id.def_id);
+        }
+    }
 }
 
 fn current_package_is_facade_owner() -> bool {
@@ -112,6 +148,140 @@ fn current_package_is_facade_owner() -> bool {
 
 fn package_is_facade_owner(package_name: Option<&str>) -> bool {
     package_name == Some("kernal-api")
+}
+
+/// The facade owner is exempt from the client rule and subject to the public
+/// signature rule instead. Cargo's package environment identifies it during an
+/// ordinary `cargo dylint` run; the crate name identifies it in this lint's
+/// own UI fixtures, where the package environment belongs to the lint.
+fn is_facade_owner(cx: &LateContext<'_>) -> bool {
+    current_package_is_facade_owner() || cx.tcx.crate_name(LOCAL_CRATE).as_str() == "kernal_api"
+}
+
+/// Reject every owned backend crate reachable from a public type position of
+/// `def_id`. This is the half of the boundary that a `pub use` grep and a
+/// client-side reference check both miss: a backend named in the payload of a
+/// public enum variant, a public field, a signature, an alias, or a bound is
+/// backend vocabulary a client must speak, whether or not it is re-exported.
+fn check_public_signature(cx: &LateContext<'_>, def_id: LocalDefId) {
+    if !cx.effective_visibilities.is_exported(def_id) {
+        return;
+    }
+    let tcx = cx.tcx;
+    let span = tcx.def_span(def_id);
+    let mut leaks = OwnedTypeLeaks::default();
+    let has_predicates = match tcx.def_kind(def_id) {
+        DefKind::Struct | DefKind::Enum | DefKind::Union => {
+            for variant in tcx.adt_def(def_id).variants() {
+                for field in &variant.fields {
+                    // Enum variant fields inherit the enum's visibility; a
+                    // private or `pub(crate)` struct field names nothing a
+                    // client can reach.
+                    if !tcx.visibility(field.did).is_public() {
+                        continue;
+                    }
+                    leaks.record_ty(
+                        cx,
+                        tcx.def_span(field.did),
+                        tcx.type_of(field.did)
+                            .instantiate_identity()
+                            .skip_normalization(),
+                    );
+                }
+            }
+            true
+        }
+        DefKind::Fn | DefKind::AssocFn => {
+            let signature = tcx.fn_sig(def_id).instantiate_identity();
+            for input_or_output in signature.skip_binder().inputs_and_output {
+                leaks.record_ty(cx, span, input_or_output);
+            }
+            true
+        }
+        DefKind::TyAlias
+        | DefKind::Const { .. }
+        | DefKind::AssocConst { .. }
+        | DefKind::Static { .. } => {
+            leaks.record_ty(
+                cx,
+                span,
+                tcx.type_of(def_id)
+                    .instantiate_identity()
+                    .skip_normalization(),
+            );
+            true
+        }
+        DefKind::Trait => true,
+        _ => false,
+    };
+    if has_predicates {
+        for (clause, clause_span) in tcx.predicates_of(def_id).predicates {
+            if let ty::ClauseKind::Trait(predicate) = clause.kind().skip_binder() {
+                leaks.record_def(cx, *clause_span, predicate.trait_ref.def_id);
+                for argument in predicate.trait_ref.args {
+                    if let Some(argument) = argument.as_type() {
+                        leaks.record_ty(cx, *clause_span, argument);
+                    }
+                }
+            }
+        }
+    }
+    leaks.report(cx);
+}
+
+/// One diagnostic per owned crate per item, at the first position that named
+/// it, so a wide signature does not bury the boundary violation in repeats.
+#[derive(Default)]
+struct OwnedTypeLeaks {
+    found: BTreeMap<String, Span>,
+}
+
+impl OwnedTypeLeaks {
+    fn record_ty<'tcx>(&mut self, cx: &LateContext<'tcx>, span: Span, ty: ty::Ty<'tcx>) {
+        for argument in ty.walk() {
+            let Some(argument) = argument.as_type() else {
+                continue;
+            };
+            let def_id = match argument.kind() {
+                ty::Adt(definition, _) => definition.did(),
+                ty::FnDef(def_id, _) | ty::Closure(def_id, _) | ty::Foreign(def_id) => *def_id,
+                ty::Alias(alias) => alias.kind.def_id(),
+                _ => continue,
+            };
+            self.record_def(cx, span, def_id);
+        }
+    }
+
+    fn record_def(&mut self, cx: &LateContext<'_>, span: Span, def_id: DefId) {
+        if let Some(crate_name) = owned_crate_name(cx, def_id) {
+            self.found.entry(crate_name).or_insert(span);
+        }
+    }
+
+    fn report(self, cx: &LateContext<'_>) {
+        for (crate_name, span) in self.found {
+            cx.opt_span_lint(
+                KERNAL_API_BOUNDARY,
+                Some(span),
+                DiagDecorator(move |diag| {
+                    diag.primary_message(format!(
+                        "`{crate_name}` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead"
+                    ));
+                }),
+            );
+        }
+    }
+}
+
+/// The owned implementation crate `def_id` belongs to, if any.
+fn owned_crate_name(cx: &LateContext<'_>, def_id: DefId) -> Option<String> {
+    if def_id.is_local() {
+        return None;
+    }
+    let crate_name = cx.tcx.crate_name(def_id.krate).as_str().to_string();
+    OWNED_IMPLEMENTATION_CRATES
+        .contains(&crate_name.as_str())
+        .then_some(crate_name)
 }
 
 /// Read the current client package manifest as well as its resolved HIR uses.
@@ -190,14 +360,10 @@ fn is_boundary_source(cx: &LateContext<'_>, span: Span) -> bool {
     filename.replace('\\', "/").contains("/kernal-api/src/")
 }
 
-fn check_def(cx: &LateContext<'_>, span: Span, def_id: rustc_hir::def_id::DefId) {
-    if def_id.is_local() {
+fn check_def(cx: &LateContext<'_>, span: Span, def_id: DefId) {
+    let Some(crate_name) = owned_crate_name(cx, def_id) else {
         return;
-    }
-    let crate_name = cx.tcx.crate_name(def_id.krate).as_str().to_string();
-    if !OWNED_IMPLEMENTATION_CRATES.contains(&crate_name.as_str()) {
-        return;
-    }
+    };
     cx.opt_span_lint(
         KERNAL_API_BOUNDARY,
         Some(span),

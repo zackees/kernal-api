@@ -1,0 +1,52 @@
+error: `crash_handler` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:19:13
+   |
+LL |     Handler(Error),
+   |             ^^^^^
+   |
+   = note: `#[deny(kernal_api_boundary)]` on by default
+
+error: `tokio` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:23:5
+   |
+LL |     pub lock: Mutex<u8>,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:26:1
+   |
+LL | pub fn public_parameter(lock: Mutex<u8>) {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `crash_handler` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:28:1
+   |
+LL | pub fn public_return() -> Option<Error> {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:32:1
+   |
+LL | pub type PublicAlias = Mutex<u8>;
+   | ^^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:34:24
+   |
+LL | pub fn public_bound<T: tokio::io::AsyncRead>(value: T) {}
+   |                        ^^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:36:29
+   |
+LL | pub trait PublicSupertrait: tokio::io::AsyncRead {}
+   |                             ^^^^^^^^^^^^^^^^^^^^
+
+error: `crash_handler` appears in a public kernal-api type position; a client that names this type speaks backend vocabulary -- expose a facade-owned type instead
+  --> $DIR/facade_public_signature.rs:41:5
+   |
+LL |     pub fn inherent_return(&self) -> Option<Error> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 8 previous errors
+

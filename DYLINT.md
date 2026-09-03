@@ -28,6 +28,15 @@ function items, imports, and public type references are also resolved to the
 underlying crate and rejected. Client APIs must expose `kernal_api`-owned
 facade types instead.
 
+Inside `kernal-api` the same lint applies the complementary rule. A backend may
+be used privately there, but it may not appear in a public type position: the
+payload of a public enum variant, a public field, a function parameter or
+return type, a type alias, a const or static, or a bound. A backend named in
+one of those is vocabulary a client has to speak in order to match on or call
+the item, whether or not it is re-exported, so a `pub use` grep does not see
+it. A private field of a public newtype, a private item, and a trait
+implementation that adapts a facade type into a backend one all remain legal.
+
 `running-process` is classified as an owned implementation dependency for the
 target architecture. It is allowed inside `kernal-api`; phase 1 will add the
 private adapter. It is denied in each first-party application once that

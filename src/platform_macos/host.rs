@@ -507,7 +507,7 @@ mod tests {
             (OsString::from("SECOND"), OsString::from("two")),
         ]);
         let text = String::from_utf16_lossy(&block);
-        let entries: Vec<&str> = text.split(' ').filter(|s| !s.is_empty()).collect();
+        let entries: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
         assert_eq!(entries, vec!["FIRST=one", "SECOND=two"]);
     }
 }

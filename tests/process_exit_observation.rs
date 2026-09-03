@@ -69,15 +69,6 @@ fn shell_command() -> std::process::Command {
     }
 }
 
-/// Let go of every handle to a finished process.
-///
-/// Reaping is not enough on Windows: a `Child` keeps the process handle open
-/// until it is dropped, and Windows will not release a PID -- or refuse to
-/// open it -- while any handle to it remains.
-fn release(child: std::process::Child) {
-    drop(child);
-}
-
 /// The trap, closed in the type rather than tested for at each call site.
 ///
 /// `u32::MAX` is the value that reached `kill(2)` as `-1` in the consumer this
@@ -113,6 +104,12 @@ fn a_process_id_holds_only_values_that_name_one_process() {
 /// Acquisition is the reuse safety: a watch either names the process running
 /// at that moment or does not exist, so there is nothing to silently retarget
 /// when the number is handed to somebody else.
+///
+/// The child handle is deliberately still held here. On Windows that keeps
+/// the process *object* alive after the process itself is finished, and
+/// `OpenProcess` goes on succeeding against it; the hosts have to agree
+/// anyway, because a caller reading a PID out of a state row has no idea who
+/// else is holding a handle to it.
 #[test]
 fn a_watch_cannot_be_acquired_for_a_process_that_has_gone() {
     let mut child = command_that_exits_now()
@@ -120,9 +117,8 @@ fn a_watch_cannot_be_acquired_for_a_process_that_has_gone() {
         .expect("spawn a process to lose");
     let pid = ProcessId::new(child.id()).expect("a spawned pid is in range");
     child.wait().expect("reap");
-    release(child);
 
-    let error = ProcessExitWatch::open(pid).expect_err("a reaped pid names nothing");
+    let error = ProcessExitWatch::open(pid).expect_err("a finished process has no exit left");
     assert_eq!(error.kind, ProcessInspectErrorKind::NotFound);
 }
 
@@ -258,7 +254,6 @@ fn a_child_bound_to_another_owner_dies_when_that_owner_does() {
 
         owner.kill().expect("end the owner");
         owner.wait().expect("reap the owner");
-        release(owner);
 
         timeout(Duration::from_secs(10), child.wait())
             .await
@@ -276,7 +271,6 @@ fn binding_to_an_owner_that_has_already_exited_fails_the_spawn() {
         .expect("spawn the nominated owner");
     let owner_id = ProcessId::new(owner.id()).expect("pid in range");
     owner.wait().expect("reap the owner");
-    release(owner);
 
     let outcome = runtime().run(async {
         long_running_spec()

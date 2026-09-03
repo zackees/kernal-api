@@ -4,10 +4,10 @@ use std::io;
 use std::ptr;
 use std::sync::Arc;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetExitCodeProcess, OpenProcess, SetEvent, WaitForMultipleObjects, INFINITE,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    CreateEventW, GetExitCodeProcess, OpenProcess, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject, INFINITE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 use crate::platform::process::{
@@ -30,9 +30,14 @@ const WAIT_FAILED: u32 = 0xFFFF_FFFF;
 /// The open handle *is* the reuse safety. Windows will not reissue a PID
 /// while any handle to that process remains open, so a handle taken once
 /// keeps naming the same process -- including after it exits, when it becomes
-/// a handle to a known-dead process rather than a stale number. Opening it
-/// either succeeds against the process alive at that moment or fails, so the
-/// watch cannot silently retarget.
+/// a handle to a known-dead process rather than a stale number.
+///
+/// That same property is why acquisition needs a second question here. On the
+/// Unix hosts a process that has been waited for is simply gone, and the
+/// acquiring syscall says so. On this one the process *object* outlives the
+/// process for as long as anybody holds a handle -- its own parent's `Child`
+/// will do -- and `OpenProcess` keeps handing out handles to it. Opening is
+/// therefore not by itself evidence of a live target, and [`Self::open`] asks.
 ///
 /// This host is the generous one about status: `GetExitCodeProcess` answers
 /// through any handle with query rights, parent or not, so the exit code is
@@ -63,7 +68,15 @@ impl ProcessExitWatch {
     ///
     /// `SYNCHRONIZE` is requested alongside query rights because a handle
     /// opened for queries alone cannot be waited on -- the access mask is
-    /// checked when the wait starts, not when it would have completed.
+    /// checked when the wait starts, not when it would have completed. It is
+    /// also what lets acquisition ask whether the target is still running.
+    ///
+    /// An exited process that somebody still holds a handle to is reported
+    /// gone, like one this host has finished with entirely. The two are
+    /// different situations for the kernel and the same one for the caller:
+    /// there is no exit left to wait for, and a watch that returned
+    /// immediately would be a subscription to something that already
+    /// happened, which is not what asking for one means.
     pub fn open(pid: ProcessId) -> Result<Self, ProcessInspectError> {
         // SAFETY: the call takes access flags, an inherit flag, and a PID by
         // value; the returned handle is checked before use.
@@ -76,16 +89,26 @@ impl ProcessExitWatch {
         };
         if handle.is_null() {
             let source = io::Error::last_os_error();
-            const ERROR_INVALID_PARAMETER: i32 = 87;
             let kind = match source.raw_os_error() {
-                Some(ERROR_INVALID_PARAMETER) => ProcessInspectErrorKind::NotFound,
+                Some(code) if code == ERROR_INVALID_PARAMETER as i32 => {
+                    ProcessInspectErrorKind::NotFound
+                }
                 _ => ProcessInspectErrorKind::Host,
             };
             return Err(ProcessInspectError { kind, source });
         }
+
+        // Owned before the liveness question, so every path below closes it.
+        let process = KernelHandle(handle);
+        if has_already_exited(&process) {
+            return Err(ProcessInspectError::stated(
+                ProcessInspectErrorKind::NotFound,
+                "no such process",
+            ));
+        }
         Ok(Self {
             pid,
-            process: Arc::new(KernelHandle(handle)),
+            process: Arc::new(process),
         })
     }
 
@@ -152,6 +175,19 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Whether this handle already names a finished process.
+///
+/// A process handle is signalled from the moment the process exits, and a
+/// zero-length wait reads that without blocking. `GetExitCodeProcess` against
+/// `STILL_ACTIVE` would answer the same question wrongly: 259 is a legal exit
+/// code, so a process that chose it would be called alive forever.
+fn has_already_exited(process: &KernelHandle) -> bool {
+    // SAFETY: the handle is live and was opened with SYNCHRONIZE; a zero
+    // timeout makes this a question rather than a wait.
+    let waited = unsafe { WaitForSingleObject(process.0, 0) };
+    waited == WAIT_OBJECT_0
+}
+
 /// A manual-reset event, so a cancellation set once stays set.
 fn create_cancel_event() -> Result<KernelHandle, ProcessInspectError> {
     // SAFETY: default security, manual reset, initially unsignalled, unnamed;
@@ -210,11 +246,11 @@ mod tests {
     /// A process that is not there cannot be subscribed to, which is the
     /// acquisition half of reuse safety: no handle, so nothing to retarget.
     ///
-    /// Waiting is not enough on this host. A `Child` keeps the process handle
-    /// open until it is dropped, and while any handle exists the process
-    /// object does too -- which is exactly the property that makes a watch
-    /// reuse-safe, and exactly why the child has to be let go of here before
-    /// the PID counts as gone.
+    /// Asserted twice on purpose. While the `Child` is still held, the process
+    /// object is alive and `OpenProcess` succeeds -- so the first assertion is
+    /// the one that pins this host to the same contract the Unix hosts get for
+    /// free. The second is the ordinary case that follows once every handle is
+    /// closed.
     #[test]
     fn a_reaped_process_cannot_be_watched() {
         let mut child = std::process::Command::new("cmd.exe")
@@ -223,9 +259,13 @@ mod tests {
             .expect("spawn");
         let pid = ProcessId::new(child.id()).expect("child pid is in range");
         child.wait().expect("reap");
+
+        let retained = ProcessExitWatch::open(pid).expect_err("an exited process has no exit left");
+        assert_eq!(retained.kind, ProcessInspectErrorKind::NotFound);
+
         drop(child);
-        let error = ProcessExitWatch::open(pid).expect_err("a reaped pid is gone");
-        assert_eq!(error.kind, ProcessInspectErrorKind::NotFound);
+        let released = ProcessExitWatch::open(pid).expect_err("a reaped pid is gone");
+        assert_eq!(released.kind, ProcessInspectErrorKind::NotFound);
     }
 
     /// A watch names the process it was opened for, and this host will open

@@ -233,6 +233,12 @@ impl ProcessId {
     /// Crate-private on purpose: the invariant is what makes this cast safe,
     /// and handing the result out would let a caller re-derive the very trap
     /// the type exists to close.
+    ///
+    /// Unix-only, because a signed process identifier is a Unix idea. Windows
+    /// passes the number unsigned and has no negative reading to guard
+    /// against; it keeps the same accepted range for the sake of a PID that
+    /// one host writes down and another reads back, not for this cast.
+    #[cfg(unix)]
     #[must_use]
     pub(crate) const fn native_signed(self) -> i32 {
         self.0 as i32

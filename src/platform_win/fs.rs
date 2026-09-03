@@ -101,24 +101,58 @@ pub fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Take or wait for a lock on the whole file, with the given `LockFileEx`
-/// flags. Private: every public lock entry point below is one flag
-/// combination of this call.
-fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result<()> {
+/// The offset of the one byte every lock in this module is taken on.
+///
+/// A `LockFileEx` range is *mandatory*: the kernel denies `ReadFile` and
+/// `WriteFile` from every other handle inside it, not just competing lock
+/// requests. Locking the whole file would therefore make this module's
+/// advisory promise false on this host alone -- a second process that opened
+/// the lock file only to read who holds it would fail with
+/// `ERROR_LOCK_VIOLATION`, and a shared holder would block every
+/// non-participating writer. Confining the lock to a single byte far outside
+/// any real file's data keeps the exclusion between lock holders exactly as
+/// it was and leaves the file body readable and writable, which is what the
+/// facade means by "advisory" and the same trick SQLite uses for its
+/// cross-platform locking.
+///
+/// `1 << 62` is the offset because it is past anything a filesystem can hold
+/// while still positive when the kernel reads it as the signed
+/// `LARGE_INTEGER` that `NtLockFile` takes underneath `LockFileEx`. Locking a
+/// range beyond end-of-file is legal and does not extend the file.
+const LOCK_BYTE_OFFSET: u64 = 1 << 62;
+
+/// Fill the `OVERLAPPED` offset pair that names [`LOCK_BYTE_OFFSET`].
+///
+/// Both `LockFileEx` and `UnlockFileEx` take the range's start this way and
+/// its length in the two `DWORD` arguments, so the pair has to agree between
+/// them or a release silently fails with `ERROR_NOT_LOCKED`.
+fn lock_byte_overlapped() -> winapi::um::minwinbase::OVERLAPPED {
     use std::mem;
-    use std::os::windows::io::AsRawHandle as _;
-    use winapi::um::fileapi::LockFileEx;
     use winapi::um::minwinbase::OVERLAPPED;
-    use winapi::um::winnt::HANDLE;
 
     let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+    let offsets = unsafe { overlapped.u.s_mut() };
+    offsets.Offset = LOCK_BYTE_OFFSET as u32;
+    offsets.OffsetHigh = (LOCK_BYTE_OFFSET >> 32) as u32;
+    overlapped
+}
+
+/// Take or wait for a lock on [`LOCK_BYTE_OFFSET`], with the given
+/// `LockFileEx` flags. Private: every public lock entry point below is one
+/// flag combination of this call.
+fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use winapi::um::fileapi::LockFileEx;
+    use winapi::um::winnt::HANDLE;
+
+    let mut overlapped = lock_byte_overlapped();
     let result = unsafe {
         LockFileEx(
             file.as_raw_handle() as HANDLE,
             flags,
             0,
-            u32::MAX,
-            u32::MAX,
+            1,
+            0,
             &mut overlapped,
         )
     };
@@ -130,6 +164,12 @@ fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result
 }
 
 /// Take an exclusive advisory lock without waiting.
+///
+/// This host refuses an exclusive request that overlaps a range the *same*
+/// handle already locked, so a caller that still holds a shared lock on this
+/// file gets a conflict here rather than an upgrade. That is the one place
+/// the hosts genuinely differ, and the facade documents it as a rule callers
+/// keep: one lock guard per open file.
 pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
     use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
 
@@ -137,6 +177,10 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
 }
 
 /// Take an exclusive advisory lock, waiting until it is available.
+///
+/// The waiting form of the same refusal [`try_lock_exclusive`] describes:
+/// asked to upgrade a lock the same handle already holds, this waits for a
+/// release that only this caller could perform, and so never returns.
 pub fn lock_exclusive(file: &File) -> io::Result<()> {
     use winapi::um::minwinbase::LOCKFILE_EXCLUSIVE_LOCK;
 
@@ -163,23 +207,17 @@ pub fn try_lock_shared(file: &File) -> io::Result<()> {
 
 /// Release a lock taken by [`try_lock_exclusive`], [`try_lock_shared`],
 /// [`lock_exclusive`], or [`lock_shared`].
+///
+/// The range must be the one `lock_file` took, byte for byte: this host
+/// releases a named range, not "whatever this handle holds", and a mismatched
+/// range fails with `ERROR_NOT_LOCKED` while the lock stays held.
 pub fn unlock(file: &File) -> io::Result<()> {
-    use std::mem;
     use std::os::windows::io::AsRawHandle as _;
     use winapi::um::fileapi::UnlockFileEx;
-    use winapi::um::minwinbase::OVERLAPPED;
     use winapi::um::winnt::HANDLE;
 
-    let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
-    let result = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle() as HANDLE,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
+    let mut overlapped = lock_byte_overlapped();
+    let result = unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) };
     if result == 0 {
         Err(io::Error::last_os_error())
     } else {

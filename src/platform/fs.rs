@@ -89,7 +89,31 @@ use std::time::SystemTime;
 /// Advisory locks exclude other advisory-lock holders only, never a process
 /// that opens and reads or writes the file without locking it -- that is true
 /// on every supported host and is what "advisory" means throughout this
-/// module.
+/// module. Unix gets it from `flock`, which is advisory by construction;
+/// Windows byte-range locks are mandatory, so the Windows implementation
+/// takes its lock on a single byte far past any file's data, leaving the body
+/// unobstructed. The exclusion between holders is identical either way; only
+/// the bytes the kernel guards differ, and no caller reads or writes those.
+///
+/// # One guard per open file
+///
+/// A guard borrows the file shared, so nothing stops a caller from holding
+/// two guards on the *same* [`File`] -- and every host answers that
+/// differently, so it is a programming error rather than a portable
+/// operation:
+///
+/// - Unix `flock` converts the lock in place, so a shared guard followed by
+///   an exclusive one is an upgrade, and *either* guard's drop releases the
+///   file's lock outright, including the one the other guard still thinks it
+///   holds.
+/// - Windows refuses an exclusive request that overlaps a range the same
+///   handle already locked: [`try_lock_exclusive`] reports a conflict (see
+///   [`is_lock_conflict`]) and [`lock_exclusive`] waits forever, because the
+///   only holder that could release it is the caller that is waiting.
+///
+/// Hold one guard per open file. A second lock on the same path needs a
+/// second [`open_lock_file`] handle, which is also what makes the exclusion
+/// between the two meaningful.
 #[cfg(feature = "fs")]
 #[derive(Debug)]
 pub struct FileLock<'file> {
@@ -683,6 +707,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A held lock obstructs no one who did not ask for a lock.
+    ///
+    /// This is the facade's advisory promise stated as a test, and it is the
+    /// pidfile pattern [`open_lock_file`] exists for: a holder writes who it
+    /// is, and anyone else reads that without participating in the locking.
+    /// Deliberately not host-gated -- the claim is that every host answers
+    /// the same way, so every host has to run it.
+    #[test]
+    fn a_lock_does_not_obstruct_a_process_that_never_locked() {
+        use std::io::{Read as _, Write as _};
+
+        let dir = std::env::temp_dir().join(format!("rp-fs-advisory-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("holder.lock");
+        std::fs::write(&path, b"00000").expect("seed contents");
+
+        let held = open_lock_file(&path).expect("open holder");
+
+        // An exclusive holder must not stop a plain reader.
+        let exclusive = lock_exclusive(&held).expect("holder takes it exclusively");
+        let mut contents = Vec::new();
+        std::fs::File::open(&path)
+            .expect("a non-participant can open it")
+            .read_to_end(&mut contents)
+            .expect("a non-participant can read it");
+        assert_eq!(contents, b"00000");
+        drop(exclusive);
+
+        // A shared holder must not stop a plain writer either. The write
+        // does not truncate: a lock file's contents belong to whoever wrote
+        // them, and replacing five bytes with five keeps this about the lock
+        // rather than about file length.
+        let shared = lock_shared(&held).expect("holder takes it shared");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .expect("a non-participant can open it for writing")
+            .write_all(b"11111")
+            .expect("a non-participant can write it");
+        drop(shared);
+
+        assert_eq!(std::fs::read(&path).expect("read back"), b"11111");
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Asking one handle to upgrade its own lock is refused, not granted.
+    ///
+    /// Windows-only because it is the host whose answer differs: `flock`
+    /// converts in place, while `LockFileEx` will not take an exclusive lock
+    /// overlapping a range the same handle already holds. Written against
+    /// the *try* form on purpose -- [`lock_exclusive`] would wait for a
+    /// release only this caller could perform, which is a hung CI lane
+    /// rather than a failing test.
+    #[cfg(windows)]
+    #[test]
+    fn one_handle_cannot_upgrade_its_own_shared_lock() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-upgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("upgrade.lock");
+
+        let file = open_lock_file(&path).expect("open");
+        let shared = lock_shared(&file).expect("take it shared");
+        let conflict = try_lock_exclusive(&file).expect_err("an upgrade must be refused");
+        assert!(
+            is_lock_conflict(&conflict),
+            "refusal must classify as a conflict, got {conflict:?}"
+        );
+        drop(shared);
+
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A genuine failure is not reported as a conflict, so a caller does not
     /// retry forever on something waiting cannot fix.
     #[test]
@@ -724,8 +824,9 @@ mod tests {
 
     /// Replacing works whether or not the target already exists.
     ///
-    /// Both cases matter: a bare rename onto an existing file fails on
-    /// Windows, and the no-target case is the one a first write takes.
+    /// Both cases matter, and they must be the same case: the no-target one
+    /// is what a first write takes, and a host that reached it by a different
+    /// call would owe that call's durability separately.
     #[test]
     fn a_file_is_replaced_whether_or_not_the_target_exists() {
         let dir = std::env::temp_dir().join(format!("rp-fs-replace-{}", std::process::id()));
@@ -748,6 +849,59 @@ mod tests {
 
         sync_directory(&dir).expect("sync the directory that records it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first write and an overwrite are the same move, not two mechanisms.
+    ///
+    /// Windows-only because it is the host that had two: a create branch that
+    /// took a plain rename and got no write-through, and a replace branch
+    /// that did. The durability itself cannot be asserted from a test -- it
+    /// only shows up across an unclean shutdown -- so this pins the property
+    /// that stands in for it: both paths move the temporary file's own record
+    /// into place, which a copy-and-replace would not do, so whatever the one
+    /// path guarantees the other guarantees too.
+    #[cfg(windows)]
+    #[test]
+    fn a_first_write_and_an_overwrite_move_the_same_way() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-replace-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("manifest");
+
+        for contents in [&b"first"[..], &b"second"[..]] {
+            let tmp = dir.join("staged.tmp");
+            std::fs::write(&tmp, contents).expect("stage");
+            let staged = path_identity(&tmp).expect("identity of the staged file");
+
+            replace_file(&tmp, &target).expect("replace");
+
+            assert_eq!(std::fs::read(&target).expect("read"), contents);
+            assert!(!tmp.exists(), "the staged path is consumed by the move");
+            if staged.is_some() {
+                assert_eq!(
+                    path_identity(&target).expect("identity of the target"),
+                    staged,
+                    "the target must be the staged file itself, moved"
+                );
+            }
+        }
+
+        sync_directory(&dir).expect("sync the directory that records it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that does not exist is not something to report as synced.
+    ///
+    /// Ungated: the answer must not depend on the host. Windows has nothing
+    /// to flush, but "nothing to flush" is not the same as "yes", and a
+    /// caller leaning on this as a cheap assertion gets the same answer
+    /// everywhere.
+    #[test]
+    fn syncing_a_directory_that_does_not_exist_is_an_error() {
+        let missing = std::env::temp_dir()
+            .join(format!("rp-fs-no-such-dir-{}", std::process::id()))
+            .join("nested");
+        let _ = std::fs::remove_dir_all(&missing);
+        sync_directory(&missing).expect_err("a missing directory cannot be synced");
     }
 
     /// Shared data and machine-local state are different roles, and a host

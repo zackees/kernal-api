@@ -101,24 +101,58 @@ pub fn open_lock_file(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Take or wait for a lock on the whole file, with the given `LockFileEx`
-/// flags. Private: every public lock entry point below is one flag
-/// combination of this call.
-fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result<()> {
+/// The offset of the one byte every lock in this module is taken on.
+///
+/// A `LockFileEx` range is *mandatory*: the kernel denies `ReadFile` and
+/// `WriteFile` from every other handle inside it, not just competing lock
+/// requests. Locking the whole file would therefore make this module's
+/// advisory promise false on this host alone -- a second process that opened
+/// the lock file only to read who holds it would fail with
+/// `ERROR_LOCK_VIOLATION`, and a shared holder would block every
+/// non-participating writer. Confining the lock to a single byte far outside
+/// any real file's data keeps the exclusion between lock holders exactly as
+/// it was and leaves the file body readable and writable, which is what the
+/// facade means by "advisory" and the same trick SQLite uses for its
+/// cross-platform locking.
+///
+/// `1 << 62` is the offset because it is past anything a filesystem can hold
+/// while still positive when the kernel reads it as the signed
+/// `LARGE_INTEGER` that `NtLockFile` takes underneath `LockFileEx`. Locking a
+/// range beyond end-of-file is legal and does not extend the file.
+const LOCK_BYTE_OFFSET: u64 = 1 << 62;
+
+/// Fill the `OVERLAPPED` offset pair that names [`LOCK_BYTE_OFFSET`].
+///
+/// Both `LockFileEx` and `UnlockFileEx` take the range's start this way and
+/// its length in the two `DWORD` arguments, so the pair has to agree between
+/// them or a release silently fails with `ERROR_NOT_LOCKED`.
+fn lock_byte_overlapped() -> winapi::um::minwinbase::OVERLAPPED {
     use std::mem;
-    use std::os::windows::io::AsRawHandle as _;
-    use winapi::um::fileapi::LockFileEx;
     use winapi::um::minwinbase::OVERLAPPED;
-    use winapi::um::winnt::HANDLE;
 
     let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+    let offsets = unsafe { overlapped.u.s_mut() };
+    offsets.Offset = LOCK_BYTE_OFFSET as u32;
+    offsets.OffsetHigh = (LOCK_BYTE_OFFSET >> 32) as u32;
+    overlapped
+}
+
+/// Take or wait for a lock on [`LOCK_BYTE_OFFSET`], with the given
+/// `LockFileEx` flags. Private: every public lock entry point below is one
+/// flag combination of this call.
+fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use winapi::um::fileapi::LockFileEx;
+    use winapi::um::winnt::HANDLE;
+
+    let mut overlapped = lock_byte_overlapped();
     let result = unsafe {
         LockFileEx(
             file.as_raw_handle() as HANDLE,
             flags,
             0,
-            u32::MAX,
-            u32::MAX,
+            1,
+            0,
             &mut overlapped,
         )
     };
@@ -130,6 +164,12 @@ fn lock_file(file: &File, flags: winapi::shared::minwindef::DWORD) -> io::Result
 }
 
 /// Take an exclusive advisory lock without waiting.
+///
+/// This host refuses an exclusive request that overlaps a range the *same*
+/// handle already locked, so a caller that still holds a shared lock on this
+/// file gets a conflict here rather than an upgrade. That is the one place
+/// the hosts genuinely differ, and the facade documents it as a rule callers
+/// keep: one lock guard per open file.
 pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
     use winapi::um::minwinbase::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
 
@@ -137,6 +177,10 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
 }
 
 /// Take an exclusive advisory lock, waiting until it is available.
+///
+/// The waiting form of the same refusal [`try_lock_exclusive`] describes:
+/// asked to upgrade a lock the same handle already holds, this waits for a
+/// release that only this caller could perform, and so never returns.
 pub fn lock_exclusive(file: &File) -> io::Result<()> {
     use winapi::um::minwinbase::LOCKFILE_EXCLUSIVE_LOCK;
 
@@ -163,23 +207,17 @@ pub fn try_lock_shared(file: &File) -> io::Result<()> {
 
 /// Release a lock taken by [`try_lock_exclusive`], [`try_lock_shared`],
 /// [`lock_exclusive`], or [`lock_shared`].
+///
+/// The range must be the one `lock_file` took, byte for byte: this host
+/// releases a named range, not "whatever this handle holds", and a mismatched
+/// range fails with `ERROR_NOT_LOCKED` while the lock stays held.
 pub fn unlock(file: &File) -> io::Result<()> {
-    use std::mem;
     use std::os::windows::io::AsRawHandle as _;
     use winapi::um::fileapi::UnlockFileEx;
-    use winapi::um::minwinbase::OVERLAPPED;
     use winapi::um::winnt::HANDLE;
 
-    let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
-    let result = unsafe {
-        UnlockFileEx(
-            file.as_raw_handle() as HANDLE,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    };
+    let mut overlapped = lock_byte_overlapped();
+    let result = unsafe { UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped) };
     if result == 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -316,16 +354,31 @@ pub fn user_config_dir(product: &str) -> PathBuf {
 /// Move `tmp` onto `target`, replacing it, without a window where neither is
 /// readable.
 ///
-/// `ReplaceFileW` is the call that gives that guarantee here; a bare rename
-/// onto an existing file fails on Windows. With no file to replace there is
-/// nothing for it to do, so a rename is both correct and cheaper.
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` gives that guarantee here,
+/// and gives it whether or not `target` already exists, so this is one call
+/// rather than a create branch and a replace branch. There is nothing for a
+/// prior `target.exists()` test to decide -- and a test like that could only
+/// be answering about a moment that has already passed.
+///
+/// `MOVEFILE_WRITE_THROUGH` is the durability half: the call does not return
+/// until the move has reached the disk, which is what lets [`sync_directory`]
+/// have nothing left to do -- on *both* paths, where `ReplaceFileW` plus a
+/// plain rename only covered the one where the target already existed.
+///
+/// `MOVEFILE_COPY_ALLOWED` is deliberately absent. A cross-volume move is a
+/// copy and a delete, which is neither atomic nor what a caller committing a
+/// file asked for; refusing it is the same answer Unix gives with `EXDEV`.
+///
+/// What `ReplaceFileW` did and this does not is carry the *target's* ACL,
+/// attributes, and creation time onto the replacement. A move keeps the
+/// replacement's own, which is what a Unix rename does, and what
+/// [`create_private_file`] already tells callers to expect on this host:
+/// protection comes from the directory the file was created in.
 pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-    if !target.exists() {
-        return std::fs::rename(tmp, target);
-    }
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -334,16 +387,13 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
             .collect()
     }
 
-    let target_w = wide(target);
     let tmp_w = wide(tmp);
+    let target_w = wide(target);
     let ok = unsafe {
-        ReplaceFileW(
-            target_w.as_ptr(),
+        MoveFileExW(
             tmp_w.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            target_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
     if ok == 0 {
@@ -355,9 +405,17 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
 
 /// Make a directory entry created by [`replace_file`] durable.
 ///
-/// Nothing to do here: `REPLACEFILE_WRITE_THROUGH` already committed the
-/// change, and Windows does not expose a directory handle to flush.
-pub fn sync_directory(_directory: &Path) -> io::Result<()> {
+/// The flush already happened, on whichever path the caller took:
+/// [`replace_file`] passes `MOVEFILE_WRITE_THROUGH`, which does not return
+/// until the move is on the disk, and Windows exposes no directory handle to
+/// flush separately. So the entry is durable before a caller gets here.
+///
+/// The directory is still resolved rather than ignored. Every host owes the
+/// same answer to "was this a directory I could have flushed?", and returning
+/// `Ok(())` for a path that does not exist would make this host's answer
+/// differ from the Unix `File::open` that reports it.
+pub fn sync_directory(directory: &Path) -> io::Result<()> {
+    std::fs::metadata(directory)?;
     Ok(())
 }
 

@@ -209,6 +209,12 @@ mod tests {
 
     /// A process that is not there cannot be subscribed to, which is the
     /// acquisition half of reuse safety: no handle, so nothing to retarget.
+    ///
+    /// Waiting is not enough on this host. A `Child` keeps the process handle
+    /// open until it is dropped, and while any handle exists the process
+    /// object does too -- which is exactly the property that makes a watch
+    /// reuse-safe, and exactly why the child has to be let go of here before
+    /// the PID counts as gone.
     #[test]
     fn a_reaped_process_cannot_be_watched() {
         let mut child = std::process::Command::new("cmd.exe")
@@ -217,13 +223,15 @@ mod tests {
             .expect("spawn");
         let pid = ProcessId::new(child.id()).expect("child pid is in range");
         child.wait().expect("reap");
-        assert!(ProcessExitWatch::open(pid).is_err(), "a reaped pid is gone");
+        drop(child);
+        let error = ProcessExitWatch::open(pid).expect_err("a reaped pid is gone");
+        assert_eq!(error.kind, ProcessInspectErrorKind::NotFound);
     }
 
-    /// This host reports a status for any process it can query, unlike the
-    /// Unix hosts, and the whole DWORD survives the signed convenience code.
+    /// A watch names the process it was opened for, and this host will open
+    /// one for any process it can query rather than only for its children.
     #[test]
-    fn an_exit_code_is_reported_for_this_process_handle() {
+    fn a_watch_can_be_opened_for_a_process_this_one_did_not_spawn() {
         let watch = ProcessExitWatch::open(ProcessId::current()).expect("open self");
         assert_eq!(watch.pid(), ProcessId::current());
     }

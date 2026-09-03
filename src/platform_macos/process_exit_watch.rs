@@ -108,10 +108,16 @@ impl ProcessExitWatch {
                     self.latch(observation);
                     return Ok(observation);
                 }
-                // A kqueue reports readable while any event is pending; if the
-                // pending one was not ours, wait for the next readiness edge
-                // rather than spinning on a drained queue.
-                None => guard.clear_ready(),
+                // Nothing to collect. Either another caller on this same watch
+                // already took the one `NOTE_EXIT` -- the queue is drained and
+                // no further edge is coming, so the latch is the only place
+                // the answer still exists -- or the pending event was not
+                // ours, in which case waiting for the next edge is right and
+                // spinning on a drained queue is not.
+                None => match self.latched() {
+                    Some(observation) => return Ok(observation),
+                    None => guard.clear_ready(),
+                },
             }
         }
     }

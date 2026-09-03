@@ -19,6 +19,12 @@ fn dump_to_vec_captures_a_sampled_allocation() {
     if is_enabled() {
         stop();
     }
+
+    // A dormant dump still serializes the pprof scaffolding — sample types,
+    // mapping, string table — so a non-empty buffer proves nothing on its own.
+    // Measure that floor first and require the sampled dump to exceed it.
+    let baseline = dump_to_vec().len();
+
     assert!(start(1), "heap profiler should start exactly once");
 
     let retained = vec![0x5a_u8; 1024 * 1024];
@@ -33,7 +39,9 @@ fn dump_to_vec_captures_a_sampled_allocation() {
     stop();
 
     assert!(
-        !snapshot.is_empty(),
-        "pprof snapshot must contain the sampled allocation"
+        snapshot.len() > baseline,
+        "pprof snapshot ({} bytes) must carry the sampled allocation beyond \
+         the dormant scaffolding ({baseline} bytes)",
+        snapshot.len()
     );
 }

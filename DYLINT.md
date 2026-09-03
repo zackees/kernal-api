@@ -56,6 +56,37 @@ the item, whether or not it is re-exported, so a `pub use` grep does not see
 it. A private field of a public newtype, a private item, and a trait
 implementation that adapts a facade type into a backend one all remain legal.
 
+The same coupling arrives from the other direction when this crate implements
+a backend's trait for one of its own exported types. `impl
+tokio::io::AsyncRead for IpcAsyncStream` names no backend in any signature,
+yet a client cannot call through it without `use tokio::io::AsyncRead`, so the
+backend is back in the application's import list. The rule splits that class
+in two.
+
+Implementing the async mirrors of `std::io::{Read, Write, Seek, BufRead}` --
+`tokio::io::AsyncRead`, `AsyncWrite`, `AsyncSeek`, and `AsyncBufRead` -- is
+allowed, and is what a usable stream facade is for. Those four are shared
+byte-stream vocabulary rather than backend design: the impl says "this is a
+byte stream", not "this is an interprocess socket", and the ecosystem's
+combinators, codecs, and protocol crates are all written against them. A
+facade-owned substitute would interoperate with none of them, so refusing the
+impl would make the facade's stream types useless in the one position they
+exist to fill. The facade still owes a caller an inherent method for the
+ordinary operations, so that reaching a stream's `read` or `write_all` needs
+no extension-trait import; the trait implementations are for handing the
+stream to someone else's generic code.
+
+Implementing any other owned-crate trait for an exported type is rejected.
+Those are backend extension points -- `framehop::ModuleSectionInfo`,
+`notify::Watcher` -- and implementing one for a type a client can name
+publishes the backend's design as this crate's contract, which is the drift
+the boundary exists to prevent. Two shapes stay outside the rule because they
+publish nothing. A backend trait implemented for a private type is
+unreachable, since no client can name the type it is attached to. A
+facade-owned trait implemented for a backend type -- the adapter direction --
+is reachable only by a caller that already holds the backend type, so it
+imposes no vocabulary on one that does not.
+
 `running-process` is classified as an owned implementation dependency for the
 target architecture. It is allowed inside `kernal-api`; phase 1 will add the
 private adapter. It is denied in each first-party application once that

@@ -27,7 +27,10 @@ dylint_linting::declare_late_lint! {
     /// may be used privately, but naming one in a public type position --
     /// enum variant payload, public field, function parameter or return type,
     /// alias, or bound -- puts backend vocabulary back into the application
-    /// interface just as surely as a `pub use` does.
+    /// interface just as surely as a `pub use` does. Implementing a backend's
+    /// own trait for an exported type does the same from the other direction,
+    /// because the trait has to be in scope to call the method; only the
+    /// async mirrors of `std::io` are exempt.
     pub KERNAL_API_BOUNDARY,
     Deny,
     "require systems and async APIs owned by kernal-api to pass through its facades"
@@ -52,6 +55,23 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "running_process",
     "sysinfo",
     "tokio",
+];
+
+/// The owned-crate traits a facade type may implement, as `(crate, trait)`.
+///
+/// These four are the async mirrors of `std::io::{Read, Write, Seek,
+/// BufRead}`: shared byte-stream vocabulary that carries no backend
+/// semantics. Implementing one says "this is a byte stream", not "this is an
+/// interprocess socket", and no facade-owned substitute could interoperate
+/// with `tokio::io::copy`, a codec, or any other combinator written against
+/// them. Every other trait in the owned set is a backend's own extension
+/// point, and implementing one for an exported type publishes the backend's
+/// design as this crate's contract. See DYLINT.md.
+const FOUNDATIONAL_TRAIT_IMPLS: &[(&str, &str)] = &[
+    ("tokio", "AsyncBufRead"),
+    ("tokio", "AsyncRead"),
+    ("tokio", "AsyncSeek"),
+    ("tokio", "AsyncWrite"),
 ];
 
 impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
@@ -104,6 +124,7 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         if is_facade_owner(cx) {
             check_public_signature(cx, item.owner_id.def_id);
+            check_owned_trait_impl(cx, item.owner_id.def_id);
             return;
         }
         if is_boundary_source(cx, item.span) {
@@ -227,6 +248,64 @@ fn check_public_signature(cx: &LateContext<'_>, def_id: LocalDefId) {
         }
     }
     leaks.report(cx);
+}
+
+/// Reject an owned backend's own trait implemented for an exported type.
+///
+/// This is the same coupling the public signature rule catches, arriving from
+/// the other direction: the trait has to be in scope for a client to call the
+/// method, so the backend is reachable through this crate's surface even
+/// though no signature names it. Two shapes stay legal and are not the leak.
+/// A private self type publishes nothing, because no client can name the type
+/// the impl is attached to. The reverse direction -- a facade-owned trait
+/// implemented for a backend type -- is reachable only by a caller that
+/// already holds the backend type, so it imposes nothing on one that does not.
+fn check_owned_trait_impl(cx: &LateContext<'_>, def_id: LocalDefId) {
+    let tcx = cx.tcx;
+    if !matches!(tcx.def_kind(def_id), DefKind::Impl { of_trait: true }) {
+        return;
+    }
+    let trait_ref = tcx
+        .impl_trait_ref(def_id)
+        .instantiate_identity()
+        .skip_normalization();
+    let Some(crate_name) = owned_crate_name(cx, trait_ref.def_id) else {
+        return;
+    };
+    let trait_name = tcx.item_name(trait_ref.def_id).to_string();
+    if FOUNDATIONAL_TRAIT_IMPLS.contains(&(crate_name.as_str(), trait_name.as_str())) {
+        return;
+    }
+    if !names_an_exported_type(cx, trait_ref.self_ty()) {
+        return;
+    }
+    cx.opt_span_lint(
+        KERNAL_API_BOUNDARY,
+        Some(tcx.def_span(def_id)),
+        DiagDecorator(move |diag| {
+            diag.primary_message(format!(
+                "`{crate_name}::{trait_name}` is implemented for an exported kernal-api type; a client cannot call through this impl without importing the trait from `{crate_name}` -- offer an inherent method or a facade-owned trait instead"
+            ));
+        }),
+    );
+}
+
+/// Whether `ty` reaches a type this crate exports, which is what makes the
+/// impl attached to it part of the client-visible surface.
+fn names_an_exported_type(cx: &LateContext<'_>, ty: ty::Ty<'_>) -> bool {
+    ty.walk().any(|argument| {
+        let Some(argument) = argument.as_type() else {
+            return false;
+        };
+        let def_id = match argument.kind() {
+            ty::Adt(definition, _) => definition.did(),
+            ty::Foreign(def_id) => *def_id,
+            _ => return false,
+        };
+        def_id
+            .as_local()
+            .is_some_and(|def_id| cx.effective_visibilities.is_exported(def_id))
+    })
 }
 
 /// One diagnostic per owned crate per item, at the first position that named
@@ -385,6 +464,17 @@ fn the_owned_crate_set_is_sorted_and_unique() {
     assert!(OWNED_IMPLEMENTATION_CRATES
         .windows(2)
         .all(|pair| pair[0] < pair[1]));
+}
+
+#[test]
+fn the_foundational_trait_set_is_sorted_and_owned() {
+    assert!(FOUNDATIONAL_TRAIT_IMPLS
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]));
+    // An exemption for a crate outside the owned set would never be reached.
+    assert!(FOUNDATIONAL_TRAIT_IMPLS
+        .iter()
+        .all(|(crate_name, _)| OWNED_IMPLEMENTATION_CRATES.contains(crate_name)));
 }
 
 #[test]

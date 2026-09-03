@@ -354,16 +354,31 @@ pub fn user_config_dir(product: &str) -> PathBuf {
 /// Move `tmp` onto `target`, replacing it, without a window where neither is
 /// readable.
 ///
-/// `ReplaceFileW` is the call that gives that guarantee here; a bare rename
-/// onto an existing file fails on Windows. With no file to replace there is
-/// nothing for it to do, so a rename is both correct and cheaper.
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` gives that guarantee here,
+/// and gives it whether or not `target` already exists, so this is one call
+/// rather than a create branch and a replace branch. There is nothing for a
+/// prior `target.exists()` test to decide -- and a test like that could only
+/// be answering about a moment that has already passed.
+///
+/// `MOVEFILE_WRITE_THROUGH` is the durability half: the call does not return
+/// until the move has reached the disk, which is what lets [`sync_directory`]
+/// have nothing left to do -- on *both* paths, where `ReplaceFileW` plus a
+/// plain rename only covered the one where the target already existed.
+///
+/// `MOVEFILE_COPY_ALLOWED` is deliberately absent. A cross-volume move is a
+/// copy and a delete, which is neither atomic nor what a caller committing a
+/// file asked for; refusing it is the same answer Unix gives with `EXDEV`.
+///
+/// What `ReplaceFileW` did and this does not is carry the *target's* ACL,
+/// attributes, and creation time onto the replacement. A move keeps the
+/// replacement's own, which is what a Unix rename does, and what
+/// [`create_private_file`] already tells callers to expect on this host:
+/// protection comes from the directory the file was created in.
 pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
-
-    if !target.exists() {
-        return std::fs::rename(tmp, target);
-    }
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str()
@@ -372,16 +387,13 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
             .collect()
     }
 
-    let target_w = wide(target);
     let tmp_w = wide(tmp);
+    let target_w = wide(target);
     let ok = unsafe {
-        ReplaceFileW(
-            target_w.as_ptr(),
+        MoveFileExW(
             tmp_w.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_WRITE_THROUGH,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            target_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
     if ok == 0 {
@@ -393,9 +405,17 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
 
 /// Make a directory entry created by [`replace_file`] durable.
 ///
-/// Nothing to do here: `REPLACEFILE_WRITE_THROUGH` already committed the
-/// change, and Windows does not expose a directory handle to flush.
-pub fn sync_directory(_directory: &Path) -> io::Result<()> {
+/// The flush already happened, on whichever path the caller took:
+/// [`replace_file`] passes `MOVEFILE_WRITE_THROUGH`, which does not return
+/// until the move is on the disk, and Windows exposes no directory handle to
+/// flush separately. So the entry is durable before a caller gets here.
+///
+/// The directory is still resolved rather than ignored. Every host owes the
+/// same answer to "was this a directory I could have flushed?", and returning
+/// `Ok(())` for a path that does not exist would make this host's answer
+/// differ from the Unix `File::open` that reports it.
+pub fn sync_directory(directory: &Path) -> io::Result<()> {
+    std::fs::metadata(directory)?;
     Ok(())
 }
 

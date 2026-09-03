@@ -824,8 +824,9 @@ mod tests {
 
     /// Replacing works whether or not the target already exists.
     ///
-    /// Both cases matter: a bare rename onto an existing file fails on
-    /// Windows, and the no-target case is the one a first write takes.
+    /// Both cases matter, and they must be the same case: the no-target one
+    /// is what a first write takes, and a host that reached it by a different
+    /// call would owe that call's durability separately.
     #[test]
     fn a_file_is_replaced_whether_or_not_the_target_exists() {
         let dir = std::env::temp_dir().join(format!("rp-fs-replace-{}", std::process::id()));
@@ -848,6 +849,59 @@ mod tests {
 
         sync_directory(&dir).expect("sync the directory that records it");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A first write and an overwrite are the same move, not two mechanisms.
+    ///
+    /// Windows-only because it is the host that had two: a create branch that
+    /// took a plain rename and got no write-through, and a replace branch
+    /// that did. The durability itself cannot be asserted from a test -- it
+    /// only shows up across an unclean shutdown -- so this pins the property
+    /// that stands in for it: both paths move the temporary file's own record
+    /// into place, which a copy-and-replace would not do, so whatever the one
+    /// path guarantees the other guarantees too.
+    #[cfg(windows)]
+    #[test]
+    fn a_first_write_and_an_overwrite_move_the_same_way() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-replace-win-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let target = dir.join("manifest");
+
+        for contents in [&b"first"[..], &b"second"[..]] {
+            let tmp = dir.join("staged.tmp");
+            std::fs::write(&tmp, contents).expect("stage");
+            let staged = path_identity(&tmp).expect("identity of the staged file");
+
+            replace_file(&tmp, &target).expect("replace");
+
+            assert_eq!(std::fs::read(&target).expect("read"), contents);
+            assert!(!tmp.exists(), "the staged path is consumed by the move");
+            if staged.is_some() {
+                assert_eq!(
+                    path_identity(&target).expect("identity of the target"),
+                    staged,
+                    "the target must be the staged file itself, moved"
+                );
+            }
+        }
+
+        sync_directory(&dir).expect("sync the directory that records it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory that does not exist is not something to report as synced.
+    ///
+    /// Ungated: the answer must not depend on the host. Windows has nothing
+    /// to flush, but "nothing to flush" is not the same as "yes", and a
+    /// caller leaning on this as a cheap assertion gets the same answer
+    /// everywhere.
+    #[test]
+    fn syncing_a_directory_that_does_not_exist_is_an_error() {
+        let missing = std::env::temp_dir()
+            .join(format!("rp-fs-no-such-dir-{}", std::process::id()))
+            .join("nested");
+        let _ = std::fs::remove_dir_all(&missing);
+        sync_directory(&missing).expect_err("a missing directory cannot be synced");
     }
 
     /// Shared data and machine-local state are different roles, and a host

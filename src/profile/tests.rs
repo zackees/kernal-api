@@ -1,5 +1,6 @@
 //! Tests for CPU profiling and its exports (#644).
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use prost::Message as _;
@@ -140,6 +141,39 @@ fn metrics_over_an_empty_session_do_not_divide_by_zero() {
     assert_eq!(metrics.overhead_ratio(), 0.0);
     // Nothing was offered, so nothing was lost.
     assert_eq!(metrics.fidelity(), 1.0);
+}
+
+// --- sessions -------------------------------------------------------------
+
+#[test]
+fn a_clamped_request_is_reported_as_clamped() {
+    // The whole point of the field: an operator who typed `--hz 5000
+    // --duration 300` gets a different session than they asked for, and the
+    // one marker that says so must not assert that nothing was substituted.
+    let session = ProfileSession::new(ProfileRequest {
+        hz: 5000,
+        duration: Duration::from_secs(300),
+    });
+    // Stopped before the first tick. The loop tests the flag on entry, so the
+    // metrics are produced without running the clamped sixty seconds.
+    session.stop_handle().store(true, Ordering::Relaxed);
+
+    let metrics = session.run();
+    assert!(metrics.clamped);
+    assert_eq!(metrics.hz, MAX_HZ);
+}
+
+#[test]
+fn a_request_already_inside_the_bounds_is_not_reported_as_clamped() {
+    let session = ProfileSession::new(ProfileRequest {
+        hz: DEFAULT_HZ,
+        duration: Duration::from_millis(20),
+    });
+    session.stop_handle().store(true, Ordering::Relaxed);
+
+    let metrics = session.run();
+    assert!(!metrics.clamped);
+    assert_eq!(metrics.hz, DEFAULT_HZ);
 }
 
 // --- folding --------------------------------------------------------------

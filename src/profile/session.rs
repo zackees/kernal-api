@@ -172,6 +172,11 @@ impl SessionResult {
 /// probe design avoids requiring.
 #[derive(Debug)]
 pub struct ProfileSession {
+    // What the caller asked for, kept alongside the clamped bounds the session
+    // runs under. Storing only the clamped request would destroy the evidence
+    // that anything was substituted, and `ProfileMetrics::clamped` exists
+    // precisely to report that substitution.
+    requested: ProfileRequest,
     request: ProfileRequest,
     ring: Arc<SampleRing>,
     stop: Arc<AtomicBool>,
@@ -181,6 +186,7 @@ impl ProfileSession {
     /// Prepare a session for `request`, clamped to the enforced bounds.
     pub fn new(request: ProfileRequest) -> Self {
         Self {
+            requested: request,
             request: request.clamped(),
             ring: Arc::new(SampleRing::default()),
             stop: Arc::new(AtomicBool::new(false)),
@@ -262,7 +268,7 @@ impl ProfileSession {
             pause_nanos,
             duration_nanos: started.elapsed().as_nanos() as u64,
             hz: self.request.hz,
-            clamped: false,
+            clamped: self.requested.was_clamped(),
         }
     }
 

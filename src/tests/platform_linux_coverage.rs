@@ -7,8 +7,34 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Duration;
 
+// `ObserverScope`, `ObserverCategory`, and `ObserverSupport` are `Copy` value
+// enums without `Debug`, so name their variants here rather than widening the
+// public API purely to make an assertion message readable.
+fn scope_label(scope: ObserverScope) -> &'static str {
+    match scope {
+        ObserverScope::SystemWide => "SystemWide",
+        ObserverScope::LaunchedProcessTree => "LaunchedProcessTree",
+    }
+}
+
+fn category_label(category: ObserverCategory) -> &'static str {
+    match category {
+        ObserverCategory::File => "File",
+        ObserverCategory::Network => "Network",
+        ObserverCategory::Process => "Process",
+    }
+}
+
+fn support_label(support: ObserverSupport) -> &'static str {
+    match support {
+        ObserverSupport::Supported => "Supported",
+        ObserverSupport::Partial => "Partial",
+        ObserverSupport::Unavailable => "Unavailable",
+    }
+}
+
 #[test]
-fn capability_environment_signals_and_observer_matrix_are_complete() {
+fn capability_environment_and_trace_backend_are_complete() {
     let pairs = vec![("A".into(), "1".into()), ("A".into(), "2".into())];
     assert_eq!(canonical_environment_pairs(pairs.clone()), pairs);
     assert!(monitor_console_windows(Duration::ZERO).is_empty());
@@ -25,14 +51,20 @@ fn capability_environment_signals_and_observer_matrix_are_complete() {
         capability.non_invasive_grade,
         NonInvasiveObservationGrade::SnapshotInferred
     );
+}
 
+#[test]
+fn unix_signal_numbers_are_positive_and_distinct() {
     let interrupt = unix_signal_raw(UnixSignalKind::Interrupt);
     let terminate = unix_signal_raw(UnixSignalKind::Terminate);
     let kill = unix_signal_raw(UnixSignalKind::Kill);
     assert!(interrupt > 0 && terminate > 0 && kill > 0);
     assert_ne!(interrupt, terminate);
     assert_ne!(terminate, kill);
+}
 
+#[test]
+fn observer_matrix_reports_every_scope_and_category() {
     for (scope, category, support, backend) in [
         (
             ObserverScope::SystemWide,
@@ -71,17 +103,89 @@ fn capability_environment_signals_and_observer_matrix_are_complete() {
             "subreaper-proc-poll",
         ),
     ] {
+        let row = format!("{}/{}", scope_label(scope), category_label(category));
         let result = observer_backend(scope, category);
-        assert!(std::mem::discriminant(&result.support) == std::mem::discriminant(&support));
-        assert_eq!(result.backend, backend);
-        assert!(!result.reason.is_empty());
+        assert_eq!(
+            support_label(result.support),
+            support_label(support),
+            "{row}"
+        );
+        assert_eq!(result.backend, backend, "{row}");
+        assert!(!result.reason.is_empty(), "{row}");
     }
+}
 
+#[test]
+fn absent_process_operations_report_their_posix_errors() {
+    let absent = i32::MAX as u32;
+    assert!(unix_signal_process(absent, UnixSignalKind::Kill).is_err());
+    assert!(unix_set_priority(absent, 0).is_err());
+}
+
+/// The absent-group case alone cannot separate "an absent group is a tolerated
+/// no-op" from "this function never signals anything", because
+/// `soft_terminate_process_group` swallows `ESRCH` by design. Pair it with a
+/// live child-owned group so the two halves together pin the behavior down.
+#[test]
+fn soft_terminate_signals_an_owned_group_and_tolerates_an_absent_one() {
+    let mut child = {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", "exec sleep 30"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        configure_process_command(
+            &mut command,
+            ProcessCommandConfig {
+                create_process_group: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        command.spawn().unwrap()
+    };
+    let pid = child.id();
+
+    // `spawn` returns only once the child has executed, so its `setpgid` has
+    // already run: the child leads a group whose id is its own pid, which makes
+    // a signal to `-pid` reach exactly this fixture.
+    assert_eq!(
+        unsafe { libc::getpgid(pid as i32) },
+        pid as i32,
+        "create_process_group should make the child its own group leader"
+    );
+
+    soft_terminate_process_group(pid).unwrap();
+
+    // A loaded runner can take a while to schedule the signalled child, so the
+    // bound is generous; only "never terminates at all" should fail here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child-owned group outlived soft_terminate_process_group");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGTERM),
+        "the owned group should end on SIGTERM, not on any other disposition"
+    );
+
+    // `i32::MAX` is above every reachable `pid_max`, so no live group can be
+    // hit here. The `Ok` below is specifically the swallowed `ESRCH` that the
+    // sibling raw group signal reports as an error.
     let absent = i32::MAX as u32;
     assert!(soft_terminate_process_group(absent).is_ok());
-    assert!(unix_signal_process(absent, UnixSignalKind::Kill).is_err());
-    assert!(unix_signal_process_group(i32::MAX, UnixSignalKind::Terminate).is_err());
-    assert!(unix_set_priority(absent, 0).is_err());
+    let error = unix_signal_process_group(i32::MAX, UnixSignalKind::Terminate)
+        .expect_err("an absent group has no raw signal target");
+    assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
 }
 
 #[test]

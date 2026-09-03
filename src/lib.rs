@@ -133,6 +133,8 @@ pub use platform_imp::{autostart_register, autostart_render_registration, autost
 
 pub use platform_imp::{process_install_owner_death_cleanup, process_owner_death_cleanup_target};
 
+pub use platform_imp::{process_spawner_lifetime_enforcement, ProcessExitWatch};
+
 pub use platform_imp::process_install_shutdown_request_handler;
 
 pub use platform_imp::fs_write_all_to_descriptor;
@@ -411,7 +413,7 @@ pub struct SpawnSpec {
     stdout: StreamMode,
     stderr: StreamMode,
     create_process_group: bool,
-    kill_when_owner_dies: bool,
+    lifetime_owner: Option<platform::process::LifetimeOwner>,
     priority: ProcessPriority,
 }
 
@@ -428,7 +430,7 @@ impl SpawnSpec {
             stdout: StreamMode::Inherit,
             stderr: StreamMode::Inherit,
             create_process_group: false,
-            kill_when_owner_dies: false,
+            lifetime_owner: None,
             priority: ProcessPriority::Normal,
         }
     }
@@ -500,9 +502,55 @@ impl SpawnSpec {
     /// Job Object policy. The opt-in group is for explicit soft termination,
     /// not a portable tree-cleanup promise. Use a separately contained
     /// operation when tree containment is required.
+    ///
+    /// This is the spelling for the common case. [`Self::bind_lifetime`] is
+    /// the same request with the owner named, and is what a caller wanting to
+    /// know *which* enforcement it got should reach for.
+    ///
+    /// `false` clears whatever binding was configured, including one made by
+    /// [`Self::bind_lifetime`] against another owner. It means "this child may
+    /// outlive anything", not "not that particular owner".
     pub fn kill_when_owner_dies(mut self, kill: bool) -> Self {
-        self.kill_when_owner_dies = kill;
+        self.lifetime_owner = kill.then_some(platform::process::LifetimeOwner::Spawner);
         self
+    }
+
+    /// Ask that this child not outlive `owner`.
+    ///
+    /// The enforcement obtained depends on the host and on who the owner is,
+    /// and the two are not interchangeable guarantees -- read
+    /// [`Self::lifetime_enforcement`] before spawning, or
+    /// [`PlatformChild::lifetime_enforcement`] afterwards, and refuse rather
+    /// than assume if a watcher is not good enough.
+    ///
+    /// [`LifetimeOwner::Spawner`] is the only owner a kernel can be asked to
+    /// enforce, because both kernel mechanisms are relationships the spawn
+    /// itself creates. Naming any other process gets a facade-owned watcher:
+    /// a [`ProcessExitWatch`] on the owner, and an identity-addressed kill of
+    /// the child when it fires. That is reuse-safe -- the watch is pinned to
+    /// the owner at spawn time and the kill is pinned to the child's creation
+    /// generation -- but it is user-space, so it reaps nothing if this process
+    /// is killed too.
+    ///
+    /// The owner is resolved before the child is started, so an owner that
+    /// has already exited fails the spawn instead of producing a child with
+    /// nothing watching it.
+    ///
+    /// [`LifetimeOwner`]: platform::process::LifetimeOwner
+    /// [`LifetimeOwner::Spawner`]: platform::process::LifetimeOwner::Spawner
+    pub fn bind_lifetime(mut self, owner: platform::process::LifetimeOwner) -> Self {
+        self.lifetime_owner = Some(owner);
+        self
+    }
+
+    /// What this host would enforce for the configured owner, before spawning.
+    ///
+    /// `None` means no binding was requested, which is not the same as a weak
+    /// one: nothing will clean this child up on its owner's behalf at all.
+    #[must_use]
+    pub fn lifetime_enforcement(&self) -> Option<platform::process::LifetimeEnforcement> {
+        self.lifetime_owner
+            .map(platform::process::lifetime_enforcement_for)
     }
 
     /// Select the semantic scheduling band for the spawned process.
@@ -540,11 +588,29 @@ impl SpawnSpec {
 /// Owned child handle returned by [`SpawnSpec::spawn`].
 pub struct PlatformChild {
     inner: process_adapter::ProcessAdapter,
+    lifetime: process_adapter::LifetimeBinding,
 }
 
 impl PlatformChild {
-    pub(crate) fn new(inner: process_adapter::ProcessAdapter) -> Self {
-        Self { inner }
+    pub(crate) fn new(
+        inner: process_adapter::ProcessAdapter,
+        lifetime: process_adapter::LifetimeBinding,
+    ) -> Self {
+        Self { inner, lifetime }
+    }
+
+    /// Which enforcement the requested lifetime binding actually obtained.
+    ///
+    /// `None` means none was requested. A caller that needs a guarantee no
+    /// user-space participant has to survive should check
+    /// [`LifetimeEnforcement::is_kernel_enforced`] here -- or, better, on
+    /// [`SpawnSpec::lifetime_enforcement`] before there is a child to clean
+    /// up.
+    ///
+    /// [`LifetimeEnforcement::is_kernel_enforced`]: platform::process::LifetimeEnforcement::is_kernel_enforced
+    #[must_use]
+    pub fn lifetime_enforcement(&self) -> Option<platform::process::LifetimeEnforcement> {
+        self.lifetime.enforcement()
     }
 
     /// Return the operating-system process identifier while this handle has
@@ -558,12 +624,22 @@ impl PlatformChild {
 
     /// Wait for completion without capturing output.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.inner.wait().await
+        let exit = self.inner.wait().await;
+        if exit.is_ok() {
+            // Nothing left to protect: keeping the owner watch open past this
+            // would hold a kernel subscription for a process that is gone.
+            self.lifetime.release();
+        }
+        exit
     }
 
     /// Terminate the child and wait for its exit.
     pub async fn kill(&mut self) -> io::Result<()> {
-        self.inner.kill().await
+        let killed = self.inner.kill().await;
+        if killed.is_ok() {
+            self.lifetime.release();
+        }
+        killed
     }
 
     /// Request graceful termination for the child-owned process group.
@@ -755,11 +831,24 @@ pub enum ProcessOutputEvent {
 /// not promise descendant-tree cleanup.
 pub struct ProcessSession {
     inner: process_adapter::ProcessSessionAdapter,
+    lifetime: process_adapter::LifetimeBinding,
 }
 
 impl ProcessSession {
-    pub(crate) fn new(inner: process_adapter::ProcessSessionAdapter) -> Self {
-        Self { inner }
+    /// Which enforcement the requested lifetime binding actually obtained.
+    ///
+    /// `None` means none was requested. See
+    /// [`PlatformChild::lifetime_enforcement`].
+    #[must_use]
+    pub fn lifetime_enforcement(&self) -> Option<platform::process::LifetimeEnforcement> {
+        self.lifetime.enforcement()
+    }
+
+    pub(crate) fn new(
+        inner: process_adapter::ProcessSessionAdapter,
+        lifetime: process_adapter::LifetimeBinding,
+    ) -> Self {
+        Self { inner, lifetime }
     }
 
     /// Return the direct child's launch-bound numeric identifier.

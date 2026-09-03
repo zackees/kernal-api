@@ -33,11 +33,16 @@ pub use raw_write::write_all_to_descriptor as fs_write_all_to_descriptor;
 pub(crate) mod shutdown_request;
 pub use shutdown_request::install_shutdown_request_handler as process_install_shutdown_request_handler;
 
+#[path = "platform_linux/process_exit_watch.rs"]
+pub(crate) mod process_exit_watch;
+pub use process_exit_watch::ProcessExitWatch;
+
 #[path = "platform_linux/process_owner_death.rs"]
 pub(crate) mod process_owner_death;
 pub use process_owner_death::{
     install_owner_death_cleanup as process_install_owner_death_cleanup,
     owner_death_cleanup_target as process_owner_death_cleanup_target,
+    spawner_lifetime_enforcement as process_spawner_lifetime_enforcement,
 };
 
 #[path = "platform_linux/host.rs"]
@@ -782,11 +787,30 @@ pub fn observer_backend(scope: crate::platform::process::ObserverScope, category
     }
 }
 
+/// Reprioritise one process, with the same range check as signalling.
+///
+/// `setpriority` takes the `id` unsigned, so this one cannot become a
+/// broadcast -- but a PID that could not name a process should not reach the
+/// kernel at all, and one validation rule is easier to keep true than two.
 pub fn unix_set_priority(pid: u32, nice: i32) -> io::Result<()> {
-    if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid, nice) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    let pid = crate::platform::process::ProcessId::new(pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid.get(), nice) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
+/// Signal one process, never a process group.
+///
+/// The range check is not decoration. `pid_t` is signed, so an unchecked
+/// `u32` above `i32::MAX` reaches `kill(2)` negative, where `-N` is process
+/// group `N` and `-1` is every process this caller may signal -- a PID read
+/// from a file or a state row could therefore end a user's whole session.
+/// [`ProcessId`] is what makes that unrepresentable; this entry point keeps
+/// its `u32` spelling for compatibility and validates before the cast.
+///
+/// [`ProcessId`]: crate::platform::process::ProcessId
 pub fn unix_signal_process(pid: u32, signal: crate::platform::process::UnixSignalKind) -> io::Result<()> {
-    if unsafe { libc::kill(pid as i32, unix_signal_raw(signal)) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+    let pid = crate::platform::process::ProcessId::new(pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if unsafe { libc::kill(pid.native_signed(), unix_signal_raw(signal)) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 pub fn unix_signal_process_group(pid: i32, signal: crate::platform::process::UnixSignalKind) -> io::Result<()> {
     if unsafe { libc::killpg(pid, unix_signal_raw(signal)) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }

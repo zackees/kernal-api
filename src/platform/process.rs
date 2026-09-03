@@ -173,6 +173,92 @@ pub struct ConsoleWindowInfo {
     pub hwnd: u64,
 }
 
+/// A process identifier this host could actually have issued.
+///
+/// `pid_t` is signed, and every native call that takes one reads a negative
+/// value as something else entirely: `kill(-N, ..)` addresses process group
+/// `N`, and `kill(-1, ..)` addresses every process the caller is permitted to
+/// signal. A PID arriving as an unchecked `u32` -- from a PID file, a state
+/// row, an environment variable, anywhere other than a live child handle --
+/// therefore stops naming a process somewhere above `i32::MAX` and silently
+/// becomes a broadcast.
+///
+/// The range is checked once, here, so no later call has to remember to: a
+/// `ProcessId` cannot hold a value whose signed reading is anything but the
+/// same single process. That is the difference between a rule tested for and
+/// a rule that cannot be broken.
+///
+/// The accepted range is `1 ..= i32::MAX` on every host, Windows included,
+/// even though Windows has no signed-PID problem of its own. One range keeps
+/// a PID meaningful when one host writes it down and another reads it -- which
+/// is what a PID file is for -- and costs nothing, because no supported host
+/// issues a number above it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProcessId(u32);
+
+impl ProcessId {
+    /// Accept `pid` only if it could name one process on this host.
+    ///
+    /// Zero is rejected alongside the out-of-range values, and for the same
+    /// reason: it is not a process address either. `kill(2)` reads it as the
+    /// caller's own process group and `waitid(2)` as "any child".
+    pub fn new(pid: u32) -> Result<Self, ProcessInspectError> {
+        if pid == 0 || pid > i32::MAX as u32 {
+            Err(ProcessInspectError::stated(
+                ProcessInspectErrorKind::InvalidPid,
+                "pid outside the range a host issues for a single process",
+            ))
+        } else {
+            Ok(Self(pid))
+        }
+    }
+
+    /// This process's own identifier.
+    ///
+    /// A host never issues itself a number it could not issue, so this cannot
+    /// fail and does not make the caller pretend it might.
+    #[must_use]
+    pub fn current() -> Self {
+        Self(std::process::id())
+    }
+
+    /// The number, for a caller that has to write it down or print it.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// The number as the signed value a native call will read.
+    ///
+    /// Crate-private on purpose: the invariant is what makes this cast safe,
+    /// and handing the result out would let a caller re-derive the very trap
+    /// the type exists to close.
+    ///
+    /// Unix-only, because a signed process identifier is a Unix idea. Windows
+    /// passes the number unsigned and has no negative reading to guard
+    /// against; it keeps the same accepted range for the sake of a PID that
+    /// one host writes down and another reads back, not for this cast.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) const fn native_signed(self) -> i32 {
+        self.0 as i32
+    }
+}
+
+impl TryFrom<u32> for ProcessId {
+    type Error = ProcessInspectError;
+
+    fn try_from(pid: u32) -> Result<Self, Self::Error> {
+        Self::new(pid)
+    }
+}
+
+impl std::fmt::Display for ProcessId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
 /// One live process instance, rather than merely an address in the PID table.
 ///
 /// The creation key is deliberately opaque. It is a Windows `FILETIME`, Linux
@@ -1128,6 +1214,103 @@ impl std::error::Error for ProcessInspectError {
 }
 
 pub use crate::{process_same_executable_path as same_executable_path, ProcessLiveness};
+
+/// What a host was able to say about an exit once it had happened.
+///
+/// The variants are not two degrees of success. Every host reports *that* the
+/// process exited; only some report *how*. Linux and macOS hand over a status
+/// for a process this one parented and nothing for any other, because the
+/// status is consumed by whoever reaps it and nobody else. Windows keeps an
+/// exit code readable through any handle. Folding that into an
+/// `Option<ExitStatus>` would let a caller read "no status" as "still
+/// running", which is the one thing it never means here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessExitObservation {
+    /// The process exited and the host reported how.
+    Reported(ProcessSessionExit),
+    /// The process exited; this host does not report the status of a process
+    /// the observer did not parent.
+    Unreported,
+}
+
+pub use crate::ProcessExitWatch;
+
+/// Whose lifetime a spawned process is asked not to outlive.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LifetimeOwner {
+    /// The process doing the spawning.
+    ///
+    /// This is the only owner a kernel mechanism can express, because both
+    /// kernel mechanisms are relationships the spawn itself creates: a
+    /// parent-death signal names the parent, and a job handle is held by the
+    /// spawner. It is also, for a broker-spawned daemon, usually *not* the
+    /// process anyone cares about -- the broker exits as soon as it has
+    /// handed the daemon over, and the session the daemon should follow is
+    /// somewhere else entirely. Such a caller wants [`Self::Process`] and the
+    /// weaker enforcement that comes with it.
+    Spawner,
+    /// A nominated process that is not necessarily this one.
+    ///
+    /// No host will enforce this in the kernel on the spawner's say-so, so it
+    /// always resolves to [`LifetimeEnforcement::Watcher`].
+    Process(ProcessId),
+}
+
+/// Which enforcement a lifetime binding actually obtained.
+///
+/// A caller that needs a hard guarantee reads this and refuses, rather than
+/// assuming the strongest and discovering otherwise from a machine full of
+/// orphans. The three are genuinely different promises and the asymmetry
+/// between hosts is real, so it is reported rather than smoothed over.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LifetimeEnforcement {
+    /// The kernel destroys the child along with its owner.
+    ///
+    /// Windows job objects with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The
+    /// strongest of the three: it covers descendants, and it holds however the
+    /// owner dies, including a `TerminateProcess` that runs no user code.
+    KernelContainer,
+    /// The kernel signals the child when its *parent* exits.
+    ///
+    /// Linux `PR_SET_PDEATHSIG`. Nothing in user space has to still be alive
+    /// for this to fire, but it covers the direct child only, and it is tied
+    /// to the parent -- more precisely to the spawning *thread*, so a spawn
+    /// performed on a pool thread that later retires fires it early. Spawn
+    /// from a thread that lives as long as the owner should.
+    ParentDeathSignal,
+    /// Something in user space watches the owner and terminates the child.
+    ///
+    /// The reaping is only as reliable as the watcher: if the watching
+    /// process is killed too, nothing runs. Reuse-safe all the same -- the
+    /// watch is a [`ProcessExitWatch`], not a repeated question about a
+    /// number, and the kill is addressed by [`ProcessIdentity`].
+    Watcher,
+}
+
+impl LifetimeEnforcement {
+    /// Whether the guarantee survives the loss of every user-space participant.
+    ///
+    /// True for both kernel mechanisms and false for the watcher. This is the
+    /// predicate a caller needing a hard guarantee should branch on; which of
+    /// the two kernel mechanisms it got is not something it can act on.
+    #[must_use]
+    pub const fn is_kernel_enforced(self) -> bool {
+        matches!(self, Self::KernelContainer | Self::ParentDeathSignal)
+    }
+}
+
+/// What this host would enforce for `owner`, without spawning anything.
+///
+/// Ask before committing: a caller that cannot accept
+/// [`LifetimeEnforcement::Watcher`] should find that out before it has a
+/// child to clean up.
+#[must_use]
+pub fn lifetime_enforcement_for(owner: LifetimeOwner) -> LifetimeEnforcement {
+    match owner {
+        LifetimeOwner::Spawner => crate::process_spawner_lifetime_enforcement(),
+        LifetimeOwner::Process(_) => LifetimeEnforcement::Watcher,
+    }
+}
 
 /// A standing request from the host that this process shut down.
 ///

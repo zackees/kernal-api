@@ -9,7 +9,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
-use crate::platform::process::{ProcessInspectError, ProcessInspectErrorKind};
+use crate::platform::process::{ProcessId, ProcessInspectError, ProcessInspectErrorKind};
 
 /// `GetExitCodeProcess` reports this while a process is still running.
 ///
@@ -57,6 +57,10 @@ impl ProcessLiveness {
     /// not query -- describes a process that exists and is reported as a host
     /// failure, so a caller cannot read "I was refused" as "it is gone".
     pub fn open(pid: u32) -> Result<Self, ProcessInspectError> {
+        // This host has no signed-PID trap of its own, but it shares the range
+        // rule so a PID written down here means the same thing when a Unix
+        // host reads it back. See `ProcessId`.
+        let pid = ProcessId::new(pid)?.get();
         // SAFETY: the call takes access flags, an inherit flag, and a PID by
         // value; the returned handle is checked before use.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -172,11 +176,12 @@ pub fn process_force_kill(pid: u32) -> Result<(), ProcessInspectError> {
 mod tests {
     use super::*;
 
-    /// PID zero names no process this host will open.
+    /// PID zero names no process this host will open, and is refused by the
+    /// shared range rule before the kernel is asked.
     #[test]
     fn pid_zero_is_never_valid() {
         let error = ProcessLiveness::open(0).expect_err("pid 0");
-        assert_eq!(error.kind, ProcessInspectErrorKind::NotFound);
+        assert_eq!(error.kind, ProcessInspectErrorKind::InvalidPid);
     }
 
     /// This process is alive, and knows where it was started from.

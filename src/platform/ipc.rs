@@ -3,6 +3,30 @@
 //! Endpoint strings and protocol policy remain with callers. These opaque
 //! values own the selected host transport so callers never name Unix sockets,
 //! Windows named pipes, `interprocess` types, file descriptors, or handles.
+//!
+//! # Endpoint existence and staleness
+//!
+//! `Endpoint::target_exists` and `Endpoint::is_stale` ask two different
+//! questions, and how far their answers can drift apart is a property of the
+//! selected transport rather than of the caller's code. Every host answers
+//! both for real; neither ever reports a fabricated value.
+//!
+//! Where [`endpoint_is_filesystem_backed`] reports `true`, the address names a
+//! socket file that outlives the process which bound it. `target_exists` reads
+//! the filesystem without disturbing a server, and the two predicates disagree
+//! exactly when a dead server left its socket file behind: `Ok(true)` from
+//! `target_exists` with `is_stale` reporting `true` is the leftover that
+//! [`Endpoint::retire`] removes before a new server binds.
+//!
+//! Where it reports `false`, the address names a kernel object that cannot
+//! outlive the process holding it. There is no leftover to find, `retire` has
+//! nothing to remove, and both predicates are answered by one connect probe, so
+//! existence and liveness always agree. That probe is observable -- the server
+//! sees a connection that never sends a byte -- so a caller that only wants
+//! liveness should probe once rather than ask both.
+//!
+//! Neither predicate takes an unclassifiable failure as a licence to reclaim an
+//! endpoint: `target_exists` returns the error and `is_stale` reports `false`.
 
 #[cfg(feature = "ipc")]
 pub use crate::{
@@ -312,7 +336,7 @@ mod tests {
         endpoint.retire().expect("retire endpoint");
     }
 
-    // These four tests pin the exact connect-and-drop liveness probe that
+    // The tests that follow pin the exact connect-and-drop liveness probe that
     // zccache's per-platform `probe_native` performs directly against
     // `interprocess` today (three call sites, one per OS, identical body):
     // resolve the endpoint name, attempt a blocking connect, and classify the
@@ -332,22 +356,26 @@ mod tests {
 
     // `Endpoint::is_stale` performs the same connect-and-classify probe as
     // `missing_endpoint_probe_reports_a_stable_not_found_or_refused_error`,
-    // collapsed to a bool. It is Unix-only here because the Windows named-pipe
-    // backend does not yet implement it (it always reports `false`); Windows
-    // callers get the same liveness answer from `Stream::connect`'s error kind
-    // instead, which the portable test above already covers.
-    #[cfg(unix)]
+    // collapsed to a bool. Every transport implements it, so this runs on
+    // every host.
     #[test]
     fn missing_endpoint_is_reported_stale() {
         let endpoint = Endpoint::test("probe-missing-stale").expect("test endpoint");
 
         assert!(endpoint.is_stale());
+        assert!(!endpoint.target_exists().expect("probe a missing endpoint"));
     }
 
-    // A bound listener answers a probe connect through the kernel backlog
-    // with no accept required, so this stays single-threaded and
-    // deterministic (unlike the multi-connection test below).
-    #[cfg(unix)]
+    // A bound listener answers a probe connect with no accept required: a Unix
+    // socket completes it from the kernel backlog, and a named pipe from the
+    // instance the listener created while binding.
+    //
+    // The second probe covers the busy named-pipe instance the first one
+    // leaves behind, which only the server's next accept would clear. Busy
+    // still means a server holds the name, so existence must come back `true`
+    // without waiting for an accept that never comes. A regression there hangs
+    // rather than fails, so the answer is collected with a deadline instead of
+    // by blocking the test thread.
     #[test]
     fn bound_endpoint_is_not_reported_stale() {
         let endpoint = Endpoint::test("probe-live-stale").expect("test endpoint");
@@ -355,7 +383,62 @@ mod tests {
 
         assert!(!endpoint.is_stale());
 
+        let probed = endpoint.clone();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let prober = std::thread::spawn(move || {
+            let _ = answer_tx.send(probed.target_exists().map_err(|error| error.to_string()));
+        });
+        let exists = answer_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the second probe answered without waiting for an accept")
+            .expect("probe a bound endpoint");
+        assert!(exists);
+        prober.join().expect("prober thread");
+
         drop(listener);
+    }
+
+    // The two transports diverge once the server is gone, and each half of
+    // that divergence is pinned on the host it applies to. A socket file is
+    // still there to find and retire; a named pipe is not, because the name
+    // died with the process that held it.
+    #[cfg(unix)]
+    #[test]
+    fn a_departed_server_leaves_a_stale_socket_file_to_retire() {
+        let endpoint = Endpoint::test("probe-leftover").expect("test endpoint");
+        let mut listener = Listener::bind(&endpoint).expect("bind");
+        // Binding reclaims the name on drop by default, which is the very
+        // cleanup a crashed server never gets to perform.
+        listener.do_not_reclaim_name_on_drop();
+        drop(listener);
+
+        assert!(endpoint
+            .target_exists()
+            .expect("inspect the leftover target"));
+        assert!(endpoint.is_stale());
+
+        endpoint.retire().expect("retire the leftover");
+        assert!(!endpoint
+            .target_exists()
+            .expect("inspect the retired target"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_departed_server_leaves_no_named_pipe_behind() {
+        let endpoint = Endpoint::test("probe-leftover").expect("test endpoint");
+        let listener = Listener::bind(&endpoint).expect("bind");
+        assert!(endpoint.target_exists().expect("inspect the live target"));
+
+        drop(listener);
+
+        assert!(!endpoint
+            .target_exists()
+            .expect("inspect the vanished target"));
+        assert!(endpoint.is_stale());
+        // Nothing was left to clean up, so retiring is a no-op that must not
+        // report a failure.
+        endpoint.retire().expect("retire a vanished endpoint");
     }
 
     #[test]

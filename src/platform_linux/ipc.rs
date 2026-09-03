@@ -40,6 +40,13 @@ impl Endpoint {
         prepare_owner_private_parent(&self.0)
     }
 
+    /// Whether this endpoint's target is present on the host.
+    ///
+    /// The address names a socket file, which outlives the process that bound
+    /// it. `true` therefore means the name is taken, not that a server is
+    /// listening: [`Endpoint::is_stale`] answers that separately, and a target
+    /// that still exists behind a stale endpoint is the leftover that
+    /// [`Endpoint::retire`] removes.
     pub fn target_exists(&self) -> io::Result<bool> {
         match std::fs::symlink_metadata(&self.0) {
             Ok(_) => Ok(true),
@@ -55,6 +62,12 @@ impl Endpoint {
         Ok(())
     }
 
+    /// Whether the endpoint has no server behind it and may be taken over.
+    ///
+    /// A connect classified by error kind: a refused or absent target means
+    /// nothing is listening. Any other failure leaves the question open, and
+    /// an open question is not a licence to take a live endpoint over. A
+    /// server observes the probe as a connection that never sends a byte.
     pub fn is_stale(&self) -> bool {
         use interprocess::local_socket::traits::Stream as _;
 

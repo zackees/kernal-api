@@ -27,6 +27,13 @@
 //! sample is a small, *measured* loss of fidelity, reported in
 //! [`ProfileMetrics::samples_dropped`] so the operator knows the profile is
 //! thinned rather than discovering it in a misleading graph.
+//!
+//! A session's own sampling loop is the one producer that cannot be left to
+//! drop indefinitely: nothing drains the ring until the session ends, so a
+//! full ring stays full and every further tick would suspend the target's
+//! threads for samples discarded on arrival. A session therefore ends when its
+//! ring fills and reports [`ProfileMetrics::buffer_full`], so the window the
+//! metrics describe is the window that was sampled.
 
 use std::time::Duration;
 
@@ -81,7 +88,12 @@ pub const MAX_HZ: u32 = 1000;
 
 /// Capacity of the raw-sample ring.
 ///
-/// At the 1 kHz ceiling this is over a minute of buffering, so the ring only
-/// fills when the symbolizer is genuinely not keeping up rather than as a
-/// matter of course.
+/// A session spends this budget at `hz × seconds × threads`, not per tick: one
+/// sample is pushed for every thread that is running when the tick fires. That
+/// covers a whole sixty-second session at the default frequency up to eleven
+/// sibling threads, and a ten-second one up to sixty-six; beyond that the ring
+/// fills first and the session ends there rather than sampling into a full
+/// ring. A caller who knows the target's thread count can size the ring for
+/// its own window with [`ProfileSession::with_ring_capacity`], trading memory
+/// for coverage explicitly rather than having the window silently cut.
 pub const RING_CAPACITY: usize = 1 << 16;

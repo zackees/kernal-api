@@ -1,5 +1,6 @@
 //! Tests for CPU profiling and its exports (#644).
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use prost::Message as _;
@@ -127,6 +128,7 @@ fn coverage_overhead_and_fidelity_are_ratios_of_what_was_observed() {
         duration_nanos: 100_000_000,
         hz: 99,
         clamped: false,
+        buffer_full: false,
     };
     assert_eq!(metrics.thread_coverage(), 0.75);
     assert_eq!(metrics.overhead_ratio(), 0.01);
@@ -140,6 +142,128 @@ fn metrics_over_an_empty_session_do_not_divide_by_zero() {
     assert_eq!(metrics.overhead_ratio(), 0.0);
     // Nothing was offered, so nothing was lost.
     assert_eq!(metrics.fidelity(), 1.0);
+}
+
+// --- sessions -------------------------------------------------------------
+
+#[test]
+fn a_clamped_request_is_reported_as_clamped() {
+    // The whole point of the field: an operator who typed `--hz 5000
+    // --duration 300` gets a different session than they asked for, and the
+    // one marker that says so must not assert that nothing was substituted.
+    let session = ProfileSession::new(ProfileRequest {
+        hz: 5000,
+        duration: Duration::from_secs(300),
+    });
+    // Stopped before the first tick. The loop tests the flag on entry, so the
+    // metrics are produced without running the clamped sixty seconds.
+    session.stop_handle().store(true, Ordering::Relaxed);
+
+    let metrics = session.run();
+    assert!(metrics.clamped);
+    assert_eq!(metrics.hz, MAX_HZ);
+}
+
+#[test]
+fn a_request_already_inside_the_bounds_is_not_reported_as_clamped() {
+    let session = ProfileSession::new(ProfileRequest {
+        hz: DEFAULT_HZ,
+        duration: Duration::from_millis(20),
+    });
+    session.stop_handle().store(true, Ordering::Relaxed);
+
+    let metrics = session.run();
+    assert!(!metrics.clamped);
+    assert_eq!(metrics.hz, DEFAULT_HZ);
+}
+
+#[test]
+fn a_session_whose_ring_is_full_stops_instead_of_sampling_into_it() {
+    // The ring's budget is hz × seconds × threads, not one sample per tick,
+    // so a many-threaded target exhausts it mid-window. Nothing drains it
+    // until the session ends, so carrying on would suspend every sibling
+    // thread on every remaining tick to produce samples that are discarded on
+    // arrival -- and the profile would describe the start of the window while
+    // `duration_nanos` claimed all of it.
+    let session = ProfileSession::with_ring_capacity(
+        ProfileRequest {
+            hz: DEFAULT_HZ,
+            duration: Duration::from_secs(5),
+        },
+        8,
+    );
+    for tid in 0..8 {
+        assert!(session.ring().push(sample(tid, &[0x1000])));
+    }
+
+    let metrics = session.run();
+
+    assert!(metrics.buffer_full, "a full ring must be reported as one");
+    assert_eq!(metrics.samples_captured, 8);
+    // Five seconds were asked for; the run must not have spent them.
+    assert!(
+        metrics.duration_nanos < Duration::from_secs(1).as_nanos() as u64,
+        "a session with nowhere to put samples ran for {} ns",
+        metrics.duration_nanos,
+    );
+}
+
+/// The failure the sizing arithmetic predicts, at four threads instead of the
+/// thirty-two it takes to hit the default capacity.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+
+    const WORKERS: usize = 4;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..WORKERS)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                ready.fetch_add(1, Ordering::Release);
+                while !stop.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            })
+        })
+        .collect();
+    // Every worker must be on a stack of its own before the first tick, or
+    // the session would be sampling fewer threads than the test claims.
+    while ready.load(Ordering::Acquire) < WORKERS {
+        std::thread::yield_now();
+    }
+
+    let session = ProfileSession::with_ring_capacity(
+        ProfileRequest {
+            hz: DEFAULT_HZ,
+            duration: Duration::from_secs(5),
+        },
+        8,
+    );
+    let metrics = session.run();
+
+    stop.store(true, Ordering::Release);
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    assert!(
+        metrics.buffer_full,
+        "four threads must fill a ring of eight"
+    );
+    assert_eq!(metrics.samples_captured, 8);
+    // Five seconds were asked for. Ending well inside them is the whole
+    // point: after the ring filled there was nowhere left to put a sample.
+    assert!(
+        metrics.duration_nanos < Duration::from_secs(4).as_nanos() as u64,
+        "the session kept suspending threads for {} ns with a full ring",
+        metrics.duration_nanos,
+    );
 }
 
 // --- folding --------------------------------------------------------------

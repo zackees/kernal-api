@@ -92,6 +92,21 @@ impl SampleRing {
         self.accepted.load(Ordering::Relaxed)
     }
 
+    /// The most samples this ring will ever hold.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Whether the ring is holding all it can.
+    ///
+    /// The sampling loop's cue to stop. Nothing drains the ring while a
+    /// session runs, so a full ring stays full: every further capture would
+    /// suspend the target's threads to produce samples that are discarded on
+    /// arrival.
+    pub fn is_full(&self) -> bool {
+        self.len() >= self.capacity
+    }
+
     /// Samples currently buffered.
     pub fn len(&self) -> usize {
         self.samples.lock().unwrap_or_else(|e| e.into_inner()).len()

@@ -75,6 +75,16 @@ pub struct ProfileMetrics {
     pub hz: u32,
     /// Whether the request was reduced to fit the enforced bounds.
     pub clamped: bool,
+    /// Whether sampling stopped early because the ring filled.
+    ///
+    /// Not the same claim as [`Self::fidelity`], which is the share of
+    /// *offered* samples that were kept: this says the session stopped
+    /// offering. When it is true, `duration_nanos` covers only the part of the
+    /// requested window that was actually sampled, so the profile describes
+    /// the start of the run and nothing after it. Size the ring for the
+    /// target's thread count with [`ProfileSession::with_ring_capacity`] to
+    /// cover a whole window.
+    pub buffer_full: bool,
 }
 
 impl ProfileMetrics {
@@ -172,6 +182,11 @@ impl SessionResult {
 /// probe design avoids requiring.
 #[derive(Debug)]
 pub struct ProfileSession {
+    // What the caller asked for, kept alongside the clamped bounds the session
+    // runs under. Storing only the clamped request would destroy the evidence
+    // that anything was substituted, and `ProfileMetrics::clamped` exists
+    // precisely to report that substitution.
+    requested: ProfileRequest,
     request: ProfileRequest,
     ring: Arc<SampleRing>,
     stop: Arc<AtomicBool>,
@@ -181,8 +196,26 @@ impl ProfileSession {
     /// Prepare a session for `request`, clamped to the enforced bounds.
     pub fn new(request: ProfileRequest) -> Self {
         Self {
+            requested: request,
             request: request.clamped(),
             ring: Arc::new(SampleRing::default()),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Prepare a session whose ring holds at most `capacity` samples.
+    ///
+    /// One tick pushes a sample per running thread, so the budget a session
+    /// spends is `hz × seconds × threads` rather than the per-tick figure the
+    /// default capacity is stated in. A caller who knows roughly how many
+    /// threads the target runs can size the ring for its whole window here;
+    /// otherwise the session ends when the ring fills and reports
+    /// [`ProfileMetrics::buffer_full`].
+    pub fn with_ring_capacity(request: ProfileRequest, capacity: usize) -> Self {
+        Self {
+            requested: request,
+            request: request.clamped(),
+            ring: Arc::new(SampleRing::with_capacity(capacity)),
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -212,12 +245,28 @@ impl ProfileSession {
         let period = Duration::from_nanos(self.request.period_nanos());
         let config = SnapshotConfig::default();
 
+        let mut buffer_full = false;
         let mut threads_at_start = 0u64;
         let mut pause_nanos = 0u64;
         let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
         let mut next = started;
         while started.elapsed() < self.request.duration && !self.stop.load(Ordering::Relaxed) {
+            // A tick pushes one sample per running thread, so the ring's real
+            // budget is hz × seconds × threads and a many-threaded target can
+            // exhaust it mid-window. Nothing drains it until the session ends,
+            // so a full ring stays full: every further tick would suspend
+            // every sibling thread to produce samples discarded on arrival,
+            // and the profile would describe the beginning of the window while
+            // `duration_nanos` claimed all of it. Stop here instead. The
+            // profile then covers exactly the window the metrics report, the
+            // target stops paying for samples nobody keeps, and
+            // `buffer_full` tells the caller the window was cut short.
+            if self.ring.is_full() {
+                buffer_full = true;
+                break;
+            }
+
             // Sample on a fixed schedule rather than sleeping a fixed period
             // after each capture. Adding the period to "now" would let the
             // capture's own cost push the interval out, so the effective rate
@@ -262,7 +311,8 @@ impl ProfileSession {
             pause_nanos,
             duration_nanos: started.elapsed().as_nanos() as u64,
             hz: self.request.hz,
-            clamped: false,
+            clamped: self.requested.was_clamped(),
+            buffer_full,
         }
     }
 

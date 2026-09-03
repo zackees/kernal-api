@@ -125,6 +125,7 @@ jobs:
           - session-relay
           - snapshot
           - symbolize
+          - symbolize-split
           - symbolize-worker
           - tokio-console
     steps:

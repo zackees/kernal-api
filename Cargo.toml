@@ -96,6 +96,16 @@ tokio-console = [
 symbolize = [
   "dep:prost",
 ]
+# Post-link debug-symbol splitting (#78): given a linked binary, produce a
+# stripped binary plus a complete, matched symbol file and report the mechanism
+# used. Separate from `symbolize-worker` because it is a packaging-time
+# operation that reads object files rather than a parser shipped in the worker;
+# it needs `object` only to read identities and section presence, and it asks
+# the worker -- not an in-process parser -- to prove the pair resolves.
+symbolize-split = [
+  "symbolize",
+  "dep:object",
+]
 symbolize-worker = [
   "symbolize",
   "dep:addr2line",
@@ -128,6 +138,7 @@ full = [
   "profile",
   "session-relay",
   "symbolize",
+  "symbolize-split",
   "tokio-console",
 ]
 

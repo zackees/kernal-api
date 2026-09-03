@@ -23,7 +23,23 @@
 #![deny(missing_docs)]
 
 mod client;
+// Post-link symbol carving is a build-time operation, not a run-time one, and
+// it reads object files -- so it stays behind its own feature rather than
+// riding along with the wire schema every consumer already compiles.
+#[cfg(all(
+    feature = "symbolize-split",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
+pub mod split;
 pub mod wire;
 
 pub use client::{default_worker_path, SymbolizerWorker, WorkerError, SYMBOLIZER_WORKER_ENV};
+#[cfg(all(
+    feature = "symbolize-split",
+    any(target_os = "linux", target_os = "macos", windows)
+))]
+pub use split::{
+    split_debug_symbols, DebugSplit, DebugSplitError, DebugSplitRequest, SplitMechanism,
+    VerifiedResolution,
+};
 pub use wire::{RawCapture, SymbolReport};

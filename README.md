@@ -61,6 +61,11 @@ keep consumers from linking tooling they do not use:
   backend name is diagnostic metadata, not the application API)
 - `symbolize` for the worker wire/client API; `symbolize-worker` builds the
   isolated `kernal-symbolize` parser executable
+- `symbolize-split` for post-link debug-symbol splitting: given a linked
+  binary it produces a stripped binary plus a complete, matched symbol file,
+  reports the mechanism obtained (`gnu-debuglink`, `dsym-bundle`, or the
+  `.pdb` the MSVC linker already wrote), and can prove the pair resolves a
+  known function through the isolated worker rather than trusting file sizes
 - `wasm-sketch-host` for opt-in core-Wasm sketch admission; the real threaded
   Rust artifact fixture remains source-only under `guests/threaded-smoke`
 - `full` for diagnostic executables that need the entire surface

@@ -20,7 +20,7 @@ use crate::platform::process::{
 /// Spelled out here rather than imported: `windows-sys` files it under the
 /// filesystem namespace, which is a generator artefact and would read at this
 /// call site as though a file were involved.
-const SYNCHRONIZE: u32 = 0x0010_0000;
+pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// `WaitForMultipleObjects` reports this when the wait itself failed.
 const WAIT_FAILED: u32 = 0xFFFF_FFFF;
@@ -146,7 +146,7 @@ impl ProcessExitWatch {
 }
 
 /// A kernel handle this crate owns and closes exactly once.
-struct KernelHandle(HANDLE);
+pub(crate) struct KernelHandle(pub(crate) HANDLE);
 
 // SAFETY: a process or event handle is a kernel object usable from any
 // thread; the value is opaque here and never dereferenced.
@@ -181,7 +181,13 @@ impl Drop for CancelOnDrop {
 /// zero-length wait reads that without blocking. `GetExitCodeProcess` against
 /// `STILL_ACTIVE` would answer the same question wrongly: 259 is a legal exit
 /// code, so a process that chose it would be called alive forever.
-fn has_already_exited(process: &KernelHandle) -> bool {
+///
+/// The handle must have been opened with [`SYNCHRONIZE`]. Without that right
+/// the wait fails rather than answering, and a failure is not a signal, so
+/// this reports `false` -- which a caller reads as "still running". Callers
+/// that may hold a query-only handle must know which one they have; see
+/// [`ProcessLiveness`](crate::ProcessLiveness).
+pub(crate) fn has_already_exited(process: &KernelHandle) -> bool {
     // SAFETY: the handle is live and was opened with SYNCHRONIZE; a zero
     // timeout makes this a question rather than a wait.
     let waited = unsafe { WaitForSingleObject(process.0, 0) };

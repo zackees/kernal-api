@@ -3,20 +3,21 @@
 use std::io;
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
+use super::process_exit_watch::{has_already_exited, KernelHandle, SYNCHRONIZE};
 use crate::platform::process::{ProcessId, ProcessInspectError, ProcessInspectErrorKind};
 
 /// `GetExitCodeProcess` reports this while a process is still running.
 ///
 /// It is also a perfectly legal exit code, so a process that exits with 259
-/// is indistinguishable from a running one by this call alone. Holding the
-/// handle open is what makes that harmless: the PID cannot be reused while a
-/// handle to it exists, so the wrong process is never described.
+/// is indistinguishable from a running one by this call alone. That is why
+/// the compare below is only the fallback: where the target can be waited on,
+/// [`has_already_exited`] answers without the ambiguity.
 const STILL_ACTIVE: u32 = 259;
 
 /// A live reference to another process, good for as long as it is held.
@@ -27,13 +28,10 @@ const STILL_ACTIVE: u32 = 259;
 /// a known-dead process rather than a stale number.
 pub struct ProcessLiveness {
     pid: u32,
-    handle: HANDLE,
+    process: KernelHandle,
+    /// Whether the handle carries `SYNCHRONIZE`, and so can be asked.
+    waitable: bool,
 }
-
-// SAFETY: a process handle is a kernel object usable from any thread; the
-// value is opaque here and never dereferenced.
-unsafe impl Send for ProcessLiveness {}
-unsafe impl Sync for ProcessLiveness {}
 
 impl std::fmt::Debug for ProcessLiveness {
     /// Names the process, not the handle.
@@ -56,6 +54,15 @@ impl ProcessLiveness {
     /// failure -- most of all `ERROR_ACCESS_DENIED` for a process this one may
     /// not query -- describes a process that exists and is reported as a host
     /// failure, so a caller cannot read "I was refused" as "it is gone".
+    ///
+    /// `SYNCHRONIZE` is asked for on top of the query right because it is what
+    /// makes [`Self::is_alive`] unambiguous, and it is asked for *as well as*
+    /// rather than *instead of*: a caller allowed to query a process but not
+    /// to wait on it still deserves the best answer this host can give, so a
+    /// refused wide open falls back to the query-only open that has always
+    /// been made here. The narrow attempt is therefore the deciding one --
+    /// every open that succeeds without this right still succeeds, and a
+    /// failure is the same failure, mapped the same way.
     pub fn open(pid: u32) -> Result<Self, ProcessInspectError> {
         // This host has no signed-PID trap of its own, but it shares the range
         // rule so a PID written down here means the same thing when a Unix
@@ -63,6 +70,16 @@ impl ProcessLiveness {
         let pid = ProcessId::new(pid)?.get();
         // SAFETY: the call takes access flags, an inherit flag, and a PID by
         // value; the returned handle is checked before use.
+        let wide =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
+        if !wide.is_null() {
+            return Ok(Self {
+                pid,
+                process: KernelHandle(wide),
+                waitable: true,
+            });
+        }
+        // SAFETY: as above.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             let source = io::Error::last_os_error();
@@ -77,7 +94,11 @@ impl ProcessLiveness {
                 source,
             });
         }
-        Ok(Self { pid, handle })
+        Ok(Self {
+            pid,
+            process: KernelHandle(handle),
+            waitable: false,
+        })
     }
 
     /// The process ID this handle was opened for.
@@ -86,21 +107,27 @@ impl ProcessLiveness {
     }
 
     /// Whether that process is still running.
+    ///
+    /// A process handle is signalled from the moment the process exits, so
+    /// where [`Self::open`] was granted `SYNCHRONIZE` the answer comes from a
+    /// zero-length wait and is exact for every exit code.
+    ///
+    /// Where that right was refused, the only question left to ask is
+    /// `GetExitCodeProcess`, which cannot tell a running process from one that
+    /// exited with 259 -- `STILL_ACTIVE` is that number. On that path alone a
+    /// process that chose 259 is reported alive for as long as this handle is
+    /// held. The narrower answer is still the better one available: it is
+    /// wrong for one exit code out of four billion, where refusing to answer
+    /// would be useless for all of them.
     pub fn is_alive(&self) -> bool {
-        let mut exit_code = 0_u32;
-        // SAFETY: `self.handle` is live for this handle's lifetime and the
-        // out-parameter is a valid initialised u32.
-        let ok = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
-        ok != 0 && exit_code == STILL_ACTIVE
-    }
-}
-
-impl Drop for ProcessLiveness {
-    fn drop(&mut self) {
-        // SAFETY: `self.handle` came from OpenProcess and is closed once.
-        unsafe {
-            CloseHandle(self.handle);
+        if self.waitable {
+            return !has_already_exited(&self.process);
         }
+        let mut exit_code = 0_u32;
+        // SAFETY: the handle is live for this value's lifetime and the
+        // out-parameter is a valid initialised u32.
+        let ok = unsafe { GetExitCodeProcess(self.process.0, &mut exit_code) };
+        ok != 0 && exit_code == STILL_ACTIVE
     }
 }
 
@@ -208,6 +235,55 @@ mod tests {
         let handle = ProcessLiveness::open(child.id()).expect("open child");
         child.wait().expect("wait");
         assert!(!handle.is_alive(), "an exited child must report dead");
+    }
+
+    /// 259 is a legal exit code, and an exit is an exit whichever number it
+    /// carried.
+    ///
+    /// This is the one exit code `GetExitCodeProcess` cannot report, because
+    /// it is the value that call also uses for "still running". A handle
+    /// opened with `SYNCHRONIZE` is asked instead, and the wait knows the
+    /// difference.
+    #[test]
+    fn a_child_that_exits_with_the_still_active_code_reports_dead() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 259"])
+            .spawn()
+            .expect("spawn");
+        let handle = ProcessLiveness::open(child.id()).expect("open child");
+        let status = child.wait().expect("wait");
+        assert_eq!(
+            status.code(),
+            Some(STILL_ACTIVE as i32),
+            "the child must actually have exited with the ambiguous code"
+        );
+        assert!(
+            !handle.is_alive(),
+            "an exit code of 259 is an exit, not a running process"
+        );
+    }
+
+    /// The fallback answers as well as it can, and no better.
+    ///
+    /// A query-only handle is what a caller gets when this host grants the
+    /// query right and withholds `SYNCHRONIZE`. That combination cannot be
+    /// arranged for a child here, so the handle is downgraded by hand -- the
+    /// rights are a superset, so the fallback call is the same call it would
+    /// make. It reports the 259 exit as alive, which is the documented limit
+    /// of that path rather than an accident.
+    #[test]
+    fn without_synchronize_the_still_active_code_is_ambiguous() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 259"])
+            .spawn()
+            .expect("spawn");
+        let mut handle = ProcessLiveness::open(child.id()).expect("open child");
+        handle.waitable = false;
+        child.wait().expect("wait");
+        assert!(
+            handle.is_alive(),
+            "the fallback cannot tell 259 from STILL_ACTIVE, and says so"
+        );
     }
 
     /// Asking politely is not silently upgraded to terminating.

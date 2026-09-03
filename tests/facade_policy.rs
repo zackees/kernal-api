@@ -525,11 +525,29 @@ const OWNED_BACKEND_PATHS: [&str; 18] = [
     "tokio::",
 ];
 
-/// An always-on companion to `kernal_api_boundary`, whose HIR pass only sees
-/// the features the Dylint job happens to compile. This scan is deliberately
-/// coarse: it covers the single-line shapes -- `pub` items, every variant of a
-/// `pub enum`, and the `pub` fields of a `pub struct` -- and leaves wrapped
-/// signatures, bounds, and alias chasing to the lint.
+/// A Dylint pass resolves types, but only for the code the compiler compiles,
+/// and `default = []`. A `dylints` job without `--all-features` skips `crash`,
+/// `wasm`, `symbolize`, and every other gated module while still reporting
+/// green, which is the failure this guard exists to prevent (#108).
+#[test]
+fn the_dylint_job_lints_every_feature_gated_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let workflow =
+        std::fs::read_to_string(root.join(".github/workflows/ci.yml")).expect("read CI workflow");
+    assert!(
+        workflow_job(&workflow, "dylints")
+            .contains("--all --workspace -- --all-features --all-targets"),
+        "the boundary lints must run over every feature-gated module and target"
+    );
+}
+
+/// An always-on companion to `kernal_api_boundary`, whose HIR pass sees only
+/// the code compiled on the lint host -- every feature since #108, but never a
+/// `cfg(windows)` or `cfg(target_os = "macos")` body, because that job runs on
+/// Linux. This scan is deliberately coarse: it covers the single-line shapes
+/// -- `pub` items, every variant of a `pub enum`, and the `pub` fields of a
+/// `pub struct` -- and leaves wrapped signatures, bounds, and alias chasing to
+/// the lint.
 #[test]
 fn backend_types_are_absent_from_public_type_positions() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

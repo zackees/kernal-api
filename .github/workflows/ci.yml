@@ -302,12 +302,18 @@ jobs:
           soldr rustup run
           nightly-2026-05-28 cargo test
           --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml
+      # A Dylint pass only sees what the compiler compiles, and `default = []`.
+      # Without `--all-features` every gated module -- `crash`, `wasm`,
+      # `symbolize`, `profile`, `fs`, `ipc`, the platform watchers -- is invisible
+      # to the boundary lints, so a green job would mean nothing beyond the
+      # ungated core. Keep both flags: features widen the module set, targets
+      # widen it to the integration tests and the two worker binaries.
       - name: Lint every client-style target
         env:
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
         run: >-
           soldr cargo dylint
-          --all --workspace -- --all-targets
+          --all --workspace -- --all-features --all-targets
 
   python:
     runs-on: ubuntu-latest

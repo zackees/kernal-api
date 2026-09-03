@@ -21,6 +21,25 @@ Then run it through the client's Soldr toolchain front door:
 soldr cargo dylint --all --workspace -- --all-targets
 ```
 
+## What the repository's own lint job covers
+
+A Dylint pass only sees code the compiler compiles, and `default = []` here.
+The `dylints` job in `.github/workflows/ci.yml` therefore runs both lints as
+
+```console
+soldr cargo dylint --all --workspace -- --all-features --all-targets
+```
+
+`--all-features` puts every gated module in front of the lint -- `crash`,
+`wasm`, `symbolize`, `profile`, `snapshot`, `fs`, `fs-watch`, `ipc`, `pty`,
+`tokio-console`, the daemon slices -- and `--all-targets` adds the integration
+tests and the two `required-features` worker binaries. A green `dylints` job
+means the whole crate is clean, not just the ungated core. The job runs on
+`ubuntu-latest`, so `cfg(windows)` and `cfg(target_os = "macos")` bodies remain
+unlinted by it; `tests/facade_policy.rs` scans those as text regardless of
+host. Narrowing the feature set is a coverage decision, not a knob: if it is
+ever narrowed, say here exactly which features remain covered.
+
 The lint checks both the client manifest and resolved Rust code. An unused,
 aliased, target-specific, build, or test dependency on a facade-owned backend
 is rejected before it can create a duplicate compile unit; method calls,

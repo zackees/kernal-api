@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::platform::process::{ProcessInspectError, ProcessInspectErrorKind};
+use crate::platform::process::{ProcessId, ProcessInspectError, ProcessInspectErrorKind};
 
 /// A live reference to another process, good for as long as it is held.
 ///
@@ -113,15 +113,13 @@ fn signal(pid: u32, signal: libc::c_int) -> Result<(), ProcessInspectError> {
     }
 }
 
+/// The one range rule, borrowed rather than restated.
+///
+/// [`ProcessId`] owns the reason a `u32` above `i32::MAX` may not reach
+/// `kill(2)`; duplicating the bound here would be a second place for it to
+/// drift out of agreement with the first.
 fn validate_pid(pid: u32) -> Result<libc::pid_t, ProcessInspectError> {
-    if pid == 0 || pid > libc::pid_t::MAX as u32 {
-        Err(ProcessInspectError::stated(
-            ProcessInspectErrorKind::InvalidPid,
-            "pid outside the range this host issues",
-        ))
-    } else {
-        Ok(pid as libc::pid_t)
-    }
+    ProcessId::new(pid).map(ProcessId::native_signed)
 }
 
 fn open_exit_kqueue(pid: u32) -> Result<OwnedFd, ProcessInspectError> {

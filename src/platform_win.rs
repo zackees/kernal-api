@@ -33,11 +33,16 @@ pub use raw_write::write_all_to_descriptor as fs_write_all_to_descriptor;
 pub(crate) mod shutdown_request;
 pub use shutdown_request::install_shutdown_request_handler as process_install_shutdown_request_handler;
 
+#[path = "platform_win/process_exit_watch.rs"]
+pub(crate) mod process_exit_watch;
+pub use process_exit_watch::ProcessExitWatch;
+
 #[path = "platform_win/process_owner_death.rs"]
 pub(crate) mod process_owner_death;
 pub use process_owner_death::{
     install_owner_death_cleanup as process_install_owner_death_cleanup,
     owner_death_cleanup_target as process_owner_death_cleanup_target,
+    spawner_lifetime_enforcement as process_spawner_lifetime_enforcement,
 };
 
 #[path = "platform_win/host.rs"]

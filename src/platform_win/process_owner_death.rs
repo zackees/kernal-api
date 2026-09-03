@@ -4,7 +4,7 @@ use std::io;
 use std::sync::OnceLock;
 
 use crate::platform::process::{
-    OwnerDeathCleanup, OwnerDeathCleanupError, OwnerDeathCleanupStage,
+    LifetimeEnforcement, OwnerDeathCleanup, OwnerDeathCleanupError, OwnerDeathCleanupStage,
 };
 
 /// The job this process was placed in, kept alive for the process's lifetime.
@@ -47,6 +47,17 @@ pub fn install_owner_death_cleanup() -> Result<OwnerDeathCleanup, OwnerDeathClea
 /// What this host will attempt, without attempting it.
 pub fn owner_death_cleanup_target() -> OwnerDeathCleanup {
     OwnerDeathCleanup::KillOnOwnerHandleClose
+}
+
+/// What binding a child to *this* process's lifetime obtains here.
+///
+/// The spawn path assigns the child to a process-wide `KILL_ON_JOB_CLOSE` job
+/// object, and a failure to do so is reported rather than swallowed -- so a
+/// spawn that succeeded got this. It is the strongest of the three: it covers
+/// descendants, and it holds however the owner dies, including a
+/// `TerminateProcess` that runs no user code at all.
+pub fn spawner_lifetime_enforcement() -> LifetimeEnforcement {
+    LifetimeEnforcement::KernelContainer
 }
 
 struct JobHandle(winapi::um::winnt::HANDLE);

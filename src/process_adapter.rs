@@ -10,11 +10,15 @@ use running_process::{
     ProcessError, StreamKind,
 };
 
+use crate::platform::process::{
+    lifetime_enforcement_for, LifetimeEnforcement, LifetimeOwner, ProcessIdentityCapture,
+    ProcessInspectError, ProcessInspectErrorKind,
+};
 use crate::{
     BoundedProcessError, BoundedProcessOutput, PlatformChild, ProcessCaptureError, ProcessExit,
-    ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion, ProcessOutputEvent,
-    ProcessOutputFault, ProcessPostExitDrain, ProcessSession, ProcessSessionExit,
-    ProcessSessionOptions, SpawnSpec, StreamMode,
+    ProcessExitWatch, ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion,
+    ProcessOutputEvent, ProcessOutputFault, ProcessPostExitDrain, ProcessSession,
+    ProcessSessionExit, ProcessSessionOptions, SpawnSpec, StreamMode,
 };
 
 /// Private child state from the selected native substrate.
@@ -35,14 +39,115 @@ pub(crate) struct ProcessSessionAdapter {
     pid: u32,
 }
 
+/// What a spawn obtained for the caller's requested owner binding.
+///
+/// The watcher handle lives here so that it is cancelled with the child
+/// handle that owns it: a watch nobody can act on any more is a pidfd and a
+/// task kept alive for nothing.
+pub(crate) struct LifetimeBinding {
+    enforcement: Option<LifetimeEnforcement>,
+    /// Held rather than read. Dropping a `Task` cancels it, which is exactly
+    /// how the watch stops when the handle that could have acted on it does.
+    #[allow(dead_code, reason = "kept for its cancel-on-drop, never queried")]
+    watcher: Option<crate::async_engine::Task<()>>,
+}
+
+impl LifetimeBinding {
+    pub(crate) const fn unbound() -> Self {
+        Self {
+            enforcement: None,
+            watcher: None,
+        }
+    }
+
+    pub(crate) fn enforcement(&self) -> Option<LifetimeEnforcement> {
+        self.enforcement
+    }
+
+    /// Stop watching, because the child this was protecting has exited.
+    ///
+    /// The enforcement report is left alone: it records what the spawn
+    /// obtained, which does not stop being true once the child is gone.
+    pub(crate) fn release(&mut self) {
+        self.watcher = None;
+    }
+}
+
 pub(crate) async fn spawn(spec: SpawnSpec) -> io::Result<PlatformChild> {
+    let owner = spec.lifetime_owner;
+    // Resolved before the child exists: an owner that has already exited must
+    // fail the spawn rather than leave a child with nothing watching it.
+    let watch = open_owner_watch(owner)?;
     let mut process = builder(spec).build();
     process.start().await.map_err(process_error_to_io)?;
     let pid = process.pid().await.map_err(process_error_to_io)?;
-    Ok(PlatformChild::new(ProcessAdapter {
-        process,
-        pid: Some(pid),
-    }))
+    let lifetime = bind_lifetime(owner, watch, pid);
+    Ok(PlatformChild::new(
+        ProcessAdapter {
+            process,
+            pid: Some(pid),
+        },
+        lifetime,
+    ))
+}
+
+/// Take the owner's exit subscription before anything is spawned.
+fn open_owner_watch(owner: Option<LifetimeOwner>) -> io::Result<Option<ProcessExitWatch>> {
+    let Some(LifetimeOwner::Process(owner)) = owner else {
+        return Ok(None);
+    };
+    ProcessExitWatch::open(owner)
+        .map(Some)
+        .map_err(|error| io::Error::new(inspect_error_kind(&error), error))
+}
+
+fn inspect_error_kind(error: &ProcessInspectError) -> io::ErrorKind {
+    match error.kind {
+        ProcessInspectErrorKind::InvalidPid => io::ErrorKind::InvalidInput,
+        ProcessInspectErrorKind::NotFound => io::ErrorKind::NotFound,
+        ProcessInspectErrorKind::Unsupported => io::ErrorKind::Unsupported,
+        ProcessInspectErrorKind::Host => io::ErrorKind::Other,
+    }
+}
+
+/// Record what the spawn obtained, and start the watcher where that is what
+/// the binding is.
+fn bind_lifetime(
+    owner: Option<LifetimeOwner>,
+    watch: Option<ProcessExitWatch>,
+    child_pid: u32,
+) -> LifetimeBinding {
+    let Some(owner) = owner else {
+        return LifetimeBinding::unbound();
+    };
+    LifetimeBinding {
+        enforcement: Some(lifetime_enforcement_for(owner)),
+        watcher: watch.map(|watch| watch_owner(watch, child_pid)),
+    }
+}
+
+/// Terminate exactly this child when exactly that owner exits.
+///
+/// Both halves are pinned rather than re-resolved: the watch names the owner
+/// process, and the kill is addressed by the child's creation generation, so
+/// neither number being handed to someone else in between can redirect it. A
+/// child that exited first leaves the kill with nothing to do, which the
+/// identity check reports rather than acting on.
+fn watch_owner(watch: ProcessExitWatch, child_pid: u32) -> crate::async_engine::Task<()> {
+    let child = match crate::platform::process::capture_identity(child_pid) {
+        ProcessIdentityCapture::Found(identity) => Some(identity),
+        _ => None,
+    };
+    crate::async_engine::launch(async move {
+        // An error here is "the host stopped answering", not "the owner
+        // died"; killing the child on it would reap for the wrong reason.
+        if watch.exited().await.is_err() {
+            return;
+        }
+        if let Some(identity) = child {
+            let _ = crate::platform::process::force_kill(identity);
+        }
+    })
 }
 
 /// Start the substrate's one-owner session and retain only facade-owned
@@ -51,15 +156,21 @@ pub(crate) async fn spawn_session(
     spec: SpawnSpec,
     options: ProcessSessionOptions,
 ) -> io::Result<ProcessSession> {
+    let owner = spec.lifetime_owner;
+    let watch = open_owner_watch(owner)?;
     let mut session = builder(spec).session(session_options(options));
     session.start().await.map_err(process_error_to_io)?;
     let (control, output) = session.into_parts().map_err(process_error_to_io)?;
     let pid = control.pid();
-    Ok(ProcessSession::new(ProcessSessionAdapter {
-        control,
-        output: tokio::sync::Mutex::new(output),
-        pid,
-    }))
+    let lifetime = bind_lifetime(owner, watch, pid);
+    Ok(ProcessSession::new(
+        ProcessSessionAdapter {
+            control,
+            output: tokio::sync::Mutex::new(output),
+            pid,
+        },
+        lifetime,
+    ))
 }
 
 /// Run one short-lived command with contained, bounded capture.
@@ -75,6 +186,15 @@ pub(crate) fn run_bounded(
     timeout: Option<Duration>,
     output_limit: usize,
 ) -> Result<BoundedProcessOutput, BoundedProcessError> {
+    // A bounded run is synchronous and owns no place to park a watcher task,
+    // so the one owner it cannot serve is refused instead of being quietly
+    // downgraded to the spawner it was not asked to bind to.
+    if matches!(spec.lifetime_owner, Some(LifetimeOwner::Process(_))) {
+        return Err(BoundedProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a bounded run binds only to its spawner; use SpawnSpec::spawn for another owner",
+        )));
+    }
     let (command, kill_when_owner_dies, priority) = std_command(spec);
     running_process::run_std_command_bounded_with_options(
         command,
@@ -221,9 +341,10 @@ fn builder(spec: SpawnSpec) -> AsyncProcessBuilder {
         stdout,
         stderr,
         create_process_group,
-        kill_when_owner_dies,
+        lifetime_owner,
         priority,
     } = spec;
+    let kill_when_owner_dies = binds_to_spawner(lifetime_owner);
     let mut builder = AsyncProcessBuilder::new(program);
     for arg in args {
         builder = builder.arg(arg);
@@ -244,6 +365,14 @@ fn builder(spec: SpawnSpec) -> AsyncProcessBuilder {
         .create_process_group(create_process_group)
         .kill_when_owner_dies(kill_when_owner_dies)
         .nice(priority.substrate_nice())
+}
+
+/// Whether the substrate's own pre-exec containment is the binding asked for.
+///
+/// It is the only owner the substrate can express, and the only one a kernel
+/// mechanism exists for.
+const fn binds_to_spawner(owner: Option<LifetimeOwner>) -> bool {
+    matches!(owner, Some(LifetimeOwner::Spawner))
 }
 
 fn session_options(options: ProcessSessionOptions) -> AsyncProcessSessionOptions {
@@ -328,9 +457,10 @@ fn std_command(spec: SpawnSpec) -> (std::process::Command, bool, crate::ProcessP
         stdout: _,
         stderr: _,
         create_process_group: _,
-        kill_when_owner_dies,
+        lifetime_owner,
         priority,
     } = spec;
+    let kill_when_owner_dies = binds_to_spawner(lifetime_owner);
     let mut command = std::process::Command::new(program);
     command.args(args);
     if let Some(current_dir) = current_dir {

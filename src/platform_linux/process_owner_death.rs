@@ -3,7 +3,7 @@
 use std::io;
 
 use crate::platform::process::{
-    OwnerDeathCleanup, OwnerDeathCleanupError, OwnerDeathCleanupStage,
+    LifetimeEnforcement, OwnerDeathCleanup, OwnerDeathCleanupError, OwnerDeathCleanupStage,
 };
 
 /// Ask the kernel to signal this process when its owner exits.
@@ -27,6 +27,21 @@ pub fn install_owner_death_cleanup() -> Result<OwnerDeathCleanup, OwnerDeathClea
 /// What this host will attempt, without attempting it.
 pub fn owner_death_cleanup_target() -> OwnerDeathCleanup {
     OwnerDeathCleanup::OwnerDeathSignal
+}
+
+/// What binding a child to *this* process's lifetime obtains here.
+///
+/// The spawn path installs `PR_SET_PDEATHSIG(SIGTERM)` in the child before
+/// `exec`, and a failure there aborts the spawn rather than returning an
+/// uncontained child -- so a spawn that succeeded got this, and reporting it
+/// is not a guess.
+///
+/// It is the weaker kernel mechanism of the two this crate can report: it
+/// covers the direct child only, never its descendants, and it is tied to the
+/// spawning *thread* rather than the process, so a spawn issued from a pool
+/// thread that later retires fires the signal early.
+pub fn spawner_lifetime_enforcement() -> LifetimeEnforcement {
+    LifetimeEnforcement::ParentDeathSignal
 }
 
 #[cfg(test)]

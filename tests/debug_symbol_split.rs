@@ -231,8 +231,22 @@ mod resolution {
     /// linker-level name is exactly this and the body cannot be folded away.
     const TARGET_FUNCTION: &str = "kernal_fixture_target";
 
-    fn worker() -> SymbolizerWorker {
-        SymbolizerWorker::new(env!("CARGO_BIN_EXE_kernal-symbolize"))
+    /// The isolated worker, or `None` when this lane never built it.
+    ///
+    /// Cargo defines `CARGO_BIN_EXE_kernal-symbolize` only where it actually
+    /// produces the binary, so `env!` made this file impossible to compile
+    /// under `cargo check --all-targets` -- which is the lane the boundary
+    /// lints run in. `option_env!` keeps the compile-time path under
+    /// `cargo test`, where the round trip still really runs, and degrades to a
+    /// skip in a check-only lane rather than to a compile error. A run-time
+    /// `env::var` would not do: Cargo sets this for the compiler, not for the
+    /// test process, so it would skip everywhere and prove nothing.
+    fn worker() -> Option<SymbolizerWorker> {
+        let Some(path) = option_env!("CARGO_BIN_EXE_kernal-symbolize") else {
+            skip("this lane did not build kernal-symbolize");
+            return None;
+        };
+        Some(SymbolizerWorker::new(path))
     }
 
     #[tokio::test]
@@ -241,9 +255,12 @@ mod resolution {
         let Some(split) = split_fixture(directory.path(), "resolved") else {
             return;
         };
+        let Some(worker) = worker() else {
+            return;
+        };
 
         let verified = split
-            .verify_resolves(&worker(), TARGET_FUNCTION)
+            .verify_resolves(&worker, TARGET_FUNCTION)
             .await
             .expect("the produced symbol file must resolve the fixture function");
 
@@ -264,13 +281,16 @@ mod resolution {
         let Some(other) = split_fixture(directory.path(), "theirs") else {
             return;
         };
+        let Some(worker) = worker() else {
+            return;
+        };
         assert_ne!(split.build_identity(), other.build_identity());
 
         // Exactly the failure a size check cannot see: a well-formed symbol
         // file of the right shape and size that describes a different build.
         std::fs::copy(other.symbol_file(), split.symbol_file()).expect("swap the symbol file");
 
-        match split.verify_resolves(&worker(), TARGET_FUNCTION).await {
+        match split.verify_resolves(&worker, TARGET_FUNCTION).await {
             Err(DebugSplitError::Unresolved { module_status, .. }) => {
                 assert_ne!(
                     module_status,
@@ -287,9 +307,12 @@ mod resolution {
         let Some(split) = split_fixture(directory.path(), "unknown") else {
             return;
         };
+        let Some(worker) = worker() else {
+            return;
+        };
 
         match split
-            .verify_resolves(&worker(), "no_such_function_exists")
+            .verify_resolves(&worker, "no_such_function_exists")
             .await
         {
             Err(DebugSplitError::FunctionAddressUnknown { function, .. }) => {

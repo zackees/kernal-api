@@ -39,10 +39,20 @@ const GRACE: Duration = Duration::from_secs(1);
 /// be spawned anywhere else. nextest exports `NEXTEST_BIN_EXE_<name>` at run
 /// time for exactly this case, so prefer it and fall back to the compile-time
 /// path for an ordinary `cargo test` run.
+///
+/// That fallback is `option_env!` rather than `env!` because Cargo defines
+/// `CARGO_BIN_EXE_…` only where it actually produces the binary: `env!` makes
+/// this file impossible to compile under `cargo check --all-targets`, which is
+/// the lane the boundary lints run in. A check-only lane never runs the test,
+/// so the `expect` here can only be reached from a run that had the path.
 fn worker_executable() -> PathBuf {
-    std::env::var_os("NEXTEST_BIN_EXE_kernal-wasm-worker")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker")))
+    if let Some(exported) = std::env::var_os("NEXTEST_BIN_EXE_kernal-wasm-worker") {
+        return PathBuf::from(exported);
+    }
+    match option_env!("CARGO_BIN_EXE_kernal-wasm-worker") {
+        Some(path) => PathBuf::from(path),
+        None => panic!("a cargo test run supplies the worker path"),
+    }
 }
 
 fn worker_config() -> SketchWorkerConfig {

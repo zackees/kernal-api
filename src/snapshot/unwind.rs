@@ -149,8 +149,12 @@ impl ModuleSectionInfo<Vec<u8>> for MappedModuleSections {
 }
 
 /// Build an unwinder covering `modules`.
+///
+/// Crate-private: the return type is a framehop type, so a public signature
+/// here would make a client speak backend vocabulary. `resolve_frames` is the
+/// facade-typed entry point.
 #[cfg(windows)]
-pub fn build_unwinder(modules: &[LoadedModule]) -> ArchUnwinder<Vec<u8>> {
+pub(crate) fn build_unwinder(modules: &[LoadedModule]) -> ArchUnwinder<Vec<u8>> {
     let mut unwinder = ArchUnwinder::new();
     for module in modules {
         let range = module.range();
@@ -168,7 +172,10 @@ pub fn build_unwinder(modules: &[LoadedModule]) -> ArchUnwinder<Vec<u8>> {
 ///
 /// Reads only `sample`'s copied bytes; the thread itself is long since
 /// resumed.
-pub fn unwind_sample(
+///
+/// Crate-private for the same reason as `build_unwinder`: the unwinder and
+/// cache parameters are framehop types.
+pub(crate) fn unwind_sample(
     unwinder: &ArchUnwinder<Vec<u8>>,
     cache: &mut ArchCache,
     sample: &ThreadSample,

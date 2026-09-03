@@ -11,3 +11,7 @@ pub mod sync {
 pub mod task {
     pub fn yield_now() {}
 }
+
+pub mod io {
+    pub trait AsyncRead {}
+}

@@ -475,6 +475,117 @@ fn process_session_surface_keeps_backend_and_native_status_types_private() {
     );
 }
 
+/// Owned-crate spellings that name a backend type wherever they appear in a
+/// type position. Mirrors `OWNED_IMPLEMENTATION_CRATES` in
+/// `dylints/kernal_api_boundary`.
+const OWNED_BACKEND_PATHS: [&str; 18] = [
+    "addr2line::",
+    "blake3::",
+    "console_api::",
+    "console_subscriber::",
+    "crash_handler::",
+    "framehop::",
+    "globset::",
+    "interprocess::",
+    "jwalk::",
+    "memmap2::",
+    "mimalloc_pprof::",
+    "notify::",
+    "pdb_addr2line::",
+    "portable_pty::",
+    "reflink_copy::",
+    "running_process::",
+    "sysinfo::",
+    "tokio::",
+];
+
+/// An always-on companion to `kernal_api_boundary`, whose HIR pass only sees
+/// the features the Dylint job happens to compile. This scan is deliberately
+/// coarse: it covers the single-line shapes -- `pub` items, every variant of a
+/// `pub enum`, and the `pub` fields of a `pub struct` -- and leaves wrapped
+/// signatures, bounds, and alias chasing to the lint.
+#[test]
+fn backend_types_are_absent_from_public_type_positions() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for path in rust_sources(&root) {
+        let source = std::fs::read_to_string(&path).expect("read Rust source");
+        for (line, position) in public_type_positions(&source) {
+            for spelling in OWNED_BACKEND_PATHS {
+                assert!(
+                    !position.contains(spelling),
+                    "{}:{line} names backend type {spelling:?} in a public type position: {}",
+                    path.display(),
+                    position.trim()
+                );
+            }
+        }
+    }
+}
+
+/// Split a single-line tuple-struct declaration into its header -- name,
+/// generics, and bounds -- and its parenthesized field list.
+fn tuple_struct_split(line: &str) -> Option<(&str, &str)> {
+    if !line.starts_with("pub struct") {
+        return None;
+    }
+    let open = line.find('(')?;
+    let close = line.rfind(')')?;
+    (open < close).then(|| (&line[..open], &line[open + 1..close]))
+}
+
+/// The one-based line number and type-bearing text of every public type
+/// position in `source`.
+fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
+    let mut positions = Vec::new();
+    // Indentation of the `pub enum`/`pub struct` header whose body is open,
+    // plus whether every field of that body is public. A `pub(crate)` field
+    // does not begin with `pub `, so it is not a public type position; every
+    // field of a public enum variant is as visible as the enum itself.
+    let mut open: Option<(usize, bool)> = None;
+    for (index, raw) in source.lines().enumerate() {
+        let line = raw.trim_start();
+        let indent = raw.len() - line.len();
+        if line.starts_with("//") {
+            continue;
+        }
+        if let Some((body_indent, fields_are_public)) = open {
+            if line == "}" && indent == body_indent {
+                open = None;
+            } else if fields_are_public || line.starts_with("pub ") {
+                positions.push((index + 1, line));
+            }
+            continue;
+        }
+        if !line.starts_with("pub ") {
+            continue;
+        }
+        // A `pub const`/`pub static` initializer is a value, not a type, and
+        // the fields of a tuple struct carry their own visibility.
+        let declaration = if line.starts_with("pub const") || line.starts_with("pub static") {
+            line.split('=').next().unwrap_or(line)
+        } else if let Some((header, fields)) = tuple_struct_split(line) {
+            if fields
+                .split(',')
+                .any(|field| field.trim_start().starts_with("pub "))
+            {
+                line
+            } else {
+                header
+            }
+        } else {
+            line
+        };
+        positions.push((index + 1, declaration));
+        if line.ends_with('{') {
+            let variant_fields_are_public = line.starts_with("pub enum");
+            if variant_fields_are_public || line.starts_with("pub struct") {
+                open = Some((indent, variant_fields_are_public));
+            }
+        }
+    }
+    positions
+}
+
 #[test]
 fn json_is_confined_to_the_external_firefox_export() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

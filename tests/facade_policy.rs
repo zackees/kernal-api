@@ -514,7 +514,7 @@ fn process_session_surface_keeps_backend_and_native_status_types_private() {
 /// Owned-crate spellings that name a backend type wherever they appear in a
 /// type position. Mirrors `OWNED_IMPLEMENTATION_CRATES` in
 /// `dylints/kernal_api_boundary`.
-const OWNED_BACKEND_PATHS: [&str; 18] = [
+const OWNED_BACKEND_PATHS: [&str; 23] = [
     "addr2line::",
     "blake3::",
     "console_api::",
@@ -524,6 +524,8 @@ const OWNED_BACKEND_PATHS: [&str; 18] = [
     "globset::",
     "interprocess::",
     "jwalk::",
+    "libc::",
+    "mach2::",
     "memmap2::",
     "mimalloc_pprof::",
     "notify::",
@@ -533,6 +535,9 @@ const OWNED_BACKEND_PATHS: [&str; 18] = [
     "running_process::",
     "sysinfo::",
     "tokio::",
+    "widestring::",
+    "winapi::",
+    "windows_sys::",
 ];
 
 /// A Dylint pass resolves types, but only for the code the compiler compiles,
@@ -587,6 +592,17 @@ fn tuple_struct_split(line: &str) -> Option<(&str, &str)> {
     (open < close).then(|| (&line[..open], &line[open + 1..close]))
 }
 
+/// Split a single-line brace-struct declaration the same way, so its field
+/// visibilities can be read rather than assumed public.
+fn inline_brace_struct_split(line: &str) -> Option<(&str, &str)> {
+    if !line.starts_with("pub struct") {
+        return None;
+    }
+    let open = line.find('{')?;
+    let close = line.rfind('}')?;
+    (open < close).then(|| (&line[..open], &line[open + 1..close]))
+}
+
 /// The one-based line number and type-bearing text of every public type
 /// position in `source`.
 fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
@@ -618,6 +634,18 @@ fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
         let declaration = if line.starts_with("pub const") || line.starts_with("pub static") {
             line.split('=').next().unwrap_or(line)
         } else if let Some((header, fields)) = tuple_struct_split(line) {
+            if fields
+                .split(',')
+                .any(|field| field.trim_start().starts_with("pub "))
+            {
+                line
+            } else {
+                header
+            }
+        } else if let Some((header, fields)) = inline_brace_struct_split(line) {
+            // `pub struct S { a: T }` written on one line never opens a body
+            // for the loop above to walk, so without this the private fields
+            // are read as public type positions. Same rule as the tuple case.
             if fields
                 .split(',')
                 .any(|field| field.trim_start().starts_with("pub "))

@@ -649,3 +649,237 @@ fn json_is_confined_to_the_external_firefox_export() {
         }
     }
 }
+
+/// The window-icon capability is GUI hosting, not part of the `default = []`
+/// async process/host HAL, so it must be feature-gated like every peer
+/// capability (`fs`, `fs-watch`, `ipc`, `pty`).
+///
+/// This is a manifest-and-source test rather than a `cargo tree` case in
+/// `ci/check_compilation_boundary_dependencies.py` on purpose. That harness
+/// proves a package is absent from the default graph, and `png`/`x11rb`
+/// cannot be: `running-process-platform-internal` 4.10.10 declares both as
+/// non-optional `cfg(target_os = "linux")` dependencies, and `running-process`
+/// is a mandatory private dependency here. Gating this crate's own copy is
+/// what is in this crate's power; the graph reduction arrives when the
+/// substrate gates its own.
+#[test]
+fn window_icon_stays_an_opt_in_gui_capability() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains(r#"window-icon = ["dep:png", "dep:x11rb"]"#),
+        "the window-icon feature must own both GUI backends"
+    );
+    for optional in [
+        r#"png = { version = "=0.17.16", optional = true }"#,
+        r#"x11rb = { version = "=0.13.2", optional = true }"#,
+    ] {
+        assert!(
+            manifest.contains(optional),
+            "this crate's own GUI backend must be optional: {optional:?}"
+        );
+    }
+    let full = manifest
+        .split("full = [")
+        .nth(1)
+        .and_then(|features| features.split(']').next())
+        .expect("locate full feature");
+    assert!(
+        full.contains("window-icon"),
+        "full must still offer the whole surface to diagnostic executables"
+    );
+
+    // Assert on the gate reaching each item rather than on an exact adjacent
+    // line pair: a later `#[cfg_attr(docsrs, ...)]` between the gate and the
+    // item, or a rustfmt rewrap, must not read as a policy violation.
+    for (file, items) in [
+        (
+            "src/lib.rs",
+            &["pub use platform_imp::{set_window_icon_impl, window_icon_support_impl};"][..],
+        ),
+        ("src/platform.rs", &["pub mod window_icon;"][..]),
+        (
+            "src/platform_linux.rs",
+            &["mod window_icon;", "pub use window_icon::{"][..],
+        ),
+        (
+            "src/platform_macos.rs",
+            &["mod window_icon;", "pub use window_icon::{"][..],
+        ),
+        (
+            "src/platform_win.rs",
+            &["mod window_icon;", "pub use window_icon::{"][..],
+        ),
+    ] {
+        let source =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|_| panic!("read {file}"));
+        for item in items {
+            assert!(
+                item_is_window_icon_gated(&source, item),
+                "{file} must place `{item}` behind #[cfg(feature = \"window-icon\")]"
+            );
+        }
+    }
+}
+
+/// True when every occurrence of `item` in `source` is preceded, ignoring
+/// attributes and blank lines, by the `window-icon` gate. The macOS and
+/// Windows host selectors are elided on the Linux lint host, so they are
+/// checked as text the way the rest of this file checks them.
+fn item_is_window_icon_gated(source: &str, item: &str) -> bool {
+    const GATE: &str = "#[cfg(feature = \"window-icon\")]";
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let mut seen = false;
+    for (index, line) in lines.iter().enumerate() {
+        if !line.starts_with(item) {
+            continue;
+        }
+        seen = true;
+        let gated = lines[..index]
+            .iter()
+            .rev()
+            .take_while(|previous| previous.starts_with('#') || previous.is_empty())
+            .any(|previous| *previous == GATE);
+        if !gated {
+            return false;
+        }
+    }
+    seen
+}
+
+/// The private `running-process` adapter is mandatory and non-optional
+/// (`Cargo.toml`, asserted by `process_substrate_is_exact_feature_minimal_and_private`),
+/// so no document may still describe it as pending or as living on a migration
+/// branch. A client that believes it has not landed keeps its own direct
+/// substrate dependency -- the duplicate compile unit the boundary Dylint
+/// exists to prevent -- and `src/lib.rs` inlines `README.md`, so a stale claim
+/// there is the crate-level rustdoc on docs.rs.
+#[test]
+fn documents_do_not_claim_the_process_substrate_is_still_pending() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Each entry pairs the exact wording that document carried before the
+    // adapter landed with wording that must be present now. Both halves
+    // matter: the banned list alone would pass vacuously against a document
+    // that never used the phrase, which is how a stale claim survives.
+    // Comparisons run on whitespace-collapsed text so a rewrap cannot slip a
+    // banned sentence past a line-oriented match.
+    for (document, stale, required) in [
+        (
+            "README.md",
+            &[
+                "adapter is implemented on the `feat/running-process-adapter` migration branch",
+                "On the phase-1 migration branch, its bounded process adapter",
+            ][..],
+            "phase-1 adapter has landed",
+        ),
+        (
+            "AGENTS.md",
+            &[
+                "will privately depend on `running-process` when phase 1 lands",
+                "Keep the broker implementation in `running-process` during phase 1",
+            ][..],
+            "privately depends on `running-process`",
+        ),
+        (
+            "ARCHITECTURE.md",
+            &["In the target architecture it depends on `running-process`"][..],
+            "bounded process adapter has landed",
+        ),
+        (
+            "COMPATIBILITY.md",
+            &["That private dependency has not landed in the current release"][..],
+            "That private dependency has landed",
+        ),
+        (
+            "DYLINT.md",
+            &["It is allowed inside `kernal-api`; phase 1 will add the private adapter"][..],
+            "where the private adapter now lives",
+        ),
+    ] {
+        let text = std::fs::read_to_string(root.join(document))
+            .unwrap_or_else(|_| panic!("read {document}"));
+        let collapsed = collapse_whitespace(&text);
+        for banned in stale {
+            assert!(
+                !collapsed.contains(&collapse_whitespace(banned)),
+                "{document} still describes the landed substrate as pending: {banned:?}"
+            );
+        }
+        assert!(
+            collapsed.contains(&collapse_whitespace(required)),
+            "{document} must state that the substrate landed: {required:?}"
+        );
+    }
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `full` deliberately excludes the four daemon slices, so a docs.rs feature
+/// set of `["full"]` alone renders none of them: four public modules would be
+/// `cfg`'d out of the only documentation clients read. Keep the documentation
+/// feature set a superset of the daemon features, and keep `--cfg docsrs`
+/// backed by the attribute that acts on it rather than dead config.
+#[test]
+fn published_documentation_renders_every_public_module() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    let metadata = manifest
+        .split("[package.metadata.docs.rs]")
+        .nth(1)
+        .and_then(|section| section.split("targets = [").next())
+        .expect("locate docs.rs metadata");
+    for feature in [
+        "daemon-identity",
+        "daemon-frame-v1",
+        "daemon-registration",
+        "daemon-registration-v2",
+    ] {
+        assert!(
+            metadata.contains(&format!("\"{feature}\"")),
+            "docs.rs must document the opt-in {feature} module that full excludes"
+        );
+    }
+    assert!(
+        metadata.contains(r#"rustdoc-args = ["--cfg", "docsrs"]"#),
+        "docs.rs metadata must still pass the cfg the crate root acts on"
+    );
+
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        lib.contains("#![cfg_attr(docsrs, feature(doc_cfg))]"),
+        "`--cfg docsrs` is dead config without the attribute that emits feature badges"
+    );
+
+    // Every module the metadata exists to render must actually be public.
+    for (feature, module) in [
+        ("daemon-identity", "daemon_identity"),
+        ("daemon-frame-v1", "daemon_frame_v1"),
+        ("daemon-registration", "daemon_registration"),
+        ("daemon-registration-v2", "daemon_registration_v2"),
+    ] {
+        assert!(
+            lib.contains(&format!(
+                "#[cfg(feature = \"{feature}\")]\npub mod {module};"
+            )),
+            "{module} must stay a public module gated on {feature}"
+        );
+    }
+
+    // Each opt-in module needs a README entry, since a reader who never opens
+    // Cargo.toml is how these stayed invisible.
+    let readme = std::fs::read_to_string(root.join("README.md")).expect("read README");
+    for feature in [
+        "daemon-identity",
+        "daemon-frame-v1",
+        "daemon-registration",
+        "daemon-registration-v2",
+        "window-icon",
+    ] {
+        assert!(
+            readme.contains(&format!("`{feature}`")),
+            "README's feature list must name {feature}"
+        );
+    }
+}

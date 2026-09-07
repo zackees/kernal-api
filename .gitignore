@@ -5,3 +5,7 @@
 __pycache__/
 # Separate workspaces: each builds into a target directory beside its manifest.
 /tests/*-consumer/target/
+# Running `scripts/build-threaded-smoke.*` locally puts a Cargo home beside the
+# guest manifest. Only the checked-in target config belongs to the repository.
+/guests/threaded-smoke/.cargo/*
+!/guests/threaded-smoke/.cargo/config.toml

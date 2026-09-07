@@ -32,13 +32,13 @@ soldr cargo dylint --all --workspace -- --all-features --all-targets
 
 `--all-features` puts every gated module in front of the lint -- `crash`,
 `wasm`, `symbolize`, `profile`, `snapshot`, `fs`, `fs-watch`, `ipc`, `pty`,
-`tokio-console`, the daemon slices -- and `--all-targets` adds the integration
-tests and the two `required-features` worker binaries. A green `dylints` job
-means the whole crate is clean, not just the ungated core. The job runs on
-`ubuntu-latest`, so `cfg(windows)` and `cfg(target_os = "macos")` bodies remain
-unlinted by it; `tests/facade_policy.rs` scans those as text regardless of
-host. Narrowing the feature set is a coverage decision, not a knob: if it is
-ever narrowed, say here exactly which features remain covered.
+`tokio-console`, `window-icon`, the daemon slices -- and `--all-targets` adds
+the integration tests and the two `required-features` worker binaries. A green
+`dylints` job means the whole crate is clean, not just the ungated core. The
+job runs on `ubuntu-latest`, so `cfg(windows)` and `cfg(target_os = "macos")`
+bodies remain unlinted by it; `tests/facade_policy.rs` scans those as text
+regardless of host. Narrowing the feature set is a coverage decision, not a
+knob: if it is ever narrowed, say here exactly which features remain covered.
 
 The lint checks both the client manifest and resolved Rust code. An unused,
 aliased, target-specific, build, or test dependency on a facade-owned backend
@@ -87,10 +87,11 @@ facade-owned trait implemented for a backend type -- the adapter direction --
 is reachable only by a caller that already holds the backend type, so it
 imposes no vocabulary on one that does not.
 
-`running-process` is classified as an owned implementation dependency for the
-target architecture. It is allowed inside `kernal-api`; phase 1 will add the
-private adapter. It is denied in each first-party application once that
-application's required process and broker facade is available.
+`running-process` is classified as an owned implementation dependency. It is
+allowed inside `kernal-api`, where the private adapter now lives
+(`src/process_adapter.rs`, on a mandatory dependency). It is denied in each
+first-party application once that application's required process and broker
+facade is available.
 `running-process` must never depend in the opposite direction.
 
 Adoption is a capability-by-capability ratchet, not a flag-day waiver. Land a

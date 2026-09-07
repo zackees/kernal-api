@@ -1,3 +1,8 @@
+// docs.rs passes `--cfg docsrs` (see `[package.metadata.docs.rs]`). Without
+// this, that flag is dead config and no gated item gets an "Available on
+// crate feature" badge -- which is how four public daemon modules stayed
+// invisible in the rendered documentation.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc = include_str!("../README.md")]
 
 //! Facade-owned asynchronous systems operations.
@@ -122,12 +127,16 @@ pub use platform_imp::{
     configure_process_command, configure_sync_contained_command, configure_sync_daemon_command,
     configure_trampoline_command, current_executable_build_id, exact_trace_capability, exit_code,
     monitor_console_windows, parent_has_console, prepare_capture_reader, set_process_name,
-    set_window_icon_impl, shell_command, soft_terminate_process_group, spawn_sync,
-    spawn_sync_daemon, start_descendant_monitor, start_exact_trace, sync_child_native_handle,
-    trampoline_exit_code, unix_mark_extra_fds_close_on_exec, unix_set_priority,
-    unix_signal_process, unix_signal_process_group, unix_signal_raw, window_icon_support_impl,
-    CaptureCancellation, TracedChild, WindowsJobHandle,
+    shell_command, soft_terminate_process_group, spawn_sync, spawn_sync_daemon,
+    start_descendant_monitor, start_exact_trace, sync_child_native_handle, trampoline_exit_code,
+    unix_mark_extra_fds_close_on_exec, unix_set_priority, unix_signal_process,
+    unix_signal_process_group, unix_signal_raw, CaptureCancellation, TracedChild, WindowsJobHandle,
 };
+
+// Window-icon mechanics are a GUI capability, not part of the default async
+// process/host HAL: on Linux they carry a PNG decoder and an X11 client.
+#[cfg(feature = "window-icon")]
+pub use platform_imp::{set_window_icon_impl, window_icon_support_impl};
 
 pub use platform_imp::{autostart_register, autostart_render_registration, autostart_unregister};
 

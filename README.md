@@ -5,9 +5,9 @@ target architecture builds on `running-process`, the trusted low-level
 native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
-`running-process` phase-1 adapter is implemented on the
-`feat/running-process-adapter` migration branch and uses the exact published
-`running-process` 4.10.10 registry release without exposing backend types.
+`running-process` phase-1 adapter has landed: this crate depends on the exact
+published `running-process` 4.10.10 registry release unconditionally, and does
+not expose backend types.
 
 In the target architecture, applications use `kernal-api`; they do not use
 `running-process` or Tokio directly. The permanent dependency direction and
@@ -43,10 +43,10 @@ direct use of implementation crates owned by this package.
 
 ## Rust features
 
-The current base crate contains the async process/host facade. On the phase-1
-migration branch, its bounded process adapter privately uses
-`running-process` 4.10.10 without exposing backend types. Optional features
-keep consumers from linking tooling they do not use:
+The base crate contains the async process/host facade. Its bounded process
+adapter privately uses `running-process` 4.10.10 without exposing backend
+types; that dependency is mandatory, not feature-gated. Optional features keep
+consumers from linking tooling they do not use:
 
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
 - `fs-watch` for filesystem-change watcher construction and event
@@ -66,9 +66,32 @@ keep consumers from linking tooling they do not use:
   reports the mechanism obtained (`gnu-debuglink`, `dsym-bundle`, or the
   `.pdb` the MSVC linker already wrote), and can prove the pair resolves a
   known function through the isolated worker rather than trusting file sizes
+- `window-icon` for host-console and child window/stock icons. This is GUI
+  hosting: on Linux it decodes PNG and speaks the X11 client protocol. Unlike
+  the other optional backends this gates the code and public surface rather
+  than the dependency graph: `running-process` declares `png` and `x11rb`
+  non-optionally on Linux, so a headless build still resolves them until the
+  substrate gates its own copy. **Source break:** `platform::window_icon`,
+  `set_window_icon_impl` and `window_icon_support_impl` were available on the
+  default feature set before this release and now require `window-icon`
 - `wasm-sketch-host` for opt-in core-Wasm sketch admission; the real threaded
   Rust artifact fixture remains source-only under `guests/threaded-smoke`
-- `full` for diagnostic executables that need the entire surface
+- `full` for diagnostic executables that need the entire non-daemon surface
+
+The four daemon slices are deliberately outside `full`, because each one
+carries a frozen wire that only an application already speaking it should
+compile. They are documented on docs.rs but must be enabled by name:
+
+- `daemon-identity` for direct-daemon identity, sidecar, probe, and
+  endpoint-mux semantics over an existing endpoint; endpoint naming, payload
+  protocols, and daemon lifecycle stay with the application
+- `daemon-frame-v1` for the frozen v1 daemon-frame envelope codec alone,
+  independent of identity, broker IPC, hashing, and runtime
+- `daemon-registration` for the frozen v1 registration records and
+  owner-private persistence, excluding endpoint/client policy and identity
+- `daemon-registration-v2` for frozen v2 service-definition registration
+  alone, so an application dual-writing during the v1-to-v2 rollout pulls no
+  broker client, identity, IPC, or runtime policy
 
 The library never installs a global allocator or subscriber by surprise.
 Applications opt in explicitly and can still compile all facilities into one

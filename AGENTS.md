@@ -10,15 +10,17 @@
 - Keep heavyweight facilities feature-gated. `default = []` must remain a
   useful async process/host HAL without profiling dependencies.
 - Follow the target graph in [ARCHITECTURE.md](ARCHITECTURE.md): applications
-  depend on `kernal-api`, which will privately depend on `running-process` when
-  phase 1 lands. Never introduce the reverse dependency.
+  depend on `kernal-api`, which privately depends on `running-process`. Phase 1
+  has landed; the dependency is mandatory and asserted by
+  `tests/facade_policy.rs`, so do not add it a second time. Never introduce the
+  reverse dependency.
 - Keep backend types private. Public APIs use facade-owned semantic types rather
   than re-exporting `running-process`, Tokio, or another implementation crate.
 - Do not add a second allocator, pprof schema, Tokio Console stack, crash
   handler, or OS HAL behind a runtime fallback. This crate is the canonical
   owner.
-- Keep the broker implementation in `running-process` during phase 1. Hoist the
-  generic broker-daemon pattern only after client migrations stabilize, without
+- Keep the broker implementation in `running-process`. Hoist the generic
+  broker-daemon pattern only after client migrations stabilize, without
   changing application payloads or adding round trips.
 - Treat one supported API and one compilation unit as separate choices. Add
   private crates or release amalgamation only when measured Soldr/Cargo timings

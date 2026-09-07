@@ -300,7 +300,6 @@ dependencies = [
  "libc",
  "mach2",
  "memmap2",
- "png",
  "running-process",
  "sysinfo",
  "thiserror",
@@ -309,7 +308,6 @@ dependencies = [
  "widestring",
  "winapi",
  "windows-sys",
- "x11rb",
 ]
 
 [[package]]

@@ -137,6 +137,7 @@ jobs:
           - symbolize-split
           - symbolize-worker
           - tokio-console
+          - window-icon
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90

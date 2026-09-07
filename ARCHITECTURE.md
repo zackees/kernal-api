@@ -23,13 +23,13 @@ zccache / soldr / fbuild
 cross-platform process, lifecycle, and broker implementation code, and it must
 have an async runtime to do that work. It must never depend on `kernal-api`.
 
-`kernal-api` is the higher semantic facade used by applications. In the target
-architecture it depends on `running-process`, selects shared implementation
-versions, adds facilities such as hashing and profiling, and turns backend
-behavior into stable application contracts. The phase-1 bounded process adapter
-uses the exact published `running-process` 4.10.10 release with only its
-`kernel-substrate` feature. First-party applications eventually depend on
-`kernal-api` only.
+`kernal-api` is the higher semantic facade used by applications. It depends on
+`running-process`, selects shared implementation versions, adds facilities such
+as hashing and profiling, and turns backend behavior into stable application
+contracts. The phase-1 bounded process adapter has landed: it uses the exact
+published `running-process` 4.10.10 release with only its `kernel-substrate`
+feature, as a mandatory dependency. First-party applications eventually depend
+on `kernal-api` only.
 
 This one-way graph resolves the async/process cycle without creating a smaller
 "base" facade that would merely move the same boundary elsewhere.
@@ -214,7 +214,14 @@ Start with cohesive, feature-gated modules. Split private implementation crates
 only when reproducible `soldr cargo` timings show a material win in clean build,
 incremental rebuild, cache reuse, or feature isolation. A release amalgamation
 is also an optimization to prove, not a permanent architectural requirement.
-Optional features must omit their dependency trees when disabled.
+Optional features must omit their dependency trees when disabled. `window-icon`
+is the one recorded exception, and a surface-only one: `running-process`
+declares `png` and `x11rb` non-optionally on Linux, so gating this crate's own
+GUI capability cannot remove them from the graph. It is therefore proved by
+`tests/facade_policy.rs::window_icon_stays_an_opt_in_gui_capability` rather
+than by a case in `ci/check_compilation_boundary_dependencies.py`, which can
+only assert absence from the graph. The exception ends when the substrate
+gates its own copy.
 
 ### Current compilation-boundary decision (issue #3)
 

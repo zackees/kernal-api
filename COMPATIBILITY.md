@@ -116,6 +116,23 @@ the same client operation and no runtime fallback to a second HAL.
   It also owns cancellation tokens, connection deadlines, and progress/idle
   timeout policy; clients must not substitute a raw runtime or global transfer
   timeout for these contracts.
+- `platform::window_icon` (feature `window-icon`): window and stock icon
+  mechanics for the host console or a child, including the ICO/PNG decode and
+  the X11 property write. GUI hosting is opt-in, so a headless client does not
+  compile it. This gates the code and public surface, not yet the dependency
+  graph: `running-process` declares `png` and `x11rb` non-optionally on Linux,
+  so they still resolve in a default build until the substrate gates its own
+  copy. `platform::window_icon`, `set_window_icon_impl` and
+  `window_icon_support_impl` were available on the default feature set before
+  this release; enabling `window-icon` is required as of it.
+- `daemon_identity`, `daemon_frame_v1`, `daemon_registration`,
+  `daemon_registration_v2` (features of the same names, each opt-in and
+  outside `full`): the frozen v1/v2 daemon wires -- identity/sidecar/probe/mux
+  semantics, the frame envelope codec, and the two registration record sets
+  with their owner-private persistence. Endpoint naming, payload protocols,
+  broker negotiation, and daemon lifecycle remain application policy. A client
+  migrating off a direct substrate dependency takes these from here rather
+  than reimplementing the records.
 
 Client CI installs the two Dylints in [DYLINT.md](DYLINT.md). They deny direct
 implementation-crate use and host `cfg` selection outside this HAL, including
@@ -134,12 +151,13 @@ facility, where dumps are stored, and which endpoints are exposed.
 
 ## Dependency direction
 
-In the target architecture, `running-process` is the lower native/process
-implementation layer and `kernal-api` is its higher semantic facade. That
-private dependency has not landed in the current release. The reverse
-dependency is forbidden. First-party applications migrate to a single direct
-systems dependency on `kernal-api` and may not expose backend types in their
-public APIs.
+`running-process` is the lower native/process implementation layer and
+`kernal-api` is its higher semantic facade. That private dependency has landed:
+it is a mandatory, non-optional dependency of the current release, so the
+client-side ban is live rather than pending. The reverse dependency is
+forbidden. First-party applications migrate to a single direct systems
+dependency on `kernal-api` and may not expose backend types in their public
+APIs.
 
 Migration branches may temporarily carry both dependencies while a capability
 is moved. The corresponding strict Dylint rule is enabled as soon as the facade

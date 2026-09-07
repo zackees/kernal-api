@@ -235,7 +235,7 @@ pub fn control_character_for_unicode(unicode: u16) -> Option<u8> {
 
 #[cfg(windows)]
 /// Writes a trace record for a translated key event and returns the event unchanged.
-pub fn trace_translated_console_key_event(
+pub(crate) fn trace_translated_console_key_event(
     record: &winapi::um::wincontypes::KEY_EVENT_RECORD,
     event: TerminalInputEventRecord,
 ) -> TerminalInputEventRecord {
@@ -259,7 +259,7 @@ pub fn trace_translated_console_key_event(
 
 #[cfg(windows)]
 /// Translates a Windows console key event into PTY input bytes.
-pub fn translate_console_key_event(
+pub(crate) fn translate_console_key_event(
     record: &winapi::um::wincontypes::KEY_EVENT_RECORD,
 ) -> Option<TerminalInputEventRecord> {
     use winapi::um::wincontypes::{

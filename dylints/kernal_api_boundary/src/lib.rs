@@ -36,6 +36,16 @@ dylint_linting::declare_late_lint! {
     "require systems and async APIs owned by kernal-api to pass through its facades"
 }
 
+/// The raw platform crates -- `libc`, `mach2`, `widestring`, `winapi`,
+/// `windows_sys` -- are owned for the same reason as the backends. #77
+/// collapsed the per-host bindings into this crate's private HAL
+/// (`src/platform_linux*`, `src/platform_macos*`, `src/platform_win*`), so a
+/// client that names one of them is speaking host vocabulary the facade
+/// exists to absorb, and a `libc::termios` or a `windows_sys` `HANDLE` in a
+/// public position here is the same leak as a backend type. Heavy private use
+/// inside those trees stays legal: within the facade owner this set is
+/// consulted only for exported items and for owned traits implemented on
+/// exported types.
 const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "addr2line",
     "blake3",
@@ -46,6 +56,8 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "globset",
     "interprocess",
     "jwalk",
+    "libc",
+    "mach2",
     "memmap2",
     "mimalloc_pprof",
     "notify",
@@ -55,6 +67,9 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "running_process",
     "sysinfo",
     "tokio",
+    "widestring",
+    "winapi",
+    "windows_sys",
 ];
 
 /// The owned-crate traits a facade type may implement, as `(crate, trait)`.

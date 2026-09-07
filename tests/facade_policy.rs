@@ -35,6 +35,11 @@ fn workflow_job<'a>(workflow: &'a str, name: &str) -> &'a str {
 #[test]
 fn implementation_crates_are_not_publicly_reexported() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    // The raw platform crates are listed beside the backends: #77 collapsed
+    // the per-host bindings into this crate's private HAL, so re-exporting one
+    // hands a client the host vocabulary the facade exists to absorb. This
+    // scan is text, so it covers the `cfg`-elided hosts the Linux lint job
+    // never compiles.
     let forbidden = [
         "pub use addr2line",
         "pub use blake3",
@@ -45,6 +50,8 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use globset",
         "pub use interprocess",
         "pub use jwalk",
+        "pub use libc",
+        "pub use mach2",
         "pub use memmap2",
         "pub use mimalloc_pprof",
         "pub use notify",
@@ -54,6 +61,9 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use running_process",
         "pub use sysinfo",
         "pub use tokio",
+        "pub use widestring",
+        "pub use winapi",
+        "pub use windows_sys",
     ];
     for path in rust_sources(&root) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");

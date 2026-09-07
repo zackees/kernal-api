@@ -108,10 +108,23 @@ pub struct ChangeEvent {
 }
 
 impl ChangeEvent {
-    /// Construct a change event. Only the per-host backend inside this crate
-    /// classifies raw host notifications, so this stays crate-private.
-    #[cfg(feature = "fs-watch")]
-    pub(crate) fn new(kind: ChangeKind, paths: Vec<PathBuf>) -> Self {
+    /// Construct a change event.
+    ///
+    /// Classifying raw host notifications is this crate's job -- a client
+    /// receives these, it does not produce them from a watch. This is public
+    /// for the case that is not production: a client whose own code turns
+    /// these into its product's event type has logic worth testing, and
+    /// testing it means handing it events. Refusing to construct one forces
+    /// that client to either skip the tests or reach for a real watcher and
+    /// a real filesystem race.
+    ///
+    /// `paths` follows the shape this type documents: a
+    /// [`RenameSide::Both`] event carries `[from, to]`, every other kind
+    /// carries the single affected path, and an empty list means the host
+    /// supplied none. Nothing enforces that here, because a test that wants
+    /// to feed its own conversion a malformed event to see what happens is a
+    /// legitimate test.
+    pub fn new(kind: ChangeKind, paths: Vec<PathBuf>) -> Self {
         Self { kind, paths }
     }
 

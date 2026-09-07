@@ -192,6 +192,109 @@ pub fn try_lock_shared(file: &File) -> io::Result<FileLock<'_>> {
     Ok(FileLock::new(file))
 }
 
+/// A held advisory lock that owns its file handle.
+///
+/// [`FileLock`] borrows, which is right when the lock and the handle live in
+/// one scope. It cannot express a lock that outlives the function taking it:
+/// a struct cannot hold a `File` and a guard borrowing that same `File`, and
+/// a function cannot return one without returning the other. Both are
+/// ordinary -- a lock file held for the lifetime of a working directory, a
+/// fetch lock returned to a caller -- so this owns the handle instead.
+///
+/// Dropping releases the lock and closes the handle, in that order.
+#[cfg(feature = "fs")]
+#[derive(Debug)]
+pub struct OwnedFileLock {
+    file: Option<File>,
+}
+
+#[cfg(feature = "fs")]
+impl OwnedFileLock {
+    /// Borrow the locked handle, to read or write the file the lock guards.
+    pub fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("the handle is taken only by unlock, which consumes self")
+    }
+
+    /// Release the lock and hand the handle back, still open.
+    ///
+    /// Use this to unlock at a point of your choosing rather than at the end
+    /// of the scope, or to keep reading the file afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns the handle alongside the error if the host refused to unlock,
+    /// since a caller that cannot unlock generally still needs to close.
+    pub fn unlock(mut self) -> Result<File, (File, io::Error)> {
+        let file = self
+            .file
+            .take()
+            .expect("the handle is taken only here, and this consumes self");
+        match crate::fs_unlock(&file) {
+            Ok(()) => Ok(file),
+            Err(error) => Err((file, error)),
+        }
+    }
+}
+
+#[cfg(feature = "fs")]
+impl Drop for OwnedFileLock {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.as_ref() {
+            let _ = crate::fs_unlock(file);
+        }
+    }
+}
+
+/// Take an exclusive advisory lock that owns `file`, waiting for it.
+///
+/// # Errors
+///
+/// Returns an error if the host lock call fails. `file` is closed in that
+/// case; a caller that needs the handle back on failure should use
+/// [`lock_exclusive`] and keep its own handle.
+#[cfg(feature = "fs")]
+pub fn lock_exclusive_owned(file: File) -> io::Result<OwnedFileLock> {
+    crate::fs_lock_exclusive(&file)?;
+    Ok(OwnedFileLock { file: Some(file) })
+}
+
+/// Take a shared advisory lock that owns `file`, waiting for it.
+///
+/// # Errors
+///
+/// As [`lock_exclusive_owned`].
+#[cfg(feature = "fs")]
+pub fn lock_shared_owned(file: File) -> io::Result<OwnedFileLock> {
+    crate::fs_lock_shared(&file)?;
+    Ok(OwnedFileLock { file: Some(file) })
+}
+
+/// Take an exclusive advisory lock that owns `file`, without waiting.
+///
+/// # Errors
+///
+/// Returns an error if another holder has the lock (see
+/// [`is_lock_conflict`]), or if the host lock call fails. `file` is closed in
+/// either case.
+#[cfg(feature = "fs")]
+pub fn try_lock_exclusive_owned(file: File) -> io::Result<OwnedFileLock> {
+    crate::fs_try_lock_exclusive(&file)?;
+    Ok(OwnedFileLock { file: Some(file) })
+}
+
+/// Take a shared advisory lock that owns `file`, without waiting.
+///
+/// # Errors
+///
+/// As [`try_lock_exclusive_owned`].
+#[cfg(feature = "fs")]
+pub fn try_lock_shared_owned(file: File) -> io::Result<OwnedFileLock> {
+    crate::fs_try_lock_shared(&file)?;
+    Ok(OwnedFileLock { file: Some(file) })
+}
+
 // ---------------------------------------------------------------------------
 // Modification time
 // ---------------------------------------------------------------------------
@@ -1201,6 +1304,48 @@ mod tests {
                 "a failed reflink must not leave a destination behind"
             ),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An owned lock excludes a second holder, and releasing it lets that
+    /// holder in -- whether the release is a drop or an explicit `unlock`.
+    ///
+    /// This is the property the borrowed guard cannot provide to a caller
+    /// that must store the lock or return it, so it is checked the same way:
+    /// take the lock, prove a second handle is refused, release, prove it is
+    /// then accepted.
+    #[test]
+    fn an_owned_lock_excludes_a_second_holder_until_released() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-owned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("lockfile");
+        std::fs::write(&path, b"").expect("create lock file");
+
+        let open = || std::fs::File::open(&path).expect("open lock file");
+
+        // Dropping the guard releases.
+        {
+            let held = lock_exclusive_owned(open()).expect("first holder takes the lock");
+            let conflict =
+                try_lock_exclusive(&open()).expect_err("a second holder must be refused");
+            assert!(is_lock_conflict(&conflict));
+            drop(held);
+        }
+        drop(try_lock_exclusive(&open()).expect("the lock is free once the owner drops"));
+
+        // `unlock` releases at a chosen point and hands the handle back still
+        // open, which is why it exists rather than only `drop`.
+        let held = lock_exclusive_owned(open()).expect("retake the lock");
+        assert!(is_lock_conflict(
+            &try_lock_exclusive(&open()).expect_err("still exclusive")
+        ));
+        let returned = held.unlock().expect("unlock returns the handle");
+        assert!(
+            returned.metadata().is_ok(),
+            "the handle must still be usable after unlocking"
+        );
+        drop(try_lock_exclusive(&open()).expect("the lock is free after unlock"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

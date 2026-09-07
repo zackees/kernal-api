@@ -249,14 +249,20 @@ pub fn set_file_mtime(
     nanoseconds: u32,
 ) -> io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
     use winapi::um::winnt::{
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
     };
 
     let time = unix_time_to_system_time(seconds_since_unix_epoch, nanoseconds)?;
+    // `FILE_FLAG_BACKUP_SEMANTICS` is what makes `CreateFileW` willing to
+    // return a handle to a directory; without it this call is
+    // `ERROR_ACCESS_DENIED` on every directory, while the Unix hosts stamp
+    // one happily. The flag does not change how a regular file is opened.
     let file = std::fs::OpenOptions::new()
         .access_mode(FILE_WRITE_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)?;
     file.set_modified(time)
 }

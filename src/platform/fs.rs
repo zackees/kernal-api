@@ -600,8 +600,28 @@ pub struct PatternSet(globset::GlobSet);
 #[cfg(feature = "fs")]
 impl PatternSet {
     /// Whether `path` matches any pattern in this set.
-    pub fn is_match(&self, path: &Path) -> bool {
-        self.0.is_match(path)
+    ///
+    /// Accepts anything path-like because callers match against whatever
+    /// they already hold -- a `String` of a relative path built for display,
+    /// an `OsStr` from a directory entry -- and requiring `&Path` only makes
+    /// them write the conversion at every call site.
+    pub fn is_match(&self, path: impl AsRef<Path>) -> bool {
+        self.0.is_match(path.as_ref())
+    }
+
+    /// Whether this set contains no patterns.
+    ///
+    /// An empty set matches nothing, so a caller filtering with "exclude
+    /// unless excluded" logic uses this to skip the walk's matching work
+    /// entirely rather than calling [`is_match`](PatternSet::is_match) per
+    /// candidate to be told no every time.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many patterns this set contains.
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -1183,6 +1203,34 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty set reports itself empty and matches nothing, and a set
+    /// accepts any path-like argument.
+    ///
+    /// Both matter to a caller that filters a walk: it asks `is_empty` once
+    /// to skip matching entirely, and matches against whatever string or
+    /// path it already holds rather than converting at every candidate.
+    #[test]
+    fn an_empty_pattern_set_is_empty_and_matches_nothing() {
+        let empty = PatternSetBuilder::new().build().expect("empty set builds");
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(!empty.is_match("anything"));
+        assert!(!empty.is_match(Path::new("anything")));
+
+        let populated = PatternSetBuilder::new()
+            .add_pattern("*.rs")
+            .add_pattern("src/**")
+            .build()
+            .expect("set builds");
+        assert!(!populated.is_empty());
+        assert_eq!(populated.len(), 2);
+        // The same candidate as a `&str`, a `String` and a `&Path`.
+        assert!(populated.is_match("main.rs"));
+        assert!(populated.is_match(String::from("main.rs")));
+        assert!(populated.is_match(Path::new("main.rs")));
+        assert!(!populated.is_match("main.txt"));
     }
 
     /// A persisted mtime survives the round trip through its two fields.

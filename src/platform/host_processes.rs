@@ -19,6 +19,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProcessSummary {
     pid: u32,
+    parent_pid: Option<u32>,
     name: String,
     running: bool,
     cpu_usage_percent: f32,
@@ -33,6 +34,17 @@ impl ProcessSummary {
     /// something to act on directly.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The parent's process identifier, when this host reports one.
+    ///
+    /// `None` means the host did not name a parent, which is how an orphan
+    /// presents once its parent has been reaped. Note the other orphan shape:
+    /// a parent pid that is present but no longer in this enumeration. A
+    /// caller reaping orphans has to treat both as orphaned, and only one of
+    /// them looks like it.
+    pub fn parent_pid(&self) -> Option<u32> {
+        self.parent_pid
     }
 
     /// The executable name, lossily decoded.
@@ -74,6 +86,7 @@ pub fn running_processes() -> Vec<ProcessSummary> {
         .iter()
         .map(|(pid, process)| ProcessSummary {
             pid: pid.as_u32(),
+            parent_pid: process.parent().map(sysinfo::Pid::as_u32),
             name: process.name().to_string(),
             running: matches!(
                 process.status(),

@@ -13,4 +13,5 @@ pub mod process;
 pub mod resources;
 pub mod terminal;
 pub mod terminal_input;
+#[cfg(feature = "window-icon")]
 pub mod window_icon;

@@ -63,6 +63,20 @@ daemon-registration = ["running-process/daemon-registration"]
 # runtime policy into applications that dual-write during the v1-to-v2 rollout.
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
 pty = ["dep:portable-pty"]
+# Window-icon and stock-icon mechanics for the host console or a child. This
+# is GUI hosting: on Linux it decodes PNG and speaks the X11 client protocol,
+# so it is gated like every peer capability rather than sitting in the
+# `default = []` process/host HAL. macOS and Windows need no extra backend,
+# but the feature name is host-independent so a client enables one capability
+# rather than one host.
+#
+# This does not yet remove `png`/`x11rb` from the default *graph*:
+# `running-process-platform-internal` 4.10.10 declares both as non-optional
+# `cfg(target_os = "linux")` dependencies and `running-process` is mandatory
+# here, so they resolve regardless. What this gates is the code and public
+# surface this crate owns; the graph reduction follows when the substrate
+# gates its own copy.
+window-icon = ["dep:png", "dep:x11rb"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
@@ -140,6 +154,7 @@ full = [
   "symbolize",
   "symbolize-split",
   "tokio-console",
+  "window-icon",
 ]
 
 [dependencies]
@@ -230,8 +245,8 @@ notify = { version = "=7.0.0", optional = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
-png = "=0.17.16"
-x11rb = "=0.13.2"
+png = { version = "=0.17.16", optional = true }
+x11rb = { version = "=0.13.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
@@ -296,7 +311,18 @@ tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "test-ut
 toml = "=0.8.23"
 
 [package.metadata.docs.rs]
-features = ["full"]
+# `full` deliberately excludes the four daemon slices (enforced by
+# `tests/facade_policy.rs`), so documenting only `full` renders none of them.
+# They are the frozen-wire surfaces client migrations depend on, and a reader
+# who cannot see them concludes the facade does not own them yet. List them
+# here explicitly; this is a documentation set, not a supported bundle.
+features = [
+  "full",
+  "daemon-identity",
+  "daemon-frame-v1",
+  "daemon-registration",
+  "daemon-registration-v2",
+]
 rustdoc-args = ["--cfg", "docsrs"]
 targets = [
   "aarch64-apple-darwin",

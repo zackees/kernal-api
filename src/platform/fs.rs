@@ -438,6 +438,10 @@ fn windows_file_time_to_unix(ticks: u64) -> FileTime {
 /// Set the modification time of the file at `path`, without disturbing its
 /// access time.
 ///
+/// `path` may name a directory as well as a regular file. Directories carry
+/// an mtime on every host this crate supports, and a client restoring a
+/// stored tree has to put it back.
+///
 /// # Errors
 ///
 /// Returns an error if the caller lacks permission to change the file's
@@ -1202,6 +1206,27 @@ mod tests {
         let metadata = std::fs::metadata(&path).expect("read metadata back");
         let read_back = FileTime::from_last_modification_time(&metadata);
         assert_eq!(read_back, stamped);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory takes a modification time the same way a file does.
+    ///
+    /// Windows needs `FILE_FLAG_BACKUP_SEMANTICS` to open a directory handle
+    /// at all, so without it this is `ERROR_ACCESS_DENIED` there while both
+    /// Unix hosts pass. A client restoring a stored tree puts directory
+    /// mtimes back, so the gap only shows up off Linux.
+    #[test]
+    fn a_unix_time_survives_the_round_trip_through_a_directory() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-dir-mtime-{}", std::process::id()));
+        let stamped_dir = dir.join("nested");
+        std::fs::create_dir_all(&stamped_dir).expect("create dir");
+
+        let stamped = FileTime::from_unix_time(1_600_000_000, 250_000_000);
+        set_file_mtime(&stamped_dir, stamped).expect("set directory mtime");
+
+        let metadata = std::fs::metadata(&stamped_dir).expect("read metadata back");
+        assert_eq!(FileTime::from_last_modification_time(&metadata), stamped);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

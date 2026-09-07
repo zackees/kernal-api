@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use kernal_api::platform::fs_watch::{ChangeEvent, ChangeKind, EntryKind, RenameSide};
+use kernal_api::platform::fs_watch::{
+    ChangeEvent, ChangeKind, EntryKind, RenameSide, RescanRequired,
+};
 
 /// A client can build the events its own conversion consumes.
 ///
@@ -42,4 +44,23 @@ fn an_event_without_paths_is_representable() {
     let pathless = ChangeEvent::new(ChangeKind::Other, Vec::new());
     assert!(pathless.paths().is_empty());
     assert_eq!(pathless.kind(), ChangeKind::Other);
+}
+
+/// A client can construct both halves of the rescan signal.
+///
+/// The two are not interchangeable: a skipped window means "rescan", while a
+/// lost watch additionally means "nothing further will arrive until you watch
+/// again". A client that treats them the same keeps a dead watch, so it needs
+/// to be able to build each one and prove it routes them differently.
+#[test]
+fn a_client_can_construct_both_halves_of_the_rescan_signal() {
+    let skipped = RescanRequired::new(false, vec![PathBuf::from("watched")]);
+    assert!(!skipped.watch_lost());
+    assert_eq!(skipped.paths(), &[PathBuf::from("watched")]);
+
+    let lost = RescanRequired::new(true, vec![PathBuf::from("watched")]);
+    assert!(
+        lost.watch_lost(),
+        "a lost watch must be distinguishable from a merely skipped window"
+    );
 }

@@ -155,10 +155,18 @@ pub struct RescanRequired {
 }
 
 impl RescanRequired {
-    /// Construct a rescan notification. Crate-private for the same reason as
-    /// [`ChangeEvent::new`].
-    #[cfg(feature = "fs-watch")]
-    pub(crate) fn new(watch_lost: bool, paths: Vec<PathBuf>) -> Self {
+    /// Construct a rescan notification.
+    ///
+    /// Public for the same reason as [`ChangeEvent::new`], and with more at
+    /// stake. A client has to decide what this variant means for it, and the
+    /// decision has two halves that are easy to get half-right: a rescan
+    /// means its view is incomplete, and [`watch_lost`](Self::watch_lost)
+    /// additionally means the watch is gone and must be re-established before
+    /// any further event arrives. A client that handles the first and forgets
+    /// the second keeps a watch that has quietly stopped reporting -- which is
+    /// the failure this variant exists to make visible. Testing that requires
+    /// constructing both.
+    pub fn new(watch_lost: bool, paths: Vec<PathBuf>) -> Self {
         Self { watch_lost, paths }
     }
 

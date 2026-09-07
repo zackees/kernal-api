@@ -363,6 +363,37 @@ pub fn copy_file(source: &Path, destination: &Path) -> io::Result<CopyOutcome> {
     }
 }
 
+/// Reflink `source` to `destination`, failing rather than falling back.
+///
+/// [`copy_file`] is the right call when the goal is that the bytes arrive.
+/// This is for the two cases where a silent byte copy is the wrong answer:
+///
+/// - **Probing a filesystem.** "Does this volume support reflinks?" is
+///   answered by attempting one and seeing whether it works. Asked through
+///   [`copy_file`], every volume answers yes, because the fallback always
+///   succeeds -- so a caller that stores the result as a capability would
+///   record a capability the filesystem does not have.
+/// - **Taking the cheap path or none.** A caller that reflinks to avoid
+///   duplicating a large artifact, and does something else entirely when it
+///   cannot, must not have a full copy performed on its behalf first. With
+///   [`copy_file`] it would pay for the copy and then, on discovering
+///   [`CopyOutcome::Copied`], have to undo it.
+///
+/// `destination` must not already exist.
+///
+/// # Errors
+///
+/// Returns an error when the filesystem does not support reflinking this
+/// pair of paths -- typically because they are on different volumes or the
+/// filesystem has no copy-on-write support -- and for the ordinary reasons a
+/// copy fails, such as `source` not existing. The two are deliberately not
+/// distinguished: a caller that cannot reflink here does the same thing
+/// whichever it is.
+#[cfg(feature = "fs")]
+pub fn reflink_file(source: &Path, destination: &Path) -> io::Result<()> {
+    reflink_copy::reflink(source, destination)
+}
+
 // ---------------------------------------------------------------------------
 // Parallel directory walk
 // ---------------------------------------------------------------------------
@@ -1090,6 +1121,40 @@ mod tests {
         match outcome {
             CopyOutcome::Reflinked => {}
             CopyOutcome::Copied { bytes } => assert_eq!(bytes, content.len() as u64),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`reflink_file`] must not silently substitute a byte copy.
+    ///
+    /// This is the property the probe callers depend on: they ask "can this
+    /// volume reflink?" by attempting one, so an implementation that fell
+    /// back would answer yes everywhere. The test cannot assume the temp
+    /// filesystem supports reflinks, so it asserts the honest disjunction --
+    /// either the reflink worked and the bytes match, or it reported failure
+    /// and left no destination behind. What must never happen is a reported
+    /// success that was actually a copy, which is exactly what
+    /// [`copy_file`] is allowed to do and this is not.
+    #[test]
+    fn reflink_file_either_reflinks_or_reports_that_it_could_not() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-reflink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        let content = b"a reflink is not a copy";
+        std::fs::write(&source, content).expect("write source");
+
+        match reflink_file(&source, &destination) {
+            Ok(()) => assert_eq!(
+                std::fs::read(&destination).expect("read destination"),
+                content,
+                "a successful reflink must expose the source's bytes"
+            ),
+            Err(_) => assert!(
+                !destination.exists(),
+                "a failed reflink must not leave a destination behind"
+            ),
         }
 
         let _ = std::fs::remove_dir_all(&dir);

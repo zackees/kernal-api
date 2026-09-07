@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           cache: false
           cross-targets: aarch64-apple-darwin
@@ -139,7 +139,7 @@ jobs:
           - tokio-console
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - run: >-
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
@@ -163,7 +163,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Check the external daemon-registration consumer
         run: >-
           soldr cargo check --locked
@@ -186,7 +186,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0
       - name: Build the source-only threaded guest and validate root execution (Unix)
@@ -205,7 +205,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - run: uv run --no-project ci/check_compilation_boundary_dependencies.py
 
@@ -243,9 +243,9 @@ jobs:
         with:
           lfs: true
       - if: matrix.legacy_cargo
-        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - if: ${{ !matrix.legacy_cargo }}
-        uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           # Apple SDK preparation has no archive payload to cache.
           cache: false
@@ -269,7 +269,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0
           cache: true

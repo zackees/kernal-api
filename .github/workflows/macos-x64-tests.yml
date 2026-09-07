@@ -69,7 +69,7 @@ jobs:
           test -r /dev/kvm && test -w /dev/kvm
           echo "kvm ok"
 
-      - uses: zackees/setup-soldr@61dbee94deb0b7240a9a006a74ed04989a920303
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           cache: false
           cross-targets: x86_64-apple-darwin

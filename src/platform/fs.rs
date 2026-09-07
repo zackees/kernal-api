@@ -207,8 +207,11 @@ pub fn try_lock_shared(file: &File) -> io::Result<FileLock<'_>> {
 /// failing on values a filesystem can actually hold. A value only ever moves
 /// between [`Metadata`](std::fs::Metadata) (via
 /// [`from_last_modification_time`](FileTime::from_last_modification_time))
-/// and a file (via [`set_file_mtime`]); nothing in this facade needs to read
-/// a `FileTime` apart from that round trip.
+/// and a file (via [`set_file_mtime`]). A client that persists mtimes rather
+/// than only copying them between a file and its metadata reads the value
+/// back through [`unix_seconds`](FileTime::unix_seconds) and
+/// [`nanoseconds`](FileTime::nanoseconds), which are the same two fields the
+/// constructors take.
 #[cfg(feature = "fs")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileTime {
@@ -228,6 +231,28 @@ impl FileTime {
             seconds_since_unix_epoch,
             nanoseconds,
         }
+    }
+
+    /// The whole seconds since the Unix epoch, negative before 1970.
+    ///
+    /// With [`nanoseconds`](FileTime::nanoseconds) this is the exact pair
+    /// [`from_unix_time`](FileTime::from_unix_time) accepts, so a persisted
+    /// mtime round-trips without going through `SystemTime` -- which is the
+    /// point, since `SystemTime` cannot represent every value a filesystem
+    /// can hold.
+    pub const fn unix_seconds(self) -> i64 {
+        self.seconds_since_unix_epoch
+    }
+
+    /// The sub-second remainder, in nanoseconds.
+    ///
+    /// This is a remainder, not a total: it is always in `0..1_000_000_000`
+    /// and is *not* signed for times before 1970. A pre-epoch mtime has a
+    /// negative [`unix_seconds`](FileTime::unix_seconds) and a positive
+    /// nanosecond remainder counting forward from it, which is how both the
+    /// host field and `from_unix_time` encode it.
+    pub const fn nanoseconds(self) -> u32 {
+        self.nanoseconds
     }
 
     /// Construct a modification time from [`SystemTime`], such as
@@ -1156,6 +1181,55 @@ mod tests {
                 "a failed reflink must not leave a destination behind"
             ),
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A persisted mtime survives the round trip through its two fields.
+    ///
+    /// This is the property a client that stores mtimes depends on, and it
+    /// is deliberately checked without `SystemTime` in the middle: the whole
+    /// reason `FileTime` carries the raw pair is that `SystemTime` cannot
+    /// represent every value a filesystem can hold, so a round trip through
+    /// it would not prove this.
+    #[test]
+    fn a_file_time_round_trips_through_its_accessors() {
+        for (seconds, nanoseconds) in [
+            (0_i64, 0_u32),
+            (1_700_000_000, 123_456_789),
+            // Before 1970: the seconds go negative while the remainder stays
+            // a positive count forward, which is the encoding that is easy
+            // to get wrong when reading a value back.
+            (-1, 999_999_999),
+            (-86_400, 1),
+        ] {
+            let time = FileTime::from_unix_time(seconds, nanoseconds);
+            assert_eq!(time.unix_seconds(), seconds);
+            assert_eq!(time.nanoseconds(), nanoseconds);
+            assert_eq!(
+                FileTime::from_unix_time(time.unix_seconds(), time.nanoseconds()),
+                time,
+                "reconstructing from the accessors must yield the same value"
+            );
+        }
+    }
+
+    /// The mtime read back off a file is the one that was written, field for
+    /// field -- not merely equal as a `SystemTime`.
+    #[test]
+    fn a_written_mtime_reads_back_through_the_accessors() {
+        let dir = std::env::temp_dir().join(format!("rp-fs-mtime-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("stamped");
+        std::fs::write(&path, b"x").expect("write file");
+
+        let written = FileTime::from_unix_time(1_600_000_000, 500_000_000);
+        set_file_mtime(&path, written).expect("set mtime");
+        let metadata = std::fs::metadata(&path).expect("stat");
+        let read_back = FileTime::from_last_modification_time(&metadata);
+
+        assert_eq!(read_back.unix_seconds(), written.unix_seconds());
+        assert_eq!(read_back.nanoseconds(), written.nanoseconds());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

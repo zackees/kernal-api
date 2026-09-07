@@ -56,7 +56,15 @@ use std::time::Duration;
 
 use crash_handler::{CrashContext, CrashEventResult, CrashHandler};
 
-use self::spool::{CrashFrame, CrashMetadata, CrashModule, CrashThread, RECORD_SIZE};
+use self::spool::{CrashFrame, CrashModule, CrashThread, RECORD_SIZE};
+
+/// The metadata `install` takes, re-exported so callers can name it.
+///
+/// It is defined in [`spool`] because that is what writes it into a
+/// record, but a client reaching `install` should not have to know that:
+/// the argument type of a public function belongs in the same module as
+/// the function.
+pub use self::spool::CrashMetadata;
 
 /// Crash interception policy. Calling `install` arms it by default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

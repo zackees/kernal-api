@@ -108,10 +108,23 @@ pub struct ChangeEvent {
 }
 
 impl ChangeEvent {
-    /// Construct a change event. Only the per-host backend inside this crate
-    /// classifies raw host notifications, so this stays crate-private.
-    #[cfg(feature = "fs-watch")]
-    pub(crate) fn new(kind: ChangeKind, paths: Vec<PathBuf>) -> Self {
+    /// Construct a change event.
+    ///
+    /// Classifying raw host notifications is this crate's job -- a client
+    /// receives these, it does not produce them from a watch. This is public
+    /// for the case that is not production: a client whose own code turns
+    /// these into its product's event type has logic worth testing, and
+    /// testing it means handing it events. Refusing to construct one forces
+    /// that client to either skip the tests or reach for a real watcher and
+    /// a real filesystem race.
+    ///
+    /// `paths` follows the shape this type documents: a
+    /// [`RenameSide::Both`] event carries `[from, to]`, every other kind
+    /// carries the single affected path, and an empty list means the host
+    /// supplied none. Nothing enforces that here, because a test that wants
+    /// to feed its own conversion a malformed event to see what happens is a
+    /// legitimate test.
+    pub fn new(kind: ChangeKind, paths: Vec<PathBuf>) -> Self {
         Self { kind, paths }
     }
 
@@ -142,10 +155,18 @@ pub struct RescanRequired {
 }
 
 impl RescanRequired {
-    /// Construct a rescan notification. Crate-private for the same reason as
-    /// [`ChangeEvent::new`].
-    #[cfg(feature = "fs-watch")]
-    pub(crate) fn new(watch_lost: bool, paths: Vec<PathBuf>) -> Self {
+    /// Construct a rescan notification.
+    ///
+    /// Public for the same reason as [`ChangeEvent::new`], and with more at
+    /// stake. A client has to decide what this variant means for it, and the
+    /// decision has two halves that are easy to get half-right: a rescan
+    /// means its view is incomplete, and [`watch_lost`](Self::watch_lost)
+    /// additionally means the watch is gone and must be re-established before
+    /// any further event arrives. A client that handles the first and forgets
+    /// the second keeps a watch that has quietly stopped reporting -- which is
+    /// the failure this variant exists to make visible. Testing that requires
+    /// constructing both.
+    pub fn new(watch_lost: bool, paths: Vec<PathBuf>) -> Self {
         Self { watch_lost, paths }
     }
 

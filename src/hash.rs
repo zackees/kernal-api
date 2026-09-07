@@ -412,6 +412,44 @@ pub fn blake3_file(
     }
 }
 
+/// Hash an already-open file's content with BLAKE3.
+///
+/// Identical to [`blake3_file`] except that the caller supplies the handle.
+/// A caller that has already opened and stated the file -- to compare
+/// metadata before and after hashing, say -- would otherwise have to reopen
+/// and restate it just to reach the mapped, parallel path, which is both
+/// slower and a TOCTOU widening: the reopened path can resolve to a
+/// different inode than the handle it already holds.
+///
+/// Honors [`Blake3ReadOptions::memory_map`] exactly as [`blake3_file`] does,
+/// including the parallel hash above the internal threshold and the fallback
+/// to the buffered read whenever mapping does not apply.
+///
+/// # Preconditions
+///
+/// The mapped path reads the whole file regardless of the handle's cursor,
+/// but the buffered fallback reads from the current position. Pass a handle
+/// positioned at byte zero so both paths return the same digest.
+///
+/// # Errors
+///
+/// Returns [`Blake3HashError`] when the file cannot be stated or read, or
+/// when a configured [`Blake3ReadOptions::maximum_bytes`] is exceeded.
+pub fn blake3_open_file(
+    file: &std::fs::File,
+    options: Blake3ReadOptions,
+) -> Result<Blake3Digest, Blake3HashError> {
+    let mapped_digest = if options.memory_map {
+        blake3_file_memory_mapped(file, options)?
+    } else {
+        None
+    };
+    match mapped_digest {
+        Some(digest) => Ok(digest),
+        None => blake3_reader(file, options),
+    }
+}
+
 /// Hash an already-open file by memory-mapping it, honoring the configured
 /// size limit against the file's exact length.
 ///

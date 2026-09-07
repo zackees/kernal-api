@@ -74,12 +74,21 @@ impl ProcessSummary {
     }
 }
 
-/// Every process this host will tell us about.
+/// Every process this host will tell us about, as of now.
 ///
 /// The result is unordered and unfiltered: callers looking for one program
 /// match on [`ProcessSummary::name`] themselves, because what counts as a
 /// match is theirs -- an exact name, a name with a `.exe` suffix, a substring.
-pub fn running_processes() -> Vec<ProcessSummary> {
+///
+/// Named `snapshot` rather than `running_processes` on purpose. The obvious
+/// name contains the substring `running_process`, which is the backend crate
+/// this facade exists to keep out of its public surface, and
+/// `tests/facade_policy.rs` scans public items for exactly that string. It
+/// cannot tell a coincidence from a leak, and it should not have to: the
+/// cheap fix is here, not in loosening a check that guards the boundary.
+/// `snapshot` also says the thing that matters -- this is a moment, already
+/// potentially stale when read.
+pub fn snapshot() -> Vec<ProcessSummary> {
     let system = sysinfo::System::new_all();
     system
         .processes()
@@ -163,7 +172,7 @@ mod tests {
     /// must carry a usable name rather than an empty string.
     #[test]
     fn enumeration_finds_this_process() {
-        let processes = running_processes();
+        let processes = snapshot();
         assert!(!processes.is_empty(), "a host always runs something");
 
         let me = std::process::id();

@@ -728,7 +728,20 @@ impl OperationHub {
         if buffer.len().saturating_add(bytes.len()) > self.blob_limits.maximum_blob_bytes {
             return Err(HubError::Quota);
         }
-        buffer.extend(bytes);
+        Self::reserve_blob_capacity(
+            &mut state,
+            blob,
+            bytes.len(),
+            self.blob_limits.maximum_sketch_bytes,
+        )?;
+        if let ResourceValue::Blob { buffer, .. } = &mut state
+            .resources
+            .get_mut(&blob)
+            .ok_or(HubError::Invalid)?
+            .value
+        {
+            buffer.extend(bytes);
+        }
         state.buffered_blob_bytes += bytes.len();
         state.peak_buffered_blob_bytes = state
             .peak_buffered_blob_bytes
@@ -841,6 +854,40 @@ impl OperationHub {
         Ok(operation)
     }
 
+    fn reserve_blob_capacity(
+        state: &mut State,
+        blob: OpaqueToken,
+        additional: usize,
+        maximum: usize,
+    ) -> Result<(), HubError> {
+        let retained = state.resources.values().fold(0_usize, |total, resource| {
+            total.saturating_add(match &resource.value {
+                ResourceValue::Blob { buffer, .. } => buffer.capacity(),
+                _ => 0,
+            })
+        });
+        let ResourceValue::Blob { buffer, .. } = &mut state
+            .resources
+            .get_mut(&blob)
+            .ok_or(HubError::Invalid)?
+            .value
+        else {
+            return Err(HubError::WrongKind);
+        };
+        let required = buffer
+            .len()
+            .checked_add(additional)
+            .ok_or(HubError::Quota)?;
+        let growth = required.saturating_sub(buffer.capacity());
+        if retained.saturating_add(growth) > maximum {
+            return Err(HubError::Quota);
+        }
+        // Avoid VecDeque's geometric growth retaining uncharged spare bytes.
+        buffer
+            .try_reserve_exact(additional)
+            .map_err(|_| HubError::Exhausted)
+    }
+
     fn drive_blob_writes(&self) -> Result<(), HubError> {
         // Each successful pass terminalizes at least one operation. Revisit
         // writes after reads release capacity, without recursive pumping.
@@ -865,7 +912,7 @@ impl OperationHub {
                 .as_ref()
                 .ok_or(HubError::Invalid)?
                 .len();
-            let terminal = match state.resources.get(&resource).map(|slot| &slot.value) {
+            let mut terminal = match state.resources.get(&resource).map(|slot| &slot.value) {
                 Some(ResourceValue::Blob { sealed: true, .. }) | None => Terminal::Closed,
                 Some(ResourceValue::Blob { buffer, .. }) => {
                     if buffer.len().saturating_add(count) > self.blob_limits.maximum_blob_bytes
@@ -878,6 +925,18 @@ impl OperationHub {
                 }
                 _ => Terminal::Rejected,
             };
+            if terminal == Terminal::Completed {
+                match Self::reserve_blob_capacity(
+                    &mut state,
+                    resource,
+                    count,
+                    self.blob_limits.maximum_sketch_bytes,
+                ) {
+                    Ok(()) => {}
+                    Err(HubError::Quota) => continue,
+                    Err(_) => terminal = Terminal::Rejected,
+                }
+            }
             if terminal == Terminal::Completed {
                 let bytes = state
                     .operations
@@ -2075,6 +2134,25 @@ mod tests {
     }
 
     #[test]
+    fn retained_blob_capacity_blocks_other_blob_growth_until_released() {
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(1024, 1024, 1024).unwrap())
+            .unwrap();
+        let first = hub.create_blob(1).unwrap();
+        let second = hub.create_blob(1).unwrap();
+        hub.blob_write(1, first, &[7; 1024]).unwrap();
+        drop(hub.blob_read(1, first, 512).unwrap());
+        assert_eq!(hub.blob_write(1, second, &[8; 512]), Err(HubError::Quota));
+        let pending = hub.submit_blob_write(1, second, &[8; 512]).unwrap();
+        assert_eq!(hub.take_terminal(pending, 1), Ok(None));
+        drop(hub.blob_read(1, first, 512).unwrap());
+        assert_eq!(
+            hub.take_terminal(pending, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        assert_eq!(hub.blob_read(1, second, 512).unwrap(), [8; 512]);
+    }
+
+    #[test]
     fn capacity_snapshot_includes_partial_blob_and_uncollected_read_allocations() {
         let hub = OperationHub::with_blob_limits(4, 1, BlobLimits::new(1024, 1024, 1024).unwrap())
             .unwrap();
@@ -2380,16 +2458,18 @@ mod tests {
 
     #[test]
     fn read_progress_drives_previously_skipped_writers_without_collection() {
-        let hub = OperationHub::with_blob_limits(8, 3, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let hub = OperationHub::with_blob_limits(8, 4, BlobLimits::new(4, 4, 8).unwrap()).unwrap();
         let a = hub.create_blob(1).unwrap();
         let b = hub.create_blob(1).unwrap();
         let c = hub.create_blob(1).unwrap();
+        let retained = hub.create_blob(1).unwrap();
         hub.blob_write(1, a, b"full").unwrap();
-        hub.blob_write(1, a, b"full").unwrap();
+        hub.blob_write(1, retained, b"full").unwrap();
         hub.submit_blob_write(1, b, b"next").unwrap();
         let last = hub.submit_blob_write(1, c, b"last").unwrap();
+        // Release backing allocations, not merely payload-length credits.
         hub.submit_blob_read(1, b, 4).unwrap();
-        hub.submit_blob_read(1, a, 4).unwrap();
+        drop(hub.blob_read(1, a, 4).unwrap());
         assert!(
             hub.take_terminal(last, 1).unwrap().is_some(),
             "read progress must revisit skipped writers"

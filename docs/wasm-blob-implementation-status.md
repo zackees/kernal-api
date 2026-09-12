@@ -75,6 +75,18 @@ payload lengths. A regression demonstrates why aggregate enforcement is still
 required: after writing 1,024 bytes and reading 512 without collection, the hub
 retains at least 1,536 bytes of backing capacity (1,024 in the partially drained
 blob plus 512 in the result), although payload-length counters total 1,024.
+Blob storage growth now checks the sum of retained blob backing capacities
+against the sketch byte limit and reserves exactly the requested growth instead
+of using geometric growth. Partial drains do not release that capacity budget;
+emptying or closing the blob does. A focused regression verifies that another
+blob's synchronous write is rejected and its asynchronous write stays pending
+until the first blob releases its allocation. All 38 native hub tests pass.
+This is a bound on blob storage, not yet one aggregate transfer-memory budget:
+pending inputs and completed read results remain separately accounted.
+The existing Cargo-built 64 MiB guest also passed with this accounting change
+on Linux x86-64: 5.95 seconds in-process and 9.47 seconds through the killable
+worker. These runs reused the admitted guest artifact and rebuilt the host.
+
 The counter covers hub-owned allocations only, not temporary buffers held by
 the output writer or caller. It is a current measurement, not a peak or quota.
 

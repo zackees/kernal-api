@@ -20,6 +20,9 @@ pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
+const BLOB_RESOURCE_KIND: u8 = 3;
+const BLOB_RIGHT_READ: u8 = 0b01;
+const BLOB_RIGHT_WRITE: u8 = 0b10;
 const STATUS_PENDING: u8 = 0;
 const STATUS_COMPLETED: u8 = 1;
 const STATUS_CANCELLED: u8 = 2;
@@ -68,7 +71,45 @@ pub(crate) struct HubSnapshot {
     pub(crate) live_resources: usize,
     pub(crate) suspends: u64,
     pub(crate) resumes: u64,
+    pub(crate) buffered_blob_bytes: usize,
+    pub(crate) peak_buffered_blob_bytes: usize,
 }
+
+/// Private limits for the opaque bulk-data boundary.  They deliberately live
+/// beside operation/resource authority: a producer cannot bypass accounting
+/// by choosing a different host queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BlobLimits {
+    pub(crate) maximum_chunk_bytes: usize,
+    pub(crate) maximum_blob_bytes: usize,
+    pub(crate) maximum_sketch_bytes: usize,
+}
+
+impl BlobLimits {
+    pub(crate) const fn new(
+        maximum_chunk_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_sketch_bytes: usize,
+    ) -> Result<Self, HubError> {
+        if maximum_chunk_bytes == 0
+            || maximum_blob_bytes < maximum_chunk_bytes
+            || maximum_sketch_bytes < maximum_blob_bytes
+        {
+            return Err(HubError::Quota);
+        }
+        Ok(Self {
+            maximum_chunk_bytes,
+            maximum_blob_bytes,
+            maximum_sketch_bytes,
+        })
+    }
+}
+
+const DEFAULT_BLOB_LIMITS: BlobLimits = BlobLimits {
+    maximum_chunk_bytes: 64 * 1024,
+    maximum_blob_bytes: 1024 * 1024,
+    maximum_sketch_bytes: 4 * 1024 * 1024,
+};
 
 /// Private typed requests shared by the generated ABI and heavyweight native
 /// backends.  It is intentionally closed: adding authority means adding a
@@ -117,6 +158,7 @@ struct ResourceSlot {
 enum ResourceValue {
     Synthetic,
     ExternalWebview,
+    Blob(VecDeque<u8>),
 }
 
 struct OperationSlot {
@@ -149,6 +191,8 @@ struct State {
     closed_resource_order: VecDeque<OpaqueToken>,
     suspends: u64,
     resumes: u64,
+    buffered_blob_bytes: usize,
+    peak_buffered_blob_bytes: usize,
     closed: bool,
 }
 
@@ -157,6 +201,7 @@ pub(crate) struct OperationHub {
     scope: u64,
     maximum_operations: usize,
     maximum_resources: usize,
+    blob_limits: BlobLimits,
     state: Mutex<State>,
 }
 
@@ -165,11 +210,20 @@ impl OperationHub {
         maximum_operations: usize,
         maximum_resources: usize,
     ) -> Result<Arc<Self>, HubError> {
+        Self::new_with_blob_limits(maximum_operations, maximum_resources, DEFAULT_BLOB_LIMITS)
+    }
+
+    fn new_with_blob_limits(
+        maximum_operations: usize,
+        maximum_resources: usize,
+        blob_limits: BlobLimits,
+    ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
             scope,
             maximum_operations,
             maximum_resources,
+            blob_limits,
             state: Mutex::new(State {
                 resources: BTreeMap::new(),
                 operations: BTreeMap::new(),
@@ -180,9 +234,22 @@ impl OperationHub {
                 closed_resource_order: VecDeque::new(),
                 suspends: 0,
                 resumes: 0,
+                buffered_blob_bytes: 0,
+                peak_buffered_blob_bytes: 0,
                 closed: false,
             }),
         }))
+    }
+
+    /// Tighten the default bulk limits for a logical sketch before it has any
+    /// resources.  This makes test/embedding quotas explicit without adding a
+    /// public storage abstraction or a second resource table.
+    pub(crate) fn with_blob_limits(
+        maximum_operations: usize,
+        maximum_resources: usize,
+        limits: BlobLimits,
+    ) -> Result<Arc<Self>, HubError> {
+        Self::new_with_blob_limits(maximum_operations, maximum_resources, limits)
     }
 
     /// The sole scheduling entry point.  Both generated guest imports and a
@@ -506,6 +573,105 @@ impl OperationHub {
         self.create_resource_value(store, kind, rights, shareable, ResourceValue::Synthetic)
     }
 
+    /// Grant an opaque, bidirectional in-memory blob to one logical sketch.
+    /// The buffer is host-owned; callers can only append or pull bounded
+    /// chunks, so it cannot become a disguised whole-value ABI transport.
+    pub(crate) fn create_blob(&self, store: u64) -> Result<OpaqueToken, HubError> {
+        let token = self.create_resource_value(
+            store,
+            BLOB_RESOURCE_KIND,
+            BLOB_RIGHT_READ | BLOB_RIGHT_WRITE,
+            false,
+            ResourceValue::Blob(VecDeque::new()),
+        )?;
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        state
+            .resources
+            .get_mut(&token)
+            .ok_or(HubError::Invalid)?
+            .reserved = false;
+        Ok(token)
+    }
+
+    /// Append exactly one quota-accounted chunk. A full blob or sketch budget
+    /// rejects before copying, which is the synchronous reservation half of
+    /// the generated capacity-awaited write operation.
+    pub(crate) fn blob_write(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        bytes: &[u8],
+    ) -> Result<usize, HubError> {
+        if bytes.len() > self.blob_limits.maximum_chunk_bytes {
+            return Err(HubError::Quota);
+        }
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.buffered_blob_bytes.saturating_add(bytes.len())
+            > self.blob_limits.maximum_sketch_bytes
+        {
+            return Err(HubError::Quota);
+        }
+        let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
+        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        let ResourceValue::Blob(buffer) = &mut resource.value else {
+            return Err(HubError::WrongKind);
+        };
+        if buffer.len().saturating_add(bytes.len()) > self.blob_limits.maximum_blob_bytes {
+            return Err(HubError::Quota);
+        }
+        buffer.extend(bytes);
+        state.buffered_blob_bytes += bytes.len();
+        state.peak_buffered_blob_bytes = state
+            .peak_buffered_blob_bytes
+            .max(state.buffered_blob_bytes);
+        Ok(bytes.len())
+    }
+
+    /// Pull at most one configured chunk. Nothing is copied or produced until
+    /// the logical guest explicitly asks, and capacity is released before the
+    /// next producer attempt observes it.
+    pub(crate) fn blob_read(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        maximum_bytes: usize,
+    ) -> Result<Vec<u8>, HubError> {
+        if maximum_bytes > self.blob_limits.maximum_chunk_bytes {
+            return Err(HubError::Quota);
+        }
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
+        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)?;
+        let ResourceValue::Blob(buffer) = &mut resource.value else {
+            return Err(HubError::WrongKind);
+        };
+        let count = maximum_bytes.min(buffer.len());
+        let result: Vec<_> = buffer.drain(..count).collect();
+        state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
+        Ok(result)
+    }
+
+    fn validate_resource(
+        resource: &ResourceSlot,
+        store: u64,
+        kind: u8,
+        rights: u8,
+    ) -> Result<(), HubError> {
+        if resource.reserved {
+            return Err(HubError::Closed);
+        }
+        if resource.identity.kind != kind {
+            return Err(HubError::WrongKind);
+        }
+        if resource.identity.rights & rights != rights {
+            return Err(HubError::WrongRights);
+        }
+        if resource.owner.store != store && !resource.shareable {
+            return Err(HubError::WrongRights);
+        }
+        Ok(())
+    }
+
     fn create_resource_value(
         &self,
         store: u64,
@@ -802,6 +968,9 @@ impl OperationHub {
                 Err(HubError::Invalid)
             };
         };
+        if let ResourceValue::Blob(buffer) = &resource.value {
+            state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(buffer.len());
+        }
         state.closed_resources.insert(token);
         state.closed_resource_order.push_back(token);
         while state.closed_resource_order.len() > MAX_CLOSED_TOMBSTONES {
@@ -829,6 +998,7 @@ impl OperationHub {
         };
         state.closed = true;
         state.resources.clear();
+        state.buffered_blob_bytes = 0;
         state.free_resource_slots.clear();
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
@@ -858,6 +1028,8 @@ impl OperationHub {
             live_resources: state.resources.len(),
             suspends: state.suspends,
             resumes: state.resumes,
+            buffered_blob_bytes: state.buffered_blob_bytes,
+            peak_buffered_blob_bytes: state.peak_buffered_blob_bytes,
         }
     }
 }
@@ -1194,5 +1366,55 @@ mod tests {
             "create payload is the opaque resource token"
         );
         assert_eq!(hub.poll_wire(0, operation) & 0xff, u64::from(STATUS_ERROR));
+    }
+
+    #[test]
+    fn opaque_blob_transfers_sixty_four_mebibytes_in_bounded_pull_chunks() {
+        let limits = BlobLimits::new(64 * 1024, 64 * 1024, 64 * 1024).unwrap();
+        let hub = OperationHub::with_blob_limits(4, 2, limits).unwrap();
+        let blob = hub.create_blob(7).unwrap();
+        let chunk = vec![0xA5; limits.maximum_chunk_bytes];
+        let mut transferred = 0;
+        while transferred < 64 * 1024 * 1024 {
+            assert_eq!(hub.blob_write(7, blob, &chunk), Ok(chunk.len()));
+            assert_eq!(hub.blob_read(7, blob, chunk.len()), Ok(chunk.clone()));
+            transferred += chunk.len();
+            assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+        }
+        let snapshot = hub.snapshot();
+        assert_eq!(
+            snapshot.peak_buffered_blob_bytes,
+            limits.maximum_chunk_bytes
+        );
+        assert_eq!(snapshot.live_resources, 1);
+    }
+
+    #[test]
+    fn blob_capacity_is_released_only_by_a_bounded_pull_and_close_reclaims_it() {
+        let limits = BlobLimits::new(4, 8, 8).unwrap();
+        let hub = OperationHub::with_blob_limits(2, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        assert_eq!(hub.blob_write(1, blob, b"1234"), Ok(4));
+        assert_eq!(hub.blob_write(1, blob, b"5678"), Ok(4));
+        assert_eq!(hub.blob_write(1, blob, b"x"), Err(HubError::Quota));
+        assert_eq!(hub.blob_read(1, blob, 4), Ok(b"1234".to_vec()));
+        assert_eq!(hub.blob_write(1, blob, b"x"), Ok(1));
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 5);
+        hub.close_resource(blob).unwrap();
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+        assert_eq!(hub.blob_read(1, blob, 1), Err(HubError::Invalid));
+    }
+
+    #[test]
+    fn blob_scope_and_chunk_limits_reject_before_copying() {
+        let limits = BlobLimits::new(4, 8, 8).unwrap();
+        let hub = OperationHub::with_blob_limits(2, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        assert_eq!(hub.blob_write(2, blob, b"a"), Err(HubError::WrongRights));
+        assert_eq!(hub.blob_write(1, blob, b"12345"), Err(HubError::Quota));
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+        hub.close_all(Terminal::Trapped);
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
     }
 }

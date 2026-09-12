@@ -8,6 +8,59 @@ use kernal_api::wasm::{
 
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
+fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("viewport.png");
+    let sentinel = directory.path().join("untouched");
+    let absent_module = directory.path().join("absent.wasm");
+    std::fs::write(&output, b"original").unwrap();
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    for url in [
+        "not a URL",
+        "file:///not-authorized",
+        "javascript:void(0)",
+        "data:text/html,not-authorized",
+        "tauri://localhost/",
+        "http://user:password@example.test/",
+        "http://[broken",
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
+            .args(["--url", url, "--output"])
+            .arg(&output)
+            .arg("--module")
+            .arg(&absent_module)
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert_eq!(
+            String::from_utf8(result.stderr).unwrap().trim(),
+            "Error: InvalidUrl"
+        );
+        assert!(result.stdout.is_empty());
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+    // Negative control: a valid URL gets past URL validation to the missing
+    // module error. Neither case needs a display or grants ambient network.
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
+        .args(["--url", "http://127.0.0.1:1/", "--output"])
+        .arg(&output)
+        .arg("--module")
+        .arg(&absent_module)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(!String::from_utf8(result.stderr)
+        .unwrap()
+        .contains("InvalidUrl"));
+    assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+#[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
 fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
     run_native_screenshot_proof(NativeScenario::Capture);

@@ -89,6 +89,10 @@ and requires capture at least five seconds later. After joined cleanup and
 dropping the admitted sketch, the proof requires zero native admission,
 backings, hub resources/operations/transfer bytes, clock/output jobs, Wasm
 roots/threads/stores/instances, epoch registrations, and memory reservations.
+An additional non-ignored CLI test rejects malformed URLs, credentials, and
+file/data/javascript/tauri schemes before module loading. It needs no display
+and verifies unchanged output/sentinel files, with a valid-URL negative control
+that reaches the separate missing-module error.
 The recorder holds at most 512 events; any omitted event fails the proof.
 The actual-guest redirect proof supplies an HTTP redirect to a prohibited
 scheme, requires `screenshot-load-rejected`, preserves the original output and

@@ -334,6 +334,7 @@ targets = [
 ]
 
 [workspace]
+exclude = ["src/wasm/generated/v1/guest"]
 
 [workspace.metadata.dylint]
 libraries = [{ path = "dylints/*" }]

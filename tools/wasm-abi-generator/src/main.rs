@@ -80,8 +80,17 @@ impl SyntheticResource {
 }
 pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
 "#;
-    use std::io::Write as _;
     let path = output.join("guest/src/lib.rs");
+    let source = fs::read_to_string(&path)?;
+    // The pinned scalar generator emits its conversion helpers at crate scope
+    // but its `imports` module only imports raw_imports/AbiError.  Primitive
+    // argument imports therefore need these explicit lexical imports.
+    let source = source.replace(
+        "use super::{raw_imports, AbiError};",
+        "use super::{raw_imports, AbiError, i32_from_i32, u32_to_i32, u64_from_i64, u64_to_i64};",
+    );
+    fs::write(&path, source)?;
+    use std::io::Write as _;
     let mut file = fs::OpenOptions::new().append(true).open(path)?;
     file.write_all(LIFECYCLE.as_bytes())
 }

@@ -55,7 +55,7 @@ mod raw_imports {
 }
 
 pub mod imports {
-    use super::{raw_imports, AbiError};
+    use super::{raw_imports, AbiError, i32_from_i32, u32_to_i32, u64_from_i64, u64_to_i64};
 
     pub fn kernel_yield() -> Result<(), AbiError> {
         unsafe { raw_imports::__kernal_api_v1_import_kernel_yield() };

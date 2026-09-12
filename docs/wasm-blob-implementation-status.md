@@ -10,8 +10,12 @@ Read collection validates a caller-supplied destination on each call and
 copies only a completed bounded result. Pending calls retain no pointer;
 wrong-owner, wrong-kind, short-buffer, and double collection are rejected.
 The real guest verifies 64 MiB through 1,024 sequential write/read pairs,
-reusing two 64 KiB arrays and checking every returned byte. Exact output is
-not yet exposed to the guest.
+reusing two 64 KiB arrays and checking every returned byte. Generated
+`OutputFile::write_blob` dispatches an opaque blob/output token pair through
+the same operation protocol to the supplied runtime's blocking lane. Its
+wire-level host test verifies exact replacement and rejection of forged or
+wrong-owner output grants. Pre-instantiation grant delivery to the real guest
+is not yet implemented, so this is not end-to-end guest output evidence.
 
 Guest `seal` publishes EOF without revoking the readable handle. Pending empty
 reads then complete with zero bytes; an empty unsealed blob stays pending.

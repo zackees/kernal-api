@@ -28,6 +28,7 @@ pub(crate) const OP_BLOB_WRITE: u32 = 6;
 pub(crate) const OP_BLOB_READ: u32 = 7;
 pub(crate) const OP_BLOB_READ_COLLECT: u32 = 8;
 pub(crate) const OP_BLOB_SEAL: u32 = 9;
+pub(crate) const OP_OUTPUT_COMMIT: u32 = 10;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -518,6 +519,12 @@ impl OperationHub {
         arg0: u64,
         arg1: u64,
     ) -> Result<u64, HubError> {
+        #[cfg(feature = "wasm-sketch-host")]
+        if kind == OP_OUTPUT_COMMIT {
+            return self
+                .submit_output_commit(runtime, store, OpaqueToken(arg0), OpaqueToken(arg1))
+                .map(|operation| operation.0);
+        }
         if kind == OP_BLOB_SEAL {
             if arg1 != 0 {
                 return Err(HubError::Invalid);
@@ -1828,6 +1835,50 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn wire_output_commit_uses_only_the_scoped_host_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("authorized");
+        std::fs::write(&path, b"previous").unwrap();
+        let hub = OperationHub::new(8, 4).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"replacement").unwrap();
+        hub.seal_blob(1, blob).unwrap();
+        let output = hub.grant_exact_output(1, &path).unwrap();
+        assert!(hub
+            .submit_wire(runtime.handle(), 2, OP_OUTPUT_COMMIT, blob.0, output.0)
+            .is_err());
+        assert!(hub
+            .submit_wire(runtime.handle(), 1, OP_OUTPUT_COMMIT, blob.0, u64::MAX)
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous");
+        let operation = hub
+            .submit_wire(runtime.handle(), 1, OP_OUTPUT_COMMIT, blob.0, output.0)
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let status = hub.poll_wire(1, operation) as u8;
+                    if status != STATUS_PENDING {
+                        assert_eq!(status, STATUS_COMPLETED);
+                        break;
+                    }
+                    hub.suspend_wire(1, operation).unwrap().notified().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
 
     #[cfg(feature = "wasm-sketch-host")]
     #[test]

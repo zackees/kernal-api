@@ -1708,7 +1708,9 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         }
         if matches!(
             kind,
-            crate::operations::OP_BLOB_READ | crate::operations::OP_BLOB_SEAL
+            crate::operations::OP_BLOB_READ
+                | crate::operations::OP_BLOB_SEAL
+                | crate::operations::OP_OUTPUT_COMMIT
         ) {
             // Expected admission failures are guest-visible rejection, not
             // Wasmtime traps. Match the bounded-write submission contract.

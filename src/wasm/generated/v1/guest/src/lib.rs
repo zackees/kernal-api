@@ -124,6 +124,16 @@ pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationF
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
+/// One exact destination authorized by the embedding host; never a guest path.
+pub struct OutputFile { token: u64 }
+impl OutputFile {
+    /// Wrap the scoped token supplied by the host. Forging this value grants
+    /// no authority: every commit checks the host's resource registry.
+    pub fn from_granted_token(token: u64) -> Self { Self { token } }
+    pub fn write_blob(&self, blob: &BlobHandle) -> Result<OperationFuture, OperationError> {
+        OperationFuture::submit(10, blob.token, self.token)
+    }
+}
 pub struct BlobReadFuture { operation: u64 }
 impl BlobReadFuture {
     /// Poll and collect into a caller-owned bounded destination. No pointer

@@ -351,7 +351,9 @@ impl OperationHub {
             Ok((operation, _)) => operation,
             Err(error) => {
                 if created {
-                    let resource = resource.expect("created request has a reservation");
+                    let resource = completion
+                        .resource
+                        .expect("create completion owns reservation");
                     let _ = self.close_resource(resource);
                 }
                 return Err(error);
@@ -800,6 +802,7 @@ impl OperationHub {
             }
         }
         self.drive_blob_reads()?;
+        self.drive_blob_writes()?;
         Ok(token)
     }
 
@@ -1495,6 +1498,45 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_submission_releases_capacity_before_its_result_is_collected() {
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        assert_eq!(hub.take_terminal(write, 1), Ok(None));
+        let read = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert_eq!(
+            hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        assert_eq!(
+            hub.take_blob_read(1, read),
+            Ok(Some((Terminal::Completed, b"full".to_vec())))
+        );
+        assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn generated_create_at_operation_quota_reclaims_its_reservation() {
+        let hub = OperationHub::new(1, 1).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (occupied, _) = hub.submit(1, None, 0, 0).unwrap();
+        assert_eq!(
+            hub.submit_wire(runtime.handle(), 1, OP_SYNTHETIC_RESOURCE_CREATE, 0, 1),
+            Err(HubError::Quota)
+        );
+        assert_eq!(hub.snapshot().live_resources, 0);
+        hub.cancel_wire(1, occupied.0).unwrap();
+        hub.take_terminal(occupied, 1).unwrap();
+        assert!(hub
+            .submit_wire(runtime.handle(), 1, OP_SYNTHETIC_RESOURCE_CREATE, 0, 1)
+            .is_ok());
+    }
 
     #[test]
     fn teardown_reclaims_unconsumed_read_results_and_pending_write_buffers() {

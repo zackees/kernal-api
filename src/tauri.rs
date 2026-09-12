@@ -819,7 +819,9 @@ impl ExternalWebviewClient {
             .lock()
             .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
             .insert(resource, native);
-        self.service.hub.finish_external_open(operation, resource);
+        if !self.service.hub.finish_external_open(operation, resource) {
+            self.service.revoke(resource);
+        }
         let service = Arc::clone(&self.service);
         self.service
             .runtime

@@ -243,7 +243,7 @@ struct OperationSlot {
     pending_blob_read: Option<usize>,
     is_blob_read: bool,
     blob_read_result: Option<Vec<u8>>,
-    clock_cancel: Option<crate::async_engine::CancellationSource>,
+    producer_cancel: Option<crate::async_engine::CancellationSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -737,14 +737,68 @@ impl OperationHub {
         let _ = self.drive_blob_reads();
     }
 
-    pub(crate) fn finish_external_open(&self, operation: OpaqueToken, resource: OpaqueToken) {
-        let _ = self.terminal(
+    pub(crate) fn finish_external_open(
+        &self,
+        operation: OpaqueToken,
+        resource: OpaqueToken,
+    ) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.closed
+            || !state.resources.get(&resource).is_some_and(|slot| {
+                slot.identity.kind == EXTERNAL_WEBVIEW_RESOURCE_KIND && slot.reserved
+            })
+            || !state.operations.get(&operation).is_some_and(|slot| {
+                slot.terminal.is_none() && slot.created_resource == Some(resource)
+            })
+        {
+            return false;
+        }
+        let Ok(wake) = Self::terminal_locked(
+            &mut state,
             operation,
             TerminalResult {
                 terminal: Terminal::Completed,
                 resource: Some(resource),
             },
-        );
+        ) else {
+            return false;
+        };
+        drop(state);
+        if let Some(wake) = wake {
+            wake.notify_one();
+        }
+        true
+    }
+
+    /// Latches any terminal result for the native producer independently of
+    /// the guest's one-consumer completion notification. Cancelling, consuming
+    /// the result, or tearing down the root cannot strand queued producer work.
+    pub(crate) fn bind_producer_cancellation(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+    ) -> Result<crate::async_engine::CancellationToken, HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let slot = state
+            .operations
+            .get_mut(&operation)
+            .ok_or(HubError::Invalid)?;
+        if slot.owner.store != store {
+            return Err(HubError::WrongRights);
+        }
+        if slot.producer_cancel.is_some() {
+            return Err(HubError::Invalid);
+        }
+        let source = crate::async_engine::CancellationSource::new();
+        let token = source.token();
+        if slot.terminal.is_some() {
+            source.cancel();
+        } else {
+            slot.producer_cancel = Some(source);
+        }
+        Ok(token)
     }
 
     pub(crate) fn observe_terminal(
@@ -863,22 +917,8 @@ impl OperationHub {
             })
             .map_err(|_| HubError::Quota)?;
         let lease = ClockLease(Arc::clone(self));
-        let cancellation = crate::async_engine::CancellationSource::new();
-        let token = cancellation.token();
         let (operation, _) = self.submit(store, None, 0, 0)?;
-        {
-            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
-            let slot = state
-                .operations
-                .get_mut(&operation)
-                .ok_or(HubError::Closed)?;
-            if slot.terminal.is_some() {
-                // Teardown won between reservation and cancellation binding.
-                cancellation.cancel();
-            } else {
-                slot.clock_cancel = Some(cancellation);
-            }
-        }
+        let token = self.bind_producer_cancellation(store, operation)?;
         let hub = Arc::clone(self);
         runtime
             .launch(async move {
@@ -2069,7 +2109,7 @@ impl OperationHub {
                 pending_blob_read: None,
                 is_blob_read: false,
                 blob_read_result: None,
-                clock_cancel: None,
+                producer_cancel: None,
             },
         );
         Ok((token, notify))
@@ -2219,7 +2259,7 @@ impl OperationHub {
                 return Ok(None);
             }
             operation.terminal = Some(result);
-            if let Some(cancel) = operation.clock_cancel.take() {
+            if let Some(cancel) = operation.producer_cancel.take() {
                 cancel.cancel();
             }
             operation.pending_blob_write = None;
@@ -2330,7 +2370,7 @@ impl OperationHub {
         state.free_resource_slots.clear();
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
-            if let Some(cancel) = operation.clock_cancel.take() {
+            if let Some(cancel) = operation.producer_cancel.take() {
                 cancel.cancel();
             }
             operation.blob_read_result = None;
@@ -2849,6 +2889,102 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn producer_terminal_signal_survives_guest_consumption() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        for terminal in [
+            Terminal::Completed,
+            Terminal::Cancelled,
+            Terminal::Closed,
+            Terminal::TimedOut,
+            Terminal::Trapped,
+            Terminal::OwnerExited,
+            Terminal::Rejected,
+        ] {
+            let (operation, _) = hub.submit(7, None, 0, 0).unwrap();
+            assert!(matches!(
+                hub.bind_producer_cancellation(8, operation),
+                Err(HubError::WrongRights)
+            ));
+            let token = hub.bind_producer_cancellation(7, operation).unwrap();
+            assert!(!token.is_cancelled());
+            assert!(matches!(
+                hub.bind_producer_cancellation(7, operation),
+                Err(HubError::Invalid)
+            ));
+            hub.finish_external_operation(operation, terminal);
+            assert!(token.is_cancelled());
+            // A producer binding after completion also observes the latch.
+            let late = hub.bind_producer_cancellation(7, operation).unwrap();
+            assert!(late.is_cancelled());
+            assert_eq!(
+                hub.observe_terminal(7, operation)
+                    .unwrap()
+                    .unwrap()
+                    .terminal,
+                terminal
+            );
+            assert!(token.is_cancelled());
+            assert!(late.is_cancelled());
+        }
+        let (operation, _) = hub.submit(7, None, 0, 0).unwrap();
+        let token = hub.bind_producer_cancellation(7, operation).unwrap();
+        hub.close_all(Terminal::Closed);
+        assert!(token.is_cancelled());
+        hub.observe_terminal(7, operation).unwrap().unwrap();
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
+    #[test]
+    fn native_open_completion_reports_only_the_authorized_terminal_winner() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let (view, open) = hub.begin_external_webview_open(7).unwrap();
+        let (other, other_open) = hub.begin_external_webview_open(7).unwrap();
+        assert!(
+            !hub.finish_external_open(open, other),
+            "cannot publish a different reservation"
+        );
+        assert!(hub.observe_terminal(7, open).unwrap().is_none());
+        let winners = std::thread::scope(|scope| {
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let attempts: Vec<_> = (0..8)
+                .map(|_| {
+                    let hub = Arc::clone(&hub);
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        hub.finish_external_open(open, view)
+                    })
+                })
+                .collect();
+            attempts
+                .into_iter()
+                .map(|attempt| usize::from(attempt.join().unwrap()))
+                .sum::<usize>()
+        });
+        assert_eq!(winners, 1);
+        assert!(
+            !hub.finish_external_open(open, view),
+            "completion wins exactly once"
+        );
+        assert_eq!(
+            hub.observe_terminal(7, open).unwrap().unwrap().resource,
+            Some(view)
+        );
+        hub.cancel_wire(7, other_open.0).unwrap();
+        assert!(!hub.finish_external_open(other_open, other));
+        assert_eq!(
+            hub.observe_terminal(7, other_open)
+                .unwrap()
+                .unwrap()
+                .terminal,
+            Terminal::Cancelled
+        );
+        hub.close_resource(view).unwrap();
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
 
     #[test]
     fn grant_revocation_before_resource_attachment_reclaims_both_reservations() {

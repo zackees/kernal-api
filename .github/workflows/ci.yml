@@ -172,7 +172,8 @@ jobs:
   # therefore use a real Xvfb display, a loopback page, and one supplied
   # kernal-api async runtime. They exercise matching Finished correlation,
   # actual window destruction, popup/redirect denial, timeout, cancellation,
-  # and window-close revocation with zero semantic/native resources.
+  # window-close revocation, bounded viewport capture, and cancelled native
+  # queue admission with zero semantic/native resources.
   tauri-webview-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -185,7 +186,7 @@ jobs:
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Restore native pkg-config search path
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - name: Run real semantic webview lifecycle proofs
+      - name: Run real semantic webview lifecycle and capture proofs
         env:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: "1"
@@ -201,6 +202,9 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it

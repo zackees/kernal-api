@@ -44,7 +44,17 @@ binary from the ephemeral shell rather than from a Nix-wrapped derivation:
 nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr --jobs 2 cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -j 1 -- close'
 ```
 
-Replace `close` with `popup`, `redirect`, `timeout`, `cancel`, or
-`window-close` to exercise isolation and cleanup paths. The test-support
+Replace `close` with `popup`, `redirect`, `timeout`, `cancel`,
+`window-close`, `capture`, or `capture-cancel` to exercise isolation and cleanup paths. The test-support
 feature is accepted only for this executable proof and exposes aggregate
 semantic counts, never backend types.
+
+The existing `tauri-webview-smoke` CI job runs both capture scenarios and the
+ignored live WebKitGTK image test explicitly. `capture` verifies the opaque
+snapshot service, bounded reads, typed pixel/byte failures, and final cleanup.
+`capture-cancel` pauses native UI dispatch, abandons four requests, verifies
+the fifth is rejected while native admission remains held, and then drains
+the queue. The live image test separately decodes PNG pixels and verifies
+viewport dimensions and fixture colors. These Linux gates do not establish
+the still-required Windows/macOS runtime proofs or the generated Wasm sketch.
+See [adapter ownership and remaining evidence](viewport-capture-adapters.md).

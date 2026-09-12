@@ -768,6 +768,11 @@ impl OperationHub {
         };
         let count = maximum_bytes.min(buffer.len());
         let result: Vec<_> = buffer.drain(..count).collect();
+        if buffer.is_empty() {
+            // An empty live resource must not retain a formerly full buffer
+            // while its length-based byte ledger reports zero.
+            *buffer = VecDeque::new();
+        }
         state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
         drop(state);
         self.drive_blob_writes()?;
@@ -968,6 +973,9 @@ impl OperationHub {
                 continue;
             }
             let bytes = buffer.drain(..count).collect();
+            if buffer.is_empty() {
+                *buffer = VecDeque::new();
+            }
             state.buffered_blob_bytes -= count;
             state
                 .operations
@@ -2044,6 +2052,33 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn fully_drained_blobs_release_their_backing_allocation() {
+        for asynchronous in [false, true] {
+            let hub =
+                OperationHub::with_blob_limits(4, 2, BlobLimits::new(1024, 1024, 1024).unwrap())
+                    .unwrap();
+            let blob = hub.create_blob(1).unwrap();
+            hub.blob_write(1, blob, &[7; 1024]).unwrap();
+            if asynchronous {
+                let read = hub.submit_blob_read(1, blob, 1024).unwrap();
+                hub.take_blob_read(1, read).unwrap().unwrap();
+            } else {
+                hub.blob_read(1, blob, 1024).unwrap();
+            }
+            let state = hub.state.lock().unwrap();
+            let ResourceValue::Blob { buffer, .. } = &state.resources[&blob].value else {
+                panic!("blob");
+            };
+            assert_eq!(
+                buffer.capacity(),
+                0,
+                "empty live blobs must not retain unaccounted allocation"
+            );
+            assert_eq!(state.buffered_blob_bytes, 0);
+        }
     }
 
     #[test]

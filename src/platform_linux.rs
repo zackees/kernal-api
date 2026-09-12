@@ -1,5 +1,9 @@
 //! Linux implementation root for the process capability.
 
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_linux/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_linux/autostart.rs"]
 pub(crate) mod autostart;
 

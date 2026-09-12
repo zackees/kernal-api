@@ -2181,6 +2181,10 @@ pub(crate) struct NativeBlobEncoder {
 }
 
 impl NativeBlobEncoder {
+    pub(crate) fn failure(&self) -> Option<HubError> {
+        self.failure
+    }
+
     pub(crate) fn new(
         hub: Arc<OperationHub>,
         store: u64,

@@ -95,6 +95,10 @@ tauri-webview = [
   "dep:tauri-utils",
   "dep:url",
   "dep:wry",
+  "dep:webkit2gtk",
+  "dep:gtk",
+  "dep:gio",
+  "dep:cairo-rs",
 ]
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
@@ -275,6 +279,10 @@ tauri-utils = { version = "=2.9.3", optional = true }
 wry = { version = "=0.57.0", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "=2.0.2", optional = true }
+gtk = { version = "=0.18.2", optional = true }
+gio = { version = "=0.18.4", optional = true }
+cairo-rs = { version = "=0.18.5", features = ["png"], optional = true }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
 png = { version = "=0.17.16", optional = true }

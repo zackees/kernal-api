@@ -1,8 +1,13 @@
 # Native viewport capture ownership (#19)
 
-Status: implementation prerequisite review; the three adapters and snapshot
-operation are not implemented. This note does not establish native capture
-acceptance or close #19.
+Status: the Linux callback adapter is implemented and compiles, but is not yet
+wired to the webview operation service. Windows/macOS adapters and the generated
+snapshot operation remain unimplemented. This note does not establish native
+capture acceptance or close #19.
+The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
+the existing root platform selector and gated only by `tauri-webview` in the
+concrete Linux tree. The broader cfg-boundary/Dylint/docs migration is tracked
+in [#152](https://github.com/zackees/kernal-api/issues/152).
 
 The shared hub now has a private `NativeBlobEncoder` implementing `io::Write`.
 It copies encoder writes in configured chunks directly into quota-accounted
@@ -13,7 +18,19 @@ copied, failures remain terminal, and drop/teardown reclaim the reservation.
 Tests cover hidden partial output, read-only publication, cross-store rejection,
 size overflow, and teardown; all 50 hub tests pass on Linux. This sink is not
 yet connected to a native capture callback and does not bound native images
-or encoder-internal scratch allocations.
+or encoder-internal scratch allocations. The private Linux adapter now calls
+WebKitGTK's visible-region snapshot API, validates scaled requested dimensions
+and returned image dimensions, and encodes the Cairo image into this sink.
+It accepts native cancellation and returns only an opaque token to its private
+completion callback. Operation-bound publication/cancellation and a live
+webpage capture proof are still required.
+
+Linux validation: `soldr cargo check --features tauri-webview --lib`, the
+three `viewport_capture::tests` unit tests, and strict Clippy for the native
+feature's library/tests passed inside the repo's Nix GTK/WebKitGTK shell.
+The tests decode an encoded Cairo image and verify pixel-limit/cancellation
+cleanup; they do not yet request a live browser snapshot. Windows/macOS
+adapter builds and native proofs remain outstanding.
 
 ## Exact dependency boundary
 
@@ -22,6 +39,11 @@ tauri-runtime-wry 2.11.4, tauri-utils 2.9.3, and Wry 0.57.0. Tauri packages
 also resolve through the existing immutable Git patch at
 `4039372c9f75fc3e1c9f0fc98858c7c100880f8f`; that patch must be included when
 reporting the implementation version, not just the registry version numbers.
+Wry also uses the existing immutable Git patch
+`29a2228b594d45c0ae9710866e46a6f898120151`. The Linux adapter's direct bindings
+are optional exact pins: webkit2gtk 2.0.2, gtk 0.18.2, gio 0.18.4, and
+cairo-rs 0.18.5 with its PNG writer enabled. No new package versions were
+introduced by these direct edges.
 
 Inspection of Wry 0.57.0's `src/lib.rs` found platform `webview()` escape
 hatches returning WebView2, WebKitGTK, and retained Cocoa webviews, but no

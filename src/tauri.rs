@@ -7,16 +7,15 @@
 //! no IPC handler, and no registered URI schemes.  The only native authority
 //! it receives is rendering an approved external HTTP(S) document.
 //!
-//! There is no public facade or guest ABI here.  Issue #16 owns the
-//! generation-safe resource handle and operation lifecycle; it will connect
-//! those semantic objects to this backend's private completion callback.
-
-#![allow(dead_code)] // Connected by #16's generated operation/resource table.
+//! The public semantic façade at the end of this module submits every native
+//! transition through the shared generation-safe operation hub. Raw Wry
+//! objects remain private physical backing only.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri_runtime::{
     window::{PendingWindow, WindowBuilder},
@@ -24,8 +23,16 @@ use tauri_runtime::{
 };
 use tauri_runtime_wry::{WindowBuilderWrapper, Wry, WryHandle, WryWindowDispatcher};
 use url::Url;
-use wry::raw_window_handle::{HandleError, HasWindowHandle, WindowHandle};
 use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+use wry::raw_window_handle::{HandleError, HasWindowHandle, WindowHandle};
 
 #[cfg(any(
     target_os = "linux",
@@ -40,8 +47,10 @@ use wry::WebViewBuilderExtUnix as _;
 use wry::WebViewBuilderExtMacos as _;
 
 use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
+use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
 
 static NEXT_LABEL: AtomicU64 = AtomicU64::new(1);
+static NEXT_WEBVIEW_STORE: AtomicU64 = AtomicU64::new(1);
 
 // Wry's WebView is deliberately !Send.  The Tauri Wry event-loop thread owns
 // this private retention map; commands only route closures to that thread.
@@ -49,9 +58,23 @@ thread_local! {
     static UI_WEBVIEWS: RefCell<HashMap<u64, WebView>> = RefCell::new(HashMap::new());
 }
 
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
 #[derive(Clone)]
 struct NativeWindowHandle(WryWindowDispatcher<()>);
 
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
 impl HasWindowHandle for NativeWindowHandle {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
         self.0.window_handle()
@@ -61,6 +84,7 @@ impl HasWindowHandle for NativeWindowHandle {
 // This binds the raw runtime implementation to the exact high-level Tauri
 // release selected in Cargo.toml without constructing its application manager
 // (whose external-page builder installs IPC).
+#[allow(dead_code)] // Compile-time exact-release binding; no application manager is constructed.
 type PinnedTauriEventLoopMessage = tauri::EventLoopMessage;
 
 /// Why native navigation could not continue.  This remains private until the
@@ -549,6 +573,409 @@ fn is_allowed_url(url: &Url) -> bool {
         && url.cannot_be_a_base() == false
         && url.username().is_empty()
         && url.password().is_none()
+}
+
+/// Facade-owned failures for an external webview operation.
+///
+/// No native backend, runtime, or window value is exposed through this type.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WebviewError {
+    #[error("webview URL is malformed or not an HTTP(S) URL")]
+    InvalidUrl,
+    #[error("webview navigation was rejected: {0}")]
+    RejectedNavigation(String),
+    #[error("webview load timed out")]
+    TimedOut,
+    #[error("webview operation was cancelled")]
+    Cancelled,
+    #[error("the webview window was closed")]
+    WindowClosed,
+    #[error("the webview host failed: {0}")]
+    HostFailure(String),
+}
+
+/// Process-main-thread owner of the opt-in native event loop.
+///
+/// Construct this on the UI/main thread, hand [`ExternalWebviewClient`] to
+/// async work, then call [`Self::run`]. The supplied facade runtime is the
+/// only async runtime used by callbacks and operations.
+pub struct ExternalWebviewHost {
+    event_loop: NativeWebviewLoop,
+    client: ExternalWebviewClient,
+}
+
+/// Instance-scoped semantic client for opening external webviews.
+#[derive(Clone)]
+pub struct ExternalWebviewClient {
+    service: Arc<WebviewService>,
+    store: u64,
+}
+
+/// Opaque, generation-safe external-webview resource.
+///
+/// It is intentionally non-cloneable: dropping it revokes the generation and
+/// requests physical close, so abandoned operations cannot retain a window.
+pub struct WebviewHandle {
+    service: Arc<WebviewService>,
+    store: u64,
+    resource: OpaqueToken,
+    terminal_operation: OpaqueToken,
+}
+
+struct WebviewService {
+    runtime: RuntimeHandle,
+    backend: NativeWebviewBackend,
+    hub: Arc<OperationHub>,
+    // This is a physical backing table, not a second authority registry:
+    // all identity, ownership, quota, terminal state, and revocation remain
+    // in OperationHub. Wry objects cannot be stored in that runtime-neutral
+    // hub because they are UI-thread-affine.
+    native: Mutex<BTreeMap<OpaqueToken, NativeWebview>>,
+    // An explicit semantic close owns its terminal result.  The independent
+    // native-terminal watcher must not race it into reporting WindowClosed.
+    closing: Mutex<BTreeSet<OpaqueToken>>,
+}
+
+impl ExternalWebviewHost {
+    /// Create the private event loop and one root semantic instance.
+    pub fn new(runtime: RuntimeHandle) -> Result<Self, WebviewError> {
+        let (event_loop, backend) = NativeWebviewLoop::new(runtime.clone()).map_err(map_native)?;
+        let hub = OperationHub::new(64, 64).map_err(map_hub)?;
+        Ok(Self {
+            event_loop,
+            client: ExternalWebviewClient {
+                service: Arc::new(WebviewService {
+                    runtime,
+                    backend,
+                    hub,
+                    native: Mutex::new(BTreeMap::new()),
+                    closing: Mutex::new(BTreeSet::new()),
+                }),
+                store: next_store()?,
+            },
+        })
+    }
+
+    /// Obtain the root instance-scoped semantic client.
+    pub fn client(&self) -> ExternalWebviewClient {
+        self.client.clone()
+    }
+
+    /// Run the canonical Tauri/Wry event loop on the creating main thread.
+    pub fn run(self) -> i32 {
+        self.event_loop.run()
+    }
+}
+
+impl ExternalWebviewClient {
+    /// Create an independently authorized logical instance over the same
+    /// host. Handles from one instance cannot be used by another.
+    pub fn new_instance(&self) -> Result<Self, WebviewError> {
+        Ok(Self {
+            service: Arc::clone(&self.service),
+            store: next_store()?,
+        })
+    }
+
+    /// Validate and asynchronously create an isolated external webview.
+    pub async fn open_webview(&self, url: &str) -> Result<WebviewHandle, WebviewError> {
+        let request = NativeWebviewRequest::parse(url).map_err(map_native)?;
+        let (resource, operation) = self
+            .service
+            .hub
+            .begin_external_webview_open(self.store)
+            .map_err(map_hub)?;
+        let mut native = match self.service.backend.open(request).await {
+            Ok(native) => native,
+            Err(error) => {
+                self.service
+                    .hub
+                    .finish_external_operation(operation, terminal_for_native(&error));
+                self.service.revoke(resource);
+                return Err(map_native(error));
+            }
+        };
+        let terminal = native.wait_until_terminal().map_err(map_native)?;
+        self.service
+            .native
+            .lock()
+            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
+            .insert(resource, native);
+        self.service.hub.finish_external_open(operation, resource);
+        let service = Arc::clone(&self.service);
+        self.service
+            .runtime
+            .launch(async move {
+                // Native callbacks retain only this hub/service state and a
+                // receiver; a Store, Caller, guest memory, or UI object never
+                // crosses into the callback task.
+                let terminal = match terminal.await {
+                    Ok(Ok(())) => return,
+                    Ok(Err(error)) => terminal_for_native(&error),
+                    Err(_) => Terminal::Closed,
+                };
+                if !service.is_explicitly_closing(resource) {
+                    service.revoke_with_terminal(resource, terminal);
+                }
+            })
+            .detach();
+        match self.service.hub.observe_terminal(self.store, operation) {
+            Ok(Some(result)) if result.terminal == Terminal::Completed => {
+                let terminal_operation = self
+                    .service
+                    .hub
+                    .begin_external_webview_wait(self.store, resource)
+                    .map_err(map_hub)?;
+                Ok(WebviewHandle {
+                    service: Arc::clone(&self.service),
+                    store: self.store,
+                    resource,
+                    terminal_operation,
+                })
+            }
+            Ok(Some(result)) => Err(map_terminal(result.terminal)),
+            Ok(None) => Err(WebviewError::HostFailure(
+                "webview open did not complete".into(),
+            )),
+            Err(error) => Err(map_hub(error)),
+        }
+    }
+
+    /// Ask the host to stop once outstanding callbacks have completed.
+    pub fn request_exit(&self) -> Result<(), WebviewError> {
+        self.service.backend.request_exit().map_err(map_native)
+    }
+}
+
+impl WebviewHandle {
+    /// Await the requested top-level page's matching `Finished` event.
+    /// A timeout revokes this handle and closes the backing native window.
+    pub async fn wait_until_loaded(&self, timeout: Duration) -> Result<(), WebviewError> {
+        let operation = self
+            .service
+            .hub
+            .begin_external_webview_wait(self.store, self.resource)
+            .map_err(map_hub)?;
+        let receiver = {
+            let mut native =
+                self.service.native.lock().map_err(|_| {
+                    WebviewError::HostFailure("native backing table poisoned".into())
+                })?;
+            native
+                .get_mut(&self.resource)
+                .ok_or(WebviewError::WindowClosed)?
+                .wait_until_loaded()
+                .map_err(map_native)?
+        };
+        let terminal = match async_engine::timeout(timeout, receiver).await {
+            Ok(Ok(Ok(()))) => Terminal::Completed,
+            Ok(Ok(Err(error))) => terminal_for_native(&error),
+            Ok(Err(_)) => Terminal::Closed,
+            Err(_) => Terminal::TimedOut,
+        };
+        self.service
+            .hub
+            .finish_external_operation(operation, terminal);
+        if terminal != Terminal::Completed {
+            self.service.revoke_with_terminal(self.resource, terminal);
+        }
+        match self.service.hub.observe_terminal(self.store, operation) {
+            Ok(Some(result)) if result.terminal == Terminal::Completed => Ok(()),
+            Ok(Some(result)) => Err(map_terminal(result.terminal)),
+            Ok(None) => Err(WebviewError::HostFailure(
+                "load operation did not complete".into(),
+            )),
+            Err(error) => Err(map_hub(error)),
+        }
+    }
+
+    /// Await a terminal security or window-close callback after opening.
+    ///
+    /// This is useful when an allowed top-level document finishes and then
+    /// attempts a prohibited redirect or popup. It is itself a hub-owned
+    /// operation, so callback completion never needs to retain a Store.
+    pub async fn wait_until_terminal(&self, timeout: Duration) -> Result<(), WebviewError> {
+        let wake = self
+            .service
+            .hub
+            .wait_external_operation(self.store, self.terminal_operation)
+            .map_err(map_hub)?;
+        if async_engine::timeout(timeout, wake.notified())
+            .await
+            .is_err()
+        {
+            self.service
+                .revoke_with_terminal(self.resource, Terminal::TimedOut);
+        }
+        match self
+            .service
+            .hub
+            .observe_terminal(self.store, self.terminal_operation)
+        {
+            Ok(Some(result)) => Err(map_terminal(result.terminal)),
+            Ok(None) => Err(WebviewError::HostFailure(
+                "terminal webview operation did not complete".into(),
+            )),
+            Err(error) => Err(map_hub(error)),
+        }
+    }
+
+    /// Request close and await native destruction before revoking the handle.
+    pub async fn close(self) -> Result<(), WebviewError> {
+        let operation = self
+            .service
+            .hub
+            .begin_external_webview_close(self.store, self.resource)
+            .map_err(map_hub)?;
+        self.service.mark_explicitly_closing(self.resource);
+        let mut native = self.service.take_native(self.resource).ok_or_else(|| {
+            self.service.clear_explicitly_closing(self.resource);
+            WebviewError::WindowClosed
+        })?;
+        let closed = match native.wait_until_closed() {
+            Ok(closed) => closed,
+            Err(error) => {
+                self.service
+                    .hub
+                    .finish_external_operation(operation, terminal_for_native(&error));
+                self.service
+                    .revoke_with_terminal(self.resource, terminal_for_native(&error));
+                self.service.clear_explicitly_closing(self.resource);
+                return Err(map_native(error));
+            }
+        };
+        if let Err(error) = native.close() {
+            self.service
+                .hub
+                .finish_external_operation(operation, terminal_for_native(&error));
+            self.service
+                .revoke_with_terminal(self.resource, terminal_for_native(&error));
+            self.service.clear_explicitly_closing(self.resource);
+            return Err(map_native(error));
+        }
+        let terminal = match closed.await {
+            Ok(()) => Terminal::Completed,
+            Err(_) => Terminal::Closed,
+        };
+        self.service
+            .hub
+            .finish_external_operation(operation, terminal);
+        let outcome = match self.service.hub.observe_terminal(self.store, operation) {
+            Ok(Some(result)) if result.terminal == Terminal::Completed => Ok(()),
+            Ok(Some(result)) => Err(map_terminal(result.terminal)),
+            Ok(None) => Err(WebviewError::HostFailure(
+                "close operation did not complete".into(),
+            )),
+            Err(error) => Err(map_hub(error)),
+        };
+        // The close operation itself is resource-bound, so publish and consume
+        // its successful terminal state before resource revocation wakes any
+        // other operation bound to the same generation.
+        let _ = self.service.hub.close_resource(self.resource);
+        self.service.clear_explicitly_closing(self.resource);
+        outcome
+    }
+
+    /// Explicitly cancel a handle. Cancellation is terminal and revokes the
+    /// resource generation before returning.
+    pub fn cancel(self) {
+        self.service
+            .revoke_with_terminal(self.resource, Terminal::Cancelled);
+    }
+}
+
+impl Drop for WebviewHandle {
+    fn drop(&mut self) {
+        self.service
+            .revoke_with_terminal(self.resource, Terminal::Cancelled);
+    }
+}
+
+impl WebviewService {
+    fn take_native(&self, resource: OpaqueToken) -> Option<NativeWebview> {
+        self.native.lock().ok()?.remove(&resource)
+    }
+
+    fn revoke(&self, resource: OpaqueToken) {
+        self.revoke_with_terminal(resource, Terminal::Closed);
+    }
+
+    fn revoke_with_terminal(&self, resource: OpaqueToken, terminal: Terminal) {
+        if let Some(native) = self.take_native(resource) {
+            let _ = native.close();
+            drop(native);
+        }
+        let _ = self.hub.revoke_external_resource(resource, terminal);
+    }
+
+    fn mark_explicitly_closing(&self, resource: OpaqueToken) {
+        if let Ok(mut closing) = self.closing.lock() {
+            closing.insert(resource);
+        }
+    }
+
+    fn clear_explicitly_closing(&self, resource: OpaqueToken) {
+        if let Ok(mut closing) = self.closing.lock() {
+            closing.remove(&resource);
+        }
+    }
+
+    fn is_explicitly_closing(&self, resource: OpaqueToken) -> bool {
+        self.closing
+            .lock()
+            .is_ok_and(|closing| closing.contains(&resource))
+    }
+}
+
+fn next_store() -> Result<u64, WebviewError> {
+    NEXT_WEBVIEW_STORE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            value.checked_add(1)
+        })
+        .map(|value| value + 1)
+        .map_err(|_| WebviewError::HostFailure("webview instance identifiers exhausted".into()))
+}
+
+fn terminal_for_native(error: &NativeWebviewError) -> Terminal {
+    match error {
+        NativeWebviewError::RejectedNavigation(_) | NativeWebviewError::InvalidUrl => {
+            Terminal::Rejected
+        }
+        NativeWebviewError::WindowClosed => Terminal::Closed,
+        NativeWebviewError::HostFailure(_) => Terminal::Trapped,
+    }
+}
+
+fn map_native(error: NativeWebviewError) -> WebviewError {
+    match error {
+        NativeWebviewError::InvalidUrl => WebviewError::InvalidUrl,
+        NativeWebviewError::RejectedNavigation(reason) => WebviewError::RejectedNavigation(reason),
+        NativeWebviewError::WindowClosed => WebviewError::WindowClosed,
+        NativeWebviewError::HostFailure(reason) => WebviewError::HostFailure(reason),
+    }
+}
+
+fn map_terminal(terminal: Terminal) -> WebviewError {
+    match terminal {
+        Terminal::Cancelled => WebviewError::Cancelled,
+        Terminal::TimedOut => WebviewError::TimedOut,
+        Terminal::Closed => WebviewError::WindowClosed,
+        Terminal::Rejected => WebviewError::RejectedNavigation("navigation policy".into()),
+        Terminal::Completed => WebviewError::HostFailure("unexpected completed error".into()),
+        Terminal::Trapped | Terminal::OwnerExited => {
+            WebviewError::HostFailure("native webview operation failed".into())
+        }
+    }
+}
+
+fn map_hub(error: HubError) -> WebviewError {
+    match error {
+        HubError::Quota => WebviewError::HostFailure("webview operation quota exhausted".into()),
+        HubError::Closed | HubError::Stale => WebviewError::WindowClosed,
+        HubError::Invalid | HubError::WrongKind | HubError::WrongRights | HubError::Exhausted => {
+            WebviewError::HostFailure("invalid semantic webview operation".into())
+        }
+    }
 }
 
 #[cfg(test)]

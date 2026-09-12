@@ -59,6 +59,15 @@ pub mod daemon_registration_v2;
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 
+// The generated Wasm ABI and opt-in native webview capability share one
+// logical operation/resource authority.  The implementation is deliberately
+// runtime-neutral: enabling `tauri-webview` must not pull Wasmtime into the
+// default or native-only graph.
+#[cfg(any(feature = "wasm-sketch-host", feature = "tauri-webview"))]
+#[path = "wasm/operations.rs"]
+#[allow(dead_code)] // Native-only builds use the hub's webview subset.
+pub(crate) mod operations;
+
 // The native implementation is intentionally private until #16's generated
 // operation and resource registry can own the semantic handles.  In
 // particular, no Tauri/Wry/platform type crosses this boundary.
@@ -67,6 +76,20 @@ pub mod async_engine;
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 mod tauri;
+
+/// Semantic, opt-in external-webview operations.
+///
+/// This module exposes no Tauri, Wry, Tokio, or platform-window types.  It
+/// is available only with the heavyweight `tauri-webview` feature.
+#[cfg(all(
+    feature = "tauri-webview",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+pub mod webview {
+    pub use crate::tauri::{
+        ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewHandle,
+    };
+}
 
 #[cfg(all(
     feature = "tauri-webview",

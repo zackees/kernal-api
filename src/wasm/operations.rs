@@ -17,7 +17,15 @@ pub(crate) const OP_SYNTHETIC_YIELD: u32 = 1;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CREATE: u32 = 2;
 pub(crate) const OP_SYNTHETIC_RESOURCE_USE: u32 = 3;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
+/// Closed scalar ABI opcode for a native external-webview resource.  The
+/// scalar ABI deliberately carries no URL pointer: URL admission remains a
+/// host-owned semantic request, rather than an ambient guest-memory bridge.
+pub(crate) const OP_EXTERNAL_WEBVIEW_OPEN: u32 = 16;
+pub(crate) const OP_EXTERNAL_WEBVIEW_WAIT_UNTIL_LOADED: u32 = 17;
+pub(crate) const OP_EXTERNAL_WEBVIEW_CLOSE: u32 = 18;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
+pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
+const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
 const STATUS_PENDING: u8 = 0;
 const STATUS_COMPLETED: u8 = 1;
 const STATUS_CANCELLED: u8 = 2;
@@ -114,6 +122,7 @@ struct ResourceSlot {
 
 enum ResourceValue {
     Synthetic,
+    ExternalWebview,
 }
 
 struct OperationSlot {
@@ -281,6 +290,96 @@ impl OperationHub {
         Ok(operation)
     }
 
+    /// Reserve a generation-safe external-webview resource and its open
+    /// operation in the sole hub.  The caller must later publish either a
+    /// terminal outcome or a successful resource activation from its native
+    /// callback; it may never retain a Wasmtime Store.
+    pub(crate) fn begin_external_webview_open(
+        &self,
+        store: u64,
+    ) -> Result<(OpaqueToken, OpaqueToken), HubError> {
+        let resource = self.create_resource_value(
+            store,
+            EXTERNAL_WEBVIEW_RESOURCE_KIND,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD,
+            false,
+            ResourceValue::ExternalWebview,
+        )?;
+        let operation = match self.submit(store, None, 0, 0) {
+            Ok((operation, _)) => operation,
+            Err(error) => {
+                let _ = self.close_resource(resource);
+                return Err(error);
+            }
+        };
+        self.attach_created_resource(operation, resource)?;
+        Ok((resource, operation))
+    }
+
+    /// Submit a load observation operation for an already activated webview.
+    pub(crate) fn begin_external_webview_wait(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.submit(
+            store,
+            Some(resource),
+            EXTERNAL_WEBVIEW_RESOURCE_KIND,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD,
+        )
+        .map(|(operation, _)| operation)
+    }
+
+    /// Validate and reserve a semantic close operation.  Physical teardown is
+    /// performed by the private native backend; this hub remains the sole
+    /// authority that revokes the resource generation.
+    pub(crate) fn begin_external_webview_close(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.validate_close(store, resource)?;
+        self.submit(store, Some(resource), EXTERNAL_WEBVIEW_RESOURCE_KIND, 0)
+            .map(|(operation, _)| operation)
+    }
+
+    pub(crate) fn finish_external_operation(&self, operation: OpaqueToken, terminal: Terminal) {
+        let _ = self.terminal(
+            operation,
+            TerminalResult {
+                terminal,
+                resource: None,
+            },
+        );
+    }
+
+    pub(crate) fn finish_external_open(&self, operation: OpaqueToken, resource: OpaqueToken) {
+        let _ = self.terminal(
+            operation,
+            TerminalResult {
+                terminal: Terminal::Completed,
+                resource: Some(resource),
+            },
+        );
+    }
+
+    pub(crate) fn observe_terminal(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+    ) -> Result<Option<TerminalResult>, HubError> {
+        self.take_terminal(operation, store)
+    }
+
+    pub(crate) fn wait_external_operation(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+    ) -> Result<Arc<Notify>, HubError> {
+        self.suspend(operation, store)
+    }
+
     /// Generated scalar ABI adapter.  `kind` is a closed opcode; `arg0` and
     /// `arg1` never carry a pointer or a host object.  Resource create/use/
     /// close are operation variants, not additional imports.
@@ -311,6 +410,12 @@ impl OperationHub {
             OP_SYNTHETIC_RESOURCE_CLOSE => Request::Close {
                 resource: OpaqueToken(arg0),
             },
+            // A guest may name these stable opcodes, but a threaded sketch
+            // has no ambient native webview host.  The opt-in facade binds
+            // the same semantic operations explicitly on the native side.
+            OP_EXTERNAL_WEBVIEW_OPEN
+            | OP_EXTERNAL_WEBVIEW_WAIT_UNTIL_LOADED
+            | OP_EXTERNAL_WEBVIEW_CLOSE => return Err(HubError::Invalid),
             _ => return Err(HubError::Invalid),
         };
         Ok(self.dispatch(runtime, store, request)?.0)
@@ -389,6 +494,17 @@ impl OperationHub {
         rights: u8,
         shareable: bool,
     ) -> Result<OpaqueToken, HubError> {
+        self.create_resource_value(store, kind, rights, shareable, ResourceValue::Synthetic)
+    }
+
+    fn create_resource_value(
+        &self,
+        store: u64,
+        kind: u8,
+        rights: u8,
+        shareable: bool,
+        value: ResourceValue,
+    ) -> Result<OpaqueToken, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         if state.closed {
             return Err(HubError::Closed);
@@ -427,7 +543,7 @@ impl OperationHub {
                 },
                 owner: Owner { store },
                 shareable,
-                value: ResourceValue::Synthetic,
+                value,
                 reserved: true,
             },
         );
@@ -552,6 +668,26 @@ impl OperationHub {
     }
 
     pub(super) fn close_resource(&self, token: OpaqueToken) -> Result<(), HubError> {
+        self.close_resource_with_terminal(token, Terminal::Closed)
+    }
+
+    /// Revoke a native resource generation and wake every operation borrowing
+    /// it with the callback's semantic terminal reason.  This preserves a
+    /// rejected navigation or timeout instead of racing it into a generic
+    /// `Closed` result.
+    pub(crate) fn revoke_external_resource(
+        &self,
+        token: OpaqueToken,
+        terminal: Terminal,
+    ) -> Result<(), HubError> {
+        self.close_resource_with_terminal(token, terminal)
+    }
+
+    fn close_resource_with_terminal(
+        &self,
+        token: OpaqueToken,
+        terminal: Terminal,
+    ) -> Result<(), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let Some(resource) = state.resources.remove(&token) else {
             return if state.closed_resources.contains(&token) {
@@ -572,7 +708,7 @@ impl OperationHub {
         for operation in state.operations.values_mut() {
             if operation.resource == Some(token) && operation.terminal.is_none() {
                 operation.terminal = Some(TerminalResult {
-                    terminal: Terminal::Closed,
+                    terminal,
                     resource: None,
                 });
                 notifications.push(Arc::clone(&operation.notify));
@@ -723,6 +859,49 @@ mod tests {
         hub.close_resource(resource).unwrap();
         let replacement = hub.create_resource(3, 9, 1, false).unwrap();
         assert_ne!(resource, replacement, "stale token cannot name reused slot");
+    }
+
+    #[test]
+    fn external_webview_uses_the_same_generation_safe_authority() {
+        let hub = OperationHub::new(4, 2).unwrap();
+        let (resource, open) = hub.begin_external_webview_open(41).unwrap();
+        hub.finish_external_open(open, resource);
+        assert_eq!(
+            hub.observe_terminal(41, open),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Completed,
+                resource: Some(resource),
+            }))
+        );
+        let wait = hub.begin_external_webview_wait(41, resource).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_wait(42, resource),
+            Err(HubError::WrongRights),
+            "another logical instance cannot borrow this external resource"
+        );
+        hub.finish_external_operation(wait, Terminal::Completed);
+        assert_eq!(
+            hub.observe_terminal(41, wait),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Completed,
+                resource: None,
+            }))
+        );
+        let close = hub.begin_external_webview_close(41, resource).unwrap();
+        hub.finish_external_operation(close, Terminal::Completed);
+        assert_eq!(
+            hub.observe_terminal(41, close),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Completed,
+                resource: None,
+            }))
+        );
+        hub.close_resource(resource).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_wait(41, resource),
+            Err(HubError::Invalid),
+            "closed native backing cannot revive its generation"
+        );
     }
 
     #[test]

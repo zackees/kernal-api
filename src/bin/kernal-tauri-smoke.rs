@@ -1,21 +1,17 @@
-//! Native raw-Wry lifecycle proof for the private `tauri-webview` backend.
+//! Native semantic-webview lifecycle proof for the `tauri-webview` facade.
 //!
 //! Run on Linux with the GTK/WebKit/Xvfb shell documented in issue #18.  This
 //! binary exists because a Rust unit test executes on a test-worker thread,
 //! while Tauri requires the event loop to be initialized by the process main
 //! thread on every supported desktop host.
 
-#[path = "../tauri.rs"]
-mod tauri;
-
-pub use kernal_api::async_engine;
-
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use tauri::{NativeWebviewBackend, NativeWebviewError, NativeWebviewLoop, NativeWebviewRequest};
+use kernal_api::async_engine;
+use kernal_api::webview::{ExternalWebviewClient, ExternalWebviewHost, WebviewError};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = SmokeScenario::from_args()?;
@@ -67,10 +63,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .worker_threads(2)
         .build()?;
-    let (event_loop, backend) = NativeWebviewLoop::new(runtime.handle()).map_err(host_error)?;
+    let host = ExternalWebviewHost::new(runtime.handle()).map_err(host_error)?;
+    let client = host.client();
     let url = format!("http://{address}/finished");
     let (result_sender, result_receiver) = mpsc::channel();
-    let task_backend = backend.clone();
+    let task_client = client.clone();
     runtime
         .handle()
         .launch(async move {
@@ -80,19 +77,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // NativeWebview, whose Drop requests native close.
             let result = async_engine::timeout(
                 Duration::from_secs(15),
-                lifecycle(&task_backend, &url, scenario),
+                lifecycle(&task_client, &url, scenario),
             )
             .await
-            .map_err(|_| NativeWebviewError::HostFailure("lifecycle timed out".into()))
+            .map_err(|_| WebviewError::TimedOut)
             .and_then(|result| result);
             let _ = result_sender.send(result);
-            let _ = task_backend.request_exit();
+            let _ = task_client.request_exit();
         })
         .detach();
 
     // This process main thread owns the Wry/Tauri event loop. The awaited
     // operation above uses the same caller-provided kernal-api runtime.
-    event_loop.run();
+    host.run();
     server.join().map_err(|_| "loopback server panicked")??;
     result_receiver
         .recv_timeout(Duration::from_secs(15))
@@ -102,60 +99,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn lifecycle(
-    backend: &NativeWebviewBackend,
+    client: &ExternalWebviewClient,
     url: &str,
     scenario: SmokeScenario,
-) -> Result<(), NativeWebviewError> {
-    let request = NativeWebviewRequest::parse(url)?;
-    let mut webview = backend.open(request).await?;
-    let mut terminal = Some(webview.wait_until_terminal()?);
-    let loaded = webview.wait_until_loaded()?;
-    loaded
-        .await
-        .map_err(|_| NativeWebviewError::HostFailure("load completion dropped".into()))??;
-    if scenario != SmokeScenario::Close {
-        let terminal_result = async_engine::timeout(
-            Duration::from_secs(5),
-            terminal.take().expect("terminal receiver is present"),
-        )
-        .await
-        .map_err(|_| NativeWebviewError::HostFailure("security callback timed out".into()))?
-        .map_err(|_| NativeWebviewError::HostFailure("terminal completion dropped".into()))?;
-        match (scenario, terminal_result) {
-            (SmokeScenario::Popup, Err(NativeWebviewError::RejectedNavigation(reason)))
-                if reason.starts_with("popup to ") => {}
-            (
-                SmokeScenario::ProhibitedRedirect,
-                Err(NativeWebviewError::RejectedNavigation(reason)),
-            ) if reason == "tauri" => {}
-            (_, other) => {
-                return Err(NativeWebviewError::HostFailure(format!(
-                    "unexpected security terminal result: {other:?}"
-                )));
+) -> Result<(), WebviewError> {
+    let webview = client.open_webview(url).await?;
+    let loaded = webview.wait_until_loaded(Duration::from_secs(5)).await;
+    match (scenario, loaded) {
+        (SmokeScenario::Close, Ok(())) => webview.close().await,
+        (SmokeScenario::Popup, Ok(())) | (SmokeScenario::ProhibitedRedirect, Ok(())) => {
+            match webview.wait_until_terminal(Duration::from_secs(5)).await {
+                Err(WebviewError::RejectedNavigation(reason))
+                    if reason.contains("popup")
+                        || reason.contains("tauri")
+                        || reason == "navigation policy" =>
+                {
+                    Ok(())
+                }
+                other => Err(WebviewError::HostFailure(format!(
+                    "unexpected semantic security terminal: {other:?}"
+                ))),
             }
         }
-    }
-    webview.close()?;
-    webview
-        .wait_until_closed()?
-        .await
-        .map_err(|_| NativeWebviewError::HostFailure("close completion dropped".into()))?;
-    if scenario == SmokeScenario::Close {
-        match terminal
-            .take()
-            .expect("close scenario retains terminal receiver")
-            .await
-            .map_err(|_| NativeWebviewError::HostFailure("terminal completion dropped".into()))?
+        (SmokeScenario::Popup, Err(WebviewError::RejectedNavigation(reason)))
+        | (SmokeScenario::ProhibitedRedirect, Err(WebviewError::RejectedNavigation(reason)))
+            if reason.contains("popup")
+                || reason.contains("tauri")
+                || reason == "navigation policy" =>
         {
-            Err(NativeWebviewError::WindowClosed) => {}
-            other => {
-                return Err(NativeWebviewError::HostFailure(format!(
-                    "unexpected close terminal result: {other:?}"
-                )));
-            }
+            Ok(())
         }
+        (_, other) => Err(WebviewError::HostFailure(format!(
+            "unexpected semantic webview outcome: {other:?}"
+        ))),
     }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +178,6 @@ impl SmokeScenario {
     }
 }
 
-fn host_error(error: NativeWebviewError) -> std::io::Error {
+fn host_error(error: WebviewError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }

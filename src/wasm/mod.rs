@@ -15,8 +15,6 @@ pub use worker::{
     SketchWorkerTerminal,
 };
 
-mod operations;
-
 // Regenerated explicitly by `tools/wasm-abi-generator`; ordinary facade
 // builds consume this checked-in private host linker.
 #[rustfmt::skip]
@@ -26,7 +24,7 @@ mod generated_v1;
 #[path = "generated/v1/admission_contract.rs"]
 mod generated_v1_contract;
 
-use self::operations::OperationHub;
+use crate::operations::{self, OperationHub};
 
 use std::cell::UnsafeCell;
 use std::fmt;

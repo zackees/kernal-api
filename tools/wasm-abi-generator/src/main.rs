@@ -112,6 +112,15 @@ impl SyntheticResource {
     pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
 }
 pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
+
+// Closed operation kinds reserved for the native external-content capability.
+// They deliberately remain variants of `operation_submit`, rather than
+// adding a second import surface. Opening takes a host-owned semantic URL
+// request (not a guest pointer), so this scalar guest layer exposes the
+// stable kind constants while the opt-in host owns URL admission and dispatch.
+pub const EXTERNAL_WEBVIEW_OPEN: u32 = 16;
+pub const EXTERNAL_WEBVIEW_WAIT_UNTIL_LOADED: u32 = 17;
+pub const EXTERNAL_WEBVIEW_CLOSE: u32 = 18;
 "#;
     let path = output.join("guest/src/lib.rs");
     let source = fs::read_to_string(&path)?;

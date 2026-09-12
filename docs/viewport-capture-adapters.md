@@ -26,7 +26,8 @@ one hub lock: cancellation or view closure that wins first prevents publication
 and releases the reserved blob. A regression covers all three terminal outcomes
 and verifies zero retained storage after teardown. The callback uses this
 operation-bound publication path, but service dispatch, native cancellation
-handle ownership, and a live webpage capture proof are still required.
+handle ownership in the service, and an end-to-end generated sketch proof are
+still required.
 Capture has a distinct hub permission and submission method; a load or close
 operation cannot publish a snapshot. The checked-in load-as-capture regression
 failed before this separation and passes with it. Additional tests reject
@@ -40,9 +41,21 @@ The tests decode an encoded Cairo image and verify pixel-limit/cancellation
 cleanup. The encoded-limit regression uses Cairo's real PNG writer with an
 eight-byte admission limit and verifies a typed blob-limit error and zero
 remaining storage. A late-image regression closes the hub before encoding and
-verifies cancellation without publication. They do not yet request a live
-browser snapshot. Windows/macOS
-adapter builds and native proofs remain outstanding.
+verifies cancellation without publication.
+
+The separately ignored `live_webkit_viewport_png_completes_capture_operation`
+test requests an actual visible-region WebKitGTK snapshot under Xvfb. Its
+in-memory offline HTML fixture has red and blue halves; the test decodes the
+quota-accounted PNG, checks physical viewport dimensions and interior colors,
+and verifies the hub's completed operation references exactly that blob. It
+also cancels a second native snapshot and waits for its callback before
+asserting no blob publication or retained storage. This is an adapter-level
+proof, not the external-content service or generated Wasm screenshot sketch.
+Windows/macOS adapter builds and native proofs remain outstanding.
+
+```sh
+nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -j 1 -- --ignored --test-threads=1'
+```
 
 ## Exact dependency boundary
 

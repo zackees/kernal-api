@@ -122,6 +122,106 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires WebKitGTK 4.1 and an X11 display (run under xvfb-run)"]
+    fn live_webkit_viewport_png_completes_capture_operation() {
+        use gtk::prelude::GtkWindowExt as _;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        use std::time::{Duration, Instant};
+        use wry::WebViewBuilderExtUnix as _;
+
+        fn pump_until(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !ready() {
+                assert!(Instant::now() < deadline, "native browser callback timed out");
+                while gtk::events_pending() {
+                    gtk::main_iteration_do(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        gtk::init().unwrap();
+        let window = gtk::Window::new(gtk::WindowType::Toplevel);
+        window.set_default_size(320, 240);
+        let loaded = Rc::new(Cell::new(false));
+        let loaded_callback = Rc::clone(&loaded);
+        let view = wry::WebViewBuilder::new()
+            .with_html("<!doctype html><style>html,body{margin:0;width:100%;height:100%;background:#ff0000}div{position:absolute;left:50%;top:0;width:50%;height:100%;background:#0000ff}</style><div></div>")
+            .with_on_page_load_handler(move |event, _| {
+                if matches!(event, wry::PageLoadEvent::Finished) {
+                    loaded_callback.set(true);
+                }
+            })
+            .build_gtk(&window)
+            .unwrap();
+        window.show_all();
+        pump_until(|| loaded.get());
+
+        let hub = OperationHub::with_blob_limits(
+            8, 4, crate::operations::BlobLimits::new(1024, 1024 * 1024, 1024 * 1024).unwrap(),
+        ).unwrap();
+        let (resource, open) = hub.begin_external_webview_open(1).unwrap();
+        hub.finish_external_open(open, resource);
+        hub.observe_terminal(1, open).unwrap().unwrap();
+        let operation = hub.begin_external_webview_capture(1, resource).unwrap();
+        let result = Rc::new(RefCell::new(None));
+        let callback_result = Rc::clone(&result);
+        let cancellation = capture(&view, Arc::clone(&hub), 1, operation, 4_000_000, 1024 * 1024,
+            move |value| *callback_result.borrow_mut() = Some(value)).unwrap();
+        pump_until(|| result.borrow().is_some());
+        let blob = result.borrow_mut().take().unwrap().unwrap();
+        let terminal = hub.observe_terminal(1, operation).unwrap().unwrap();
+        assert_eq!(terminal.terminal, crate::operations::Terminal::Completed);
+        assert_eq!(terminal.resource, Some(blob));
+        let mut encoded = Vec::new(); // Test-only decoding, never the guest ABI.
+        loop {
+            let chunk = hub.blob_read(1, blob, 1024).unwrap();
+            if chunk.is_empty() { break; }
+            encoded.extend(chunk);
+        }
+        let mut image = cairo::ImageSurface::create_from_png(&mut std::io::Cursor::new(encoded)).unwrap();
+        let native = view.webview();
+        let width = native.allocated_width() * native.scale_factor();
+        let height = native.allocated_height() * native.scale_factor();
+        assert_eq!((image.width(), image.height()), (width, height));
+        let stride = image.stride() as usize;
+        let pixels = image.data().unwrap();
+        for (x, expected) in [(width / 4, 0x00ff0000_u32), (width * 3 / 4, 0x000000ff_u32)] {
+            let offset = height as usize / 2 * stride + x as usize * 4;
+            let pixel = u32::from_ne_bytes(pixels[offset..offset + 4].try_into().unwrap());
+            assert_eq!(pixel & 0x00ffffff, expected, "viewport region has incorrect color");
+        }
+        drop(pixels);
+        drop(image);
+        drop(cancellation);
+        hub.close_resource(blob).unwrap();
+
+        let cancelled_operation = hub.begin_external_webview_capture(1, resource).unwrap();
+        let cancelled_result = Rc::new(RefCell::new(None));
+        let callback_result = Rc::clone(&cancelled_result);
+        let cancellation = capture(&view, Arc::clone(&hub), 1, cancelled_operation, 4_000_000, 1024 * 1024,
+            move |value| *callback_result.borrow_mut() = Some(value)).unwrap();
+        hub.finish_external_operation(cancelled_operation, crate::operations::Terminal::Cancelled);
+        cancellation.cancel();
+        pump_until(|| cancelled_result.borrow().is_some());
+        assert_eq!(cancelled_result.borrow_mut().take().unwrap(), Err(CaptureError::Cancelled));
+        let terminal = hub.observe_terminal(1, cancelled_operation).unwrap().unwrap();
+        assert_eq!(terminal.terminal, crate::operations::Terminal::Cancelled);
+        assert_eq!(terminal.resource, None);
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        drop(cancellation);
+        hub.close_all(crate::operations::Terminal::Closed);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        drop(native);
+        drop(view);
+        window.close();
+    }
+
+    #[test]
     fn physical_pixel_limit_checks_scale_and_overflow() {
         assert_eq!(check_pixels(10, 20, 2, 800), Ok(()));
         assert_eq!(check_pixels(10, 20, 2, 799), Err(CaptureError::PixelLimit));

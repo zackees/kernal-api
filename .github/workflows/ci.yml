@@ -160,7 +160,7 @@ jobs:
           --locked --no-default-features --features ${{ matrix.feature }}
 
   # A unit test does not own process main on every test harness, while Tauri
-  # requires its event loop to start there.  These three executable proofs
+  # requires its event loop to start there.  These executable proofs
   # therefore use a real Xvfb display, a loopback page, and one supplied
   # kernal-api async runtime.  They exercise matching Finished correlation,
   # actual window destruction, popup denial, and a prohibited custom redirect.
@@ -178,12 +178,15 @@ jobs:
         env:
           GDK_BACKEND: x11
         run: |
-          xvfb-run -a soldr cargo run --locked --features tauri-webview --bin kernal-tauri-smoke -- close
+          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
           xvfb-run -a bash -c '
-            soldr cargo run --locked --features tauri-webview --bin kernal-tauri-smoke -- popup & proof=$!;
+            soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
             test -n "$window"; sleep 1; xdotool mousemove --window "$window" 150 150 click 1; wait "$proof"'
-          xvfb-run -a soldr cargo run --locked --features tauri-webview --bin kernal-tauri-smoke -- redirect
+          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- redirect
+          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
+          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
+          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it

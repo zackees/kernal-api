@@ -63,11 +63,11 @@ pub(crate) enum HubError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HubSnapshot {
-    pub(super) scope: u64,
-    pub(super) pending_operations: usize,
-    pub(super) live_resources: usize,
-    pub(super) suspends: u64,
-    pub(super) resumes: u64,
+    pub(crate) scope: u64,
+    pub(crate) pending_operations: usize,
+    pub(crate) live_resources: usize,
+    pub(crate) suspends: u64,
+    pub(crate) resumes: u64,
 }
 
 /// Private typed requests shared by the generated ABI and heavyweight native
@@ -316,13 +316,19 @@ impl OperationHub {
         store: u64,
         resource: OpaqueToken,
     ) -> Result<OpaqueToken, HubError> {
-        self.submit(
+        match self.submit(
             store,
             Some(resource),
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
             EXTERNAL_WEBVIEW_RIGHT_LOAD,
-        )
-        .map(|(operation, _)| operation)
+        ) {
+            Ok((operation, _)) => Ok(operation),
+            // A revoked external handle has a bounded tombstone. Preserve
+            // that semantic distinction for the facade instead of treating
+            // an immediately repeated use as a malformed host request.
+            Err(HubError::Invalid) if self.resource_was_closed(resource) => Err(HubError::Closed),
+            Err(error) => Err(error),
+        }
     }
 
     /// Validate and reserve a semantic close operation.  Physical teardown is
@@ -439,6 +445,12 @@ impl OperationHub {
             return Err(HubError::WrongRights);
         }
         Ok(())
+    }
+
+    fn resource_was_closed(&self, resource: OpaqueToken) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.closed_resources.contains(&resource))
     }
 
     fn take_owner(&self, operation: OpaqueToken, store: u64) -> Result<(), HubError> {
@@ -732,7 +744,7 @@ impl OperationHub {
         }
     }
 
-    pub(super) fn snapshot(&self) -> HubSnapshot {
+    pub(crate) fn snapshot(&self) -> HubSnapshot {
         let state = self.state.lock().expect("operation hub mutex poisoned");
         HubSnapshot {
             scope: self.scope,
@@ -887,7 +899,7 @@ mod tests {
         hub.close_resource(resource).unwrap();
         assert_eq!(
             hub.begin_external_webview_wait(41, resource),
-            Err(HubError::Invalid),
+            Err(HubError::Closed),
             "closed native backing cannot revive its generation"
         );
     }
@@ -916,7 +928,7 @@ mod tests {
             );
             assert_eq!(
                 hub.begin_external_webview_wait(7, resource),
-                Err(HubError::Invalid),
+                Err(HubError::Closed),
                 "a terminal native event must not revive the old generation"
             );
             let snapshot = hub.snapshot();

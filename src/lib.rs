@@ -86,6 +86,8 @@ mod tauri;
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 pub mod webview {
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::WebviewTestObservation;
     pub use crate::tauri::{
         ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewHandle,
     };

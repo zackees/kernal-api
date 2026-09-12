@@ -40,6 +40,16 @@ use wasmtime::{
     UpdateDeadline,
 };
 
+#[cfg(test)]
+#[test]
+fn wasm_host_uses_the_root_shared_operation_authority_module() {
+    assert_eq!(
+        std::any::type_name::<OperationHub>(),
+        "kernal_api::operations::OperationHub",
+        "the Wasm host and native facade must not compile separate operation hubs"
+    );
+}
+
 const PAGE_BYTES: u64 = 64 * 1024;
 const ABI_MODULE: &str = generated_v1_contract::NAMESPACE;
 const ABI_YIELD: &str = generated_v1_contract::KERNEL_YIELD;

@@ -622,6 +622,21 @@ pub struct WebviewHandle {
     terminal_operation: OpaqueToken,
 }
 
+/// Acceptance-only semantic counters for the process-main-thread smoke test.
+///
+/// This deliberately reports counts rather than a backend handle, native
+/// window, runtime, or raw resource token.
+#[cfg(feature = "tauri-webview-test-support")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebviewTestObservation {
+    /// Private physical WebView backings retained by the facade.
+    pub native_backings: usize,
+    /// Live generation-safe semantic resources in the shared hub.
+    pub live_resources: usize,
+    /// Pending semantic operations in the shared hub.
+    pub pending_operations: usize,
+}
+
 struct WebviewService {
     runtime: RuntimeHandle,
     backend: NativeWebviewBackend,
@@ -745,6 +760,18 @@ impl ExternalWebviewClient {
     pub fn request_exit(&self) -> Result<(), WebviewError> {
         self.service.backend.request_exit().map_err(map_native)
     }
+
+    /// Return acceptance-only semantic counts without exposing a backend type.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn test_observation(&self) -> WebviewTestObservation {
+        let snapshot = self.service.hub.snapshot();
+        let native_backings = self.service.native.lock().map_or(0, |native| native.len());
+        WebviewTestObservation {
+            native_backings,
+            live_resources: snapshot.live_resources,
+            pending_operations: snapshot.pending_operations,
+        }
+    }
 }
 
 impl WebviewHandle {
@@ -795,17 +822,36 @@ impl WebviewHandle {
     /// attempts a prohibited redirect or popup. It is itself a hub-owned
     /// operation, so callback completion never needs to retain a Store.
     pub async fn wait_until_terminal(&self, timeout: Duration) -> Result<(), WebviewError> {
-        let wake = self
+        // A cancellation or window callback may have completed this operation
+        // before the caller first awaits it. Poll first; if completion wins
+        // the short race before suspension, consume that typed terminal below
+        // rather than collapsing it into HubError::Closed.
+        if let Some(result) = self
+            .service
+            .hub
+            .observe_terminal(self.store, self.terminal_operation)
+            .map_err(map_hub)?
+        {
+            return Err(map_terminal(result.terminal));
+        }
+        match self
             .service
             .hub
             .wait_external_operation(self.store, self.terminal_operation)
-            .map_err(map_hub)?;
-        if async_engine::timeout(timeout, wake.notified())
-            .await
-            .is_err()
         {
-            self.service
-                .revoke_with_terminal(self.resource, Terminal::TimedOut);
+            Ok(wake) => {
+                if async_engine::timeout(timeout, wake.notified())
+                    .await
+                    .is_err()
+                {
+                    self.service
+                        .revoke_with_terminal(self.resource, Terminal::TimedOut);
+                }
+            }
+            // Completion can race the poll above; the final observe below
+            // retains the callback's typed terminal result.
+            Err(HubError::Closed) => {}
+            Err(error) => return Err(map_hub(error)),
         }
         match self
             .service
@@ -878,9 +924,26 @@ impl WebviewHandle {
 
     /// Explicitly cancel a handle. Cancellation is terminal and revokes the
     /// resource generation before returning.
-    pub fn cancel(self) {
+    pub fn cancel(&self) {
         self.service
             .revoke_with_terminal(self.resource, Terminal::Cancelled);
+    }
+
+    /// Acceptance-only stand-in for a user/window-manager close gesture.
+    /// The normal terminal callback path must revoke the same semantic handle
+    /// as a real user close, while the smoke can invoke it deterministically.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn request_window_close_for_test(&self) -> Result<(), WebviewError> {
+        let native = self
+            .service
+            .native
+            .lock()
+            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?;
+        native
+            .get(&self.resource)
+            .ok_or(WebviewError::WindowClosed)?
+            .close()
+            .map_err(map_native)
     }
 }
 

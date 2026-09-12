@@ -41,8 +41,10 @@ The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built
 binary from the ephemeral shell rather than from a Nix-wrapped derivation:
 
 ```sh
-nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr --jobs 2 cargo run --locked --features tauri-webview --bin kernal-tauri-smoke -j 1 -- close'
+nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr --jobs 2 cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -j 1 -- close'
 ```
 
-Replace `close` with `popup` or `redirect` to exercise the isolation fault
-paths.
+Replace `close` with `popup`, `redirect`, `timeout`, `cancel`, or
+`window-close` to exercise isolation and cleanup paths. The test-support
+feature is accepted only for this executable proof and exposes aggregate
+semantic counts, never backend types.

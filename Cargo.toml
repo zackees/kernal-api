@@ -30,7 +30,7 @@ required-features = ["wasm-sketch-worker"]
 [[bin]]
 name = "kernal-tauri-smoke"
 path = "src/bin/kernal-tauri-smoke.rs"
-required-features = ["tauri-webview"]
+required-features = ["tauri-webview-test-support"]
 
 [features]
 default = []
@@ -96,6 +96,9 @@ tauri-webview = [
   "dep:url",
   "dep:wry",
 ]
+# Private acceptance-only observation for the process-main-thread smoke
+# executable. It exposes semantic counts only, never a Tauri/Wry/native type.
+tauri-webview-test-support = ["tauri-webview"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",

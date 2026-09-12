@@ -37,15 +37,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let (mut stream, _) = accept()?;
+        // Accepted sockets inherit the listener's nonblocking mode on the
+        // supported Unix CI hosts.  The proof uses a bounded blocking read so
+        // an in-flight navigation cannot race the harness into WouldBlock.
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request)?;
+        match stream.read(&mut request) {
+            Ok(_) => {}
+            // A real WebKit navigation may establish its loopback connection
+            // just as the semantic timeout tears down the native backing,
+            // before it writes HTTP bytes. That is a successful timeout
+            // proof, not a server failure.
+            Err(error)
+                if scenario == SmokeScenario::Timeout
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        if scenario == SmokeScenario::Timeout {
+            // Keep the top-level navigation pending past the facade timeout.
+            // The client has already sent a real loopback request, so this
+            // proves teardown of an actual native backing rather than a mock.
+            std::thread::sleep(Duration::from_secs(1));
+            return Ok(());
+        }
         write!(
             stream,
             "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
             page.len()
         )?;
         let (mut report, _) = accept()?;
+        report.set_nonblocking(false)?;
         report.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut report_request = [0_u8; 4096];
         let read = report.read(&mut report_request)?;
@@ -104,9 +132,47 @@ async fn lifecycle(
     scenario: SmokeScenario,
 ) -> Result<(), WebviewError> {
     let webview = client.open_webview(url).await?;
+    if scenario == SmokeScenario::Timeout {
+        let timed_out = webview.wait_until_loaded(Duration::from_millis(50)).await;
+        if timed_out != Err(WebviewError::TimedOut) {
+            return Err(WebviewError::HostFailure(format!(
+                "expected typed load timeout, got {timed_out:?}"
+            )));
+        }
+        // The resource token remains opaque, but another semantic operation
+        // through this façade must observe the revoked generation.
+        if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::WindowClosed) {
+            return Err(WebviewError::HostFailure(
+                "timed-out handle remained usable".into(),
+            ));
+        }
+        return assert_clean(client);
+    }
     let loaded = webview.wait_until_loaded(Duration::from_secs(5)).await;
     match (scenario, loaded) {
         (SmokeScenario::Close, Ok(())) => webview.close().await,
+        (SmokeScenario::Cancel, Ok(())) => {
+            webview.cancel();
+            if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::Cancelled) {
+                return Err(WebviewError::HostFailure(
+                    "cancellation did not publish its typed terminal outcome".into(),
+                ));
+            }
+            require_stale(&webview).await?;
+            assert_clean(client)
+        }
+        (SmokeScenario::WindowClose, Ok(())) => {
+            webview.request_window_close_for_test()?;
+            if webview.wait_until_terminal(Duration::from_secs(5)).await
+                != Err(WebviewError::WindowClosed)
+            {
+                return Err(WebviewError::HostFailure(
+                    "window close did not revoke the semantic handle".into(),
+                ));
+            }
+            require_stale(&webview).await?;
+            assert_clean(client)
+        }
         (SmokeScenario::Popup, Ok(())) | (SmokeScenario::ProhibitedRedirect, Ok(())) => {
             match webview.wait_until_terminal(Duration::from_secs(5)).await {
                 Err(WebviewError::RejectedNavigation(reason))
@@ -135,11 +201,24 @@ async fn lifecycle(
     }
 }
 
+async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(), WebviewError> {
+    if webview.wait_until_loaded(Duration::ZERO).await == Err(WebviewError::WindowClosed) {
+        Ok(())
+    } else {
+        Err(WebviewError::HostFailure(
+            "revoked webview handle remained usable".into(),
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeScenario {
     Close,
     Popup,
     ProhibitedRedirect,
+    Timeout,
+    Cancel,
+    WindowClose,
 }
 
 impl SmokeScenario {
@@ -148,8 +227,11 @@ impl SmokeScenario {
             None | Some("close") => Ok(Self::Close),
             Some("popup") => Ok(Self::Popup),
             Some("redirect") => Ok(Self::ProhibitedRedirect),
+            Some("timeout") => Ok(Self::Timeout),
+            Some("cancel") => Ok(Self::Cancel),
+            Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use close, popup, or redirect"
+                "unknown smoke scenario {other:?}; use close, popup, redirect, timeout, cancel, or window-close"
             )
             .into()),
         }
@@ -158,6 +240,7 @@ impl SmokeScenario {
     fn page(self, address: &str) -> String {
         let action = match self {
             Self::Close => "",
+            Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with
             // xdotool; no host script or IPC is injected into the page.
@@ -175,6 +258,20 @@ impl SmokeScenario {
              xhr.open('GET', 'http://{address}/_isolation?' + probe, false); xhr.send();\
              {action}</script>"
         )
+    }
+}
+
+fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
+    let observation = client.test_observation();
+    if observation.native_backings == 0
+        && observation.live_resources == 0
+        && observation.pending_operations == 0
+    {
+        Ok(())
+    } else {
+        Err(WebviewError::HostFailure(format!(
+            "webview cleanup leaked semantic state: {observation:?}"
+        )))
     }
 }
 

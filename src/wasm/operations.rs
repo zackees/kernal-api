@@ -1418,6 +1418,7 @@ impl OperationHub {
         output: OpaqueToken,
         operation: Option<OpaqueToken>,
     ) -> std::io::Result<()> {
+        self.check_output_operation(store, blob, output, operation)?;
         let destination = self.exact_output_path(store, output)?;
         {
             let mut state = self
@@ -1455,6 +1456,7 @@ impl OperationHub {
         let mut temporary = TemporaryOutput::create(temporary)?;
         let result = (|| {
             loop {
+                self.check_output_operation(store, blob, output, operation)?;
                 let chunk = self
                     .read_blob_chunk(store, blob, self.blob_limits.maximum_chunk_bytes, true)
                     .map_err(hub_io_error)?;
@@ -1467,6 +1469,7 @@ impl OperationHub {
                     .expect("open temporary")
                     .write_all(&chunk)?;
             }
+            self.check_output_operation(store, blob, output, operation)?;
             temporary
                 .file
                 .as_ref()
@@ -1477,6 +1480,46 @@ impl OperationHub {
         })();
         temporary.committed = result.is_ok();
         result
+    }
+
+    /// Cooperative checkpoints do not interrupt an already-issued filesystem
+    /// call; they stop cancelled work before another bounded chunk or sync.
+    #[cfg(feature = "wasm-sketch-host")]
+    fn check_output_operation(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+        operation: Option<OpaqueToken>,
+    ) -> std::io::Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| hub_io_error(HubError::Closed))?;
+        if state.closed {
+            return Err(hub_io_error(HubError::Closed));
+        }
+        if let Some(token) = operation {
+            let slot = state
+                .operations
+                .get(&token)
+                .ok_or_else(|| hub_io_error(HubError::Closed))?;
+            if slot.owner.store != store || slot.resource != Some(output) || slot.terminal.is_some()
+            {
+                return Err(hub_io_error(HubError::Closed));
+            }
+        }
+        for (token, kind, rights) in [
+            (blob, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ),
+            (output, OUTPUT_RESOURCE_KIND, OUTPUT_RIGHT_COMMIT),
+        ] {
+            let resource = state
+                .resources
+                .get(&token)
+                .ok_or_else(|| hub_io_error(HubError::Closed))?;
+            Self::validate_resource(resource, store, kind, rights).map_err(hub_io_error)?;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "wasm-sketch-host")]
@@ -2375,6 +2418,11 @@ mod tests {
         );
         assert_eq!(std::fs::read(&final_path).unwrap(), b"complete");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            hub.blob_read(1, blob, 64).unwrap(),
+            b"cancelled",
+            "cancellation before job start must not consume the source blob"
+        );
     }
 
     #[cfg(feature = "wasm-sketch-host")]

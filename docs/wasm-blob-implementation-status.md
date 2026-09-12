@@ -39,6 +39,11 @@ pending and subsequent writes.
   temporary file, syncs and closes it, and uses the existing atomic replacement.
 - Replacement failure removes the owned temporary file. Failed exclusive
   creation does not remove a file belonging to another creator.
+- Output jobs check operation/resource authority before starting, before
+  each bounded pull, and before sync. Cancellation before job start leaves
+  the source blob unconsumed. Cancellation during a syscall cannot interrupt
+  that syscall, but the next checkpoint stops further work. Atomic replacement
+  still checks the terminal winner under the hub lock.
 - An ownership guard now closes and removes the temporary file on unwind as
   well as ordinary errors. Focused injected-panic tests cover partial writes
   and the post-sync/close, pre-replacement boundary while preserving the

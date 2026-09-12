@@ -238,7 +238,7 @@ jobs:
         env:
           KERNAL_API_SCREENSHOT_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
         run: |
-          soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot portable_png_assertions
+          soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
       - name: Preserve screenshot and process diagnostics
         if: always()

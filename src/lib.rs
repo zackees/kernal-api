@@ -93,6 +93,8 @@ pub mod webview {
     pub use crate::tauri::capture::WebviewTestUiPause;
     #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestObservation;
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::WebviewTestTraceEvent;
     pub use crate::tauri::{
         ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,
         WebviewHandle, WebviewSnapshot, WebviewSnapshotChunk, WebviewUrlGrant,

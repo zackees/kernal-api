@@ -1924,6 +1924,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("submit", Some(kind));
+        }
         if kind == crate::operations::OP_WEBVIEW_URL_GRANT {
             #[cfg(feature = "tauri-webview")]
             if arg0 == 0 && arg1 == 0 {
@@ -2020,6 +2024,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_poll(&mut self, operation: u64) -> wasmtime::Result<u64> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("poll", None);
+        }
         Ok(self.operations.poll_wire(self.store_owner, operation))
     }
 
@@ -2027,6 +2035,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         &mut self,
         operation: u64,
     ) -> wasmtime::Result<Arc<crate::async_engine::Notify>> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("yield", None);
+        }
         // The generated future calls this only after submit/poll. The async
         // owner driver will replace this scalar acknowledgement with its
         // parked Wasmtime yield glue; no Caller escapes this boundary.
@@ -2036,6 +2048,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_cancel(&mut self, operation: u64) -> wasmtime::Result<i32> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("cancel", None);
+        }
         Ok(i32::from(
             self.operations
                 .cancel_wire(self.store_owner, operation)

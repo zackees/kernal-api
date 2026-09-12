@@ -16,6 +16,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use tauri_runtime::{
     window::{PendingWindow, WindowBuilder},
@@ -50,7 +51,11 @@ use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
 use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
 
 pub(crate) mod capture;
+#[cfg(feature = "tauri-webview-test-support")]
+mod trace;
 pub use capture::{ViewportCaptureLimits, WebviewSnapshot, WebviewSnapshotChunk};
+#[cfg(feature = "tauri-webview-test-support")]
+pub use trace::WebviewTestTraceEvent;
 
 static NEXT_LABEL: AtomicU64 = AtomicU64::new(1);
 static NEXT_WEBVIEW_STORE: AtomicU64 = AtomicU64::new(1);
@@ -335,7 +340,7 @@ pub(crate) struct NativeWebview {
     window: WryWindowDispatcher<()>,
     native_id: u64,
     completion: Arc<LoadCompletion>,
-    load_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
+    load_waiter: Option<OneshotReceiver<Result<Instant, NativeWebviewError>>>,
     terminal_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
     close_waiter: Option<OneshotReceiver<()>>,
     close_requested: AtomicBool,
@@ -346,7 +351,7 @@ impl NativeWebview {
     /// A resource can have one generated operation waiting at a time.
     pub(crate) fn wait_until_loaded(
         &mut self,
-    ) -> Result<OneshotReceiver<Result<(), NativeWebviewError>>, NativeWebviewError> {
+    ) -> Result<OneshotReceiver<Result<Instant, NativeWebviewError>>, NativeWebviewError> {
         self.load_waiter
             .take()
             .ok_or_else(|| NativeWebviewError::HostFailure("load waiter already consumed".into()))
@@ -405,7 +410,7 @@ impl Drop for NativeWebview {
 
 struct LoadCompletion {
     target: Url,
-    sender: Mutex<Option<OneshotSender<Result<(), NativeWebviewError>>>>,
+    sender: Mutex<Option<OneshotSender<Result<Instant, NativeWebviewError>>>>,
 }
 
 struct TerminalCompletion {
@@ -463,7 +468,12 @@ impl CloseCompletion {
 }
 
 impl LoadCompletion {
-    fn new(target: Url) -> (Arc<Self>, OneshotReceiver<Result<(), NativeWebviewError>>) {
+    fn new(
+        target: Url,
+    ) -> (
+        Arc<Self>,
+        OneshotReceiver<Result<Instant, NativeWebviewError>>,
+    ) {
         let (sender, receiver) = async_engine::oneshot_channel();
         (
             Arc::new(Self {
@@ -475,6 +485,7 @@ impl LoadCompletion {
     }
 
     fn finish(&self, result: Result<(), NativeWebviewError>) {
+        let result = result.map(|()| Instant::now());
         let sender = self
             .sender
             .lock()
@@ -673,6 +684,10 @@ pub struct WebviewHandle {
 #[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WebviewTestObservation {
+    /// Kernel clock producers not yet drained.
+    pub active_clocks: usize,
+    /// Exact-output jobs not yet joined.
+    pub active_output_jobs: usize,
     /// Queued UI captures and native callbacks still holding admission.
     pub active_native_captures: usize,
     /// Native creation requests retained after semantic cancellation.
@@ -690,6 +705,8 @@ pub struct WebviewTestObservation {
 }
 
 struct WebviewService {
+    #[cfg(feature = "tauri-webview-test-support")]
+    trace: Arc<trace::Recorder>,
     runtime: RuntimeHandle,
     backend: NativeWebviewBackend,
     hub: Arc<OperationHub>,
@@ -750,6 +767,8 @@ impl ExternalWebviewHost {
             event_loop,
             client: ExternalWebviewClient {
                 service: Arc::new(WebviewService {
+                    #[cfg(feature = "tauri-webview-test-support")]
+                    trace: Arc::new(trace::Recorder::new()),
                     runtime,
                     backend,
                     hub,
@@ -773,6 +792,12 @@ impl ExternalWebviewHost {
 }
 
 impl ExternalWebviewClient {
+    /// Return bounded acceptance events and the number omitted at capacity.
+    /// A proof must reject a nonzero omitted count instead of assuming a full trace.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn test_trace(&self) -> (Vec<WebviewTestTraceEvent>, usize) {
+        self.service.trace.snapshot()
+    }
     /// Create an independently authorized logical instance over the same
     /// host. Handles from one instance cannot be used by another.
     pub fn new_instance(&self) -> Result<Self, WebviewError> {
@@ -882,6 +907,8 @@ impl ExternalWebviewClient {
         let snapshot = self.service.hub.snapshot();
         let native_backings = self.service.native.lock().map_or(0, |native| native.len());
         WebviewTestObservation {
+            active_clocks: snapshot.active_clocks,
+            active_output_jobs: snapshot.active_output_jobs,
             active_native_captures: snapshot.active_native_captures,
             active_native_opens: snapshot.active_native_opens,
             live_blobs: snapshot.live_blobs,
@@ -914,7 +941,7 @@ impl WebviewHandle {
                 .map_err(map_native)?
         };
         let terminal = match async_engine::timeout(timeout, receiver).await {
-            Ok(Ok(Ok(()))) => Terminal::Completed,
+            Ok(Ok(Ok(_loaded_at))) => Terminal::Completed,
             Ok(Ok(Err(error))) => terminal_for_native(&error),
             Ok(Err(_)) => Terminal::Closed,
             Err(_) => Terminal::TimedOut,

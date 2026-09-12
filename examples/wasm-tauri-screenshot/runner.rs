@@ -104,6 +104,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 output,
             )
             .await;
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            let (events, omitted) = client.test_trace();
+            for event in events {
+                eprint!("kernal-webview-trace phase={} elapsed_us={} opcode={}", event.phase, event.elapsed.as_micros(), event.opcode.unwrap_or(0));
+                if let Some(counts) = event.observation {
+                    eprint!(" clocks={} output_jobs={}", counts.active_clocks, counts.active_output_jobs);
+                    eprint!(" captures={} opens={} blobs={} transfer_bytes={} backings={} resources={} operations={}", counts.active_native_captures, counts.active_native_opens, counts.live_blobs, counts.retained_transfer_capacity, counts.native_backings, counts.live_resources, counts.pending_operations);
+                }
+                eprintln!();
+            }
+            drop(sketch);
+            let counts = compiler.execution_limits_snapshot();
+            eprintln!("kernal-webview-trace phase=trace-end omitted={} roots={} threads={} stores={} instances={} epochs={} memory_bytes={}", omitted, counts.active_root_executions(), counts.live_guest_threads(), counts.live_stores(), counts.live_instances(), counts.active_epoch_registrations(), counts.reserved_shared_memory_bytes());
+        }
         let _ = sender.send(result);
         let _ = client.request_exit();
     });

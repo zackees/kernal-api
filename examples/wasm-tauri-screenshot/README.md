@@ -20,8 +20,8 @@ redundant guest close after output commit; commit consumes the snapshot and
 output grants, so the guest now proceeds directly to closing the view.
 
 This is still an in-progress #20/#21 implementation, not completion of the
-full acceptance matrix. Structured ABI/event tracing, detailed guest error
-reporting, queued/cancelled native-creation destruction evidence, the complete
+full acceptance matrix. Detailed guest error reporting, failure-path trace
+coverage, queued/cancelled native-creation destruction evidence, the complete
 failure matrix, killable native-webview worker integration, and native
 Windows/macOS execution remain outstanding. Do not treat this in-process
 diagnostic CLI as containment for arbitrary untrusted Wasm.
@@ -64,8 +64,15 @@ The native test launches the CLI as a separate process, serves the checked-in
 fixture over loopback, verifies successful guest completion, decodes the PNG
 with portable Rust tooling, checks bounded dimensions and tolerant red/blue
 regions at six interior points, and checks exact-output replacement and
-temporary-file cleanup. Its elapsed-time check is not a substitute for the
-still-required load-finished/clock event trace. Run under Xvfb on headless
+temporary-file cleanup. A bounded host trace records generated submit/poll/yield
+crossings, preserves the matching native load callback's monotonic timestamp,
+and requires capture at least five seconds later. After joined cleanup and
+dropping the admitted sketch, the proof requires zero native admission,
+backings, hub resources/operations/transfer bytes, clock/output jobs, Wasm
+roots/threads/stores/instances, epoch registrations, and memory reservations.
+The recorder holds at most 512 events; any omitted event fails the proof.
+These success-path observations do not establish the remaining failure matrix.
+Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.
 
 The dedicated `wasm-tauri-screenshot-linux` CI job builds this actual guest
@@ -73,8 +80,10 @@ and runs both proofs with WebKitGTK 4.1 under Xvfb. Set
 `KERNAL_API_SCREENSHOT_PROOF_DIR` to retain a unique diagnostic directory
 containing runner stdout/stderr, process outcome/timing JSON, and the exact
 output directory even if an assertion fails. CI uploads these artifacts on
-success or failure. The process summary is not the outstanding structured
-load/clock/capture/resource event trace. This Linux x86-64 lane does not
+success or failure. `runner.stderr.log` includes structured
+`kernal-webview-trace` records; `process.json` separately summarizes the child
+process. Hard termination can prevent the bounded trace from being emitted,
+so failure-path/containment diagnostics remain incomplete. This Linux x86-64 lane does not
 establish native execution on the other five supported host targets.
 
 Focused formatting and lint checks:
@@ -82,7 +91,7 @@ Focused formatting and lint checks:
 ```sh
 soldr cargo fmt --all -- --check
 soldr cargo clippy --locked --features wasm-sketch-host,tauri-webview-test-support --lib --tests --bins -- -D warnings
-soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot portable_png_assertions
+soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot
 ```
 
 The generated command driver handles only

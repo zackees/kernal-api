@@ -143,6 +143,8 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
     let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
     assert!(width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 4_000_000);
     validate_fixture_png(&png).expect("decodable native viewport with expected color regions");
+    let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
+    validate_execution_trace(&trace).expect("generated ABI, native timing, and drained root trace");
     assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
     assert_eq!(
         std::fs::read_dir(&directory).unwrap().count(),
@@ -158,6 +160,89 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
         png.len(),
         start.elapsed()
     );
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+fn validate_execution_trace(trace: &str) -> Result<(), &'static str> {
+    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_ascii_whitespace().find_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            (name == key).then_some(value)
+        })
+    }
+    let records: Vec<_> = trace
+        .lines()
+        .filter(|line| line.starts_with("kernal-webview-trace "))
+        .collect();
+    let one = |phase: &str| -> Result<&str, &'static str> {
+        let matching: Vec<_> = records
+            .iter()
+            .copied()
+            .filter(|line| field(line, "phase") == Some(phase))
+            .collect();
+        if matching.len() != 1 {
+            return Err("missing or duplicate lifecycle event");
+        }
+        Ok(matching[0])
+    };
+    let time = |phase| -> Result<u128, &'static str> {
+        field(one(phase)?, "elapsed_us")
+            .and_then(|value| value.parse().ok())
+            .ok_or("invalid event timestamp")
+    };
+    if time("capture-requested")?
+        .checked_sub(time("load-finished")?)
+        .is_none_or(|delta| delta < 5_000_000)
+    {
+        return Err("capture preceded the five-second post-load wait");
+    }
+    for opcode in [13, 11, 14, 15, 12, 16, 10, 17] {
+        if !records.iter().any(|line| {
+            field(line, "phase") == Some("submit")
+                && field(line, "opcode").and_then(|v| v.parse::<u32>().ok()) == Some(opcode)
+        }) {
+            return Err("missing generated operation crossing");
+        }
+    }
+    for phase in ["poll", "yield"] {
+        if !records
+            .iter()
+            .any(|line| field(line, "phase") == Some(phase))
+        {
+            return Err("missing async lifecycle crossing");
+        }
+    }
+    let drained = one("hub-drained")?;
+    for counter in [
+        "clocks",
+        "output_jobs",
+        "captures",
+        "opens",
+        "blobs",
+        "transfer_bytes",
+        "backings",
+        "resources",
+        "operations",
+    ] {
+        if field(drained, counter) != Some("0") {
+            return Err("root retains native or semantic resources");
+        }
+    }
+    let end = one("trace-end")?;
+    for counter in [
+        "omitted",
+        "roots",
+        "threads",
+        "stores",
+        "instances",
+        "epochs",
+        "memory_bytes",
+    ] {
+        if field(end, counter) != Some("0") {
+            return Err("incomplete trace or retained Wasm state");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
@@ -209,6 +294,38 @@ fn validate_fixture_png(bytes: &[u8]) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+#[test]
+fn execution_trace_assertions_reject_early_capture_leaks_and_missing_crossings() {
+    // Parser controls only; the ignored acceptance test still requires the
+    // actual native callback and actual compiled guest to produce its trace.
+    let mut trace = String::new();
+    for opcode in [13, 11, 14, 15, 12, 16, 10, 17] {
+        trace.push_str(&format!(
+            "kernal-webview-trace phase=submit opcode={opcode}\n"
+        ));
+    }
+    trace.push_str("kernal-webview-trace phase=poll\nkernal-webview-trace phase=yield\n");
+    trace.push_str("kernal-webview-trace phase=load-finished elapsed_us=100\n");
+    trace.push_str("kernal-webview-trace phase=capture-requested elapsed_us=5000100\n");
+    trace.push_str("kernal-webview-trace phase=hub-drained clocks=0 output_jobs=0 captures=0 opens=0 blobs=0 transfer_bytes=0 backings=0 resources=0 operations=0\n");
+    trace.push_str("kernal-webview-trace phase=trace-end omitted=0 roots=0 threads=0 stores=0 instances=0 epochs=0 memory_bytes=0\n");
+    assert_eq!(validate_execution_trace(&trace), Ok(()));
+    for (from, to) in [
+        ("elapsed_us=5000100", "elapsed_us=5000099"),
+        ("resources=0", "resources=1"),
+        ("threads=0", "threads=1"),
+        ("omitted=0", "omitted=1"),
+        ("opcode=16", "opcode=99"),
+        ("phase=yield", "phase=unknown"),
+    ] {
+        assert!(
+            validate_execution_trace(&trace.replace(from, to)).is_err(),
+            "accepted invalid trace mutation {from} -> {to}"
+        );
+    }
 }
 
 #[cfg(feature = "tauri-webview-test-support")]

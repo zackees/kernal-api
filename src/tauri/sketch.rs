@@ -58,6 +58,8 @@ impl SketchWebviews {
         }
         Ok(Arc::new(Self {
             service: Arc::new(WebviewService {
+                #[cfg(feature = "tauri-webview-test-support")]
+                trace: Arc::clone(&client.service.trace),
                 runtime: runtime.clone(),
                 backend: client.service.backend.clone(),
                 hub,
@@ -78,6 +80,13 @@ impl SketchWebviews {
         let mut jobs = self.admit_job()?;
         self.spawn_job(&mut jobs, future);
         Ok(())
+    }
+
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub(crate) fn trace_abi(&self, phase: &'static str, opcode: Option<u32>) {
+        self.service
+            .trace
+            .record(Instant::now(), phase, opcode, None);
     }
 
     fn admit_job(
@@ -244,7 +253,7 @@ impl SketchWebviews {
                     .ok_or(WebviewError::WindowClosed)?
                     .wait_until_loaded()
                     .map_err(map_native)?;
-                async_engine::cancellable(
+                let loaded_at = async_engine::cancellable(
                     &cancellation,
                     async_engine::timeout(Duration::from_secs(30), receiver),
                 )
@@ -253,11 +262,19 @@ impl SketchWebviews {
                 .map_err(|_| WebviewError::TimedOut)?
                 .map_err(|_| WebviewError::WindowClosed)?
                 .map_err(map_native)?;
+                #[cfg(feature = "tauri-webview-test-support")]
+                self.service
+                    .trace
+                    .record(loaded_at, "load-finished", None, None);
+                #[cfg(not(feature = "tauri-webview-test-support"))]
+                let _ = loaded_at;
                 self.service
                     .hub
                     .finish_external_operation(operation, Terminal::Completed);
             }
             OP_WEBVIEW_CAPTURE => {
+                #[cfg(feature = "tauri-webview-test-support")]
+                self.trace_abi("capture-requested", None);
                 let request = self
                     .service
                     .native
@@ -357,6 +374,31 @@ impl SketchWebviews {
         .map_err(|_| WebviewError::TimedOut)?;
         if self.failed.load(Ordering::Acquire) {
             return Err(WebviewError::HostFailure("native job panicked".into()));
+        }
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            let snapshot = self.service.hub.snapshot();
+            self.service.trace.record(
+                Instant::now(),
+                "hub-drained",
+                None,
+                Some(WebviewTestObservation {
+                    active_clocks: snapshot.active_clocks,
+                    active_output_jobs: snapshot.active_output_jobs,
+                    active_native_captures: snapshot.active_native_captures,
+                    active_native_opens: snapshot.active_native_opens,
+                    live_blobs: snapshot.live_blobs,
+                    retained_transfer_capacity: snapshot.retained_transfer_capacity,
+                    native_backings: self
+                        .service
+                        .native
+                        .lock()
+                        .map_err(|_| WebviewError::WindowClosed)?
+                        .len(),
+                    live_resources: snapshot.live_resources,
+                    pending_operations: snapshot.pending_operations,
+                }),
+            );
         }
         Ok(())
     }

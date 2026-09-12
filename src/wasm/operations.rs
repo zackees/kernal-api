@@ -123,8 +123,20 @@ struct OperationSlot {
     owner: Owner,
     resource: Option<OpaqueToken>,
     terminal: Option<TerminalResult>,
+    // A generated close must not complete before its guest future has parked.
+    // The scheduler may run its detached task before the synchronous import
+    // returns, so retain the authority-free completion until `suspend` has
+    // registered the guest waiter.
+    deferred_completion: Option<DeferredCompletion>,
+    suspended: bool,
     notify: Arc<Notify>,
     created_resource: Option<OpaqueToken>,
+}
+
+#[derive(Clone, Copy)]
+struct DeferredCompletion {
+    result: TerminalResult,
+    revoke: Option<OpaqueToken>,
 }
 
 struct State {
@@ -260,9 +272,6 @@ impl OperationHub {
                 return Err(error);
             }
         };
-        if let Some(resource) = close_after {
-            self.close_resource(resource)?;
-        }
         if created {
             self.attach_created_resource(
                 operation,
@@ -278,7 +287,7 @@ impl OperationHub {
                 // operation. Real native work supplies the same terminal
                 // handoff after its callback, never a Store callback.
                 crate::async_engine::yield_now().await;
-                let _ = hub.terminal(operation, completion);
+                let _ = hub.complete_after_suspend(operation, completion, close_after);
             })
             .detach();
         Ok(operation)
@@ -592,6 +601,8 @@ impl OperationHub {
                 owner: Owner { store },
                 resource,
                 terminal: None,
+                deferred_completion: None,
+                suspended: false,
                 notify: Arc::clone(&notify),
                 created_resource: None,
             },
@@ -601,7 +612,7 @@ impl OperationHub {
 
     pub(super) fn suspend(&self, token: OpaqueToken, store: u64) -> Result<Arc<Notify>, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
-        let notify = {
+        let (notify, deferred) = {
             let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
             if operation.owner.store != store {
                 return Err(HubError::Stale);
@@ -609,10 +620,83 @@ impl OperationHub {
             if operation.terminal.is_some() {
                 return Err(HubError::Closed);
             }
-            Arc::clone(&operation.notify)
+            (Arc::clone(&operation.notify), operation.deferred_completion)
         };
+        let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
+        operation.suspended = true;
+        operation.deferred_completion = None;
         state.suspends = state.suspends.saturating_add(1);
+        drop(state);
+        if let Some(deferred) = deferred {
+            self.finish_deferred_completion(token, deferred)?;
+        }
         Ok(notify)
+    }
+
+    /// Complete a synthetic operation only after its generated guest future
+    /// has registered a suspension. This is needed for close because its
+    /// detached scheduler task can otherwise win the synchronous import path
+    /// and make `operation_yield` reject an already-terminal operation.
+    fn complete_after_suspend(
+        &self,
+        token: OpaqueToken,
+        result: TerminalResult,
+        revoke: Option<OpaqueToken>,
+    ) -> Result<(), HubError> {
+        let deferred = DeferredCompletion { result, revoke };
+        let ready = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
+            if operation.terminal.is_some() {
+                return Ok(());
+            }
+            if !operation.suspended {
+                operation.deferred_completion = Some(deferred);
+                false
+            } else {
+                true
+            }
+        };
+        if ready {
+            self.finish_deferred_completion(token, deferred)?;
+        }
+        Ok(())
+    }
+
+    fn finish_deferred_completion(
+        &self,
+        token: OpaqueToken,
+        deferred: DeferredCompletion,
+    ) -> Result<(), HubError> {
+        // Claim the terminal result and resource revocation under the one hub
+        // mutex. A cancellation that wins first therefore leaves the resource
+        // live; a close that wins first revokes it before either outcome is
+        // observable. Notifications happen only after releasing the lock.
+        let notifications = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            if state
+                .operations
+                .get(&token)
+                .ok_or(HubError::Invalid)?
+                .terminal
+                .is_some()
+            {
+                return Ok(());
+            }
+            let mut notifications = if let Some(resource) = deferred.revoke {
+                Self::close_resource_with_terminal_locked(&mut state, resource, Terminal::Closed)?
+            } else {
+                Vec::new()
+            };
+            if let Some(notify) = Self::terminal_locked(&mut state, token, deferred.result)? {
+                notifications.push(notify);
+            }
+            notifications
+        };
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(())
     }
 
     pub(super) fn take_terminal(
@@ -641,10 +725,25 @@ impl OperationHub {
         result: TerminalResult,
     ) -> Result<(), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let notify = Self::terminal_locked(&mut state, token, result)?;
+        drop(state);
+        if let Some(notify) = notify {
+            // One generated guest future owns one operation. `notify_one`
+            // preserves a completion that wins before waiter registration.
+            notify.notify_one();
+        }
+        Ok(())
+    }
+
+    fn terminal_locked(
+        state: &mut State,
+        token: OpaqueToken,
+        result: TerminalResult,
+    ) -> Result<Option<Arc<Notify>>, HubError> {
         let (notify, created) = {
             let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
             if operation.terminal.is_some() {
-                return Ok(());
+                return Ok(None);
             }
             operation.terminal = Some(result);
             (Arc::clone(&operation.notify), operation.created_resource)
@@ -658,13 +757,7 @@ impl OperationHub {
                 state.free_resource_slots.push(resource.identity.slot);
             }
         }
-        {
-            drop(state);
-            // One generated guest future owns one operation. `notify_one`
-            // preserves a completion that wins before waiter registration.
-            notify.notify_one();
-        }
-        Ok(())
+        Ok(Some(notify))
     }
 
     pub(super) fn close_resource(&self, token: OpaqueToken) -> Result<(), HubError> {
@@ -689,9 +782,22 @@ impl OperationHub {
         terminal: Terminal,
     ) -> Result<(), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let notifications = Self::close_resource_with_terminal_locked(&mut state, token, terminal)?;
+        drop(state);
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(())
+    }
+
+    fn close_resource_with_terminal_locked(
+        state: &mut State,
+        token: OpaqueToken,
+        terminal: Terminal,
+    ) -> Result<Vec<Arc<Notify>>, HubError> {
         let Some(resource) = state.resources.remove(&token) else {
             return if state.closed_resources.contains(&token) {
-                Ok(())
+                Ok(Vec::new())
             } else {
                 Err(HubError::Invalid)
             };
@@ -714,11 +820,7 @@ impl OperationHub {
                 notifications.push(Arc::clone(&operation.notify));
             }
         }
-        drop(state);
-        for notify in notifications {
-            notify.notify_one();
-        }
-        Ok(())
+        Ok(notifications)
     }
 
     pub(super) fn close_all(&self, terminal: Terminal) {
@@ -989,6 +1091,87 @@ mod tests {
         assert_eq!(result.terminal, Terminal::Completed);
         assert!(result.resource.is_some());
         assert_eq!(hub.snapshot().live_resources, 1);
+    }
+
+    #[test]
+    fn generated_close_stays_pending_until_its_guest_waiter_parks() {
+        let hub = OperationHub::new(2, 1).unwrap();
+        let resource = hub.create_resource(0, 5, 1, false).unwrap();
+        hub.activate_for_test(resource);
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let operation = hub
+            .dispatch(runtime.handle(), 0, Request::Close { resource })
+            .unwrap();
+
+        // Drive the detached completion past its scheduler yield before the
+        // generated synchronous `operation_yield` import is invoked. The old
+        // implementation terminalized here, making the subsequent suspend
+        // fail nondeterministically in the real Wasm artifact.
+        runtime.run(async {
+            crate::async_engine::yield_now().await;
+            crate::async_engine::yield_now().await;
+        });
+        assert_eq!(hub.take_terminal(operation, 0), Ok(None));
+        assert_eq!(hub.snapshot().live_resources, 1);
+
+        let wake = hub.suspend(operation, 0).unwrap();
+        runtime.run(async { wake.notified().await });
+        assert_eq!(
+            hub.take_terminal(operation, 0),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Completed,
+                resource: None,
+            }))
+        );
+        assert_eq!(
+            hub.begin_external_webview_wait(0, resource),
+            Err(HubError::Closed),
+            "close revokes the generation only after the guest is parked"
+        );
+        assert_eq!(hub.snapshot().suspends, 1);
+        assert_eq!(hub.snapshot().resumes, 1);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[test]
+    fn cancelled_deferred_close_cannot_revoke_its_resource() {
+        let hub = OperationHub::new(2, 1).unwrap();
+        let resource = hub.create_resource(0, 5, 1, false).unwrap();
+        hub.activate_for_test(resource);
+        let (operation, _) = hub.submit(0, None, 0, 0).unwrap();
+        let deferred = DeferredCompletion {
+            result: TerminalResult {
+                terminal: Terminal::Completed,
+                resource: None,
+            },
+            revoke: Some(resource),
+        };
+
+        hub.cancel_wire(0, operation.0).unwrap();
+        // This models a detached close completion that was copied from the
+        // deferred slot just as cancellation won. It must be a no-op: a
+        // cancelled close does not acquire authority to revoke its resource.
+        hub.finish_deferred_completion(operation, deferred).unwrap();
+
+        assert_eq!(
+            hub.take_terminal(operation, 0),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Cancelled,
+                resource: None,
+            }))
+        );
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(snapshot.live_resources, 1);
+        assert!(hub.submit(0, Some(resource), 5, 1).is_ok());
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.pending_operations, 1);
+        assert_eq!(snapshot.live_resources, 1);
     }
 
     #[test]

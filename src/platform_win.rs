@@ -1,5 +1,9 @@
 //! Windows implementation root for the process capability.
 
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_win/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_win/autostart.rs"]
 pub(crate) mod autostart;
 

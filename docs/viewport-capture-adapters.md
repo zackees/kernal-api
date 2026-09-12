@@ -1,7 +1,7 @@
 # Native viewport capture ownership (#19)
 
-Status: the Linux callback adapter is implemented and compiles, but is not yet
-wired to the webview operation service. Windows/macOS adapters and the generated
+Status: the Linux and Windows callback adapters are implemented, but are not yet
+wired to the webview operation service. The macOS adapter and generated
 snapshot operation remain unimplemented. This note does not establish native
 capture acceptance or close #19.
 The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
@@ -43,7 +43,7 @@ The same sink now supports bounded seeking and overwriting for the Windows
 `IStream` adapter: seeks allocate nothing, overwrites reuse reserved storage,
 and holes are filled through chunked quota admission only when written.
 Tests cover header rewrites, zero-filled holes, invalid seeks, and cleanup.
-This is shared storage support, not an implemented Windows COM adapter.
+The private Windows adapter uses this storage through its COM `IStream`.
 
 Linux validation: `soldr cargo check --features tauri-webview --lib`, the
 five `viewport_capture::tests` unit tests, and strict Clippy for the native
@@ -62,7 +62,7 @@ and verifies the hub's completed operation references exactly that blob. It
 also cancels a second native snapshot and waits for its callback before
 asserting no blob publication or retained storage. This is an adapter-level
 proof, not the external-content service or generated Wasm screenshot sketch.
-Windows/macOS adapter builds and native proofs remain outstanding.
+Windows native execution and the macOS adapter remain outstanding.
 
 ```sh
 nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -j 1 -- --ignored --test-threads=1'
@@ -85,8 +85,37 @@ The lockfile resolves Windows Wry bindings to `webview2-com` 0.39.1 and
 `windows`/`windows-core` 0.62.2. Any direct COM adapter edges must match those
 versions. Microsoft's [CapturePreview contract](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2#capturepreview)
 writes image data to an `IStream` and signals completion afterward. The adapter
-must implement its stream over the shared quota-accounted sink, not an
-unbounded memory stream followed by a size check.
+implements its stream over the shared quota-accounted sink, not an
+unbounded memory stream followed by a size check. Its optional exact-pinned
+direct dependencies match those lockfile versions; the lockfile adds only
+three direct dependency edges.
+
+## Windows adapter status
+
+`src/platform_win/viewport_capture.rs` is selected within the existing Windows
+tree and calls WebView2 `CapturePreview` with PNG format. It checks controller
+bounds before submission and PNG IHDR dimensions before publication, retains
+only a fixed 24-byte format header outside the shared sink, and uses the same
+operation-bound publication as Linux. Revocation prevents further encoded
+writes; the eventual callback drops the COM-owned encoder. There is no native
+CapturePreview cancellation handle.
+
+The stream implements write, bounded seek, stat, and commit. Unsupported read,
+resize, clone, and transaction operations return `E_NOTIMPL`. Compatibility
+with the actual WebView2 PNG writer must still be demonstrated on Windows;
+successful cross-compilation alone does not prove this stream contract is
+sufficient. No memory-stream fallback is allowed if native testing exposes
+another required stream method.
+
+Windows x86-64 library compilation and strict Clippy for library/tests passed.
+Windows ARM64 library/test compilation also passed in an isolated target
+directory with `RUSTFLAGS='-C debuginfo=1'`. The initial shared-target attempt
+failed in `windows-strings`; an isolated attempt was terminated by SIGTERM
+inside the `windows` dependency, and its completed retry passed. These earlier
+failures are not evidence of native Windows runtime behavior.
+The COM write/seek/quota and PNG-header tests are checked in and type-checked,
+but have not executed on Windows. A live Windows viewport PNG and cancellation
+proof remain required; the Linux Xvfb proof does not cover this adapter.
 
 Inspection of Wry 0.57.0's `src/lib.rs` found platform `webview()` escape
 hatches returning WebView2, WebKitGTK, and retained Cocoa webviews, but no

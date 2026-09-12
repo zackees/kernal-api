@@ -99,6 +99,9 @@ tauri-webview = [
   "dep:gtk",
   "dep:gio",
   "dep:cairo-rs",
+  "dep:webview2-com",
+  "dep:windows",
+  "dep:windows-core",
 ]
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
@@ -294,6 +297,9 @@ lzma-rs = { version = "=0.3.0", optional = true }
 mach2 = "=0.4.3"
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = { version = "=0.39.1", optional = true }
+windows = { version = "=0.62.2", optional = true, features = ["Win32_System_Com", "Win32_Foundation"] }
+windows-core = { version = "=0.62.2", optional = true }
 libc = "=0.2.189"
 object = { version = "=0.36.7", default-features = false, features = ["read", "std"], optional = true }
 pdb = { version = "=0.8.0", optional = true }

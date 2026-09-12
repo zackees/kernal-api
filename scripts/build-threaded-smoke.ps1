@@ -99,6 +99,8 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     soldr --no-cache $subcommand test --locked --features wasm-sketch-worker --test wasm_worker_containment cargo_built_threaded_guest_ -- --ignored --test-threads=1
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment cargo_built_threaded_guest_forced_output_cleanup -- --ignored
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
     if ($hadPrevious) {

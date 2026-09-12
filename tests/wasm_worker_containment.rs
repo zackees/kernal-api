@@ -290,6 +290,89 @@ fn real_worker_classifies_fuel_cancellation_and_deadline() {
     );
 }
 
+#[cfg(feature = "wasm-sketch-worker-test-support")]
+#[test]
+#[ignore = "requires the real threaded artifact and test-support worker"]
+fn cargo_built_threaded_guest_forced_output_cleanup() {
+    let artifact =
+        std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM").expect("threaded artifact");
+    let compiler = compiler(Duration::from_secs(30), long_fuel());
+    let sketch = admit(&compiler, std::fs::read(artifact).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("output.png");
+    std::fs::write(&destination, b"original").unwrap();
+    let config = worker_config()
+        .with_output_destination(destination.clone())
+        .unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let source = CancellationSource::new();
+        let task = runtime.handle().launch({
+            let sketch = Arc::clone(&sketch);
+            let token = source.token();
+            let handle = runtime.handle();
+            async move {
+                sketch
+                    .execute_threaded_root_contained_cancellable(handle, &config, token)
+                    .await
+            }
+        });
+        let staging = async_engine::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_dir())
+                {
+                    break path;
+                }
+                async_engine::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("parent staging was created");
+        std::fs::write(staging.join(".proof-pause-output"), b"armed").unwrap();
+        async_engine::timeout(Duration::from_secs(20), async {
+            while !staging.join(".proof-output-paused").is_file() {
+                async_engine::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("worker reached an actual partial file write");
+        assert!(
+            std::fs::read_dir(&staging)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    !entry.file_name().to_string_lossy().starts_with(".proof-")
+                        && std::fs::read(entry.path())
+                            .is_ok_and(|bytes| bytes == b"guest exact output")
+                }),
+            "the worker must hold a nonempty partial output before cancellation"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        source.cancel();
+        let terminal = async_engine::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::ForcedContainment {
+                trigger: SketchWorkerStopReason::Cancelled
+            }
+        );
+        assert_clean(&compiler, &sketch).await;
+        assert!(!staging.exists());
+    });
+    assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
 #[test]
 fn real_worker_forces_containment_for_atomic_wait() {
     run_case(

@@ -104,8 +104,16 @@ Cargo-built threaded guest completed its 64 MiB transfer and exact output in
 the worker; the parent published `guest exact output` with no staging leftovers
 (Linux x86-64, 10.62 seconds). Both smoke scripts include this ignored artifact
 test. Twenty-one worker unit tests pass, including terminal cancellation,
-deadline, trap, and forced-containment discard decisions. Actual process-kill
-coverage during output I/O and native macOS/Windows evidence remain outstanding.
+deadline, trap, and forced-containment discard decisions. A feature-gated native
+proof now pauses the real worker immediately after its first file write while
+the partial file remains open. The harness observes the nonempty partial file,
+cancels execution, and requires `ForcedContainment` after grace expires. It
+verifies worker/protocol/lease counters are zero, the original final bytes are
+unchanged, and the entire staging directory is gone. This passed on Linux
+x86-64 in 11.61 seconds. Both smoke scripts explicitly build the test-support
+worker and run `cargo_built_threaded_guest_forced_output_cleanup`; ordinary
+worker builds contain no pause hook. Native macOS/Windows evidence remains
+outstanding, as do failure cases for parent-side filesystem cleanup itself.
 The private protocol is now version 4, with an optional staging destination
 bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
 without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,

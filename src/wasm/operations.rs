@@ -1472,6 +1472,8 @@ impl OperationHub {
                     .as_mut()
                     .expect("open temporary")
                     .write_all(&chunk)?;
+                #[cfg(feature = "wasm-sketch-worker-test-support")]
+                pause_worker_output_for_containment_proof(&destination)?;
                 #[cfg(test)]
                 self.inject_output_fault(OutputFault::AfterWrite)?;
             }
@@ -2147,6 +2149,25 @@ enum OutputFault {
     AfterWrite,
     Sync,
     Replace,
+}
+
+// Deliberately absent from ordinary worker builds. The native proof arms this
+// inside its own parent-owned staging directory before guest output starts.
+// Holding a real open, partially written file here forces the supervisor to
+// kill the worker: cooperative guest cancellation cannot finish this I/O job.
+#[cfg(feature = "wasm-sketch-worker-test-support")]
+fn pause_worker_output_for_containment_proof(destination: &Path) -> std::io::Result<()> {
+    let Some(parent) = destination.parent() else {
+        return Ok(());
+    };
+    let armed = parent.join(".proof-pause-output");
+    if armed.is_file() {
+        fs::write(parent.join(".proof-output-paused"), b"partial-write")?;
+        while armed.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "wasm-sketch-host")]

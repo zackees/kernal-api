@@ -10,6 +10,18 @@ use kernal_api::wasm::{
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
 fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
+    run_native_screenshot_proof(false);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+#[test]
+#[ignore = "requires a native display and the actual built screenshot guest"]
+fn actual_screenshot_guest_rejects_redirect_and_drains_without_output() {
+    run_native_screenshot_proof(true);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+fn run_native_screenshot_proof(redirect: bool) {
     use std::io::{Read, Write};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -56,7 +68,11 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).is_ok() {
-                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
+                        if redirect {
+                            let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: tauri://localhost/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        } else {
+                            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
+                        }
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -126,6 +142,19 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
         ),
     )
     .unwrap();
+    if redirect {
+        assert!(!status.success(), "disallowed redirect succeeded");
+        let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
+        assert!(
+            trace.contains("screenshot-load-rejected"),
+            "wrong typed redirect error: {trace}"
+        );
+        validate_teardown_trace(&trace).expect("redirect failure must drain the actual root");
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        return;
+    }
     assert!(
         status.success(),
         "actual guest runner failed: {status}; diagnostics: {}",
@@ -212,6 +241,29 @@ fn validate_execution_trace(trace: &str) -> Result<(), &'static str> {
             return Err("missing async lifecycle crossing");
         }
     }
+    validate_teardown_trace(trace)
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+fn validate_teardown_trace(trace: &str) -> Result<(), &'static str> {
+    fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_ascii_whitespace().find_map(|part| {
+            let (name, value) = part.split_once('=')?;
+            (name == key).then_some(value)
+        })
+    }
+    let one = |phase: &str| -> Result<&str, &'static str> {
+        let matching: Vec<_> = trace
+            .lines()
+            .filter(|line| {
+                line.starts_with("kernal-webview-trace ") && field(line, "phase") == Some(phase)
+            })
+            .collect();
+        if matching.len() != 1 {
+            return Err("missing or duplicate teardown event");
+        }
+        Ok(matching[0])
+    };
     let drained = one("hub-drained")?;
     for counter in [
         "clocks",
@@ -397,8 +449,8 @@ fn actual_screenshot_guest_admits_but_cannot_execute_without_webview_grants() {
     let outcome = runtime.run(sketch.execute_threaded_root(runtime.handle()));
     assert_eq!(
         outcome,
-        Err(SketchExecutionError::Trapped),
-        "ungranted command must trap, not time out or succeed"
+        Err(SketchExecutionError::NonzeroExit { code: 17 }),
+        "ungranted command must report URL-grant rejection, not trap, time out, or succeed"
     );
     assert_eq!(
         sketch.execution_limits_snapshot().active_root_executions(),

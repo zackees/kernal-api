@@ -20,8 +20,8 @@ redundant guest close after output commit; commit consumes the snapshot and
 output grants, so the guest now proceeds directly to closing the view.
 
 This is still an in-progress #20/#21 implementation, not completion of the
-full acceptance matrix. Detailed guest error reporting, failure-path trace
-coverage, queued/cancelled native-creation destruction evidence, the complete
+full acceptance matrix. Broader failure-path trace coverage,
+queued/cancelled native-creation destruction evidence, the complete
 failure matrix, killable native-webview worker integration, and native
 Windows/macOS execution remain outstanding. Do not treat this in-process
 diagnostic CLI as containment for arbitrary untrusted Wasm.
@@ -71,7 +71,10 @@ dropping the admitted sketch, the proof requires zero native admission,
 backings, hub resources/operations/transfer bytes, clock/output jobs, Wasm
 roots/threads/stores/instances, epoch registrations, and memory reservations.
 The recorder holds at most 512 events; any omitted event fails the proof.
-These success-path observations do not establish the remaining failure matrix.
+The actual-guest redirect proof supplies an HTTP redirect to a prohibited
+scheme, requires `screenshot-load-rejected`, preserves the original output and
+unrelated file, and applies the same zero-resource teardown assertions.
+These observations do not establish the remaining failure matrix.
 Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.
 
@@ -115,5 +118,11 @@ gets the root's existing hub and the same runtime, never copied tokens from a
 different client hub. Native jobs are bounded and joined; cancelled native
 creation and capture retain separate four-request admission until callbacks
 release them. Failed root execution reports a semantic host error; full guest
-step/error tracing is not implemented yet. A PowerShell build entry point
-also remains required.
+status includes its failing step and semantic operation error. The shared
+`status.rs` encodes eight steps and four causes in the already-admitted
+`proc_exit` scalar; it introduces no import, path, payload, or logging grant.
+For example, missing URL authority is exit 17, and a rejected load is exit 65.
+Actual traps remain `trapped`, distinct from these reported failures. The
+generated poll decoder preserves rejected status 7 rather than collapsing it
+to a generic failure. Timeout-specific causes and the rest of the negative
+matrix remain required, as does a PowerShell build entry point.

@@ -2,37 +2,56 @@
 //! No URL, native path, image bytes, host runtime, or platform API enters it.
 
 use kernal_api_v1_bindings::{self as kernel, OperationError, OutputFile, WebviewUrl};
+#[allow(dead_code)]
+#[path = "../../status.rs"]
+mod status;
+use status::{Cause, Failure, Step};
 
-async fn screenshot() -> Result<(), OperationError> {
+async fn screenshot(step: &mut Step) -> Result<(), OperationError> {
     let url = WebviewUrl::granted()?.ok_or(OperationError::Rejected)?;
+    *step = Step::OutputGrant;
     let output = OutputFile::granted()?.ok_or(OperationError::Rejected)?;
+    *step = Step::Open;
     let view = url.open().await?;
+    *step = Step::Load;
     view.wait_until_loaded().await?;
     // Submitted only after the matching top-level load completion. The host
     // monotonic timer owns the wait; there is no guest clock import.
+    *step = Step::Sleep;
     kernel::clock_sleep(5_000)?.wait().await?;
+    *step = Step::Capture;
     let snapshot = view.capture_visible_png().await?;
+    *step = Step::Write;
     output.write_blob(&snapshot)?.wait().await?;
     // Successful exact-output commit consumes the snapshot and output grants.
+    *step = Step::Close;
     view.close().await?;
     Ok(())
 }
 
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
-    match kernel::run(screenshot()) {
+    let mut step = Step::UrlGrant;
+    match kernel::run(screenshot(&mut step)) {
         Ok(()) => 0,
-        Err(OperationError::Rejected) => 1,
-        Err(OperationError::Cancelled) => 2,
-        Err(OperationError::Closed) => 3,
-        Err(OperationError::Failed) => 4,
+        Err(error) => Failure {
+            step,
+            cause: match error {
+                OperationError::Rejected => Cause::Rejected,
+                OperationError::Cancelled => Cause::Cancelled,
+                OperationError::Closed => Cause::Closed,
+                OperationError::Failed => Cause::Failed,
+            },
+        }
+        .code(),
     }
 }
 
 fn main() {
-    if kernal_api_run() != 0 {
-        // Fail the threaded command entry as well as the diagnostic export.
-        // Do not print through WASI or report success after a rejected step.
-        std::arch::wasm32::unreachable();
+    let status = kernal_api_run();
+    if status != 0 {
+        // The already-admitted command-exit boundary preserves this scalar;
+        // actual Wasm traps remain distinct from semantic operation failures.
+        std::process::exit(status as i32);
     }
 }

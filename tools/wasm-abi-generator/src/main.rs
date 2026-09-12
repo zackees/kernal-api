@@ -98,7 +98,7 @@ impl OperationFuture {
     }
     pub fn poll(&self) -> Result<Option<u64>, OperationError> {
         let packed = imports::operation_poll(self.operation).map_err(|_| OperationError::Failed)?;
-        match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), _ => Err(OperationError::Failed) }
+        match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), 7 => Err(OperationError::Rejected), _ => Err(OperationError::Failed) }
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
@@ -454,6 +454,14 @@ mod tests {
     #[no_mangle]
     extern "C" fn operation_poll(_operation: i64) -> i64 {
         POLL_RESPONSE.get()
+    }
+    #[test]
+    fn generated_poll_preserves_rejected_terminal_status() {
+        let operation = generated_guest::synthetic_yield().unwrap();
+        POLL_RESPONSE.set(7);
+        assert_eq!(operation.poll(), Err(generated_guest::OperationError::Rejected));
+        POLL_RESPONSE.set(0x80);
+        assert_eq!(operation.poll(), Err(generated_guest::OperationError::Failed));
     }
     #[test]
     fn generated_webview_sequence_exchanges_only_opaque_scalars() {

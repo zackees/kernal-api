@@ -5,6 +5,7 @@ use kernal_api::webview::{ExternalWebviewHost, WebviewUrlGrant};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+mod status;
 
 fn build_guest() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -125,6 +126,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.run();
     let result = receiver.recv_timeout(Duration::from_secs(60))?;
     runtime.run(task)?;
-    result.map_err(|error| std::io::Error::other(error.code()))?;
+    result.map_err(|error| {
+        if let kernal_api::wasm::SketchExecutionError::NonzeroExit { code } = error {
+            if let Some(failure) = status::Failure::from_code(code as u32) {
+                debug_assert_eq!(failure.code(), code as u32);
+                return std::io::Error::other(format!(
+                    "screenshot-{}-{}",
+                    failure.step.name(),
+                    failure.cause.name()
+                ));
+            }
+            return std::io::Error::other(format!("nonzero-exit:{code}"));
+        }
+        std::io::Error::other(error.code())
+    })?;
     Ok(())
 }

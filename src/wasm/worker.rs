@@ -9,6 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// Stage ownership is tested independently before wiring it into process
+// ownership and the private worker protocol.
+#[cfg(test)]
+mod output;
+
 #[cfg(feature = "wasm-sketch-worker-test-support")]
 mod test_support;
 

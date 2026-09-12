@@ -88,6 +88,18 @@ transfers.
 
 ## Remaining acceptance work
 
+Worker exact-output integration remains incomplete. A private, currently
+test-only `worker::output` component now owns a sibling staging directory and
+keeps the final destination unchanged until explicit parent commit. Five Linux
+tests cover deferred byte-identical publication, partial/completed-file discard,
+missing completion, replacement failure, and symlink rejection. Successful
+replacement reports directory-cleanup errors separately so they cannot be
+mistaken for a failure that preserved the original final file. These tests do
+not yet exercise a killed worker: production integration must retain staging
+with `ExecutionOwnership` through cleanup handoff and reap, transport only the
+staged destination in the private protocol, and commit only after successful
+execution and validated cleanup. Native macOS/Windows evidence is outstanding.
+
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
 success before the fix; it now verifies success, failure, zero, and unknown

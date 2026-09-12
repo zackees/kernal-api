@@ -1,0 +1,145 @@
+//! Parent-owned output staging. The supervisor must retain this owner until
+//! the worker has been reaped; guest-visible authority never includes the final
+//! destination. Protocol integration is the next step of the output work.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+pub(super) struct StagedOutput {
+    directory: tempfile::TempDir,
+    destination: PathBuf,
+}
+
+pub(super) struct CommittedOutput {
+    // Replacement has already succeeded. A cleanup error must not be reported
+    // as though the original final file were still intact.
+    pub(super) cleanup: io::Result<()>,
+}
+
+impl StagedOutput {
+    pub(super) fn new(destination: &Path) -> io::Result<Self> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no parent"))?;
+        let name = destination.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output has no file name")
+        })?;
+        let parent = std::fs::canonicalize(parent)?;
+        let directory = tempfile::Builder::new()
+            .prefix(".kernal-worker-output-")
+            .tempdir_in(&parent)?;
+        Ok(Self {
+            directory,
+            destination: parent.join(name),
+        })
+    }
+
+    pub(super) fn worker_destination(&self) -> PathBuf {
+        self.directory.path().join("completed-output")
+    }
+
+    /// Call only after successful worker completion and reap. Never publish
+    /// the directory itself, an unfinished sibling, or a symbolic link.
+    pub(super) fn commit(self) -> io::Result<CommittedOutput> {
+        let staged = self.worker_destination();
+        if !std::fs::symlink_metadata(&staged)?.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker output is not a regular file",
+            ));
+        }
+        // Windows FlushFileBuffers requires a write-capable handle.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)?
+            .sync_all()?;
+        crate::fs_replace_file(&staged, &self.destination)?;
+        Ok(CommittedOutput {
+            cleanup: self.directory.close(),
+        })
+    }
+
+    /// Explicit cleanup lets the supervisor report failure instead of relying
+    /// solely on best-effort Drop. This must also follow worker reap.
+    pub(super) fn discard(self) -> io::Result<()> {
+        self.directory.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_output_is_invisible_until_parent_commit() {
+        let root = tempfile::tempdir().unwrap();
+        let final_path = root.path().join("result.png");
+        std::fs::write(&final_path, b"original").unwrap();
+        let output = StagedOutput::new(&final_path).unwrap();
+        let staged = output.worker_destination();
+        assert_ne!(staged, final_path);
+        std::fs::write(&staged, b"completed bytes").unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+        output.commit().unwrap().cleanup.unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"completed bytes");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn parent_discard_removes_worker_partial_and_completed_files() {
+        for completed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let final_path = root.path().join("result.png");
+            std::fs::write(&final_path, b"original").unwrap();
+            let output = StagedOutput::new(&final_path).unwrap();
+            std::fs::write(output.directory.path().join("partial.tmp"), b"partial").unwrap();
+            if completed {
+                std::fs::write(output.worker_destination(), b"uncommitted").unwrap();
+            }
+            output.discard().unwrap();
+            assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn missing_completed_output_preserves_destination_and_cleans_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let final_path = root.path().join("result.png");
+        std::fs::write(&final_path, b"original").unwrap();
+        let output = StagedOutput::new(&final_path).unwrap();
+        std::fs::write(output.directory.path().join("partial.tmp"), b"partial").unwrap();
+        assert!(output.commit().is_err());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn replacement_failure_preserves_existing_directory_and_cleans_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let final_path = root.path().join("existing-directory");
+        std::fs::create_dir(&final_path).unwrap();
+        std::fs::write(final_path.join("keep"), b"original").unwrap();
+        let output = StagedOutput::new(&final_path).unwrap();
+        std::fs::write(output.worker_destination(), b"completed").unwrap();
+        assert!(output.commit().is_err());
+        assert_eq!(std::fs::read(final_path.join("keep")).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_symlink_is_not_published_or_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let final_path = root.path().join("result.png");
+        let unrelated = root.path().join("unrelated");
+        std::fs::write(&final_path, b"original").unwrap();
+        std::fs::write(&unrelated, b"private").unwrap();
+        let output = StagedOutput::new(&final_path).unwrap();
+        std::os::unix::fs::symlink(&unrelated, output.worker_destination()).unwrap();
+        assert!(output.commit().is_err());
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"private");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
+    }
+}

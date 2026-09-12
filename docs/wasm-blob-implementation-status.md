@@ -100,6 +100,16 @@ tree --locked --no-default-features -e normal --prefix none` still includes
 noted in `Cargo.toml`; this requires an upstream feature-gating release, not
 a facade-only optional-dependency change. The manifest isolation test alone
 does not prove this transitive graph requirement.
+An upstream fix is committed locally as `2831c36` on
+`feat/optional-window-icon` in the sister checkout
+`../kernal-api-extern/running-process`. The resolver guard reproduced the
+PNG/X11 failure before the change and passes afterward for the host and both
+Windows targets. Upstream defaults retain icon support; explicit
+`kernel-substrate` excludes it. Nine guard tests, 21 existing icon tests,
+default/substrate/icon-enabled builds, and strict platform all-target Clippy
+pass on Linux. Bare platform compilation also passes, with two existing
+unused process-snapshot warnings. Upstream review/merge/release and this
+repository's registry-pin update remain outstanding; no path patch was added.
 
 The shared hub now enforces independent live-blob, pending-read, and
 pending-write count limits (128 each by default). Hosts configure these and

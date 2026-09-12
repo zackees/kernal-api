@@ -181,7 +181,7 @@ jobs:
       - name: Install native webview development packages
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
+          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Restore native pkg-config search path
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
@@ -192,15 +192,15 @@ jobs:
           NO_AT_BRIDGE: "1"
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
-          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
-          xvfb-run -a bash -c '
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a bash -c '
             soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
             test -n "$window"; sleep 1; xdotool mousemove --window "$window" 150 150 click 1; wait "$proof"'
-          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- redirect
-          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
-          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
-          xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- redirect
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it
@@ -333,6 +333,8 @@ jobs:
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
+        env:
+          RUSTFLAGS: -L native=/usr/lib/x86_64-linux-gnu
         run: >-
           soldr cargo build
           --locked --target ${{ matrix.target }} --all-features

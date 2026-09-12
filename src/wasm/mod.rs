@@ -1603,11 +1603,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
                 let _ = file.sync_all();
             }
         }
-        if self.runtime.is_some() {
+        if let Some(actual) = &self.runtime {
             controller
                 .runtime_handle_count
                 .fetch_add(1, Ordering::Relaxed);
-            let actual = self.runtime.as_ref().expect("checked runtime");
             let matches = controller
                 .runtime_identity
                 .lock()

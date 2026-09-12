@@ -1,10 +1,13 @@
 # Issue 17 implementation status
 
 The blob implementation on this development branch is incomplete and is not
-release evidence for issue #17. The generated ABI exposes blob creation and
-closure through the existing operation family, exercised by the threaded
-smoke guest. Bulk-transfer tests still call the private operation hub directly;
-chunk transfers and exact output are not yet exposed to the guest.
+release evidence for issue #17. The generated ABI exposes blob creation,
+bounded writes, and closure through the existing operation family, exercised
+by the threaded smoke guest. The write import validates the guest-memory range
+and checks authority/chunk/pending-byte quotas before copying into host-owned
+bytes using atomic byte loads. It retains no guest pointer across suspension.
+Large-transfer tests still call the private operation hub directly;
+pull reads and exact output are not yet exposed to the guest.
 
 ## Verified host behavior
 

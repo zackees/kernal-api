@@ -1670,6 +1670,26 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         let Some(runtime) = self.runtime.clone() else {
             return Ok(0);
         };
+        if kind == crate::operations::OP_BLOB_WRITE {
+            let offset = arg1 as u32 as i32;
+            let length = (arg1 >> 32) as usize;
+            let Some(cells) = shared_range(&self.controller.memory, offset, length) else {
+                return Ok(0);
+            };
+            return Ok(self
+                .operations
+                .submit_blob_write_wire(self.store_owner, arg0, length, || {
+                    cells
+                        .iter()
+                        .map(|cell| {
+                            // SAFETY: shared_range returns pinned byte cells;
+                            // all host access uses atomics, as in write_shared.
+                            unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed)
+                        })
+                        .collect()
+                })
+                .unwrap_or(0));
+        }
         self.operations
             .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
             .map_err(|_| wasmtime::Error::msg("operation rejected"))
@@ -3398,7 +3418,9 @@ mod threaded_root_observation_tests {
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
         assert_eq!(operations.suspends, 6);
-        assert_eq!(operations.resumes, 6);
+        assert_eq!(operations.resumes, 7);
+        assert_eq!(operations.peak_buffered_blob_bytes, 4);
+        assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(
             *prepared
                 .controller

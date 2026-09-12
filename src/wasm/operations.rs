@@ -24,6 +24,7 @@ pub(crate) const OP_SYNTHETIC_RESOURCE_CREATE: u32 = 2;
 pub(crate) const OP_SYNTHETIC_RESOURCE_USE: u32 = 3;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
 pub(crate) const OP_BLOB_CREATE: u32 = 5;
+pub(crate) const OP_BLOB_WRITE: u32 = 6;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -728,7 +729,28 @@ impl OperationHub {
         blob: OpaqueToken,
         bytes: &[u8],
     ) -> Result<OpaqueToken, HubError> {
-        if bytes.len() > self.blob_limits.maximum_chunk_bytes {
+        self.submit_blob_write_from(store, blob, bytes.len(), || bytes.to_vec())
+    }
+
+    pub(crate) fn submit_blob_write_wire(
+        &self,
+        store: u64,
+        blob: u64,
+        length: usize,
+        copy: impl FnOnce() -> Vec<u8>,
+    ) -> Result<u64, HubError> {
+        self.submit_blob_write_from(store, OpaqueToken(blob), length, copy)
+            .map(|token| token.0)
+    }
+
+    fn submit_blob_write_from(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        length: usize,
+        copy: impl FnOnce() -> Vec<u8>,
+    ) -> Result<OpaqueToken, HubError> {
+        if length > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
         let (operation, _) =
@@ -741,7 +763,7 @@ impl OperationHub {
                 .filter_map(|op| op.pending_blob_write.as_ref())
                 .map(Vec::len)
                 .sum();
-            if pending.saturating_add(bytes.len()) > self.blob_limits.maximum_sketch_bytes {
+            if pending.saturating_add(length) > self.blob_limits.maximum_sketch_bytes {
                 state.operations.remove(&operation);
                 return Err(HubError::Quota);
             }
@@ -750,7 +772,9 @@ impl OperationHub {
                 .get_mut(&operation)
                 .ok_or(HubError::Invalid)?;
             if slot.terminal.is_none() {
-                slot.pending_blob_write = Some(bytes.to_vec());
+                // Copy only after authority and capacity checks, without
+                // retaining the producer or guest-memory view in the hub.
+                slot.pending_blob_write = Some(copy());
             }
         }
         self.drive_blob_writes()?;
@@ -1827,6 +1851,27 @@ mod tests {
             Ok(Some((Terminal::Completed, b"full".to_vec())))
         );
         assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn guest_write_rejects_before_copy_and_retains_only_owned_bytes() {
+        let hub = OperationHub::with_blob_limits(4, 1, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        assert_eq!(
+            hub.submit_blob_write_wire(1, blob.0, 5, || panic!("oversized copy")),
+            Err(HubError::Quota)
+        );
+        assert_eq!(
+            hub.submit_blob_write_wire(2, blob.0, 4, || panic!("unauthorized copy")),
+            Err(HubError::WrongRights)
+        );
+        let mut guest_bytes = *b"data";
+        let write = hub
+            .submit_blob_write_wire(1, blob.0, 4, || guest_bytes.to_vec())
+            .unwrap();
+        guest_bytes.fill(0);
+        assert_eq!(hub.poll_wire(1, write) as u8, STATUS_COMPLETED);
+        assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"data");
     }
 
     #[test]

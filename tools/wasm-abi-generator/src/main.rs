@@ -119,6 +119,13 @@ impl BlobHandle {
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { token } }
     pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
+    /// The host copies this bounded slice before returning the future.
+    /// No guest pointer or borrow is retained while waiting for capacity.
+    pub fn write_chunk(&self, bytes: &[u8]) -> Result<OperationFuture, OperationError> {
+        let length = u32::try_from(bytes.len()).map_err(|_| OperationError::Rejected)?;
+        let pointer = u32::try_from(bytes.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        OperationFuture::submit(6, self.token, (u64::from(length) << 32) | u64::from(pointer))
+    }
 }
 "#;
     let path = output.join("guest/src/lib.rs");

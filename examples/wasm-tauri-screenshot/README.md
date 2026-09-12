@@ -67,6 +67,22 @@ temporary-file cleanup. Its elapsed-time check is not a substitute for the
 still-required load-finished/clock event trace. Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.
 
+The dedicated `wasm-tauri-screenshot-linux` CI job builds this actual guest
+and runs both proofs with WebKitGTK 4.1 under Xvfb. Set
+`KERNAL_API_SCREENSHOT_PROOF_DIR` to retain a unique diagnostic directory
+containing runner stdout/stderr, process outcome/timing JSON, and the exact
+output directory even if an assertion fails. CI uploads these artifacts on
+success or failure. The process summary is not the outstanding structured
+load/clock/capture/resource event trace. This Linux x86-64 lane does not
+establish native execution on the other five supported host targets.
+
+Focused formatting and lint checks:
+
+```sh
+soldr cargo fmt --all -- --check
+soldr cargo clippy --locked --features wasm-sketch-host,tauri-webview --lib --tests --bins -- -D warnings
+```
+
 The generated command driver handles only
 generated kernel futures: Wasmtime suspends the guest stack at its async host
 import, so no guest runtime is created. Foreign futures returning `Pending`

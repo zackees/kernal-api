@@ -70,9 +70,22 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
         stop,
         thread: Some(thread),
     };
-    let directory = tempfile::tempdir().unwrap();
-    let output = directory.path().join("viewport.png");
-    let sentinel = directory.path().join("untouched");
+    // Opt-in diagnostic retention is outside the exact-output directory, so
+    // logs cannot accidentally weaken the no-extra-output assertion below.
+    let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("screenshot-")
+            .tempdir_in(root)
+            .unwrap()
+            .keep()
+    });
+    let temporary = tempfile::tempdir().unwrap();
+    let proof = retained.as_deref().unwrap_or(temporary.path());
+    let directory = proof.join("output");
+    std::fs::create_dir(&directory).unwrap();
+    let output = directory.join("viewport.png");
+    let sentinel = directory.join("untouched");
     std::fs::write(&output, b"original").unwrap();
     std::fs::write(&sentinel, b"unchanged").unwrap();
     let start = Instant::now();
@@ -84,6 +97,8 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
             .arg(&output)
             .arg("--module")
             .arg(artifact)
+            .stdout(std::fs::File::create(proof.join("runner.stdout.log")).unwrap())
+            .stderr(std::fs::File::create(proof.join("runner.stderr.log")).unwrap())
             .spawn()
             .unwrap(),
     );
@@ -91,13 +106,31 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        assert!(
-            start.elapsed() < Duration::from_secs(90),
-            "screenshot runner exceeded its proof bound"
-        );
+        if start.elapsed() >= Duration::from_secs(90) {
+            std::fs::write(proof.join("process.json"), "{\"outcome\":\"timeout\"}\n").unwrap();
+            panic!(
+                "screenshot runner exceeded its proof bound; diagnostics: {}",
+                proof.display()
+            );
+        }
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(status.success(), "actual guest runner failed: {status}");
+    std::fs::write(
+        proof.join("process.json"),
+        format!(
+            "{{\"os\":\"{}\",\"arch\":\"{}\",\"success\":{},\"elapsed_ms\":{}}}\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            status.success(),
+            start.elapsed().as_millis()
+        ),
+    )
+    .unwrap();
+    assert!(
+        status.success(),
+        "actual guest runner failed: {status}; diagnostics: {}",
+        proof.display()
+    );
     assert!(
         start.elapsed() >= Duration::from_secs(5),
         "guest omitted its kernel wait"
@@ -111,7 +144,7 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
     assert!(width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 4_000_000);
     assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
     assert_eq!(
-        std::fs::read_dir(directory.path()).unwrap().count(),
+        std::fs::read_dir(&directory).unwrap().count(),
         2,
         "temporary output survived commit"
     );

@@ -126,7 +126,10 @@ fn publish_report_to_host() {
 fn complete_operation(
     operation: kernal_api_v1_bindings::OperationFuture,
 ) -> Result<u64, kernal_api_v1_bindings::OperationError> {
-    assert!(operation.poll()?.is_none(), "synthetic operation begins pending");
+    assert!(
+        operation.poll()?.is_none(),
+        "synthetic operation begins pending"
+    );
     operation.yield_now()?;
     Ok(operation
         .poll()?
@@ -137,30 +140,46 @@ fn complete_operation(
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
     let blob = kernal_api_v1_bindings::BlobHandle::from_create_payload(
-        complete_operation(kernal_api_v1_bindings::BlobHandle::create().expect("submit blob create"))
-            .expect("generated blob create"),
+        complete_operation(
+            kernal_api_v1_bindings::BlobHandle::create().expect("submit blob create"),
+        )
+        .expect("generated blob create"),
     );
-    let write = blob.write_chunk(b"blob").expect("submit bounded blob write");
-    if write.poll().expect("poll blob write").is_none() {
-        write.yield_now().expect("yield pending blob write");
-        assert!(write.poll().expect("poll completed blob write").is_some());
+    const CHUNK_BYTES: usize = 64 * 1024;
+    const CHUNKS: usize = 1024;
+    let mut sent = [0_u8; CHUNK_BYTES];
+    let mut received = [0_u8; CHUNK_BYTES];
+    for chunk in 0..CHUNKS {
+        for (index, byte) in sent.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_add(chunk as u8);
+        }
+        let write = blob.write_chunk(&sent).expect("submit bounded blob write");
+        if write.poll().expect("poll blob write").is_none() {
+            write.yield_now().expect("yield pending blob write");
+            assert!(write.poll().expect("poll completed blob write").is_some());
+        }
+        let read = blob
+            .read_chunk(CHUNK_BYTES as u32)
+            .expect("submit bounded blob read");
+        let count = loop {
+            if let Some(count) = read.poll_into(&mut received).expect("collect blob read") {
+                break count;
+            }
+            read.yield_now().expect("yield pending blob read");
+        };
+        assert_eq!(count, CHUNK_BYTES);
+        assert_eq!(received, sent);
     }
-    let read = blob.read_chunk(4).expect("submit bounded blob read");
-    let mut received = [0_u8; 4];
-    let count = loop {
-        if let Some(count) = read.poll_into(&mut received).expect("collect blob read") { break count; }
-        read.yield_now().expect("yield pending blob read");
-    };
-    assert_eq!(count, 4);
-    assert_eq!(&received, b"blob");
     complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));
     // Use an explicit deterministic hasher: the closed threaded P1 surface
     // intentionally owns no ambient `random_get` authority.
-    let map = Arc::new(DashMap::<u32, u32, BuildHasherDefault<DefaultHasher>>::with_hasher(
-        BuildHasherDefault::default(),
-    ));
+    let map = Arc::new(
+        DashMap::<u32, u32, BuildHasherDefault<DefaultHasher>>::with_hasher(
+            BuildHasherDefault::default(),
+        ),
+    );
     let (tx, rx) = mpsc::channel();
     let resource = kernal_api_v1_bindings::SyntheticResource::from_create_payload(
         complete_operation(
@@ -179,10 +198,13 @@ pub extern "C" fn kernal_api_run() -> u32 {
         workers.push(std::thread::spawn(move || {
             // Each native child crosses the kernel boundary too, proving the
             // supplied runtime handle is observed in every guest Store.
-            kernal_api_v1_bindings::imports::kernel_yield()
-                .expect("generated kernel yield ABI");
-            complete_operation(resource.use_().expect("submit generated shared resource use"))
-                .expect("generated shared resource use");
+            kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
+            complete_operation(
+                resource
+                    .use_()
+                    .expect("submit generated shared resource use"),
+            )
+            .expect("generated shared resource use");
             counter.fetch_add(1, Ordering::SeqCst);
             *totals.lock().expect("mutex") += 1;
             map.insert(key, 1_u32);
@@ -208,12 +230,8 @@ pub extern "C" fn kernal_api_run() -> u32 {
     complete_operation(resource.close().expect("submit generated resource close"))
         .expect("generated resource close");
     kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
-    let result = joined
-        + counter.load(Ordering::SeqCst)
-        + mutex_total
-        + channel_total
-        + map_sum
-        + tls_total;
+    let result =
+        joined + counter.load(Ordering::SeqCst) + mutex_total + channel_total + map_sum + tls_total;
     RESULT_RECORD.publish(
         joined,
         counter.load(Ordering::SeqCst),

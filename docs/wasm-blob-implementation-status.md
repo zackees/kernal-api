@@ -9,9 +9,9 @@ bytes using atomic byte loads. It retains no guest pointer across suspension.
 Read collection validates a caller-supplied destination on each call and
 copies only a completed bounded result. Pending calls retain no pointer;
 wrong-owner, wrong-kind, short-buffer, and double collection are rejected.
-The real guest currently verifies a four-byte round trip, not a large stream.
-Large-transfer tests still call the private operation hub directly;
-exact output is not yet exposed to the guest.
+The real guest verifies 64 MiB through 1,024 sequential write/read pairs,
+reusing two 64 KiB arrays and checking every returned byte. Exact output is
+not yet exposed to the guest.
 
 ## Verified host behavior
 
@@ -32,10 +32,17 @@ Focused command:
 soldr cargo test --locked --features wasm-sketch-host operations::tests --lib
 ```
 
-The 64 MiB test proves repeated native hub transfers, not Wasm transfers. Its
-64 KiB peak is the blob buffer only; pending write inputs and retained read
-results have separate snapshot counters. It does not establish a bound on
-total allocated memory, collection capacity, or simultaneous guest transfers.
+The native hub test and the Cargo-built guest both transfer 64 MiB. Run the
+guest proof with `CARGO_TARGET_DIR="$PWD/target/threaded-proof" bash
+scripts/build-threaded-smoke.sh` on Unix (PowerShell counterpart on Windows).
+On Linux x86-64 on 2026-09-12, the in-process proof passed in 5.52 seconds and
+the worker proof in 9.33 seconds, including compilation/admission overhead
+inside each test. The transfer uses an explicit finite fuel budget of
+1.7 trillion aggregate and 100 billion for each root/child Store slice.
+The asserted 64 KiB peak is the blob buffer only; pending write inputs and
+retained read results have separate snapshot counters. This does not establish
+a bound on total allocated memory, collection capacity, or simultaneous guest
+transfers, and the sequential proof does not exercise a slow consumer.
 
 ## Remaining acceptance work
 
@@ -50,8 +57,8 @@ total allocated memory, collection capacity, or simultaneous guest transfers.
   terminal winner at final replacement under the hub lock. A stalled filesystem
   replacement holds the hub lock; worker containment must bound this case.
 - Grant output before guest execution and pass only its semantic handle.
-- Exercise 64 MiB through the real generated guest ABI, including slow-consumer
-  backpressure, cancellation, forged/stale/cross-sketch handles, and teardown.
+- Extend the 64 MiB generated guest proof with slow-consumer backpressure,
+  cancellation, forged/stale/cross-sketch handles, and teardown.
 - Inject write, flush, and rename failures and cancellation at the commit
   boundary; prove preservation of existing output and temporary cleanup.
 - Verify the six supported targets and native output behavior on each OS;

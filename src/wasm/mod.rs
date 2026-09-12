@@ -3357,6 +3357,12 @@ mod threaded_root_observation_tests {
             return;
         };
         let bytes = std::fs::read(path).expect("read threaded artifact");
+        let transfer_limits = SketchExecutionLimits::default()
+            .with_fuel_limits(
+                SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
+                    .expect("finite transfer fuel"),
+            )
+            .expect("transfer limits");
         let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
         assert_eq!(
             manifest,
@@ -3365,7 +3371,12 @@ mod threaded_root_observation_tests {
                 "/tests/fixtures/threaded_rust_artifact_manifest_v1.txt"
             ))
         );
-        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let compiler = SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(transfer_limits)
+                .expect("transfer configuration"),
+        )
+        .expect("compiler");
         let sketch = compiler
             .admit(
                 &bytes,
@@ -3434,8 +3445,8 @@ mod threaded_root_observation_tests {
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
         assert_eq!(operations.suspends, 6);
-        assert_eq!(operations.resumes, 8);
-        assert_eq!(operations.peak_buffered_blob_bytes, 4);
+        assert_eq!(operations.resumes, 6 + 2 * 1024);
+        assert_eq!(operations.peak_buffered_blob_bytes, 64 * 1024);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(
             *prepared

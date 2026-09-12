@@ -186,7 +186,7 @@ fn cargo_built_threaded_guest_runs_inside_killable_worker() {
     run_case(
         bytes,
         Duration::from_secs(8),
-        normal_fuel(),
+        long_fuel(),
         false,
         SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
     );

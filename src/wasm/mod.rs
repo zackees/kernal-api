@@ -784,34 +784,37 @@ impl AdmittedSketch {
         // drain every accepted native child.
         let mut validation_getter = None;
         let mut _instance_observation = None;
-        let outcome = if store.set_fuel(root.root_fuel).is_err() {
-            Err(SketchExecutionError::PrelinkFailed)
-        } else {
-            let instance = match prepared.prelink.instantiate_async(&mut store).await {
-                Ok(instance) => instance,
-                Err(error) => return map_root_error(&error, &logical_epoch),
-            };
-            _instance_observation = Some(CounterObservation::new(
-                Arc::clone(&prepared.controller.execution_ledger),
-                LedgerCounter::Instances,
-            ));
-            let start = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
-                Ok(start) => start,
-                Err(_) => return Err(SketchExecutionError::Trapped),
-            };
-            if self.validation {
-                validation_getter = Some(
-                    instance
-                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
-                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
-                );
+        let outcome = async {
+            if store.set_fuel(root.root_fuel).is_err() {
+                Err(SketchExecutionError::PrelinkFailed)
+            } else {
+                let instance = match prepared.prelink.instantiate_async(&mut store).await {
+                    Ok(instance) => instance,
+                    Err(error) => return map_root_error(&error, &logical_epoch),
+                };
+                _instance_observation = Some(CounterObservation::new(
+                    Arc::clone(&prepared.controller.execution_ledger),
+                    LedgerCounter::Instances,
+                ));
+                let start = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                    Ok(start) => start,
+                    Err(_) => return Err(SketchExecutionError::Trapped),
+                };
+                if self.validation {
+                    validation_getter = Some(
+                        instance
+                            .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                            .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                    );
+                }
+                start
+                    .call_async(&mut store, ())
+                    .await
+                    .map(|_| ThreadedRootOutcome::Started)
+                    .or_else(|error| map_root_error(&error, &logical_epoch))
             }
-            start
-                .call_async(&mut store, ())
-                .await
-                .map(|_| ThreadedRootOutcome::Started)
-                .or_else(|error| map_root_error(&error, &logical_epoch))
-        };
+        }
+        .await;
         let outcome = if matches!(&outcome, Err(SketchExecutionError::OutOfFuel)) {
             outcome
         } else {
@@ -820,9 +823,12 @@ impl AdmittedSketch {
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
+        // Revoke before joining: a surviving child may be suspended on an
+        // operation whose producer exited with the root. Instantiation/start
+        // errors must reach this same finalization path.
+        operation_cleanup.close_all(operations::Terminal::Closed);
         let children = prepared.controller.join_completed();
         let rejections = prepared.controller.take_thread_spawn_rejections();
-        operation_cleanup.close_all(operations::Terminal::Closed);
         #[cfg(test)]
         if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
             *snapshot = Some(operation_cleanup.snapshot());
@@ -4005,6 +4011,55 @@ mod threaded_root_observation_tests {
             i32_zero_body(),
             infinite_loop_body(),
         ])
+    }
+
+    #[test]
+    fn instantiation_trap_revokes_output_and_records_final_cleanup() {
+        let bytes = threaded_code_fixture([
+            empty_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            vec![0, 0x00, 0x0b], // unreachable in the module start section
+        ]);
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .unwrap(),
+            )
+            .unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("unchanged");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = runtime.run(sketch.execute_threaded_root_with_output(
+            runtime.handle(),
+            crate::async_engine::CancellationSource::new().token(),
+            destination.clone(),
+        ));
+        assert_eq!(result, Err(SketchExecutionError::Trapped));
+        let prepared = sketch
+            .prepared_root
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let snapshot = prepared
+            .controller
+            .operation_snapshot
+            .lock()
+            .unwrap()
+            .expect("instantiation failures must finalize the hub");
+        assert_eq!(snapshot.live_resources, 0);
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     fn root_fuel_fixture() -> Vec<u8> {

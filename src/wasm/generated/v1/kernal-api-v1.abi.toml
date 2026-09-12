@@ -11,3 +11,31 @@ direction = "guest-to-host"
 params = []
 results = [{ semantic = "()", abi = "unit" }]
 
+[[imports]]
+namespace = "kernal-api:v1"
+name = "operation_cancel"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "i32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "operation_poll"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u64", abi = "i64" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "operation_submit"
+direction = "guest-to-host"
+params = [{ semantic = "u32", abi = "i32" }, { semantic = "u64", abi = "i64" }, { semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u64", abi = "i64" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "operation_yield"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "i32", abi = "i32" }]
+

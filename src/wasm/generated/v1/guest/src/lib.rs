@@ -43,6 +43,14 @@ mod raw_imports {
     extern "C" {
         #[link_name = "kernel_yield"]
         pub(super) fn __kernal_api_v1_import_kernel_yield() -> ();
+        #[link_name = "operation_cancel"]
+        pub(super) fn __kernal_api_v1_import_operation_cancel(operation: i64) -> i32;
+        #[link_name = "operation_poll"]
+        pub(super) fn __kernal_api_v1_import_operation_poll(operation: i64) -> i64;
+        #[link_name = "operation_submit"]
+        pub(super) fn __kernal_api_v1_import_operation_submit(kind: i32, arg0: i64, arg1: i64) -> i64;
+        #[link_name = "operation_yield"]
+        pub(super) fn __kernal_api_v1_import_operation_yield(operation: i64) -> i32;
     }
 }
 
@@ -52,6 +60,26 @@ pub mod imports {
     pub fn kernel_yield() -> Result<(), AbiError> {
         unsafe { raw_imports::__kernal_api_v1_import_kernel_yield() };
         Ok(())
+    }
+
+    pub fn operation_cancel(operation: u64) -> Result<i32, AbiError> {
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_cancel(u64_to_i64(operation)) };
+        i32_from_i32(raw)
+    }
+
+    pub fn operation_poll(operation: u64) -> Result<u64, AbiError> {
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_poll(u64_to_i64(operation)) };
+        u64_from_i64(raw)
+    }
+
+    pub fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> Result<u64, AbiError> {
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_submit(u32_to_i32(kind), u64_to_i64(arg0), u64_to_i64(arg1)) };
+        u64_from_i64(raw)
+    }
+
+    pub fn operation_yield(operation: u64) -> Result<i32, AbiError> {
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_yield(u64_to_i64(operation)) };
+        i32_from_i32(raw)
     }
 }
 

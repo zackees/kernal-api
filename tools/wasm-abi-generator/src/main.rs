@@ -5,7 +5,13 @@ use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
 const METADATA_SECTION: &str = "kernal-api.abi";
-fp_import! { fn kernel_yield(); }
+fp_import! {
+    fn kernel_yield();
+    fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> u64;
+    fn operation_poll(operation: u64) -> u64;
+    fn operation_yield(operation: u64) -> i32;
+    fn operation_cancel(operation: u64) -> i32;
+}
 fp_export! {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,9 +94,7 @@ impl Contract {
             .get("imports")
             .and_then(toml::Value::as_array)
             .ok_or("missing imports")?;
-        if imports.len() != 1 {
-            return Err("this admission adapter requires exactly one scalar yield import".into());
-        }
+        if imports.is_empty() { return Err("missing imports".into()); }
         if root
             .get("exports")
             .is_some_and(|value| value.as_array().is_none_or(|values| !values.is_empty()))
@@ -108,26 +112,6 @@ impl Contract {
             .ok_or("missing import name")?;
         if import.get("direction").and_then(toml::Value::as_str) != Some("guest-to-host") {
             return Err("unexpected import direction".into());
-        }
-        if !import
-            .get("params")
-            .and_then(toml::Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
-            return Err("yield import must have no parameters".into());
-        }
-        let results = import
-            .get("results")
-            .and_then(toml::Value::as_array)
-            .ok_or("missing results")?;
-        if results.len() != 1
-            || results[0].as_table().is_none_or(|result| {
-                result.len() != 2
-                    || result.get("semantic").and_then(toml::Value::as_str) != Some("()")
-                    || result.get("abi").and_then(toml::Value::as_str) != Some("unit")
-            })
-        {
-            return Err("yield import must have exactly one unit result declaration".into());
         }
         Ok(Self {
             schema: string("schema")?,

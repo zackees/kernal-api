@@ -81,6 +81,8 @@ pub(crate) struct HubSnapshot {
     pub(crate) resumes: u64,
     pub(crate) buffered_blob_bytes: usize,
     pub(crate) peak_buffered_blob_bytes: usize,
+    pub(crate) pending_write_bytes: usize,
+    pub(crate) completed_read_bytes: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -865,6 +867,9 @@ impl OperationHub {
         token: OpaqueToken,
     ) -> Result<Option<(Terminal, Vec<u8>)>, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed {
+            return Err(HubError::Closed);
+        }
         let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
         if operation.owner.store != store {
             return Err(HubError::Stale);
@@ -1389,6 +1394,7 @@ impl OperationHub {
         state.free_resource_slots.clear();
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
+            operation.blob_read_result = None;
             if operation.terminal.is_none() {
                 operation.pending_blob_write = None;
                 operation.pending_blob_read = None;
@@ -1419,6 +1425,18 @@ impl OperationHub {
             resumes: state.resumes,
             buffered_blob_bytes: state.buffered_blob_bytes,
             peak_buffered_blob_bytes: state.peak_buffered_blob_bytes,
+            pending_write_bytes: state
+                .operations
+                .values()
+                .filter_map(|operation| operation.pending_blob_write.as_ref())
+                .map(Vec::len)
+                .sum(),
+            completed_read_bytes: state
+                .operations
+                .values()
+                .filter_map(|operation| operation.blob_read_result.as_ref())
+                .map(Vec::len)
+                .sum(),
         }
     }
 }
@@ -1477,6 +1495,46 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teardown_reclaims_unconsumed_read_results_and_pending_write_buffers() {
+        for reason in [
+            Terminal::Cancelled,
+            Terminal::Trapped,
+            Terminal::TimedOut,
+            Terminal::OwnerExited,
+            Terminal::Closed,
+        ] {
+            let hub =
+                OperationHub::with_blob_limits(8, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+            let blob = hub.create_blob(1).unwrap();
+            hub.blob_write(1, blob, b"read").unwrap();
+            let read = hub.submit_blob_read(1, blob, 4).unwrap();
+            hub.blob_write(1, blob, b"full").unwrap();
+            let write = hub.submit_blob_write(1, blob, b"wait").unwrap();
+            let before = hub.snapshot();
+            assert_eq!(before.completed_read_bytes, 4);
+            assert_eq!(before.pending_write_bytes, 4);
+            assert_eq!(before.buffered_blob_bytes, 4);
+            hub.close_all(reason);
+            let after = hub.snapshot();
+            assert_eq!(
+                (
+                    after.completed_read_bytes,
+                    after.pending_write_bytes,
+                    after.buffered_blob_bytes,
+                    after.live_resources,
+                    after.pending_operations
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert_eq!(hub.take_blob_read(1, read), Err(HubError::Closed));
+            assert_eq!(
+                hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+                reason
+            );
+        }
+    }
 
     #[test]
     fn pending_reads_distinguish_data_eof_and_cancellation() {

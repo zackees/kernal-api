@@ -492,9 +492,11 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             "{trace}"
         );
         if scenario == NativeScenario::ContainedCapture {
+            validate_execution_trace(&trace).expect("contained ABI and timing trace");
             assert!(trace.contains("terminal=worker-completed"), "{trace}");
             validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
         } else {
+            validate_teardown_trace(&trace).expect("contained trap cleanup trace");
             assert!(trace.contains("terminal=trapped"), "{trace}");
             assert_eq!(std::fs::read(&output).unwrap(), b"original");
         }

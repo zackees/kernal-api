@@ -145,15 +145,39 @@ fn execute_request(
     #[cfg(not(feature = "tauri-webview"))]
     let result = execute_plain();
     #[cfg(feature = "tauri-webview")]
+    let mut trace = None;
+    #[cfg(feature = "tauri-webview")]
     let result = match native_grant {
-        Some((grant, destination)) => {
-            execute_native(&runtime, Arc::clone(&sketch), token, grant, destination)
-        }
+        Some((grant, destination)) => execute_native(
+            &runtime,
+            Arc::clone(&sketch),
+            token,
+            grant,
+            destination,
+            &mut trace,
+        ),
         None => execute_plain(),
     };
     let _ = sketch.close_threaded_root();
     drop(sketch);
     let counters = snapshot(&compiler);
+    #[cfg(feature = "tauri-webview")]
+    if let Some(mut text) = trace {
+        use std::fmt::Write as _;
+        let counts = compiler.execution_limits_snapshot();
+        writeln!(
+            text,
+            " roots={} threads={} stores={} instances={} epochs={} memory_bytes={}",
+            counts.active_root_executions(),
+            counts.live_guest_threads(),
+            counts.live_stores(),
+            counts.live_instances(),
+            counts.active_epoch_registrations(),
+            counts.reserved_shared_memory_bytes()
+        )
+        .expect("format trace");
+        write_message(output, &Message::Trace { request_id, text }).map_err(protocol_text)?;
+    }
     let (kind, detail, diagnostic) = map_result(result);
     let (kind, detail, diagnostic) = if counters_are_zero(counters) {
         (kind, detail, diagnostic)
@@ -204,10 +228,13 @@ fn execute_native(
     token: kernal_api::async_engine::CancellationToken,
     grant: kernal_api::webview::WebviewUrlGrant,
     destination: std::path::PathBuf,
+    _trace: &mut Option<String>,
 ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
     let host = kernal_api::webview::ExternalWebviewHost::new(runtime.handle())
         .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
     let client = host.client();
+    #[cfg(feature = "tauri-webview-test-support")]
+    let observer = client.clone();
     let handle = runtime.handle();
     let task = handle.clone().launch(async move {
         // Unwinding or dropping the task must also release the UI loop.
@@ -223,9 +250,36 @@ fn execute_native(
             .await
     });
     host.run();
-    runtime
+    let result = runtime
         .run(task)
-        .map_err(|_| SketchExecutionError::BlockingTaskFailed)?
+        .map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
+    #[cfg(feature = "tauri-webview-test-support")]
+    {
+        use std::fmt::Write as _;
+        let (events, omitted) = observer.test_trace();
+        let mut text = String::new();
+        for event in events {
+            write!(
+                text,
+                "kernal-webview-trace phase={} elapsed_us={} opcode={}",
+                event.phase,
+                event.elapsed.as_micros(),
+                event.opcode.unwrap_or(0)
+            )
+            .expect("format trace");
+            if let Some(counts) = event.observation {
+                write!(text, " clocks={} output_jobs={} captures={} opens={} blobs={} transfer_bytes={} backings={} resources={} operations={}", counts.active_clocks, counts.active_output_jobs, counts.active_native_captures, counts.active_native_opens, counts.live_blobs, counts.retained_transfer_capacity, counts.native_backings, counts.live_resources, counts.pending_operations).expect("format trace");
+            }
+            text.push('\n');
+        }
+        write!(
+            text,
+            "kernal-webview-trace phase=trace-end omitted={omitted}"
+        )
+        .expect("format trace");
+        *_trace = Some(text);
+    }
+    result
 }
 
 fn reconstruct(

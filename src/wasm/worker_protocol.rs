@@ -1,18 +1,19 @@
 //! Private, bounded v1 framing for the one-request Wasm worker.
 //!
-//! This intentionally transports only one module and terminal observation. It
-//! is not a capability, resource, or generic streaming protocol.
+//! This transports one module, an optional bounded acceptance trace, and a
+//! terminal observation. It is not a generic resource streaming protocol.
 
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
 /// admission policy: only the process transport is bounded by this contract.
 pub(super) const WORKER_PROTOCOL_MAX_MODULE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+pub(super) const MAX_TRACE_BYTES: usize = 64 * 1024;
 const NO_STATUS_CODE: i32 = i32::MIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +27,7 @@ pub(super) enum Kind {
     Cancel = 6,
     Terminal = 7,
     ExecuteAck = 8,
+    Trace = 9,
 }
 
 impl TryFrom<u8> for Kind {
@@ -40,6 +42,7 @@ impl TryFrom<u8> for Kind {
             6 => Ok(Self::Cancel),
             7 => Ok(Self::Terminal),
             8 => Ok(Self::ExecuteAck),
+            9 => Ok(Self::Trace),
             _ => Err(ProtocolError::UnknownKind),
         }
     }
@@ -227,6 +230,10 @@ pub(super) struct FinalCounters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Message {
+    Trace {
+        request_id: u64,
+        text: String,
+    },
     Hello {
         request_id: u64,
     },
@@ -270,6 +277,7 @@ impl Message {
             | Self::ExecuteEnd { request_id }
             | Self::Cancel { request_id } => *request_id,
             Self::ExecuteStart { request_id, .. }
+            | Self::Trace { request_id, .. }
             | Self::ModuleChunk { request_id, .. }
             | Self::Terminal { request_id, .. } => *request_id,
         }
@@ -284,6 +292,7 @@ impl Message {
             Self::ExecuteEnd { .. } => Kind::ExecuteEnd,
             Self::Cancel { .. } => Kind::Cancel,
             Self::Terminal { .. } => Kind::Terminal,
+            Self::Trace { .. } => Kind::Trace,
         }
     }
 }
@@ -295,6 +304,10 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     let mut payload = Vec::new();
     put_u64(&mut payload, message.request_id());
     match message {
+        Message::Trace { text, .. } => {
+            validate_trace(text.as_bytes())?;
+            payload.extend_from_slice(text.as_bytes());
+        }
         Message::Hello { .. }
         | Message::HelloAck { .. }
         | Message::ExecuteAck { .. }
@@ -383,6 +396,14 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         return Err(ProtocolError::InvalidRequestId);
     }
     let message = match kind {
+        Kind::Trace => {
+            validate_trace(input)?;
+            Message::Trace {
+                request_id,
+                text: String::from_utf8(std::mem::take(&mut input).to_vec())
+                    .map_err(|_| ProtocolError::InvalidPayload)?,
+            }
+        }
         Kind::Hello => Message::Hello { request_id },
         Kind::HelloAck => Message::HelloAck { request_id },
         Kind::ExecuteAck => Message::ExecuteAck { request_id },
@@ -458,10 +479,13 @@ pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolE
     if get_u16(&header[4..6])? != VERSION {
         return Err(ProtocolError::UnsupportedVersion);
     }
-    let _ = Kind::try_from(header[6])?;
+    let kind = Kind::try_from(header[6])?;
     let length =
         usize::try_from(get_u32(&header[7..11])?).map_err(|_| ProtocolError::LengthOverflow)?;
     if length > MAX_FRAME_PAYLOAD {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    if kind == Kind::Trace && length > MAX_TRACE_BYTES + 8 {
         return Err(ProtocolError::FrameTooLarge);
     }
     let total = HEADER_LEN
@@ -474,6 +498,16 @@ pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolE
         .read_exact(&mut frame[HEADER_LEN..])
         .map_err(|_| ProtocolError::Truncated)?;
     decode(&frame)
+}
+
+fn validate_trace(bytes: &[u8]) -> Result<(), ProtocolError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_TRACE_BYTES
+        || bytes.iter().any(|byte| !matches!(byte, b'\n' | 32..=126))
+    {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    Ok(())
 }
 
 pub(super) fn write_message<W: Write>(
@@ -1204,6 +1238,45 @@ mod tests {
         assert_eq!(
             encode(&cancelled_with_status),
             Err(ProtocolError::InvalidTerminal)
+        );
+    }
+    #[test]
+    fn trace_batch_is_bounded_printable_and_round_trips() {
+        for text in [
+            "kernal-webview-trace phase=poll\n".to_owned(),
+            "x".repeat(MAX_TRACE_BYTES),
+        ] {
+            let message = Message::Trace {
+                request_id: 3,
+                text,
+            };
+            assert_eq!(decode(&encode(&message).unwrap()).unwrap(), message);
+        }
+        for text in [
+            String::new(),
+            "x".repeat(MAX_TRACE_BYTES + 1),
+            "escape\x1b[31m".into(),
+            "nul\0".into(),
+            "é".into(),
+        ] {
+            assert!(encode(&Message::Trace {
+                request_id: 3,
+                text
+            })
+            .is_err());
+        }
+        let mut frame = encode(&Message::Trace {
+            request_id: 3,
+            text: "ok".into(),
+        })
+        .unwrap();
+        *frame.last_mut().unwrap() = 0xff;
+        assert!(decode(&frame).is_err());
+        let mut header = frame[..HEADER_LEN].to_vec();
+        header[7..11].copy_from_slice(&((MAX_TRACE_BYTES + 9) as u32).to_le_bytes());
+        assert_eq!(
+            read_message(&mut header.as_slice()),
+            Err(ProtocolError::FrameTooLarge)
         );
     }
 }

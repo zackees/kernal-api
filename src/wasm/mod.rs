@@ -6,6 +6,8 @@
 
 #[cfg(feature = "wasm-sketch-worker")]
 mod worker;
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+pub use worker::SketchWorkerTrace;
 #[cfg(feature = "wasm-sketch-worker")]
 #[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
 mod worker_protocol;

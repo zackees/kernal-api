@@ -102,10 +102,10 @@ KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-a
   soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
 ```
 
-The diagnostic-mode native test launches the CLI as a separate process, serves the checked-in
-fixture over loopback, verifies successful guest completion, decodes the PNG
-with portable Rust tooling, checks bounded dimensions and tolerant red/blue
-regions at six interior points, and checks exact-output replacement and
+The native CLI tests launch the executable as a separate process, serve the checked-in
+fixture over loopback, verify successful guest completion, decode the PNG
+with portable Rust tooling, check bounded dimensions and tolerant red/blue
+regions at six interior points, and check exact-output replacement and
 temporary-file cleanup. A bounded host trace records generated submit/poll/yield
 crossings, preserves the matching native load callback's monotonic timestamp,
 and requires capture at least five seconds later. After joined cleanup and
@@ -149,7 +149,11 @@ containing runner stdout/stderr, process outcome/timing JSON, and the exact
 output directory even if an assertion fails. CI uploads these artifacts on
 success or failure. `runner.stderr.log` includes structured
 `kernal-webview-trace` records; `process.json` separately summarizes the child
-process. Hard termination can prevent the bounded trace from being emitted,
+process. With the test feature enabled, the default contained CLI receives one
+64-KiB-capped trace batch through private protocol version 6; its success and
+trap tests check the same detailed timing/resource assertions as diagnostic mode.
+Rebuild the worker and CLI together when the private protocol changes.
+Hard termination can prevent the bounded trace from being emitted,
 so failure-path/containment diagnostics remain incomplete. This Linux x86-64 lane does not
 establish native execution on the other five supported host targets.
 

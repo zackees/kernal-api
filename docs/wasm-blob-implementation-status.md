@@ -121,7 +121,7 @@ succeeded, and `worker-output-cleanup` when discard failed without publication.
 The RED/GREEN regression checks both error codes and actual final bytes;
 all 22 worker unit tests pass. This injection tests error classification, not
 a native filesystem driver's cleanup failure or eventual cleanup retry.
-The private protocol is now version 5, with an optional staging destination
+The private protocol is now version 6, with an optional staging destination
 bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
 without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,
 oversized, and truncated inputs are rejected. The worker grants the staged
@@ -159,7 +159,7 @@ neighbor unchanged, removes staging, and drains those same parent counters.
 All 18 focused parent lifecycle/configuration unit tests also pass.
 The focused Linux CI lane now includes this ignored native proof. This is not
 Windows/macOS runtime evidence; the separate forced case follows below.
-Worker-internal trace transport remains unfinished.
+Worker trace transport is described below.
 
 The source-built `proof-block-after-capture` guest then passed the Linux forced
 containment proof in 23.70 seconds. It receives the native snapshot before
@@ -183,8 +183,7 @@ in-process fallback. The detailed native timing/failure proofs explicitly select
 Default-mode CLI success and trap proofs pass on Linux alongside the diagnostic
 capture proof (three tests, 26.71 seconds): they verify decoded output or original
 file preservation, clean stdout, and zero parent counters in the bounded terminal
-summary. Native callback traces still come from diagnostic mode, not the worker;
-this does not claim feature parity in contained diagnostics.
+summary. The next protocol revision adds the detailed contained trace below.
 The full Linux screenshot suite then passed all 15 tests in 123.76 seconds,
 including the explicit missing-worker/no-fallback regression, diagnostic load
 timeout and write failure, contained success/trap/block, and validator negative
@@ -193,6 +192,27 @@ the diagnostic feature enabled.
 The non-worker native test configuration passes strict Clippy too; it exposed
 and fixed an over-broad gate on native worker environment helpers. Those helpers
 now require both the native capability and worker support.
+
+Protocol version 6 adds one optional acceptance trace batch, capped at 64 KiB
+and restricted to printable ASCII/newlines. Oversized trace headers are rejected
+before payload allocation. The parent requires the matching execution ack,
+rejects duplicate/wrong-request traces, and bounds its entire response producer
+to four messages plus one failure notification. The flood regression proves
+the producer stops without reading the remaining input or waiting for a consumer;
+wrong-direction module payloads are never queued. A feature-gated recorder retains
+one batch, with no caller callback or file I/O on the supervisor thread.
+
+Native test workers send their bounded ABI/callback trace after joined execution,
+including post-drop compiler counters. The default CLI prints it only after the
+worker terminal path. All three default CLI tests pass in 20.78 seconds, now
+requiring the detailed generated-boundary, >=5-second load/capture, and zero-hub/
+compiler-resource assertions inside containment. Forty focused worker/protocol
+unit tests and strict combined Clippy pass. This is terminal-batch transport,
+not live streaming: forced termination before emission still loses worker-local
+events and must not be presented as a zero-counter report from the killed worker.
+The non-native worker's 21 binary/protocol tests and four containment regressions
+also pass with version 6. The acceptance recorder test verifies destructive
+retrieval and duplicate/request rejection; final formatting and diff checks pass.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
@@ -250,7 +270,7 @@ the host.
 
 The worker supervisor sends all seven limits, and the worker validates them
 through the same public constructor before compiler construction. Private
-worker protocol version 5 rejects older peers rather than silently using
+worker protocol version 6 rejects older peers rather than silently using
 default limits; rebuild the worker executable together with the host. This
 changes no guest ABI import signature or guest artifact. Pending inputs and
 completed reads still have separate byte budgets. Hosts can additionally set

@@ -34,6 +34,8 @@ pub struct SketchWorkerConfig {
     cooperative_cancel_grace: Duration,
     output_destination: Option<PathBuf>,
     webview_url: Option<String>,
+    #[cfg(feature = "tauri-webview-test-support")]
+    trace: Option<SketchWorkerTrace>,
 }
 impl SketchWorkerConfig {
     pub fn new(
@@ -52,6 +54,8 @@ impl SketchWorkerConfig {
             cooperative_cancel_grace,
             output_destination: None,
             webview_url: None,
+            #[cfg(feature = "tauri-webview-test-support")]
+            trace: None,
         })
     }
     /// Authorize one exact final output. The worker receives only a private
@@ -68,6 +72,13 @@ impl SketchWorkerConfig {
     }
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+    /// Retain one bounded diagnostic batch without running caller code or
+    /// writing files on the deadline-owning supervisor thread.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn with_trace(mut self, trace: SketchWorkerTrace) -> Self {
+        self.trace = Some(trace);
+        self
     }
     /// Authorize native capture of one validated URL into one exact output.
     /// The executable must be built with `tauri-webview`. Renderer processes
@@ -92,6 +103,26 @@ impl SketchWorkerConfig {
     }
     pub fn cooperative_cancel_grace(&self) -> Duration {
         self.cooperative_cancel_grace
+    }
+}
+
+/// Acceptance-only storage for at most one 64-KiB batch. Use one recorder per
+/// concurrent execution. A later batch replaces a previously retained batch.
+#[cfg(feature = "tauri-webview-test-support")]
+#[derive(Clone, Debug, Default)]
+pub struct SketchWorkerTrace(Arc<std::sync::Mutex<Option<String>>>);
+#[cfg(feature = "tauri-webview-test-support")]
+impl PartialEq for SketchWorkerTrace {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+#[cfg(feature = "tauri-webview-test-support")]
+impl Eq for SketchWorkerTrace {}
+#[cfg(feature = "tauri-webview-test-support")]
+impl SketchWorkerTrace {
+    pub fn take(&self) -> Option<String> {
+        self.0.lock().expect("worker trace lock poisoned").take()
     }
 }
 
@@ -410,6 +441,9 @@ struct ParentReceivePhase {
     upload_complete: bool,
     execute_ack_deferred: bool,
     execute_acked: bool,
+    trace_received: bool,
+    #[cfg(feature = "tauri-webview-test-support")]
+    trace: Option<SketchWorkerTrace>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -417,6 +451,7 @@ enum ParentReceiveAction {
     QueueUpload,
     AwaitingUpload,
     ExecuteAcknowledged,
+    TraceReceived,
     Terminal(Box<Message>),
 }
 
@@ -429,6 +464,9 @@ impl ParentReceivePhase {
             upload_complete: false,
             execute_ack_deferred: false,
             execute_acked: false,
+            trace_received: false,
+            #[cfg(feature = "tauri-webview-test-support")]
+            trace: None,
         }
     }
 
@@ -465,6 +503,16 @@ impl ParentReceivePhase {
             return Err(SketchWorkerFailure::Protocol);
         }
         match message {
+            Message::Trace { text, .. } if self.execute_acked && !self.trace_received => {
+                self.trace_received = true;
+                #[cfg(feature = "tauri-webview-test-support")]
+                if let Some(trace) = &self.trace {
+                    *trace.0.lock().expect("worker trace lock poisoned") = Some(text);
+                }
+                #[cfg(not(feature = "tauri-webview-test-support"))]
+                let _ = text;
+                Ok(ParentReceiveAction::TraceReceived)
+            }
             Message::HelloAck { .. } if !self.hello_acked => {
                 self.hello_acked = true;
                 Ok(ParentReceiveAction::QueueUpload)
@@ -606,6 +654,10 @@ fn supervise(
     config: SketchWorkerConfig,
     cancellation: crate::async_engine::CancellationToken,
 ) -> SketchWorkerTerminal {
+    #[cfg(feature = "tauri-webview-test-support")]
+    if let Some(trace) = &config.trace {
+        let _ = trace.take();
+    }
     // This authority begins before admission, spawning, and the handshake.
     let deadline = std::time::Instant::now()
         + sketch
@@ -713,14 +765,7 @@ fn supervise(
         let reader_ledger = Arc::clone(&sketch.worker_ledger);
         let reader = std::thread::spawn(move || {
             let _gauge = reader_ledger.live_protocol();
-            let mut output = stdout;
-            loop {
-                let message = worker_protocol::read_message(&mut output).map_err(|_| ());
-                let finished = message.is_err() || matches!(message, Ok(Message::Terminal { .. }));
-                if read_tx.send(message).is_err() || finished {
-                    break;
-                }
-            }
+            forward_worker_responses(stdout, read_tx);
         });
         let lanes = ProtocolLanes {
             write_tx,
@@ -739,6 +784,10 @@ fn supervise(
         let mut cancel_written = false;
         let mut cancel_queued = false;
         let mut receive_phase = ParentReceivePhase::new(id);
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            receive_phase.trace = config.trace.clone();
+        }
         let mut selected = None;
         let mut grace_deadline = None;
         loop {
@@ -841,6 +890,7 @@ fn supervise(
                     }
                     Ok(ParentReceiveAction::AwaitingUpload) => {}
                     Ok(ParentReceiveAction::ExecuteAcknowledged) => {}
+                    Ok(ParentReceiveAction::TraceReceived) => {}
                     Ok(ParentReceiveAction::Terminal(message)) => {
                         let mapped = map_terminal(*message, id);
                         let mapped = match mapped {
@@ -1239,6 +1289,34 @@ fn spawn_worker(
     limits: crate::platform::process::WorkerLimits,
 ) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
     crate::platform_imp::spawn_contained_worker(command, limits)
+}
+
+/// The entire response is at most four messages, not an open-ended stream. Keep the
+/// channel nonblocking for teardown joins, but bound what its producer can
+/// enqueue even when the supervisor is not scheduled. Module payloads are
+/// never valid in this direction. The phase machine still validates ordering.
+fn forward_worker_responses(
+    mut output: impl std::io::Read,
+    responses: std::sync::mpsc::Sender<Result<Message, ()>>,
+) {
+    for _ in 0..4 {
+        let message = worker_protocol::read_message(&mut output)
+            .map_err(|_| ())
+            .and_then(|message| match message {
+                Message::HelloAck { .. }
+                | Message::ExecuteAck { .. }
+                | Message::Trace { .. }
+                | Message::Terminal { .. } => Ok(message),
+                _ => Err(()),
+            });
+        let finished = message.is_err() || matches!(message, Ok(Message::Terminal { .. }));
+        if responses.send(message).is_err() || finished {
+            return;
+        }
+    }
+    // Four nonterminal messages exhaust the response budget. Do not read or
+    // allocate another frame, and wake the supervisor to force containment.
+    let _ = responses.send(Err(()));
 }
 fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMetadata {
     let config = sketch.worker_compiler_config();
@@ -1742,6 +1820,96 @@ mod tests {
             Err(SketchWorkerFailure::InvalidConfiguration)
         );
         assert!(SketchWorkerConfig::new(absolute, Duration::from_millis(1)).is_ok());
+    }
+
+    #[test]
+    fn response_reader_bounds_a_flood_without_waiting_for_the_consumer() {
+        let frame = worker_protocol::encode(&Message::HelloAck { request_id: 1 }).unwrap();
+        let input = frame.repeat(1_000);
+        let mut cursor = std::io::Cursor::new(input);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        forward_worker_responses(&mut cursor, sender);
+        assert_eq!(cursor.position() as usize, 4 * frame.len());
+        let queued: Vec<_> = receiver.try_iter().collect();
+        assert_eq!(queued.len(), 5);
+        assert!(queued[..4].iter().all(Result::is_ok));
+        assert_eq!(queued[4], Err(()));
+    }
+
+    #[test]
+    fn trace_requires_execution_ack_and_rejects_duplicates_or_wrong_request() {
+        let trace = || Message::Trace {
+            request_id: 1,
+            text: "bounded trace\n".into(),
+        };
+        let mut phase = ParentReceivePhase::new(1);
+        #[cfg(feature = "tauri-webview-test-support")]
+        let recorder = SketchWorkerTrace::default();
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            phase.trace = Some(recorder.clone());
+        }
+        assert!(phase.receive(trace()).is_err());
+        assert_eq!(
+            phase.receive(Message::HelloAck { request_id: 1 }).unwrap(),
+            ParentReceiveAction::QueueUpload
+        );
+        phase.upload_queued();
+        phase.upload(Ok(())).unwrap();
+        phase
+            .receive(Message::ExecuteAck { request_id: 1 })
+            .unwrap();
+        assert!(phase
+            .receive(Message::Trace {
+                request_id: 2,
+                text: "wrong request".into()
+            })
+            .is_err());
+        assert_eq!(
+            phase.receive(trace()).unwrap(),
+            ParentReceiveAction::TraceReceived
+        );
+        assert!(phase.receive(trace()).is_err());
+        assert!(matches!(
+            phase.receive(terminal(1)).unwrap(),
+            ParentReceiveAction::Terminal(_)
+        ));
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            assert_eq!(recorder.take().as_deref(), Some("bounded trace\n"));
+            assert!(recorder.take().is_none());
+        }
+    }
+
+    #[test]
+    fn response_reader_rejects_wrong_direction_and_stops_at_terminal() {
+        let frame = worker_protocol::encode(&Message::ModuleChunk {
+            request_id: 1,
+            sequence: 0,
+            bytes: vec![0; 1024],
+        })
+        .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        forward_worker_responses(frame.as_slice(), sender);
+        assert_eq!(receiver.try_iter().collect::<Vec<_>>(), vec![Err(())]);
+
+        let expected = vec![
+            Message::HelloAck { request_id: 1 },
+            Message::ExecuteAck { request_id: 1 },
+            terminal(1),
+        ];
+        let input: Vec<_> = expected
+            .iter()
+            .flat_map(|message| worker_protocol::encode(message).unwrap())
+            .collect();
+        let mut cursor = std::io::Cursor::new(input.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        forward_worker_responses(&mut cursor, sender);
+        assert_eq!(cursor.position() as usize, input.len());
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<_>>(),
+            expected.into_iter().map(Ok).collect::<Vec<_>>()
+        );
     }
     #[test]
     fn terminal_codes_preserve_semantic_categories() {

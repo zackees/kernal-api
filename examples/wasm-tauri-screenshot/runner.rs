@@ -129,10 +129,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let config = SketchWorkerConfig::new(executable, Duration::from_secs(2))?
             .with_webview_capture(grant, output)?;
+        #[cfg(feature = "tauri-webview-test-support")]
+        let trace = kernal_api::wasm::SketchWorkerTrace::default();
+        #[cfg(feature = "tauri-webview-test-support")]
+        let config = config.with_trace(trace.clone());
         let terminal =
             runtime.run(sketch.execute_threaded_root_contained(runtime.handle(), &config));
         #[cfg(feature = "tauri-webview-test-support")]
         {
+            if let Some(text) = trace.take() {
+                eprint!("{text}");
+            }
             let counts = sketch.worker_execution_snapshot();
             eprintln!("kernal-worker-trace terminal={} spawned={} reaped={} forced={} workers={} tasks={} leases={}", terminal.code(), counts.spawned, counts.reaped, counts.forced, counts.live_workers, counts.live_protocol_tasks, counts.pending_root_leases);
         }

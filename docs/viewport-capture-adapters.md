@@ -1,8 +1,8 @@
 # Native viewport capture ownership (#19)
 
-Status: the Linux and Windows callback adapters are implemented, but are not yet
-wired to the webview operation service. The macOS adapter and generated
-snapshot operation remain unimplemented. This note does not establish native
+Status: the Linux, Windows, and macOS callback adapters are implemented, but are
+not yet wired to the webview operation service. The generated snapshot operation
+remains unimplemented. This note does not establish full native
 capture acceptance or close #19.
 The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
 the existing root platform selector and gated only by `tauri-webview` in the
@@ -62,7 +62,7 @@ and verifies the hub's completed operation references exactly that blob. It
 also cancels a second native snapshot and waits for its callback before
 asserting no blob publication or retained storage. This is an adapter-level
 proof, not the external-content service or generated Wasm screenshot sketch.
-Windows native execution and the macOS adapter remain outstanding.
+Windows and macOS native execution remain outstanding.
 
 ```sh
 nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -j 1 -- --ignored --test-threads=1'
@@ -136,6 +136,31 @@ capture must be optional, exact-pinned, and compatible with this graph.
 
 ## Integration requirements
 
+### macOS adapter status
+
+`src/platform_macos/viewport_capture.rs` calls WKWebView's asynchronous
+`takeSnapshotWithConfiguration:completionHandler:` on the AppKit thread. It
+checks logical dimensions and backing scale before requesting capture, then
+checks the returned CGImage dimensions before encoding. ImageIO writes PNG
+through a callback-backed `CGDataConsumer` into the operation-owned blob sink;
+no full PNG `NSData` or second encoded-image vector is created by the adapter.
+The consumer owns one retained reference to the encoder state, releases it
+through its native release callback, and rejects writes after quota failure or
+hub revocation. The completion consumes its encoder at most once.
+
+Bindings are optional, macOS-only exact pins: block2 0.6.2 and the objc2
+AppKit/Foundation/CoreFoundation/CoreGraphics/WebKit/ImageIO family at 0.3.2.
+ImageIO is the only new lockfile package; unrelated dependency edges remain
+unchanged. This follows Apple's [consumer-backed ImageIO destination API](https://developer.apple.com/documentation/imageio/cgimagedestinationcreatewithdataconsumer(_:_:_:_:)).
+
+Apple Silicon strict Clippy for library/tests and Intel macOS library/test
+compilation passed. Pixel/scale rejection and consumer callback quota/ownership
+tests are checked in and type-checked, but have not run on macOS. Actual snapshot
+rendering, native scale, PNG decoding, and cancellation/close execution on macOS
+remain required. Cross-compilation does not establish those outcomes.
+
+### Shared service integration
+
 `src/tauri.rs` retains Wry webviews in the UI-thread `UI_WEBVIEWS` map. Native
 capture must dispatch there and keep native image objects on their permitted
 thread. A completion must enter the existing `OperationHub`; it must not
@@ -163,13 +188,13 @@ is actually released, even if the guest already consumed cancellation.
 ## Required evidence still missing
 
 - A checked-in RED regression for the absent generated capture operation.
-- Three native adapters, private bindings, and operation/resource integration.
+- Shared native adapter dispatch and operation/resource integration.
 - Decodable viewport PNGs at native scale without window chrome.
 - Pixel/encoded-byte admission, stale and cross-instance rejection, cancellation,
   late callbacks, and teardown tests with truthful final resource counters.
 - Native Linux WebKitGTK 4.1/Xvfb, macOS, and Windows execution, plus both
   architecture compile checks for each supported operating system.
 
-The Linux callback and bounded encoder are the first implementation step;
-their completion must consume the shared blob protocol from #17. This does not
-reduce the requirement to deliver all three native adapters.
+All three callbacks use the shared blob protocol from #17. Their existence and
+compile checks do not reduce the requirement for native execution and the
+generated screenshot sketch on every supported operating system.

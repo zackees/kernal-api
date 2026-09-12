@@ -17,12 +17,6 @@ pub(crate) const OP_SYNTHETIC_YIELD: u32 = 1;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CREATE: u32 = 2;
 pub(crate) const OP_SYNTHETIC_RESOURCE_USE: u32 = 3;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
-/// Closed scalar ABI opcode for a native external-webview resource.  The
-/// scalar ABI deliberately carries no URL pointer: URL admission remains a
-/// host-owned semantic request, rather than an ambient guest-memory bridge.
-pub(crate) const OP_EXTERNAL_WEBVIEW_OPEN: u32 = 16;
-pub(crate) const OP_EXTERNAL_WEBVIEW_WAIT_UNTIL_LOADED: u32 = 17;
-pub(crate) const OP_EXTERNAL_WEBVIEW_CLOSE: u32 = 18;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -410,12 +404,6 @@ impl OperationHub {
             OP_SYNTHETIC_RESOURCE_CLOSE => Request::Close {
                 resource: OpaqueToken(arg0),
             },
-            // A guest may name these stable opcodes, but a threaded sketch
-            // has no ambient native webview host.  The opt-in facade binds
-            // the same semantic operations explicitly on the native side.
-            OP_EXTERNAL_WEBVIEW_OPEN
-            | OP_EXTERNAL_WEBVIEW_WAIT_UNTIL_LOADED
-            | OP_EXTERNAL_WEBVIEW_CLOSE => return Err(HubError::Invalid),
             _ => return Err(HubError::Invalid),
         };
         Ok(self.dispatch(runtime, store, request)?.0)
@@ -902,6 +890,39 @@ mod tests {
             Err(HubError::Invalid),
             "closed native backing cannot revive its generation"
         );
+    }
+
+    #[test]
+    fn native_terminal_cleanup_reclaims_every_handle_and_rejects_stale_use() {
+        for terminal in [Terminal::TimedOut, Terminal::Cancelled, Terminal::Closed] {
+            let hub = OperationHub::new(4, 1).unwrap();
+            let (resource, open) = hub.begin_external_webview_open(7).unwrap();
+            hub.finish_external_open(open, resource);
+            assert!(matches!(
+                hub.observe_terminal(7, open),
+                Ok(Some(TerminalResult {
+                    terminal: Terminal::Completed,
+                    resource: Some(_),
+                }))
+            ));
+            let waiter = hub.begin_external_webview_wait(7, resource).unwrap();
+            hub.revoke_external_resource(resource, terminal).unwrap();
+            assert_eq!(
+                hub.observe_terminal(7, waiter),
+                Ok(Some(TerminalResult {
+                    terminal,
+                    resource: None,
+                }))
+            );
+            assert_eq!(
+                hub.begin_external_webview_wait(7, resource),
+                Err(HubError::Invalid),
+                "a terminal native event must not revive the old generation"
+            );
+            let snapshot = hub.snapshot();
+            assert_eq!(snapshot.pending_operations, 0, "{terminal:?}");
+            assert_eq!(snapshot.live_resources, 0, "{terminal:?}");
+        }
     }
 
     #[test]

@@ -26,9 +26,15 @@ Wry owns the platform event loop and must be initialized and driven on its UI
 thread. Creation uses Wry's supported handle routing from the facade-owned
 async runtime's blocking lane; it never blocks the event loop and avoids the
 Windows callback-creation deadlock. The backend does not create a Tokio runtime
-or another OS runtime. Issue #16's generated operation table will own the
-generation-safe semantic resource handle, timeout, cancellation, and public
-error mapping, then attach its operation completion to this backend callback.
+or another OS runtime. The public `webview` facade owns semantic
+`open_webview`, `wait_until_loaded`, terminal observation, and `close`
+operations. They share the generated kernel operation/resource hub without
+exposing a Tauri/Wry type or inventing a second registry. Timeout,
+cancellation, user close, and rejected navigation revoke the resource
+generation and wake pending operations with typed facade errors. The current
+scalar guest ABI intentionally remains synthetic: it has no bounded URL
+request transport, so native-only acceptance tests use this same hub path
+until a generated URL capability is added.
 
 For a repeatable Linux proof outside CI, use the Nix development shell below.
 The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built

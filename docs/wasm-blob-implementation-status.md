@@ -134,18 +134,33 @@ Version 5 also reserves an optional host-owned URL field for native worker
 integration. Its UTF-8 payload is bounded to 16 KiB before allocation;
 NUL-containing, oversized, and truncated values are rejected, and absent
 authority remains distinct from an invalid empty URL. This is transport
-preparation, not yet a working contained screenshot: the parent still emits no
-URL grant. A worker without `tauri-webview` returns
+transport for the explicit `SketchWorkerConfig::with_webview_capture` grant.
+A worker without `tauri-webview` returns
 `native-webview-worker-unavailable` before compiler construction if one is
 supplied. A native-enabled worker revalidates the URL and requires the private
 staged output, then runs the UI on process main and the root on its own async
-runtime. Its UI exit guard also runs on task unwind. Parent grant configuration,
-bounded renderer-child allowance, and actual contained screenshot validation
-remain required. No process limit was relaxed, and no guest authority was added.
+runtime. Its UI exit guard also runs on task unwind. Native capture permits up
+to 16 processes in the Windows job; ordinary workers retain their one-process
+limit. Linux/macOS process groups provide cleanup, not process-count enforcement.
+Only native workers receive a platform-owned display/session/loader environment
+allowlist; ordinary workers retain the empty environment. No guest chooses these
+environment values or process limits.
 The worker's 20 unit tests pass both with and without native features on Linux;
 the native variant verifies invalid URL and missing-output rejection without
 starting UI or compiler work. Strict native-enabled worker Clippy also passes.
-These checks do not establish that a renderer runs inside containment.
+The actual screenshot guest also passed inside the Linux worker in 9.34 seconds:
+the decoded PNG matches all six fixture color points, the exact output is
+published only after successful execution/reap, its neighbor is unchanged, and
+parent live worker/task/lease counters are zero. The initial native run failed
+with the empty environment; adding only the native allowlist made it pass.
+The paired success/trap-after-capture proof then passed in 18.40 seconds. The
+real trap is reported as `Execution(Trapped)`, leaves the original output and
+neighbor unchanged, removes staging, and drains those same parent counters.
+All 18 focused parent lifecycle/configuration unit tests also pass.
+The focused Linux CI lane now includes this ignored native proof. This is not
+Windows/macOS runtime evidence or a forced-native-teardown proof; the screenshot
+CLI still needs migration from its in-process path, and worker trace retention
+remains unfinished.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning

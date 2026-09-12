@@ -240,8 +240,8 @@ jobs:
           KERNAL_API_SCREENSHOT_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
           KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
         run: |
-          soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot
-          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
+          soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

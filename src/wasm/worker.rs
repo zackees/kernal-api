@@ -33,6 +33,7 @@ pub struct SketchWorkerConfig {
     executable: PathBuf,
     cooperative_cancel_grace: Duration,
     output_destination: Option<PathBuf>,
+    webview_url: Option<String>,
 }
 impl SketchWorkerConfig {
     pub fn new(
@@ -50,6 +51,7 @@ impl SketchWorkerConfig {
             executable,
             cooperative_cancel_grace,
             output_destination: None,
+            webview_url: None,
         })
     }
     /// Authorize one exact final output. The worker receives only a private
@@ -66,6 +68,27 @@ impl SketchWorkerConfig {
     }
     pub fn executable(&self) -> &Path {
         &self.executable
+    }
+    /// Authorize native capture of one validated URL into one exact output.
+    /// The executable must be built with `tauri-webview`. Renderer processes
+    /// remain inside the worker tree; Windows permits at most 16 processes
+    /// for this mode. Unix process groups provide tree cleanup, not a count cap.
+    #[cfg(feature = "tauri-webview")]
+    pub fn with_webview_capture(
+        self,
+        grant: crate::webview::WebviewUrlGrant,
+        destination: PathBuf,
+    ) -> Result<Self, SketchWorkerFailure> {
+        let mut config = self.with_output_destination(destination)?;
+        config.webview_url = Some(grant.worker_url().to_owned());
+        Ok(config)
+    }
+
+    fn process_limits(&self) -> crate::platform::process::WorkerLimits {
+        crate::platform::process::WorkerLimits {
+            active_processes: Some(if self.webview_url.is_some() { 16 } else { 1 }),
+            ..Default::default()
+        }
     }
     pub fn cooperative_cancel_grace(&self) -> Duration {
         self.cooperative_cancel_grace
@@ -609,6 +632,10 @@ fn supervise(
         Err(()) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
     };
     let mut command = std::process::Command::new(config.executable());
+    #[cfg(feature = "tauri-webview")]
+    if config.webview_url.is_some() {
+        crate::platform::process::configure_native_worker_environment(&mut command);
+    }
     let output = match config
         .output_destination
         .as_deref()
@@ -618,7 +645,7 @@ fn supervise(
         Ok(output) => output,
         Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputGrant),
     };
-    let child = match spawn_worker(&mut command) {
+    let child = match spawn_worker(&mut command, config.process_limits()) {
         Ok(child) => child,
         Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
     };
@@ -792,6 +819,7 @@ fn supervise(
                                 source: sketch.worker_source(),
                                 metadata: {
                                     let mut metadata = metadata(sketch, deadline);
+                                    metadata.webview_url = config.webview_url.clone();
                                     metadata.staged_output = control
                                         .ownership
                                         .as_ref()
@@ -1208,14 +1236,9 @@ fn force_join_terminal(
 
 fn spawn_worker(
     command: &mut std::process::Command,
+    limits: crate::platform::process::WorkerLimits,
 ) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
-    crate::platform_imp::spawn_contained_worker(
-        command,
-        crate::platform::process::WorkerLimits {
-            active_processes: Some(1),
-            ..Default::default()
-        },
-    )
+    crate::platform_imp::spawn_contained_worker(command, limits)
 }
 fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMetadata {
     let config = sketch.worker_compiler_config();
@@ -1748,6 +1771,32 @@ mod tests {
             SketchWorkerFailure::InvalidConfiguration.code(),
             "worker-invalid-configuration"
         );
+    }
+    #[test]
+    #[cfg(feature = "tauri-webview")]
+    fn native_capture_configuration_keeps_plain_worker_limits_and_exact_authority() {
+        let directory = std::env::temp_dir();
+        let plain =
+            SketchWorkerConfig::new(directory.join("worker"), Duration::from_secs(1)).unwrap();
+        assert_eq!(plain.process_limits().active_processes, Some(1));
+        assert!(plain.webview_url.is_none());
+        let grant = crate::webview::WebviewUrlGrant::new("https://example.test/exact").unwrap();
+        assert!(plain
+            .clone()
+            .with_webview_capture(grant.clone(), PathBuf::from("relative.png"))
+            .is_err());
+        let output = directory.join("exact.png");
+        let native = plain
+            .clone()
+            .with_webview_capture(grant, output.clone())
+            .unwrap();
+        assert_eq!(native.process_limits().active_processes, Some(16));
+        assert_eq!(
+            native.webview_url.as_deref(),
+            Some("https://example.test/exact")
+        );
+        assert_eq!(native.output_destination, Some(output));
+        assert_eq!(plain.process_limits().active_processes, Some(1));
     }
     #[test]
     fn worker_protocol_module_ceiling_is_checked_without_allocating_a_fixture() {

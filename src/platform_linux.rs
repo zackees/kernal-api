@@ -891,6 +891,15 @@ pub(crate) fn spawn_contained_worker(
     worker_from_spawned_child(child)
 }
 
+#[cfg(feature = "tauri-webview")]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    // Host-selected display/session and native loader settings, never guest input.
+    // Do not inherit HOME, credentials, or the full ambient environment.
+    for key in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LD_LIBRARY_PATH", "GDK_BACKEND", "LIBGL_ALWAYS_SOFTWARE", "NO_AT_BRIDGE", "WEBKIT_DISABLE_COMPOSITING_MODE"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
+}
+
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 fn worker_from_spawned_child(
     child: crate::platform::process::SpawnedChild,

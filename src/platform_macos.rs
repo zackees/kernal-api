@@ -954,6 +954,13 @@ pub(crate) fn spawn_contained_worker(
     ))
 }
 
+#[cfg(feature = "tauri-webview")]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    for key in ["TMPDIR", "__CF_USER_TEXT_ENCODING"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
+}
+
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 struct MacosWorkerControl {
     inner: Box<dyn crate::platform::process::SpawnedChildControl>,

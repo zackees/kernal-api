@@ -646,6 +646,11 @@ pub struct WebviewUrlGrant {
 }
 
 impl WebviewUrlGrant {
+    #[cfg(feature = "wasm-sketch-worker")]
+    pub(crate) fn worker_url(&self) -> &str {
+        &self.url
+    }
+
     /// Validate without creating a window or starting native work. Both the
     /// input and canonical URL must fit the fixed 16 KiB authority bound.
     pub fn new(url: &str) -> Result<Self, WebviewError> {

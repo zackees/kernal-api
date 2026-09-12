@@ -6,6 +6,145 @@ use kernal_api::wasm::{
     SketchModulePolicy,
 };
 
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn actual_screenshot_guest_runs_inside_containment() {
+    run_contained_screenshot(false);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual trap-after-capture artifact"]
+fn actual_screenshot_guest_trap_inside_containment_preserves_output() {
+    run_contained_screenshot(true);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+fn run_contained_screenshot(trap: bool) {
+    use kernal_api::wasm::{SketchEpochLimits, SketchWorkerConfig, SketchWorkerTerminal};
+    use std::io::{Read, Write};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+    let artifact = std::env::var_os(if trap {
+        "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM"
+    } else {
+        "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
+    })
+    .expect("built screenshot artifact");
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("viewport.png");
+    let sentinel = directory.path().join("untouched");
+    std::fs::write(&output, b"original").unwrap();
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    struct Server(Arc<AtomicBool>, Option<std::thread::JoinHandle<()>>);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let stopping = Arc::clone(&stop);
+    let thread = std::thread::spawn(move || {
+        while !stopping.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = [0; 4096];
+                    if stream.read(&mut request).unwrap_or(0) > 0 {
+                        let page = include_str!(
+                            "../examples/wasm-tauri-screenshot/fixtures/viewport.html"
+                        );
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("fixture server: {error}"),
+            }
+        }
+    });
+    let _server = Server(stop, Some(thread));
+    let config = SketchWorkerConfig::new(
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker")),
+        Duration::from_secs(2),
+    )
+    .unwrap()
+    .with_webview_capture(
+        kernal_api::webview::WebviewUrlGrant::new(&format!("http://{address}/")).unwrap(),
+        output.clone(),
+    )
+    .unwrap();
+    let epochs = SketchEpochLimits::default();
+    let compiler = SketchCompiler::new(
+        SketchCompilerConfig::default()
+            .with_epoch_limits(
+                SketchEpochLimits::new(
+                    Duration::from_secs(60),
+                    epochs.tick_interval(),
+                    epochs.maximum_active_registrations(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let sketch = Arc::new(
+        compiler
+            .admit(
+                &std::fs::read(artifact).unwrap(),
+                SketchModulePolicy::threaded_rust_v1(32 * 1024 * 1024, 16_384).unwrap(),
+            )
+            .unwrap(),
+    );
+    let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
+    let terminal = runtime.run(sketch.execute_threaded_root_contained(runtime.handle(), &config));
+    if trap {
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Execution(SketchExecutionError::Trapped)
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    } else {
+        assert!(
+            matches!(terminal, SketchWorkerTerminal::Completed(_)),
+            "{terminal:?}"
+        );
+        validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
+    }
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    let counts = sketch.worker_execution_snapshot();
+    assert_eq!(counts.spawned, 1);
+    assert_eq!(counts.reaped, 1);
+    assert_eq!(
+        (
+            counts.live_workers,
+            counts.live_protocol_tasks,
+            counts.pending_root_leases
+        ),
+        (0, 0, 0)
+    );
+    drop(sketch);
+    let counts = compiler.execution_limits_snapshot();
+    assert_eq!(counts.active_root_executions(), 0);
+    assert_eq!(counts.live_stores(), 0);
+    assert_eq!(counts.reserved_shared_memory_bytes(), 0);
+}
+
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes() {

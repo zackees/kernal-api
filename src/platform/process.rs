@@ -498,6 +498,11 @@ pub(crate) struct WorkerLimits {
     pub(crate) job_memory_bytes: Option<u64>,
 }
 
+#[cfg(feature = "tauri-webview")]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    crate::platform_imp::configure_native_worker_environment(command);
+}
+
 /// Semantic stage at which a contained-worker launch or cleanup failed.
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

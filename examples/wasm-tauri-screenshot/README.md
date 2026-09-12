@@ -9,6 +9,14 @@ receives a URL/path string nor reads PNG bytes into guest memory.
 
 ## Current acceptance stage
 
+The library's `SketchWorkerConfig::with_webview_capture` now runs this real
+guest in a separate contained worker on Linux. The focused
+`wasm_tauri_screenshot` tests matching `inside_containment` prove successful
+pixel capture and trap-after-capture output preservation when built with
+`wasm-sketch-worker,tauri-webview-test-support`. They use the same normal/trap
+artifact environment variables documented below. Windows/macOS native worker
+execution, forced native teardown, and migration of the CLI remain pending.
+
 Commit `52d4a3b` preserves the initial real Rust build failure: the generated
 `WebviewUrl`, `run`, and `OperationFuture::wait` interfaces were absent. The
 generated contract, native dispatch, and CLI now run the actual sequence.
@@ -22,7 +30,7 @@ output grants, so the guest now proceeds directly to closing the view.
 This is still an in-progress #20/#21 implementation, not completion of the
 full acceptance matrix. Broader failure-path trace coverage,
 queued/cancelled native-creation destruction evidence, the complete
-failure matrix, killable native-webview worker integration, and native
+failure matrix, CLI worker migration and forced native teardown, and native
 Windows/macOS execution remain outstanding. Do not treat this in-process
 diagnostic CLI as containment for arbitrary untrusted Wasm.
 

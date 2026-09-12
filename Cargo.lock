@@ -992,7 +992,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1175,7 +1175,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1928,7 +1928,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -2843,7 +2843,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3727,7 +3727,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix",
- "windows 0.61.3",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -3906,7 +3906,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4586,7 +4586,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 [[package]]
 name = "tauri"
 version = "2.11.5"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4632,7 +4632,7 @@ dependencies = [
 [[package]]
 name = "tauri-build"
 version = "2.6.3"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "anyhow",
  "cargo_toml",
@@ -4652,7 +4652,7 @@ dependencies = [
 [[package]]
 name = "tauri-codegen"
 version = "2.6.3"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "base64 0.22.1",
  "ico",
@@ -4677,7 +4677,7 @@ dependencies = [
 [[package]]
 name = "tauri-macros"
 version = "2.6.3"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -4690,7 +4690,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime"
 version = "2.11.3"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "cookie",
  "dpi",
@@ -4714,7 +4714,7 @@ dependencies = [
 [[package]]
 name = "tauri-runtime-wry"
 version = "2.11.4"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "gtk",
  "http",
@@ -4731,15 +4731,15 @@ dependencies = [
  "tauri-utils",
  "url",
  "webkit2gtk",
- "webview2-com 0.38.2",
- "windows 0.61.3",
+ "webview2-com 0.39.1",
+ "windows 0.62.2",
  "wry",
 ]
 
 [[package]]
 name = "tauri-utils"
 version = "2.9.3"
-source = "git+https://github.com/zackees/tauri.git?rev=1c1472ff16cce30fa2748b53857268a132549e1f#1c1472ff16cce30fa2748b53857268a132549e1f"
+source = "git+https://github.com/zackees/tauri.git?rev=4e5ab1cc583c05918c1c2b65df6b72e44281189f#4e5ab1cc583c05918c1c2b65df6b72e44281189f"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -4790,10 +4790,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5930,7 +5930,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

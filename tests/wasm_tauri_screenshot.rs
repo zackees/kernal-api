@@ -10,18 +10,33 @@ use kernal_api::wasm::{
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
 fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
-    run_native_screenshot_proof(false);
+    run_native_screenshot_proof(NativeScenario::Capture);
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
 fn actual_screenshot_guest_rejects_redirect_and_drains_without_output() {
-    run_native_screenshot_proof(true);
+    run_native_screenshot_proof(NativeScenario::Redirect);
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
-fn run_native_screenshot_proof(redirect: bool) {
+#[test]
+#[ignore = "requires a native display, actual guest, and the real 30-second load deadline"]
+fn actual_screenshot_guest_times_out_and_drains_without_output() {
+    run_native_screenshot_proof(NativeScenario::Timeout);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeScenario {
+    Capture,
+    Redirect,
+    Timeout,
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+fn run_native_screenshot_proof(scenario: NativeScenario) {
     use std::io::{Read, Write};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -68,7 +83,14 @@ fn run_native_screenshot_proof(redirect: bool) {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).is_ok() {
-                        if redirect {
+                        if scenario == NativeScenario::Timeout {
+                            // Hold the real HTTP request open without finishing
+                            // navigation; only the production host deadline may
+                            // end this load. The fixture remains promptly stoppable.
+                            while !stopping.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        } else if scenario == NativeScenario::Redirect {
                             let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: tauri://localhost/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                         } else {
                             let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
@@ -142,14 +164,29 @@ fn run_native_screenshot_proof(redirect: bool) {
         ),
     )
     .unwrap();
-    if redirect {
-        assert!(!status.success(), "disallowed redirect succeeded");
+    if scenario != NativeScenario::Capture {
+        assert!(!status.success(), "negative native scenario succeeded");
+        if scenario == NativeScenario::Timeout {
+            assert!(
+                start.elapsed() >= Duration::from_secs(30),
+                "load timeout bypassed the production deadline"
+            );
+        }
         let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
         assert!(
-            trace.contains("screenshot-load-rejected"),
-            "wrong typed redirect error: {trace}"
+            !trace.contains("phase=capture-requested"),
+            "failed navigation reached capture"
         );
-        validate_teardown_trace(&trace).expect("redirect failure must drain the actual root");
+        let expected = if scenario == NativeScenario::Redirect {
+            "screenshot-load-rejected"
+        } else {
+            "screenshot-load-timed-out"
+        };
+        assert!(
+            trace.contains(expected),
+            "wrong typed native error (expected {expected}): {trace}"
+        );
+        validate_teardown_trace(&trace).expect("native failure must drain the actual root");
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
         assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);

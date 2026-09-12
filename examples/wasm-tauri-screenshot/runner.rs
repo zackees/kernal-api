@@ -88,7 +88,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .take((MAX_MODULE_BYTES + 1) as u64)
         .read_to_end(&mut bytes)?;
     let policy = SketchModulePolicy::threaded_rust_v1(MAX_MODULE_BYTES, 16_384)?;
-    let compiler = SketchCompiler::new(SketchCompilerConfig::default())?;
+    // The overall command deadline must leave room for the production
+    // 30-second load/capture/close deadlines and five-second guest sleep.
+    // Do not let the compiler's generic 30-second default mask a typed step
+    // timeout. This remains finite and does not replace worker containment.
+    let epochs = kernal_api::wasm::SketchEpochLimits::default();
+    let compiler = SketchCompiler::new(SketchCompilerConfig::default().with_epoch_limits(
+        kernal_api::wasm::SketchEpochLimits::new(
+            Duration::from_secs(120),
+            epochs.tick_interval(),
+            epochs.maximum_active_registrations(),
+        )?,
+    )?)?;
     let sketch = compiler.admit(&bytes, policy)?;
     let runtime = RuntimeBuilder::multi_thread().enable_all().build()?;
     let host = ExternalWebviewHost::new(runtime.handle())?;

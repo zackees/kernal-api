@@ -98,7 +98,7 @@ fn require_abi<T>(value: Result<T, AbiError>) -> T { value.expect("host passed a
 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperationError { Rejected, Cancelled, Closed, Failed }
+pub enum OperationError { Rejected, Cancelled, Closed, Failed, TimedOut }
 pub struct OperationFuture { operation: u64 }
 impl OperationFuture {
     fn submit(kind: u32, arg0: u64, arg1: u64) -> Result<Self, OperationError> {
@@ -107,7 +107,7 @@ impl OperationFuture {
     }
     pub fn poll(&self) -> Result<Option<u64>, OperationError> {
         let packed = imports::operation_poll(self.operation).map_err(|_| OperationError::Failed)?;
-        match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), 7 => Err(OperationError::Rejected), _ => Err(OperationError::Failed) }
+        match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 3 => Err(OperationError::TimedOut), 6 => Err(OperationError::Closed), 7 => Err(OperationError::Rejected), _ => Err(OperationError::Failed) }
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }

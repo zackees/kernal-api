@@ -36,6 +36,7 @@ pub enum Cause {
     Cancelled,
     Closed,
     Failed,
+    TimedOut,
 }
 
 impl Cause {
@@ -45,6 +46,7 @@ impl Cause {
             Self::Cancelled => "cancelled",
             Self::Closed => "closed",
             Self::Failed => "failed",
+            Self::TimedOut => "timed-out",
         }
     }
 }
@@ -77,6 +79,7 @@ impl Failure {
             2 => Cause::Cancelled,
             3 => Cause::Closed,
             4 => Cause::Failed,
+            5 => Cause::TimedOut,
             _ => return None,
         };
         Some(Self { step, cause })
@@ -97,7 +100,7 @@ mod tests {
                 accepted += 1;
             }
         }
-        assert_eq!(accepted, 32);
+        assert_eq!(accepted, 40);
         assert_eq!(Failure::from_code(u32::MAX), None);
     }
 }

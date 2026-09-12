@@ -41,6 +41,7 @@ pub extern "C" fn kernal_api_run() -> u32 {
                 OperationError::Cancelled => Cause::Cancelled,
                 OperationError::Closed => Cause::Closed,
                 OperationError::Failed => Cause::Failed,
+                OperationError::TimedOut => Cause::TimedOut,
             },
         }
         .code(),

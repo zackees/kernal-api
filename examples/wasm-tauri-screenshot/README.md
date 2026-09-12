@@ -74,6 +74,9 @@ The recorder holds at most 512 events; any omitted event fails the proof.
 The actual-guest redirect proof supplies an HTTP redirect to a prohibited
 scheme, requires `screenshot-load-rejected`, preserves the original output and
 unrelated file, and applies the same zero-resource teardown assertions.
+The timeout proof holds the real HTTP request open for the production
+30-second load deadline, requires `screenshot-load-timed-out`, forbids capture,
+and applies the same output-preservation and teardown checks.
 These observations do not establish the remaining failure matrix.
 Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.
@@ -119,10 +122,15 @@ different client hub. Native jobs are bounded and joined; cancelled native
 creation and capture retain separate four-request admission until callbacks
 release them. Failed root execution reports a semantic host error; full guest
 status includes its failing step and semantic operation error. The shared
-`status.rs` encodes eight steps and four causes in the already-admitted
+`status.rs` encodes eight steps and five causes in the already-admitted
 `proc_exit` scalar; it introduces no import, path, payload, or logging grant.
-For example, missing URL authority is exit 17, and a rejected load is exit 65.
+For example, missing URL authority is exit 17, a rejected load is exit 65,
+and a timed-out load is exit 69.
+The CLI uses a finite 120-second whole-root epoch budget, leaving room for
+the production 30-second operation deadlines and five-second wait. The
+generic compiler default remains 30 seconds; using it unchanged here masked
+the load timeout with a whole-root `deadline-exceeded` error.
 Actual traps remain `trapped`, distinct from these reported failures. The
 generated poll decoder preserves rejected status 7 rather than collapsing it
-to a generic failure. Timeout-specific causes and the rest of the negative
-matrix remain required, as does a PowerShell build entry point.
+to a generic failure; status 3 is preserved as `TimedOut`. The rest of the
+negative matrix remains required, as does a PowerShell build entry point.

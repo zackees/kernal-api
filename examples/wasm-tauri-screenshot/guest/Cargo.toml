@@ -1,0 +1,12 @@
+[package]
+name = "kernal-api-wasm-tauri-guest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+publish = false
+
+# Source-only application guest, not another public facade or host dependency.
+[workspace]
+
+[dependencies]
+kernal-api-v1-bindings = { path = "../../../src/wasm/generated/v1/guest" }

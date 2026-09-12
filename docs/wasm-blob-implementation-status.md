@@ -39,8 +39,8 @@ total allocated memory, collection capacity, or simultaneous guest transfers.
   consumers; exercise scheduler races through real guest threads.
 - Integrate output commit with the operation terminal winner. Final replacement
   now serializes resource revocation under the hub lock, but the synchronous
-  helper still needs exclusive blob consumption and a cancellable commit
-  operation dispatched on the caller's blocking lane. A stalled filesystem
+  helper reserves exclusive blob consumption but still needs a cancellable
+  commit operation dispatched on the caller's blocking lane. A stalled filesystem
   replacement holds the hub lock; worker containment must bound this case.
 - Grant output before guest execution and pass only its semantic handle.
 - Exercise 64 MiB through the real generated guest ABI, including slow-consumer

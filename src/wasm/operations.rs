@@ -163,6 +163,7 @@ struct ResourceSlot {
     shareable: bool,
     value: ResourceValue,
     reserved: bool,
+    committing: bool,
 }
 
 enum ResourceValue {
@@ -664,11 +665,24 @@ impl OperationHub {
         blob: OpaqueToken,
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, HubError> {
+        self.read_blob_chunk(store, blob, maximum_bytes, false)
+    }
+
+    fn read_blob_chunk(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        maximum_bytes: usize,
+        committing: bool,
+    ) -> Result<Vec<u8>, HubError> {
         if maximum_bytes > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
+        if resource.committing != committing {
+            return Err(HubError::WrongRights);
+        }
         Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)?;
         let ResourceValue::Blob { buffer, .. } = &mut resource.value else {
             return Err(HubError::WrongKind);
@@ -948,23 +962,35 @@ impl OperationHub {
     ) -> std::io::Result<()> {
         let destination = self.exact_output_path(store, output)?;
         {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .map_err(|_| hub_io_error(HubError::Closed))?;
+            if state
+                .operations
+                .values()
+                .any(|operation| operation.resource == Some(blob) && operation.terminal.is_none())
+            {
+                return Err(hub_io_error(HubError::WrongRights));
+            }
             let resource = state
                 .resources
-                .get(&blob)
+                .get_mut(&blob)
                 .ok_or_else(|| hub_io_error(HubError::Invalid))?;
             Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)
                 .map_err(hub_io_error)?;
+            if resource.committing {
+                return Err(hub_io_error(HubError::WrongRights));
+            }
             if !matches!(resource.value, ResourceValue::Blob { sealed: true, .. }) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WouldBlock,
                     "blob producer has not published EOF",
                 ));
             }
+            resource.committing = true;
         }
+        let _consumption = BlobCommitLease { hub: self, blob };
         let temporary = self.temporary_output_path(&destination)?;
         // Only clean up a file this operation successfully created. A
         // competing creator must never have its file removed on open failure.
@@ -975,7 +1001,7 @@ impl OperationHub {
         let result = (|| {
             loop {
                 let chunk = self
-                    .blob_read(store, blob, self.blob_limits.maximum_chunk_bytes)
+                    .read_blob_chunk(store, blob, self.blob_limits.maximum_chunk_bytes, true)
                     .map_err(hub_io_error)?;
                 if chunk.is_empty() {
                     break;
@@ -1152,6 +1178,7 @@ impl OperationHub {
                 shareable,
                 value,
                 reserved: true,
+                committing: false,
             },
         );
         Ok(token)
@@ -1173,6 +1200,9 @@ impl OperationHub {
         }
         if let Some(resource) = resource {
             let slot = state.resources.get(&resource).ok_or(HubError::Invalid)?;
+            if slot.committing {
+                return Err(HubError::WrongRights);
+            }
             if slot.reserved {
                 return Err(HubError::Closed);
             }
@@ -1489,6 +1519,19 @@ impl OperationHub {
     }
 }
 
+#[cfg(feature = "wasm-sketch-host")]
+struct BlobCommitLease<'a> {
+    hub: &'a OperationHub,
+    blob: OpaqueToken,
+}
+
+#[cfg(feature = "wasm-sketch-host")]
+impl Drop for BlobCommitLease<'_> {
+    fn drop(&mut self) {
+        let _ = self.hub.close_resource(self.blob);
+    }
+}
+
 fn next(counter: &AtomicU64) -> Result<u64, HubError> {
     counter
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
@@ -1543,6 +1586,38 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn output_commit_refuses_a_blob_with_a_pending_reader() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("final");
+        let hub = OperationHub::new(4, 4).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let output = hub.grant_exact_output(1, &destination).unwrap();
+        let read = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert!(hub.commit_blob_to_output(1, blob, output).is_err());
+        assert!(!destination.exists());
+        assert_eq!(hub.take_blob_read(1, read), Ok(None));
+    }
+
+    #[test]
+    fn commit_consumption_excludes_other_readers_and_generated_submissions() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"data").unwrap();
+        hub.seal_blob(1, blob).unwrap();
+        hub.state
+            .lock()
+            .unwrap()
+            .resources
+            .get_mut(&blob)
+            .unwrap()
+            .committing = true;
+        assert_eq!(hub.blob_read(1, blob, 4), Err(HubError::WrongRights));
+        assert_eq!(hub.submit_blob_read(1, blob, 4), Err(HubError::WrongRights));
+        assert_eq!(hub.read_blob_chunk(1, blob, 4, true).unwrap(), b"data");
+    }
 
     #[cfg(feature = "wasm-sketch-host")]
     #[test]

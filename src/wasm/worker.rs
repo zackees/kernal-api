@@ -89,7 +89,10 @@ pub enum SketchWorkerFailure {
     WorkerForcedContainment,
     OutputGrant,
     OutputCommit,
+    /// Staging cleanup failed without publishing a new final file.
     OutputCleanup,
+    /// The final file was atomically replaced, but staging cleanup failed.
+    OutputCommittedCleanup,
 }
 impl SketchWorkerFailure {
     pub fn code(self) -> &'static str {
@@ -105,6 +108,7 @@ impl SketchWorkerFailure {
             Self::OutputGrant => "worker-output-grant",
             Self::OutputCommit => "worker-output-commit",
             Self::OutputCleanup => "worker-output-cleanup",
+            Self::OutputCommittedCleanup => "worker-output-committed-cleanup",
         }
     }
 }
@@ -933,7 +937,7 @@ fn finish_output(
     if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
         match output.commit() {
             Ok(committed) if committed.cleanup.is_ok() => terminal,
-            Ok(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCleanup),
+            Ok(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCommittedCleanup),
             Err(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCommit),
         }
     } else if output.discard().is_err() {
@@ -1335,6 +1339,41 @@ mod tests {
     use crate::platform::process::{WorkerChild, WorkerChildControl, WorkerError, WorkerStage};
     use std::io;
     use std::sync::{mpsc, Condvar, Mutex};
+
+    #[test]
+    fn output_cleanup_failure_reports_whether_publication_occurred() {
+        for publish in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("final");
+            std::fs::write(&destination, b"original").unwrap();
+            let output = output::StagedOutput::new(&destination)
+                .unwrap()
+                .with_cleanup_failure();
+            std::fs::write(output.worker_destination(), b"completed").unwrap();
+            let terminal = if publish {
+                SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started)
+            } else {
+                SketchWorkerTerminal::Execution(SketchExecutionError::Trapped)
+            };
+            let result = finish_output(Some(output), terminal, None);
+            assert_eq!(
+                result.code(),
+                if publish {
+                    "worker-output-committed-cleanup"
+                } else {
+                    "worker-output-cleanup"
+                }
+            );
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                if publish {
+                    &b"completed"[..]
+                } else {
+                    &b"original"[..]
+                }
+            );
+        }
+    }
 
     #[test]
     fn parent_output_discards_on_failure_or_stop_and_commits_only_success() {

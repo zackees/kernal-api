@@ -114,6 +114,13 @@ x86-64 in 11.61 seconds. Both smoke scripts explicitly build the test-support
 worker and run `cargo_built_threaded_guest_forced_output_cleanup`; ordinary
 worker builds contain no pause hook. Native macOS/Windows evidence remains
 outstanding, as do failure cases for parent-side filesystem cleanup itself.
+An injected parent cleanup-boundary failure exposed an outcome ambiguity:
+post-replacement failure previously used the same public code as failed discard.
+The facade now reports `worker-output-committed-cleanup` when publication
+succeeded, and `worker-output-cleanup` when discard failed without publication.
+The RED/GREEN regression checks both error codes and actual final bytes;
+all 22 worker unit tests pass. This injection tests error classification, not
+a native filesystem driver's cleanup failure or eventual cleanup retry.
 The private protocol is now version 4, with an optional staging destination
 bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
 without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub(super) struct StagedOutput {
     directory: tempfile::TempDir,
     destination: PathBuf,
+    #[cfg(test)]
+    fail_cleanup: bool,
 }
 
 pub(super) struct CommittedOutput {
@@ -31,6 +33,8 @@ impl StagedOutput {
         Ok(Self {
             directory,
             destination: parent.join(name),
+            #[cfg(test)]
+            fail_cleanup: false,
         })
     }
 
@@ -55,13 +59,27 @@ impl StagedOutput {
             .sync_all()?;
         crate::fs_replace_file(&staged, &self.destination)?;
         Ok(CommittedOutput {
-            cleanup: self.directory.close(),
+            cleanup: self.cleanup(),
         })
     }
 
     /// Explicit cleanup lets the supervisor report failure instead of relying
     /// solely on best-effort Drop. This must also follow worker reap.
     pub(super) fn discard(self) -> io::Result<()> {
+        self.cleanup()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_cleanup_failure(mut self) -> Self {
+        self.fail_cleanup = true;
+        self
+    }
+
+    fn cleanup(self) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_cleanup {
+            return Err(io::Error::other("injected parent staging cleanup failure"));
+        }
         self.directory.close()
     }
 }

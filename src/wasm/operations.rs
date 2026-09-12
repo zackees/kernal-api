@@ -90,6 +90,9 @@ pub(crate) struct HubSnapshot {
     pub(crate) peak_buffered_blob_bytes: usize,
     pub(crate) pending_write_bytes: usize,
     pub(crate) completed_read_bytes: usize,
+    /// Actual buffer capacities currently retained by the hub, including
+    /// unused blob capacity, pending inputs, and uncollected read results.
+    pub(crate) retained_transfer_capacity: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -1783,6 +1786,23 @@ impl OperationHub {
                 .filter_map(|operation| operation.blob_read_result.as_ref())
                 .map(Vec::len)
                 .sum(),
+            retained_transfer_capacity: state
+                .resources
+                .values()
+                .map(|resource| match &resource.value {
+                    ResourceValue::Blob { buffer, .. } => buffer.capacity(),
+                    _ => 0,
+                })
+                .chain(state.operations.values().map(|operation| {
+                    operation
+                        .pending_blob_write
+                        .as_ref()
+                        .map_or(0, Vec::capacity)
+                        .saturating_add(
+                            operation.blob_read_result.as_ref().map_or(0, Vec::capacity),
+                        )
+                }))
+                .fold(0_usize, usize::saturating_add),
         }
     }
 }
@@ -2052,6 +2072,27 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn capacity_snapshot_includes_partial_blob_and_uncollected_read_allocations() {
+        let hub = OperationHub::with_blob_limits(4, 1, BlobLimits::new(1024, 1024, 1024).unwrap())
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, &[7; 1024]).unwrap();
+        let read = hub.submit_blob_read(1, blob, 512).unwrap();
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.buffered_blob_bytes, 512);
+        assert_eq!(snapshot.completed_read_bytes, 512);
+        assert!(
+            snapshot.retained_transfer_capacity >= 1536,
+            "partial drain retains backing capacity plus the read result"
+        );
+        drop(hub.take_blob_read(1, read).unwrap());
+        drop(hub.blob_read(1, blob, 512).unwrap());
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
     }
 
     #[test]

@@ -70,6 +70,14 @@ transfers.
 
 ## Remaining acceptance work
 
+The capacity audit now measures `retained_transfer_capacity` separately from
+payload lengths. A regression demonstrates why aggregate enforcement is still
+required: after writing 1,024 bytes and reading 512 without collection, the hub
+retains at least 1,536 bytes of backing capacity (1,024 in the partially drained
+blob plus 512 in the result), although payload-length counters total 1,024.
+The counter covers hub-owned allocations only, not temporary buffers held by
+the output writer or caller. It is a current measurement, not a peak or quota.
+
 - Extend the sole generated ABI with bounded guest-memory transfers and
   semantic blob/output APIs; retain no guest pointer across suspension.
 - Configure and account total bytes, live blobs, pending reads/writes, and all

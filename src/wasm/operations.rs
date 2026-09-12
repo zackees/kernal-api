@@ -300,6 +300,8 @@ impl Drop for OutputJobLease {
 
 /// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
+    #[cfg(all(test, feature = "wasm-sketch-host"))]
+    output_fault: Mutex<Option<OutputFault>>,
     output_job_failed: AtomicBool,
     output_job_count: AtomicU64,
     scope: u64,
@@ -324,6 +326,8 @@ impl OperationHub {
     ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
+            #[cfg(all(test, feature = "wasm-sketch-host"))]
+            output_fault: Mutex::new(None),
             output_job_failed: AtomicBool::new(false),
             output_job_count: AtomicU64::new(0),
             scope,
@@ -1468,8 +1472,12 @@ impl OperationHub {
                     .as_mut()
                     .expect("open temporary")
                     .write_all(&chunk)?;
+                #[cfg(test)]
+                self.inject_output_fault(OutputFault::AfterWrite)?;
             }
             self.check_output_operation(store, blob, output, operation)?;
+            #[cfg(test)]
+            self.inject_output_fault(OutputFault::Sync)?;
             temporary
                 .file
                 .as_ref()
@@ -1480,6 +1488,16 @@ impl OperationHub {
         })();
         temporary.committed = result.is_ok();
         result
+    }
+
+    #[cfg(all(test, feature = "wasm-sketch-host"))]
+    fn inject_output_fault(&self, stage: OutputFault) -> std::io::Result<()> {
+        let mut fault = self.output_fault.lock().unwrap();
+        if *fault == Some(stage) {
+            *fault = None;
+            return Err(std::io::Error::other("injected output I/O failure"));
+        }
+        Ok(())
     }
 
     /// Cooperative checkpoints do not interrupt an already-issued filesystem
@@ -1575,6 +1593,8 @@ impl OperationHub {
         };
         // Revocation cannot interleave between this last authority check and
         // the filesystem commit. No await, callback, or guest re-entry occurs.
+        #[cfg(test)]
+        self.inject_output_fault(OutputFault::Replace)?;
         crate::fs_replace_file(temporary, destination)?;
         let mut wakes = Vec::new();
         if let Some(token) = operation {
@@ -2121,6 +2141,14 @@ impl OperationHub {
     }
 }
 
+#[cfg(all(test, feature = "wasm-sketch-host"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputFault {
+    AfterWrite,
+    Sync,
+    Replace,
+}
+
 #[cfg(feature = "wasm-sketch-host")]
 struct TemporaryOutput {
     file: Option<File>,
@@ -2261,6 +2289,66 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn injected_output_io_failures_preserve_final_and_reclaim_temp_and_buffers() {
+        for stage in [
+            OutputFault::AfterWrite,
+            OutputFault::Sync,
+            OutputFault::Replace,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("final");
+            fs::write(&path, b"original").unwrap();
+            let hub =
+                OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let blob = hub.create_blob(1).unwrap();
+            hub.blob_write(1, blob, b"part").unwrap();
+            hub.blob_write(1, blob, b"rest").unwrap();
+            hub.seal_blob(1, blob).unwrap();
+            let output = hub.grant_exact_output(1, &path).unwrap();
+            *hub.output_fault.lock().unwrap() = Some(stage);
+            let operation = hub
+                .submit_output_commit(runtime.handle(), 1, blob, output)
+                .unwrap();
+            runtime.run(async {
+                crate::async_engine::timeout(std::time::Duration::from_secs(2), async {
+                    loop {
+                        if let Some(result) = hub.take_terminal(operation, 1).unwrap() {
+                            assert_eq!(result.terminal, Terminal::Rejected, "{stage:?}");
+                            break;
+                        }
+                        crate::async_engine::yield_now().await;
+                    }
+                    hub.close_all(Terminal::Closed);
+                    hub.join_output_jobs().await.unwrap();
+                })
+                .await
+                .unwrap();
+            });
+            assert_eq!(
+                *hub.output_fault.lock().unwrap(),
+                None,
+                "fault must be reached"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"original", "{stage:?}");
+            assert_eq!(
+                fs::read_dir(directory.path()).unwrap().count(),
+                1,
+                "{stage:?}"
+            );
+            let snapshot = hub.snapshot();
+            assert_eq!(snapshot.live_resources, 0);
+            assert_eq!(snapshot.pending_operations, 0);
+            assert_eq!(snapshot.active_output_jobs, 0);
+            assert_eq!(snapshot.retained_transfer_capacity, 0);
+        }
     }
 
     #[cfg(feature = "wasm-sketch-host")]

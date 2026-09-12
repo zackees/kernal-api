@@ -44,6 +44,12 @@ pending and subsequent writes.
   the source blob unconsumed. Cancellation during a syscall cannot interrupt
   that syscall, but the next checkpoint stops further work. Atomic replacement
   still checks the terminal winner under the hub lock.
+- Test-only error checkpoints now exercise the actual async output job after
+  its first written chunk, before sync, and before atomic replacement. Each
+  path returns `Rejected`, preserves the existing final file, removes its
+  temporary, and reaches zero resources, operations, output jobs, and retained
+  transfer capacity after teardown/join. These are injected boundary errors,
+  not failures induced in native filesystem drivers.
 - An ownership guard now closes and removes the temporary file on unwind as
   well as ordinary errors. Focused injected-panic tests cover partial writes
   and the post-sync/close, pre-replacement boundary while preserving the

@@ -88,6 +88,19 @@ transfers.
 
 ## Remaining acceptance work
 
+Strict lint validation passes for `soldr cargo clippy --locked --features
+wasm-sketch-worker --all-targets -- -D warnings` and the host-only library
+variant (`--features wasm-sketch-host --lib`). Worker-only helpers now match
+their consumers' feature gates.
+
+The no-default dependency graph is **not** acceptance-complete: `soldr cargo
+tree --locked --no-default-features -e normal --prefix none` still includes
+`png` and `x11rb` through mandatory `running-process-platform-internal`
+4.10.10. Its Linux dependency declarations are unconditional, as already
+noted in `Cargo.toml`; this requires an upstream feature-gating release, not
+a facade-only optional-dependency change. The manifest isolation test alone
+does not prove this transitive graph requirement.
+
 The shared hub now enforces independent live-blob, pending-read, and
 pending-write count limits (128 each by default). Hosts configure these and
 chunk/per-blob/per-sketch byte limits through facade-owned `SketchBlobLimits`

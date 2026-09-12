@@ -29,6 +29,7 @@ const CONTAINMENT_DEADLINE: Duration = Duration::from_secs(1);
 // exact live native identity before their intentional action.  Keep their
 // worker deadline beyond the outer acquisition bound so normal containment
 // cannot race the proof into a false success.
+#[cfg(feature = "wasm-sketch-worker-test-support")]
 const FAILURE_PROOF_DEADLINE: Duration = Duration::from_secs(30);
 const GRACE: Duration = Duration::from_secs(1);
 

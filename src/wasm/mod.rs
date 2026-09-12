@@ -1143,6 +1143,7 @@ pub struct ThreadSpawnRejectionSummary {
     epoch: u32,
 }
 impl ThreadSpawnRejectionSummary {
+    #[cfg(feature = "wasm-sketch-worker")]
     pub(crate) const fn from_worker_counts(
         capacity: u32,
         closing: u32,

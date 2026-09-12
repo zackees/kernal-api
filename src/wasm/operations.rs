@@ -804,6 +804,13 @@ impl OperationHub {
     }
 
     fn drive_blob_writes(&self) -> Result<(), HubError> {
+        // Each successful pass terminalizes at least one operation. Revisit
+        // writes after reads release capacity, without recursive pumping.
+        while self.drive_blob_write_pass()? {}
+        Ok(())
+    }
+
+    fn drive_blob_write_pass(&self) -> Result<bool, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let tokens: Vec<_> = state
             .operations
@@ -863,11 +870,11 @@ impl OperationHub {
             }
         }
         drop(state);
+        let progressed = !wakes.is_empty();
         for wake in wakes {
             wake.notify_one();
         }
-        self.drive_blob_reads()?;
-        Ok(())
+        Ok(self.drive_blob_read_pass()? || progressed)
     }
 
     pub(crate) fn submit_blob_read(
@@ -894,6 +901,10 @@ impl OperationHub {
     }
 
     fn drive_blob_reads(&self) -> Result<(), HubError> {
+        self.drive_blob_read_pass().map(|_| ())
+    }
+
+    fn drive_blob_read_pass(&self) -> Result<bool, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let tokens: Vec<_> = state
             .operations
@@ -945,10 +956,11 @@ impl OperationHub {
             }
         }
         drop(state);
+        let progressed = !wakes.is_empty();
         for wake in wakes {
             wake.notify_one();
         }
-        Ok(())
+        Ok(progressed)
     }
 
     /// Copy a terminal bounded result during the collecting import. Invalid
@@ -1534,6 +1546,7 @@ impl OperationHub {
         for notify in notifications {
             notify.notify_one();
         }
+        self.drive_blob_writes()?;
         Ok(())
     }
 
@@ -2152,6 +2165,47 @@ mod tests {
         hub.close_all(Terminal::Closed);
         assert_eq!(hub.snapshot().pending_operations, 0);
         assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+    }
+
+    #[test]
+    fn generated_close_resumes_another_blobs_capacity_waiter() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let first = hub.create_blob(1).unwrap();
+        let second = hub.create_blob(1).unwrap();
+        hub.blob_write(1, first, b"full").unwrap();
+        let write = hub.submit_blob_write(1, second, b"next").unwrap();
+        let close = hub
+            .submit_wire(runtime.handle(), 1, OP_SYNTHETIC_RESOURCE_CLOSE, first.0, 0)
+            .unwrap();
+        let wake = hub.suspend_wire(1, close).unwrap();
+        runtime.run(async { wake.notified().await });
+        assert_eq!(hub.poll_wire(1, close) as u8, STATUS_COMPLETED);
+        assert!(
+            hub.take_terminal(write, 1).unwrap().is_some(),
+            "generated close must drive writes"
+        );
+    }
+
+    #[test]
+    fn read_progress_drives_previously_skipped_writers_without_collection() {
+        let hub = OperationHub::with_blob_limits(8, 3, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let a = hub.create_blob(1).unwrap();
+        let b = hub.create_blob(1).unwrap();
+        let c = hub.create_blob(1).unwrap();
+        hub.blob_write(1, a, b"full").unwrap();
+        hub.blob_write(1, a, b"full").unwrap();
+        hub.submit_blob_write(1, b, b"next").unwrap();
+        let last = hub.submit_blob_write(1, c, b"last").unwrap();
+        hub.submit_blob_read(1, b, 4).unwrap();
+        hub.submit_blob_read(1, a, 4).unwrap();
+        assert!(
+            hub.take_terminal(last, 1).unwrap().is_some(),
+            "read progress must revisit skipped writers"
+        );
     }
 
     #[test]

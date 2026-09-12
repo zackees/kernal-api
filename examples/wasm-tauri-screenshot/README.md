@@ -133,6 +133,12 @@ recreated parent or sibling temporary file, unchanged preserved files, and
 zero captured blobs/output jobs/native/Wasm resources. This is a missing-parent
 I/O failure in explicit diagnostic mode, not yet a contained permissions or
 disk-exhaustion proof.
+The default contained publication-failure proof instead preserves the original
+file and places a nonempty directory at its final path after grants are installed.
+The guest completes real capture and staging; the parent reports
+`worker-output-commit`, removes staging, preserves the fixture-owned files and
+obstruction, and reports zero worker/root resources. This covers real atomic
+replacement failure without introducing a fake capture or filesystem backend.
 The trap proof compiles the same actual guest with the explicit
 `proof-trap-after-capture` feature. It traps only after the native capture
 result returns through the generated ABI, before output commit. The test

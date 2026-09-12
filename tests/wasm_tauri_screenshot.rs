@@ -282,6 +282,7 @@ enum NativeScenario {
     ContainedCapture,
     ContainedTrap,
     MissingWorker,
+    PublicationFailure,
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
@@ -303,6 +304,13 @@ fn default_screenshot_cli_uses_containment_and_preserves_output_on_trap() {
 #[ignore = "requires the actual built screenshot artifact"]
 fn default_screenshot_cli_missing_worker_never_falls_back() {
     run_native_screenshot_proof(NativeScenario::MissingWorker);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn default_screenshot_cli_publication_failure_cleans_staging() {
+    run_native_screenshot_proof(NativeScenario::PublicationFailure);
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
@@ -382,6 +390,20 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).is_ok() {
+                        if scenario == NativeScenario::PublicationFailure && !relocated {
+                            // Parent staging already exists. Preserve the original
+                            // file and obstruct only final atomic publication;
+                            // guest capture and its private staged write remain real.
+                            let destination = fixture_output_directory.join("viewport.png");
+                            std::fs::rename(
+                                &destination,
+                                fixture_output_directory.join("preserved-original"),
+                            )
+                            .unwrap();
+                            std::fs::create_dir(&destination).unwrap();
+                            std::fs::write(destination.join("keep"), b"obstruction").unwrap();
+                            relocated = true;
+                        }
                         if scenario == NativeScenario::MissingOutputParent && !relocated {
                             // Reaching this HTTP request proves URL/output grants
                             // were already installed and the guest opened its view.
@@ -427,6 +449,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             | NativeScenario::MissingWorker
             | NativeScenario::Redirect
             | NativeScenario::Timeout
+            | NativeScenario::PublicationFailure
     );
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"));
     if !contained {
@@ -497,6 +520,17 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             validate_execution_trace(&trace).expect("contained ABI and timing trace");
             assert!(trace.contains("terminal=worker-completed"), "{trace}");
             validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
+        } else if scenario == NativeScenario::PublicationFailure {
+            validate_execution_trace(&trace)
+                .expect("guest completed real capture and staged output before parent failure");
+            assert!(trace.contains("terminal=worker-output-commit"), "{trace}");
+            assert!(output.is_dir());
+            assert_eq!(std::fs::read(output.join("keep")).unwrap(), b"obstruction");
+            assert_eq!(
+                std::fs::read(directory.join("preserved-original")).unwrap(),
+                b"original"
+            );
+            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
         } else if matches!(scenario, NativeScenario::Redirect | NativeScenario::Timeout) {
             validate_teardown_trace(&trace).expect("contained load failure cleanup trace");
             let expected = if scenario == NativeScenario::Timeout {
@@ -523,7 +557,14 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             .unwrap()
             .is_empty());
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            if scenario == NativeScenario::PublicationFailure {
+                3
+            } else {
+                2
+            }
+        );
         return;
     }
     if scenario != NativeScenario::Capture {

@@ -223,6 +223,16 @@ trace plus parent worker/task/lease counters are zero. The old unreachable
 in-process load-failure assertions were removed rather than counting two modes
 as separate acceptance evidence.
 
+A real contained publication-failure proof passes on Linux in 9.29 seconds.
+After the guest's HTTP request establishes that grants/staging exist, the fixture
+preserves its original output under another name and places a nonempty directory
+at the final destination. The unchanged actual guest completes native capture,
+its private staged write, and close; final atomic replacement then fails with
+`worker-output-commit`. The transported execution/timing/zero-resource trace
+passes, parent counters drain, staging disappears, and the preserved original,
+neighbor, and obstructing directory contents are unchanged. This is a native
+replacement failure, not a permissions/disk-exhaustion or renamed-parent proof.
+
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
 success before the fix; it now verifies success, failure, zero, and unknown

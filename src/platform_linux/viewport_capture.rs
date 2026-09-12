@@ -40,6 +40,7 @@ pub(crate) fn capture(
     view: &wry::WebView,
     hub: Arc<OperationHub>,
     store: u64,
+    operation: OpaqueToken,
     maximum_pixels: u64,
     maximum_encoded_bytes: usize,
     completed: impl FnOnce(Result<OpaqueToken, CaptureError>) + 'static,
@@ -66,7 +67,8 @@ pub(crate) fn capture(
                 result
                     .map_err(|_| CaptureError::NativeFailure)
                     .and_then(|surface| {
-                        encode_surface(surface, encoder, maximum_pixels, &callback_cancellation)
+                        encode_surface_with(surface, encoder, maximum_pixels, &callback_cancellation,
+                            |encoder| encoder.finish_for_operation(operation))
                     })
             };
             completed(result);
@@ -75,11 +77,22 @@ pub(crate) fn capture(
     Ok(cancellation)
 }
 
+#[cfg(test)]
 fn encode_surface(
+    surface: cairo::Surface,
+    encoder: NativeBlobEncoder,
+    maximum_pixels: u64,
+    cancellation: &gio::Cancellable,
+) -> Result<OpaqueToken, CaptureError> {
+    encode_surface_with(surface, encoder, maximum_pixels, cancellation, NativeBlobEncoder::finish)
+}
+
+fn encode_surface_with(
     surface: cairo::Surface,
     mut encoder: NativeBlobEncoder,
     maximum_pixels: u64,
     cancellation: &gio::Cancellable,
+    publish: impl FnOnce(NativeBlobEncoder) -> Result<OpaqueToken, crate::operations::HubError>,
 ) -> Result<OpaqueToken, CaptureError> {
     if cancellation.is_cancelled() {
         return Err(CaptureError::Cancelled);
@@ -98,7 +111,10 @@ fn encode_surface(
     if cancellation.is_cancelled() {
         return Err(CaptureError::Cancelled);
     }
-    encoder.finish().map_err(|_| CaptureError::BlobLimit)
+    publish(encoder).map_err(|error| match error {
+        crate::operations::HubError::Closed | crate::operations::HubError::Invalid => CaptureError::Cancelled,
+        _ => CaptureError::BlobLimit,
+    })
 }
 
 #[cfg(test)]

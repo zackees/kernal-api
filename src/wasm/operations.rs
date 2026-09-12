@@ -2242,7 +2242,20 @@ impl NativeBlobEncoder {
         result
     }
 
-    pub(crate) fn finish(mut self) -> Result<OpaqueToken, HubError> {
+    pub(crate) fn finish(self) -> Result<OpaqueToken, HubError> {
+        self.finish_inner(None)
+    }
+
+    /// Atomically publish encoded storage and complete its native operation.
+    /// Cancellation/close and publication choose one winner under the hub lock.
+    pub(crate) fn finish_for_operation(
+        self,
+        operation: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.finish_inner(Some(operation))
+    }
+
+    fn finish_inner(mut self, operation: Option<OpaqueToken>) -> Result<OpaqueToken, HubError> {
         if let Some(error) = self.failure {
             return Err(error);
         }
@@ -2250,6 +2263,26 @@ impl NativeBlobEncoder {
         let mut state = self.hub.state.lock().map_err(|_| HubError::Closed)?;
         if state.closed {
             return Err(HubError::Closed);
+        }
+        if let Some(operation) = operation {
+            let pending = state.operations.get(&operation).ok_or(HubError::Closed)?;
+            if pending.owner.store != self.store {
+                return Err(HubError::WrongRights);
+            }
+            if pending.terminal.is_some() {
+                return Err(HubError::Closed);
+            }
+            if pending.created_resource.is_some() {
+                return Err(HubError::WrongRights);
+            }
+            let view = pending.resource.ok_or(HubError::WrongKind)?;
+            let view = state.resources.get(&view).ok_or(HubError::Closed)?;
+            OperationHub::validate_resource(
+                view,
+                self.store,
+                EXTERNAL_WEBVIEW_RESOURCE_KIND,
+                EXTERNAL_WEBVIEW_RIGHT_LOAD,
+            )?;
         }
         let resource = state.resources.get_mut(&token).ok_or(HubError::Closed)?;
         OperationHub::validate_resource_owner(
@@ -2266,8 +2299,29 @@ impl NativeBlobEncoder {
         };
         *sealed = true;
         resource.identity.rights = BLOB_RIGHT_READ;
-        resource.reserved = false;
+        resource.reserved = operation.is_some();
+        let notify = if let Some(operation) = operation {
+            state
+                .operations
+                .get_mut(&operation)
+                .ok_or(HubError::Closed)?
+                .created_resource = Some(token);
+            OperationHub::terminal_locked(
+                &mut state,
+                operation,
+                TerminalResult {
+                    terminal: Terminal::Completed,
+                    resource: Some(token),
+                },
+            )?
+        } else {
+            None
+        };
         self.blob = None;
+        drop(state);
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
         Ok(token)
     }
 }
@@ -2415,6 +2469,52 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_encoder_operation_publication_has_one_terminal_winner() {
+        use std::io::Write as _;
+        for revoke in [0, 1, 2] {
+            let hub =
+                OperationHub::with_blob_limits(4, 3, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+            let (view, open) = hub.begin_external_webview_open(7).unwrap();
+            hub.finish_external_open(open, view);
+            hub.observe_terminal(7, open).unwrap().unwrap();
+            let operation = hub.begin_external_webview_wait(7, view).unwrap();
+            let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 8).unwrap();
+            encoder.write_all(b"encoded").unwrap();
+            match revoke {
+                1 => hub.finish_external_operation(operation, Terminal::Cancelled),
+                2 => {
+                    hub.close_resource(view).unwrap();
+                }
+                _ => {}
+            }
+            let published = encoder.finish_for_operation(operation);
+            let terminal = hub.observe_terminal(7, operation).unwrap().unwrap();
+            if revoke == 0 {
+                let blob = published.unwrap();
+                assert_eq!(terminal.terminal, Terminal::Completed);
+                assert_eq!(terminal.resource, Some(blob));
+                assert_eq!(hub.blob_read(7, blob, 4).unwrap(), b"enco");
+                hub.close_resource(blob).unwrap();
+            } else {
+                assert_eq!(published, Err(HubError::Closed));
+                assert_eq!(
+                    terminal.terminal,
+                    if revoke == 1 {
+                        Terminal::Cancelled
+                    } else {
+                        Terminal::Closed
+                    }
+                );
+                assert_eq!(terminal.resource, None);
+            }
+            hub.close_all(Terminal::Closed);
+            assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+            assert_eq!(hub.snapshot().live_blobs, 0);
+            assert_eq!(hub.snapshot().pending_operations, 0);
+        }
+    }
 
     #[test]
     fn native_encoder_publishes_only_sealed_read_only_quota_accounted_blob() {

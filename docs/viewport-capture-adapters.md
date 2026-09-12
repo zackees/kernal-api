@@ -39,6 +39,11 @@ partial hub-owned encoding immediately, even while the callback still holds its
 encoder. A RED-to-GREEN regression checks both revocation paths before dropping
 the encoder, including buffered-byte accounting and rejection of later writes.
 Native browser image ownership still lasts until the callback releases it.
+The same sink now supports bounded seeking and overwriting for the Windows
+`IStream` adapter: seeks allocate nothing, overwrites reuse reserved storage,
+and holes are filled through chunked quota admission only when written.
+Tests cover header rewrites, zero-filled holes, invalid seeks, and cleanup.
+This is shared storage support, not an implemented Windows COM adapter.
 
 Linux validation: `soldr cargo check --features tauri-webview --lib`, the
 five `viewport_capture::tests` unit tests, and strict Clippy for the native
@@ -75,6 +80,13 @@ Wry also uses the existing immutable Git patch
 are optional exact pins: webkit2gtk 2.0.2, gtk 0.18.2, gio 0.18.4, and
 cairo-rs 0.18.5 with its PNG writer enabled. No new package versions were
 introduced by these direct edges.
+
+The lockfile resolves Windows Wry bindings to `webview2-com` 0.39.1 and
+`windows`/`windows-core` 0.62.2. Any direct COM adapter edges must match those
+versions. Microsoft's [CapturePreview contract](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/icorewebview2#capturepreview)
+writes image data to an `IStream` and signals completion afterward. The adapter
+must implement its stream over the shared quota-accounted sink, not an
+unbounded memory stream followed by a size check.
 
 Inspection of Wry 0.57.0's `src/lib.rs` found platform `webview()` escape
 hatches returning WebView2, WebKitGTK, and retained Cocoa webviews, but no

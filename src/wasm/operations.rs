@@ -2216,6 +2216,7 @@ pub(crate) struct NativeBlobEncoder {
     bound_operation: Option<OpaqueToken>,
     maximum_bytes: usize,
     written: usize,
+    position: usize,
     failure: Option<HubError>,
 }
 
@@ -2249,6 +2250,7 @@ impl NativeBlobEncoder {
             bound_operation: None,
             maximum_bytes,
             written: 0,
+            position: 0,
             failure: None,
         })
     }
@@ -2334,6 +2336,70 @@ impl NativeBlobEncoder {
         result
     }
 
+    fn write_at_position(&mut self, bytes: &[u8]) -> Result<(), HubError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let result = (|| {
+            let end = self
+                .position
+                .checked_add(bytes.len())
+                .ok_or(HubError::Quota)?;
+            if end > self.maximum_bytes {
+                return Err(HubError::Quota);
+            }
+            // Seeking allocates nothing. A later write fills any hole through
+            // the same chunked admission path as normal encoding.
+            while self.written < self.position {
+                let zeros = [0_u8; 1024];
+                let count = (self.position - self.written).min(zeros.len());
+                self.append(&zeros[..count])?;
+            }
+            let overwrite = bytes.len().min(self.written - self.position);
+            if overwrite > 0 {
+                let mut state = self.hub.state.lock().map_err(|_| HubError::Closed)?;
+                if state.closed {
+                    return Err(HubError::Closed);
+                }
+                let resource = state
+                    .resources
+                    .get_mut(&self.blob.ok_or(HubError::Closed)?)
+                    .ok_or(HubError::Closed)?;
+                OperationHub::validate_resource_owner(
+                    resource,
+                    self.store,
+                    BLOB_RESOURCE_KIND,
+                    BLOB_RIGHT_WRITE,
+                )?;
+                if !resource.reserved {
+                    return Err(HubError::WrongRights);
+                }
+                let ResourceValue::Blob {
+                    buffer,
+                    sealed: false,
+                } = &mut resource.value
+                else {
+                    return Err(HubError::WrongKind);
+                };
+                for (index, byte) in bytes[..overwrite].iter().enumerate() {
+                    *buffer
+                        .get_mut(self.position + index)
+                        .ok_or(HubError::Closed)? = *byte;
+                }
+            }
+            self.append(&bytes[overwrite..])?;
+            self.position = end;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+
     pub(crate) fn finish(self) -> Result<OpaqueToken, HubError> {
         self.finish_inner(None)
     }
@@ -2406,12 +2472,30 @@ impl NativeBlobEncoder {
 
 impl std::io::Write for NativeBlobEncoder {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.append(bytes)
+        self.write_at_position(bytes)
             .map_err(|error| std::io::Error::other(format!("native blob encoding: {error:?}")))?;
         Ok(bytes.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl std::io::Seek for NativeBlobEncoder {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let position = match from {
+            std::io::SeekFrom::Start(position) => i128::from(position),
+            std::io::SeekFrom::Current(offset) => self.position as i128 + i128::from(offset),
+            std::io::SeekFrom::End(offset) => self.written as i128 + i128::from(offset),
+        };
+        if position < 0 || position > self.maximum_bytes as i128 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "native blob seek exceeds encoding bounds",
+            ));
+        }
+        self.position = position as usize;
+        Ok(self.position as u64)
     }
 }
 
@@ -2547,6 +2631,41 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_encoder_seek_overwrites_and_fills_holes_with_bounded_storage() {
+        use std::io::{Seek as _, SeekFrom, Write as _};
+        let hub =
+            OperationHub::with_blob_limits(4, 3, BlobLimits::new(4, 16, 16).unwrap()).unwrap();
+        let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 16).unwrap();
+        encoder.write_all(b"header").unwrap();
+        encoder.seek(SeekFrom::Start(0)).unwrap();
+        encoder.write_all(b"HEADER").unwrap();
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 6);
+        encoder.seek(SeekFrom::End(2)).unwrap();
+        assert_eq!(
+            hub.snapshot().buffered_blob_bytes,
+            6,
+            "seek must not allocate a hole"
+        );
+        encoder.write_all(b"tail").unwrap();
+        assert_eq!(encoder.stream_position().unwrap(), 12);
+        assert!(encoder.seek(SeekFrom::Start(17)).is_err());
+        assert!(encoder.seek(SeekFrom::Current(-13)).is_err());
+        assert_eq!(encoder.stream_position().unwrap(), 12);
+        let blob = encoder.finish().unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = hub.blob_read(7, blob, 4).unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            bytes.extend(chunk);
+        }
+        assert_eq!(bytes, b"HEADER\0\0tail");
+        hub.close_resource(blob).unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    }
 
     #[test]
     fn capture_revocation_reclaims_partial_encoding_before_callback_drop() {

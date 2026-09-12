@@ -20,7 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page = scenario.page(&address.to_string());
     let server = std::thread::spawn(move || -> std::io::Result<()> {
         listener.set_nonblocking(true)?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(16);
+        // Hosted Linux can spend tens of seconds initializing WebKitGTK on a
+        // cold Xvfb process. Keep the proof bounded without mistaking that
+        // startup variance for a navigation failure.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let accept = || loop {
             match listener.accept() {
                 Ok(connection) => return Ok(connection),
@@ -104,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // or in an embedding shell.  Dropping `lifecycle` drops a created
             // NativeWebview, whose Drop requests native close.
             let result = async_engine::timeout(
-                Duration::from_secs(15),
+                Duration::from_secs(60),
                 lifecycle(&task_client, &url, scenario),
             )
             .await
@@ -120,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.run();
     server.join().map_err(|_| "loopback server panicked")??;
     result_receiver
-        .recv_timeout(Duration::from_secs(15))
+        .recv_timeout(Duration::from_secs(60))
         .map_err(|_| "webview lifecycle task did not exit")?
         .map_err(host_error)?;
     Ok(())
@@ -150,7 +153,7 @@ async fn lifecycle(
         require_stale(&webview).await?;
         return assert_clean(client);
     }
-    let loaded = webview.wait_until_loaded(Duration::from_secs(5)).await;
+    let loaded = webview.wait_until_loaded(Duration::from_secs(30)).await;
     match (scenario, loaded) {
         (SmokeScenario::Close, Ok(())) => webview.close().await,
         (SmokeScenario::Cancel, Ok(())) => {

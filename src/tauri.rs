@@ -25,6 +25,9 @@ use tauri_runtime_wry::{WindowBuilderWrapper, Wry, WryHandle, WryWindowDispatche
 use url::Url;
 use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
+#[cfg(feature = "wasm-sketch-host")]
+pub(crate) mod sketch;
+
 #[cfg(not(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -191,11 +194,12 @@ impl NativeWebviewBackend {
     pub(crate) async fn open(
         &self,
         request: NativeWebviewRequest,
+        lease: crate::operations::NativeOpenLease,
     ) -> Result<NativeWebview, NativeWebviewError> {
         let (created_sender, created_receiver) = async_engine::oneshot_channel();
         let backend = self.clone();
         self.async_runtime
-            .launch_blocking(move || backend.create_on_wry_thread(request, created_sender))
+            .launch_blocking(move || backend.create_on_wry_thread(request, created_sender, lease))
             .detach();
 
         created_receiver.await.map_err(|_| {
@@ -207,6 +211,7 @@ impl NativeWebviewBackend {
         &self,
         request: NativeWebviewRequest,
         created_sender: OneshotSender<Result<NativeWebview, NativeWebviewError>>,
+        lease: crate::operations::NativeOpenLease,
     ) {
         let (completion, load_waiter) = LoadCompletion::new(request.url.clone());
         let (terminal, terminal_waiter) = TerminalCompletion::new();
@@ -270,6 +275,7 @@ impl NativeWebviewBackend {
         let terminal_for_ui = Arc::clone(&terminal);
         let created_sender_for_ui = Arc::clone(&created_sender);
         if let Err(error) = dispatcher.run_on_main_thread(move || {
+            let _lease = lease;
             let result = build_isolated_webview(
                 &window_for_ui,
                 request.url,
@@ -669,6 +675,8 @@ pub struct WebviewHandle {
 pub struct WebviewTestObservation {
     /// Queued UI captures and native callbacks still holding admission.
     pub active_native_captures: usize,
+    /// Native creation requests retained after semantic cancellation.
+    pub active_native_opens: usize,
     /// Encoded image resources retained by the shared hub.
     pub live_blobs: usize,
     /// Hub and native chunk allocations still charged to the transfer quota.
@@ -803,7 +811,8 @@ impl ExternalWebviewClient {
             transferred: false,
         };
         let request = NativeWebviewRequest::parse(&url).map_err(map_native)?;
-        let mut native = match self.service.backend.open(request).await {
+        let lease = self.service.hub.acquire_native_open().map_err(map_hub)?;
+        let mut native = match self.service.backend.open(request, lease).await {
             Ok(native) => native,
             Err(error) => {
                 self.service
@@ -874,6 +883,7 @@ impl ExternalWebviewClient {
         let native_backings = self.service.native.lock().map_or(0, |native| native.len());
         WebviewTestObservation {
             active_native_captures: snapshot.active_native_captures,
+            active_native_opens: snapshot.active_native_opens,
             live_blobs: snapshot.live_blobs,
             retained_transfer_capacity: snapshot.retained_transfer_capacity,
             native_backings,

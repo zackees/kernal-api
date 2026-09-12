@@ -41,10 +41,12 @@ operations. They share the generated kernel operation/resource hub without
 exposing a Tauri/Wry type or inventing a second registry. Timeout,
 cancellation, user close, and rejected navigation revoke the resource
 generation and wake pending operations with typed facade errors. The current
-generated screenshot guest contract now names URL-grant/open/load/capture/close
-operations, but Wasm-root grant installation and native opcode dispatch are
-still incomplete. Native-only acceptance tests exercise the URL-grant hub
-path; they are not evidence of an end-to-end Wasm screenshot run.
+generated screenshot guest now uses URL-grant/open/load/capture/close
+operations through a root-scoped native dispatcher. URL/output grants precede
+instantiation and every operation uses the root's original hub and runtime.
+See `examples/wasm-tauri-screenshot` for the actual CLI/guest proof and its
+remaining tracing, containment, and platform acceptance work. Native-only
+smoke tests remain distinct from that end-to-end Wasm proof.
 
 For a repeatable Linux proof outside CI, use the Nix development shell below.
 The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built
@@ -69,7 +71,10 @@ requires the reserved operation and resource counts to return immediately
 to their pre-open baseline. Before the reservation guard, this real Linux
 runner failed with two resources and two pending operations instead of one
 of each; the guard now releases that semantic authority on future drop.
-This counter check does not claim that native creation has already drained.
+It separately waits for native creation admission to drain after releasing
+the paused UI. This does not establish every native destruction race on
+every platform. Creation admission, like capture admission, is held through
+the native callback even after semantic cancellation consumes the operation.
 The live image test separately decodes PNG pixels and verifies
 viewport dimensions and fixture colors. These Linux gates do not establish
 the still-required Windows/macOS runtime proofs or the generated Wasm sketch.

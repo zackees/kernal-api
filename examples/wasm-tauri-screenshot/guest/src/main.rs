@@ -13,7 +13,7 @@ async fn screenshot() -> Result<(), OperationError> {
     kernel::clock_sleep(5_000)?.wait().await?;
     let snapshot = view.capture_visible_png().await?;
     output.write_blob(&snapshot)?.wait().await?;
-    snapshot.close()?.wait().await?;
+    // Successful exact-output commit consumes the snapshot and output grants.
     view.close().await?;
     Ok(())
 }

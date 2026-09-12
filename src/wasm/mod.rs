@@ -769,7 +769,7 @@ impl AdmittedSketch {
         runtime: crate::async_engine::RuntimeHandle,
         cancellation: crate::async_engine::CancellationToken,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
-        self.execute_threaded_root_with_grant(runtime, cancellation, None)
+        self.execute_threaded_root_with_grant(runtime, cancellation, RootGrants::default())
             .await
     }
 
@@ -782,15 +782,46 @@ impl AdmittedSketch {
         cancellation: crate::async_engine::CancellationToken,
         destination: std::path::PathBuf,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
-        self.execute_threaded_root_with_grant(runtime, cancellation, Some(destination))
-            .await
+        self.execute_threaded_root_with_grant(
+            runtime,
+            cancellation,
+            RootGrants {
+                output: Some(destination),
+                #[cfg(feature = "tauri-webview")]
+                webview: None,
+            },
+        )
+        .await
+    }
+
+    /// Run with host-authorized URL and exact-output capabilities. The UI host
+    /// must be driven on its creating thread using the same supplied runtime.
+    /// This in-process entry is not a replacement for killable containment.
+    #[cfg(feature = "tauri-webview")]
+    pub async fn execute_threaded_root_with_webview(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        client: crate::webview::ExternalWebviewClient,
+        url: crate::webview::WebviewUrlGrant,
+        destination: std::path::PathBuf,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(
+            runtime,
+            cancellation,
+            RootGrants {
+                output: Some(destination),
+                webview: Some((client, url)),
+            },
+        )
+        .await
     }
 
     async fn execute_threaded_root_with_grant(
         self: &Arc<Self>,
         runtime: crate::async_engine::RuntimeHandle,
         cancellation: crate::async_engine::CancellationToken,
-        destination: Option<std::path::PathBuf>,
+        grants: RootGrants,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
@@ -808,7 +839,7 @@ impl AdmittedSketch {
             blocking_runtime.block_on_wasm(sketch.execute_threaded_root_async(
                 blocking_runtime.clone(),
                 logical,
-                destination,
+                grants,
             ))
         });
         let outcome = match blocking.await {
@@ -828,7 +859,7 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
         logical_epoch: Arc<LogicalEpoch>,
-        destination: Option<std::path::PathBuf>,
+        grants: RootGrants,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
@@ -852,12 +883,31 @@ impl AdmittedSketch {
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         // Grant before constructing or instantiating the root Store: even a
         // module start section sees only the already-authorized resource.
-        let initial_output = destination
+        let initial_output = grants
+            .output
             .as_deref()
             .map(|path| operations.grant_exact_output_wire(0, path))
             .transpose()
             .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
+        #[cfg(feature = "tauri-webview")]
+        let (webviews, initial_url) = match grants.webview {
+            Some((client, url)) => {
+                let context = crate::tauri::sketch::SketchWebviews::new(
+                    client,
+                    Arc::clone(&operations),
+                    &runtime,
+                )
+                .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+                let token = url
+                    .bind(&operations, 0)
+                    .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+                (Some(context), Some(token.wire()))
+            }
+            None => (None, None),
+        };
+        #[cfg(feature = "tauri-webview")]
+        let webview_cleanup = webviews.clone();
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -868,6 +918,10 @@ impl AdmittedSketch {
                 operations,
                 store_owner: 0,
                 initial_output,
+                #[cfg(feature = "tauri-webview")]
+                webviews,
+                #[cfg(feature = "tauri-webview")]
+                initial_url,
             },
         );
         install_epoch_deadline(&mut store);
@@ -926,6 +980,14 @@ impl AdmittedSketch {
         let children = prepared.controller.join_completed();
         let output_cleanup = operation_cleanup.join_output_jobs().await;
         operation_cleanup.join_clock_jobs().await;
+        #[cfg(feature = "tauri-webview")]
+        let webview_cleanup = match webview_cleanup {
+            Some(context) => context
+                .shutdown()
+                .await
+                .map_err(|_| SketchExecutionError::WebviewCleanupFailed),
+            None => Ok(()),
+        };
         let rejections = prepared.controller.take_thread_spawn_rejections();
         #[cfg(test)]
         if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
@@ -952,6 +1014,8 @@ impl AdmittedSketch {
             .store(store.get_fuel().unwrap_or(0), Ordering::Release);
         let result = resolve_threaded_result(outcome, children, report, rejections)?;
         output_cleanup.map_err(|_| SketchExecutionError::OutputCleanupFailed)?;
+        #[cfg(feature = "tauri-webview")]
+        webview_cleanup?;
         Ok(result)
     }
     fn prepare_threaded_root_with_permit(
@@ -1033,6 +1097,10 @@ impl AdmittedSketch {
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
                 store_owner: 0,
                 initial_output: None,
+                #[cfg(feature = "tauri-webview")]
+                webviews: None,
+                #[cfg(feature = "tauri-webview")]
+                initial_url: None,
             },
         );
         linker
@@ -1195,6 +1263,8 @@ pub enum SketchExecutionError {
     PrelinkFailed,
     OutputGrantRejected,
     OutputCleanupFailed,
+    WebviewGrantRejected,
+    WebviewCleanupFailed,
     NonzeroExit {
         code: i32,
     },
@@ -1228,6 +1298,8 @@ impl SketchExecutionError {
             Self::PrelinkFailed => "prelink-failed",
             Self::OutputGrantRejected => "output-grant-rejected",
             Self::OutputCleanupFailed => "output-cleanup-failed",
+            Self::WebviewGrantRejected => "webview-grant-rejected",
+            Self::WebviewCleanupFailed => "webview-cleanup-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",
@@ -1777,6 +1849,16 @@ impl Drop for LogicalRootPermit {
     }
 }
 
+#[derive(Default)]
+struct RootGrants {
+    output: Option<std::path::PathBuf>,
+    #[cfg(feature = "tauri-webview")]
+    webview: Option<(
+        crate::webview::ExternalWebviewClient,
+        crate::webview::WebviewUrlGrant,
+    )>,
+}
+
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
@@ -1787,6 +1869,10 @@ struct ThreadStoreState {
     operations: Arc<OperationHub>,
     store_owner: u64,
     initial_output: Option<u64>,
+    #[cfg(feature = "tauri-webview")]
+    initial_url: Option<u64>,
+    #[cfg(feature = "tauri-webview")]
+    webviews: Option<Arc<crate::tauri::sketch::SketchWebviews>>,
 }
 
 impl generated_v1::KernalApiV1Imports for ThreadStoreState {
@@ -1838,6 +1924,36 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if kind == crate::operations::OP_WEBVIEW_URL_GRANT {
+            #[cfg(feature = "tauri-webview")]
+            if arg0 == 0 && arg1 == 0 {
+                return Ok(self.initial_url.unwrap_or(0));
+            }
+            return Ok(0);
+        }
+        #[cfg(feature = "tauri-webview")]
+        if let Some(webviews) = &self.webviews {
+            let kind = if kind == crate::operations::OP_SYNTHETIC_RESOURCE_CLOSE
+                && self
+                    .operations
+                    .external_webview_wire(self.store_owner, arg0)
+            {
+                crate::operations::OP_WEBVIEW_CLOSE
+            } else {
+                kind
+            };
+            if matches!(
+                kind,
+                crate::operations::OP_WEBVIEW_OPEN
+                    | crate::operations::OP_WEBVIEW_LOAD
+                    | crate::operations::OP_WEBVIEW_CAPTURE
+                    | crate::operations::OP_WEBVIEW_CLOSE
+            ) {
+                return Ok(webviews
+                    .submit(self.store_owner, kind, arg0, arg1)
+                    .unwrap_or(0));
+            }
+        }
         if kind == crate::operations::OP_OUTPUT_GRANT {
             return Ok(if arg0 == 0 && arg1 == 0 {
                 self.initial_output.unwrap_or(0)
@@ -2558,6 +2674,8 @@ fn define_closed_imports(
                 let generation = caller.data().fuel_generation;
                 let epoch = Arc::clone(&caller.data().epoch);
                 let operations = Arc::clone(&caller.data().operations);
+                #[cfg(feature = "tauri-webview")]
+                let webviews = caller.data().webviews.clone();
                 if epoch.winner.load(Ordering::Acquire) != EPOCH_PENDING {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.epoch_rejections = workers.epoch_rejections.saturating_add(1);
@@ -2633,6 +2751,10 @@ fn define_closed_imports(
                                 operations,
                                 store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
                                 initial_output: None,
+                                #[cfg(feature = "tauri-webview")]
+                                webviews,
+                                #[cfg(feature = "tauri-webview")]
+                                initial_url: None,
                             },
                         );
                         install_epoch_deadline(&mut store);

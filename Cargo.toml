@@ -32,6 +32,11 @@ name = "kernal-tauri-smoke"
 path = "src/bin/kernal-tauri-smoke.rs"
 required-features = ["tauri-webview-test-support"]
 
+[[bin]]
+name = "kernal-api-wasm-tauri"
+path = "examples/wasm-tauri-screenshot/runner.rs"
+required-features = ["wasm-sketch-host", "tauri-webview"]
+
 [features]
 default = []
 # Advisory locking and modification-time setting are implemented natively

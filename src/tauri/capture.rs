@@ -102,12 +102,20 @@ impl std::ops::Deref for WebviewSnapshotChunk<'_> {
     }
 }
 
-struct CaptureRequest {
+pub(super) struct CaptureRequest {
     hub: Arc<OperationHub>,
     store: u64,
     operation: OpaqueToken,
     window: WryWindowDispatcher<()>,
     error: Arc<Mutex<Option<CaptureError>>>,
+    guest_owned: bool,
+}
+impl CaptureRequest {
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(super) fn for_guest(mut self) -> Self {
+        self.guest_owned = true;
+        self
+    }
 }
 impl Drop for CaptureRequest {
     fn drop(&mut self) {
@@ -115,9 +123,11 @@ impl Drop for CaptureRequest {
             .finish_external_operation(self.operation, Terminal::Cancelled);
         // Completion may have won just before the awaiting future was dropped.
         // Reclaim an unconsumed successful result as well as pending encoding.
-        if let Ok(Some(result)) = self.hub.observe_terminal(self.store, self.operation) {
-            if let Some(blob) = result.resource {
-                let _ = self.hub.close_resource(blob);
+        if !self.guest_owned {
+            if let Ok(Some(result)) = self.hub.observe_terminal(self.store, self.operation) {
+                if let Some(blob) = result.resource {
+                    let _ = self.hub.close_resource(blob);
+                }
             }
         }
         let operation = self.operation;
@@ -129,7 +139,7 @@ impl Drop for CaptureRequest {
 }
 
 impl NativeWebview {
-    fn capture_png(
+    pub(super) fn capture_png(
         &self,
         hub: Arc<OperationHub>,
         store: u64,
@@ -146,6 +156,7 @@ impl NativeWebview {
         let error = Arc::new(Mutex::new(None));
         let native_id = self.native_id;
         let request = CaptureRequest {
+            guest_owned: false,
             hub: Arc::clone(&hub),
             store,
             operation,

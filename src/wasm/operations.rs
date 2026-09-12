@@ -61,6 +61,15 @@ const STATUS_ERROR: u8 = 0x80;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(crate) struct OpaqueToken(u64);
 
+impl OpaqueToken {
+    pub(crate) fn from_wire(value: u64) -> Self {
+        Self(value)
+    }
+    pub(crate) fn wire(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Terminal {
     Completed,
@@ -111,6 +120,7 @@ pub(crate) struct HubSnapshot {
     pub(crate) native_transfer_capacity: usize,
     pub(crate) active_output_jobs: usize,
     pub(crate) active_native_captures: usize,
+    pub(crate) active_native_opens: usize,
     pub(crate) active_clocks: usize,
 }
 
@@ -316,6 +326,13 @@ impl Drop for OutputJobLease {
 /// Admission retained until queued UI work and its native callback are gone.
 pub(crate) struct NativeCaptureLease(Arc<OperationHub>);
 
+pub(crate) struct NativeOpenLease(Arc<OperationHub>);
+impl Drop for NativeOpenLease {
+    fn drop(&mut self) {
+        self.0.native_open_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ClockLease(Arc<OperationHub>);
 
 impl Drop for ClockLease {
@@ -338,6 +355,7 @@ pub(crate) struct OperationHub {
     output_job_failed: AtomicBool,
     output_job_count: AtomicU64,
     native_capture_count: AtomicU64,
+    native_open_count: AtomicU64,
     clock_count: AtomicU64,
     clock_drained: Notify,
     scope: u64,
@@ -348,6 +366,30 @@ pub(crate) struct OperationHub {
 }
 
 impl OperationHub {
+    pub(crate) fn acquire_native_open(self: &Arc<Self>) -> Result<NativeOpenLease, HubError> {
+        let state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed {
+            return Err(HubError::Closed);
+        }
+        let limit = self.maximum_operations.min(4) as u64;
+        self.native_open_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .map_err(|_| HubError::Quota)?;
+        Ok(NativeOpenLease(Arc::clone(self)))
+    }
+    pub(crate) fn external_webview_wire(&self, store: u64, token: u64) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .resources
+                .get(&OpaqueToken(token))
+                .is_some_and(|resource| {
+                    Self::validate_resource(resource, store, EXTERNAL_WEBVIEW_RESOURCE_KIND, 0)
+                        .is_ok()
+                })
+        })
+    }
     /// Keep native admission independent of consumed operation terminals.
     /// At most four captures may be queued or in flight in a logical hub.
     pub(crate) fn acquire_native_capture(self: &Arc<Self>) -> Result<NativeCaptureLease, HubError> {
@@ -383,6 +425,7 @@ impl OperationHub {
             output_job_failed: AtomicBool::new(false),
             output_job_count: AtomicU64::new(0),
             native_capture_count: AtomicU64::new(0),
+            native_open_count: AtomicU64::new(0),
             clock_count: AtomicU64::new(0),
             clock_drained: Notify::new(),
             scope,
@@ -2460,6 +2503,7 @@ impl OperationHub {
             native_transfer_capacity: state.native_transfer_capacity,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
             active_native_captures: self.native_capture_count.load(Ordering::Acquire) as usize,
+            active_native_opens: self.native_open_count.load(Ordering::Acquire) as usize,
             active_clocks: self.clock_count.load(Ordering::Acquire) as usize,
         }
     }
@@ -2889,6 +2933,27 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_open_admission_outlives_semantic_cancellation() {
+        let hub = OperationHub::new(8, 8).unwrap();
+        let mut leases = Vec::new();
+        for _ in 0..4 {
+            leases.push(hub.acquire_native_open().unwrap());
+            let (_, op) = hub.begin_external_webview_open(7).unwrap();
+            hub.cancel_wire(7, op.0).unwrap();
+            hub.observe_terminal(7, op).unwrap().unwrap();
+        }
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().active_native_opens, 4);
+        assert!(matches!(hub.acquire_native_open(), Err(HubError::Quota)));
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().active_native_opens, 4);
+        drop(leases);
+        assert_eq!(hub.snapshot().active_native_opens, 0);
+        assert!(matches!(hub.acquire_native_open(), Err(HubError::Closed)));
+    }
 
     #[test]
     fn producer_terminal_signal_survives_guest_consumption() {

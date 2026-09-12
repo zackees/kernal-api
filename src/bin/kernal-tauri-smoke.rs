@@ -180,6 +180,13 @@ async fn lifecycle(
             }
             drop(pause);
             webview.close().await?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while client.test_observation().active_native_opens != 0 {
+                if std::time::Instant::now() >= deadline {
+                    return Err(WebviewError::TimedOut);
+                }
+                async_engine::sleep(Duration::from_millis(5)).await;
+            }
             assert_clean(client)
         }
         (SmokeScenario::CaptureCancel, Ok(())) => {
@@ -398,6 +405,7 @@ impl SmokeScenario {
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
     let observation = client.test_observation();
     if observation.native_backings == 0
+        && observation.active_native_opens == 0
         && observation.active_native_captures == 0
         && observation.live_blobs == 0
         && observation.retained_transfer_capacity == 0

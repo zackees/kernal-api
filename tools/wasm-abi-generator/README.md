@@ -40,8 +40,8 @@ alone does not establish that proof.
 
 The screenshot guest contract reserves opcodes 13–17 for URL-grant discovery,
 open, matching load wait, viewport capture, and close. These generated guest
-methods exchange only opaque tokens. Their native host dispatch is not yet
-implemented. `OperationFuture::wait` and `run` provide composition for this
+methods exchange only opaque tokens. Their native host dispatch uses the same
+logical-root hub. `OperationFuture::wait` and `run` provide composition for this
 single generated command; the async host yield suspends the Wasm stack rather
 than constructing a guest runtime. The driver rejects unrelated futures that
 return `Pending`. See `examples/wasm-tauri-screenshot` for the actual Rust

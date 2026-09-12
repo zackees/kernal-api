@@ -11,12 +11,20 @@ receives a URL/path string nor reads PNG bytes into guest memory.
 
 Commit `52d4a3b` preserves the initial real Rust build failure: the generated
 `WebviewUrl`, `run`, and `OperationFuture::wait` interfaces were absent. The
-generated guest contract now supplies those interfaces and the application
-compiles. The native host's webview opcode dispatch and CLI integration are
-not implemented yet. This is not a working screenshot runner and is not
-enabled as a passing CI gate. The real-runner RED → GREEN proof remains
-incomplete until the native CLI loads this artifact and the complete guest
-sequence executes against the offline native fixture.
+generated contract, native dispatch, and CLI now run the actual sequence.
+On Linux x86-64, the checked-in offline CLI proof produced an 800×600,
+2,809-byte PNG in about 7.5 seconds, preserved an unrelated file, and left no
+temporary output. A separate decoded-pixel check confirmed red and blue at
+the fixture's left/right sample points. An initial native run exposed a
+redundant guest close after output commit; commit consumes the snapshot and
+output grants, so the guest now proceeds directly to closing the view.
+
+This is still an in-progress #20/#21 implementation, not completion of the
+full acceptance matrix. Structured ABI/event tracing, detailed guest error
+reporting, queued/cancelled native-creation destruction evidence, the complete
+failure matrix, killable native-webview worker integration, and native
+Windows/macOS execution remain outstanding. Do not treat this in-process
+diagnostic CLI as containment for arbitrary untrusted Wasm.
 
 Build the actual guest on a Unix host with the pinned target installed:
 
@@ -44,18 +52,39 @@ of the same exact name/signature allowlist, while requiring a complete
 generated lifecycle (or the legacy kernel-yield boundary). No new import or
 ambient authority was allowed by this change.
 
+To run the real offline native CLI regression, supply the same artifact and
+enable both capabilities on a host with a working native display:
+
+```sh
+KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
+  soldr cargo test --locked --features wasm-sketch-host,tauri-webview --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
+```
+
+The native test launches the CLI as a separate process, serves the checked-in
+fixture over loopback, verifies successful guest completion, checks PNG header
+dimensions and encoded-byte limits, and checks exact-output replacement and
+temporary-file cleanup. Its elapsed-time check is not a substitute for the
+still-required load-finished/clock event trace. Run under Xvfb on headless
+Linux, using the environment in `docs/tauri-external-content-isolation.md`.
+
 The generated command driver handles only
 generated kernel futures: Wasmtime suspends the guest stack at its async host
 import, so no guest runtime is created. Foreign futures returning `Pending`
 are rejected rather than busy-polled by an alternate scheduler.
 
-The intended native executable remains:
+Run the native executable from this source checkout:
 
-```text
-kernal-api-wasm-tauri --url <http-or-https-url> --output <screenshot.png>
+```sh
+soldr cargo run --locked --features wasm-sketch-host,tauri-webview --bin kernal-api-wasm-tauri -- --url http://127.0.0.1:8000/ --output screenshot.png
 ```
 
-Its remaining work includes pre-instantiation grants, import validation,
-shared logical-root webview ownership, structured ABI/event tracing, typed
-failure reporting, and deterministic window/blob/output teardown. Native
-Windows/macOS execution and a PowerShell build entry point remain required.
+Without `--module`, the CLI builds the checked-in guest through Soldr and
+embeds its generated metadata. `--module <artifact>` selects an already-built
+diagnostic artifact; either path validates imports before instantiation.
+URL and exact-output grants are installed before module start. The UI service
+gets the root's existing hub and the same runtime, never copied tokens from a
+different client hub. Native jobs are bounded and joined; cancelled native
+creation and capture retain separate four-request admission until callbacks
+release them. Failed root execution reports a semantic host error; full guest
+step/error tracing is not implemented yet. A PowerShell build entry point
+also remains required.

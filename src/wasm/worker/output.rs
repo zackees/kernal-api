@@ -1,6 +1,6 @@
 //! Parent-owned output staging. The supervisor must retain this owner until
 //! the worker has been reaped; guest-visible authority never includes the final
-//! destination. Protocol integration is the next step of the output work.
+//! destination. Only successful, reaped execution may publish staged bytes.
 
 use std::io;
 use std::path::{Path, PathBuf};

@@ -109,9 +109,18 @@ fn execute_request(
         Err(error) => return protocol_terminal(output, request_id, error.to_string().as_str()),
     };
     let result = runtime.run(async {
-        sketch
-            .execute_threaded_root_cancellable(runtime.handle(), token)
-            .await
+        match metadata.staged_output {
+            Some(destination) => {
+                sketch
+                    .execute_threaded_root_with_output(runtime.handle(), token, destination)
+                    .await
+            }
+            None => {
+                sketch
+                    .execute_threaded_root_cancellable(runtime.handle(), token)
+                    .await
+            }
+        }
     });
     let _ = sketch.close_threaded_root();
     drop(sketch);
@@ -144,10 +153,6 @@ fn execute_request(
 fn reconstruct(
     metadata: &ExecuteMetadata,
 ) -> Result<(SketchCompilerConfig, SketchModulePolicy), String> {
-    // Fail closed until supervisor staging ownership and execution are wired.
-    if metadata.staged_output.is_some() {
-        return Err("worker-output-not-enabled".into());
-    }
     let mut blob_values = [0_usize; 7];
     for (destination, source) in blob_values.iter_mut().zip(metadata.blob_limits) {
         *destination = usize::try_from(source).map_err(|_| "blob-limit-overflow")?;
@@ -365,13 +370,12 @@ mod tests {
     }
 
     #[test]
-    fn staging_grant_fails_closed_until_supervisor_ownership_is_enabled() {
+    fn staging_grant_does_not_change_compiler_limit_reconstruction() {
         let mut metadata = metadata();
+        metadata.reserved_memory_bytes = 1024 * 1024 * 1024;
+        metadata.max_shared_memory_pages = 16_384;
         metadata.staged_output = Some(std::env::temp_dir().join("completed-output"));
-        assert_eq!(
-            reconstruct(&metadata).unwrap_err(),
-            "worker-output-not-enabled"
-        );
+        assert!(reconstruct(&metadata).is_ok());
     }
 
     fn metadata() -> ExecuteMetadata {

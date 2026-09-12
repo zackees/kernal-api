@@ -68,4 +68,4 @@ KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
   soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker \
-    --test wasm_worker_containment cargo_built_threaded_guest_runs_inside_killable_worker -- --ignored
+    --test wasm_worker_containment cargo_built_threaded_guest_ -- --ignored --test-threads=1

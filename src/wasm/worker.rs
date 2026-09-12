@@ -9,9 +9,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Stage ownership is tested independently before wiring it into process
-// ownership and the private worker protocol.
-#[cfg(test)]
 mod output;
 
 #[cfg(feature = "wasm-sketch-worker-test-support")]
@@ -35,6 +32,7 @@ const MAX_COOPERATIVE_CANCEL_GRACE: Duration = Duration::from_secs(60);
 pub struct SketchWorkerConfig {
     executable: PathBuf,
     cooperative_cancel_grace: Duration,
+    output_destination: Option<PathBuf>,
 }
 impl SketchWorkerConfig {
     pub fn new(
@@ -51,7 +49,20 @@ impl SketchWorkerConfig {
         Ok(Self {
             executable,
             cooperative_cancel_grace,
+            output_destination: None,
         })
+    }
+    /// Authorize one exact final output. The worker receives only a private
+    /// staging destination; publication follows successful execution and reap.
+    pub fn with_output_destination(
+        mut self,
+        destination: PathBuf,
+    ) -> Result<Self, SketchWorkerFailure> {
+        if !destination.is_absolute() || destination.file_name().is_none() {
+            return Err(SketchWorkerFailure::InvalidConfiguration);
+        }
+        self.output_destination = Some(destination);
+        Ok(self)
     }
     pub fn executable(&self) -> &Path {
         &self.executable
@@ -76,6 +87,9 @@ pub enum SketchWorkerFailure {
     ChildFailure,
     WorkerReportedFailure,
     WorkerForcedContainment,
+    OutputGrant,
+    OutputCommit,
+    OutputCleanup,
 }
 impl SketchWorkerFailure {
     pub fn code(self) -> &'static str {
@@ -88,6 +102,9 @@ impl SketchWorkerFailure {
             Self::ChildFailure => "worker-child-failure",
             Self::WorkerReportedFailure => "worker-reported-failure",
             Self::WorkerForcedContainment => "worker-forced-containment",
+            Self::OutputGrant => "worker-output-grant",
+            Self::OutputCommit => "worker-output-commit",
+            Self::OutputCleanup => "worker-output-cleanup",
         }
     }
 }
@@ -452,6 +469,7 @@ impl ParentReceivePhase {
 /// synchronously dropping the native control or releasing admission early.
 struct ExecutionOwnership {
     control: crate::platform::process::WorkerControl,
+    output: Option<output::StagedOutput>,
     _lease: WorkerParentRootLease,
     _lease_gauge: WorkerGauge,
     _worker_gauge: WorkerGauge,
@@ -587,6 +605,15 @@ fn supervise(
         Err(()) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
     };
     let mut command = std::process::Command::new(config.executable());
+    let output = match config
+        .output_destination
+        .as_deref()
+        .map(output::StagedOutput::new)
+        .transpose()
+    {
+        Ok(output) => output,
+        Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputGrant),
+    };
     let child = match spawn_worker(&mut command) {
         Ok(child) => child,
         Err(_) => return SketchWorkerTerminal::Failure(SketchWorkerFailure::Launch),
@@ -597,168 +624,267 @@ fn supervise(
     let mut control = ActiveOwnership {
         ownership: Some(ExecutionOwnership {
             control: native_control,
+            output,
             _lease,
             _lease_gauge,
             _worker_gauge: worker_gauge,
         }),
         cleanup,
     };
-    #[cfg(feature = "wasm-sketch-worker-test-support")]
-    if let Err(()) = test_support::publish_worker_identity(control.id()) {
-        // The marker is an all-or-nothing test observation point.  Do not
-        // start protocol work when its observer cannot identify this exact
-        // worker; the existing pre-protocol path contains and reaps it.
-        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::UnexpectedExit);
-    }
-    let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
-        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
-    };
-    let Some(id) = next_request_id() else {
-        drop(stdin);
-        drop(stdout);
-        return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
-    };
-    let (write_tx, write_rx) = std::sync::mpsc::channel();
-    let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
-    let writer_ledger = Arc::clone(&sketch.worker_ledger);
-    let writer = std::thread::spawn(move || {
-        let _gauge = writer_ledger.live_protocol();
-        let mut input = stdin;
-        while let Ok(command) = write_rx.recv() {
-            let event = match command {
-                WriterCommand::Hello { request_id } => WriterEvent::Hello(
-                    worker_protocol::write_message(&mut input, &Message::Hello { request_id })
-                        .map_err(|_| ()),
-                ),
-                WriterCommand::Upload {
-                    request_id,
-                    source,
-                    metadata,
-                } => {
-                    let result = write_upload(&mut input, request_id, source, metadata);
-                    WriterEvent::Upload(result)
+    let terminal = (|| {
+        #[cfg(feature = "wasm-sketch-worker-test-support")]
+        if let Err(()) = test_support::publish_worker_identity(control.id()) {
+            // The marker is an all-or-nothing test observation point.  Do not
+            // start protocol work when its observer cannot identify this exact
+            // worker; the existing pre-protocol path contains and reaps it.
+            return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::UnexpectedExit);
+        }
+        let (Some(stdin), Some(stdout)) = (stdin, stdout) else {
+            return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
+        };
+        let Some(id) = next_request_id() else {
+            drop(stdin);
+            drop(stdout);
+            return force_pre_protocol(sketch, &mut control, SketchWorkerFailure::Protocol);
+        };
+        let (write_tx, write_rx) = std::sync::mpsc::channel();
+        let (write_done_tx, write_done_rx) = std::sync::mpsc::channel();
+        let writer_ledger = Arc::clone(&sketch.worker_ledger);
+        let writer = std::thread::spawn(move || {
+            let _gauge = writer_ledger.live_protocol();
+            let mut input = stdin;
+            while let Ok(command) = write_rx.recv() {
+                let event = match command {
+                    WriterCommand::Hello { request_id } => WriterEvent::Hello(
+                        worker_protocol::write_message(&mut input, &Message::Hello { request_id })
+                            .map_err(|_| ()),
+                    ),
+                    WriterCommand::Upload {
+                        request_id,
+                        source,
+                        metadata,
+                    } => {
+                        let result = write_upload(&mut input, request_id, source, metadata);
+                        WriterEvent::Upload(result)
+                    }
+                    WriterCommand::Cancel { request_id } => WriterEvent::Cancel(
+                        worker_protocol::write_message(&mut input, &Message::Cancel { request_id })
+                            .map_err(|_| ()),
+                    ),
+                    WriterCommand::Close => break,
+                };
+                if write_done_tx.send(event).is_err() {
+                    break;
                 }
-                WriterCommand::Cancel { request_id } => WriterEvent::Cancel(
-                    worker_protocol::write_message(&mut input, &Message::Cancel { request_id })
-                        .map_err(|_| ()),
-                ),
-                WriterCommand::Close => break,
-            };
-            if write_done_tx.send(event).is_err() {
-                break;
             }
+        });
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader_ledger = Arc::clone(&sketch.worker_ledger);
+        let reader = std::thread::spawn(move || {
+            let _gauge = reader_ledger.live_protocol();
+            let mut output = stdout;
+            loop {
+                let message = worker_protocol::read_message(&mut output).map_err(|_| ());
+                let finished = message.is_err() || matches!(message, Ok(Message::Terminal { .. }));
+                if read_tx.send(message).is_err() || finished {
+                    break;
+                }
+            }
+        });
+        let lanes = ProtocolLanes {
+            write_tx,
+            write_done_rx,
+            read_rx,
+            writer,
+            reader,
+        };
+        if lanes
+            .write_tx
+            .send(WriterCommand::Hello { request_id: id })
+            .is_err()
+        {
+            return force_join_result(sketch, &mut control, lanes, SketchWorkerFailure::Protocol);
         }
-    });
-    let (read_tx, read_rx) = std::sync::mpsc::channel();
-    let reader_ledger = Arc::clone(&sketch.worker_ledger);
-    let reader = std::thread::spawn(move || {
-        let _gauge = reader_ledger.live_protocol();
-        let mut output = stdout;
+        let mut cancel_written = false;
+        let mut cancel_queued = false;
+        let mut receive_phase = ParentReceivePhase::new(id);
+        let mut selected = None;
+        let mut grace_deadline = None;
         loop {
-            let message = worker_protocol::read_message(&mut output).map_err(|_| ());
-            let finished = message.is_err() || matches!(message, Ok(Message::Terminal { .. }));
-            if read_tx.send(message).is_err() || finished {
-                break;
+            if selected.is_none() {
+                selected = selected_stop(&cancellation, deadline);
             }
-        }
-    });
-    let lanes = ProtocolLanes {
-        write_tx,
-        write_done_rx,
-        read_rx,
-        writer,
-        reader,
-    };
-    if lanes
-        .write_tx
-        .send(WriterCommand::Hello { request_id: id })
-        .is_err()
-    {
-        return force_join_result(sketch, &mut control, lanes, SketchWorkerFailure::Protocol);
-    }
-    let mut cancel_written = false;
-    let mut cancel_queued = false;
-    let mut receive_phase = ParentReceivePhase::new(id);
-    let mut selected = None;
-    let mut grace_deadline = None;
-    loop {
-        if selected.is_none() {
-            selected = selected_stop(&cancellation, deadline);
-        }
-        if let Some(trigger) = selected {
-            if !receive_phase.upload_complete() {
-                return force_join_terminal(sketch, &mut control, lanes, trigger);
+            if let Some(trigger) = selected {
+                if !receive_phase.upload_complete() {
+                    return force_join_terminal(sketch, &mut control, lanes, trigger);
+                }
             }
-        }
-        if let Ok(event) = lanes.write_done_rx.try_recv() {
-            match event {
-                WriterEvent::Hello(Ok(())) => {}
-                WriterEvent::Upload(result) => {
-                    // A failed write is a pipe fact, not a protocol fact: the
-                    // worker may already have died under it.  A rejected but
-                    // successful write is a real protocol violation.
-                    let write_failed = result.is_err();
-                    if receive_phase.upload(result).is_err() {
-                        return if write_failed {
-                            pipe_failure_result(
-                                sketch,
-                                &mut control,
-                                lanes,
-                                &mut receive_phase,
-                                id,
-                                selected,
-                            )
-                        } else {
-                            force_join_result(
+            if let Ok(event) = lanes.write_done_rx.try_recv() {
+                match event {
+                    WriterEvent::Hello(Ok(())) => {}
+                    WriterEvent::Upload(result) => {
+                        // A failed write is a pipe fact, not a protocol fact: the
+                        // worker may already have died under it.  A rejected but
+                        // successful write is a real protocol violation.
+                        let write_failed = result.is_err();
+                        if receive_phase.upload(result).is_err() {
+                            return if write_failed {
+                                pipe_failure_result(
+                                    sketch,
+                                    &mut control,
+                                    lanes,
+                                    &mut receive_phase,
+                                    id,
+                                    selected,
+                                )
+                            } else {
+                                force_join_result(
+                                    sketch,
+                                    &mut control,
+                                    lanes,
+                                    SketchWorkerFailure::Protocol,
+                                )
+                            };
+                        }
+                    }
+                    WriterEvent::Cancel(Ok(())) => {
+                        cancel_written = true;
+                        sketch.worker_ledger.record_cancel_sent();
+                        grace_deadline =
+                            Some(std::time::Instant::now() + config.cooperative_cancel_grace());
+                    }
+                    WriterEvent::Hello(Err(())) | WriterEvent::Cancel(Err(())) => {
+                        return pipe_failure_result(
+                            sketch,
+                            &mut control,
+                            lanes,
+                            &mut receive_phase,
+                            id,
+                            selected,
+                        )
+                    }
+                }
+            }
+            if let Ok(result) = lanes.read_rx.try_recv() {
+                let message = match result {
+                    Ok(message) => message,
+                    Err(()) => {
+                        return pipe_failure_result(
+                            sketch,
+                            &mut control,
+                            lanes,
+                            &mut receive_phase,
+                            id,
+                            selected,
+                        )
+                    }
+                };
+                match receive_phase.receive(message) {
+                    Ok(ParentReceiveAction::QueueUpload) => {
+                        if lanes
+                            .write_tx
+                            .send(WriterCommand::Upload {
+                                request_id: id,
+                                source: sketch.worker_source(),
+                                metadata: {
+                                    let mut metadata = metadata(sketch, deadline);
+                                    metadata.staged_output = control
+                                        .ownership
+                                        .as_ref()
+                                        .and_then(|owner| owner.output.as_ref())
+                                        .map(output::StagedOutput::worker_destination);
+                                    metadata
+                                },
+                            })
+                            .is_err()
+                        {
+                            return force_join_result(
                                 sketch,
                                 &mut control,
                                 lanes,
                                 SketchWorkerFailure::Protocol,
-                            )
+                            );
+                        }
+                        receive_phase.upload_queued();
+                    }
+                    Ok(ParentReceiveAction::AwaitingUpload) => {}
+                    Ok(ParentReceiveAction::ExecuteAcknowledged) => {}
+                    Ok(ParentReceiveAction::Terminal(message)) => {
+                        let mapped = map_terminal(message, id);
+                        let mapped = match mapped {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return force_join_result(sketch, &mut control, lanes, error)
+                            }
                         };
+                        if matches!(
+                            mapped,
+                            SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol)
+                        ) {
+                            sketch.worker_ledger.record_protocol_failure();
+                        }
+                        match control.reap_clean(Duration::from_secs(5)) {
+                            Ok(crate::platform::process::WorkerNormalReap::Clean) => {
+                                lanes.close();
+                                sketch.worker_ledger.record_reaped();
+                                return selected.map_or(mapped, SketchWorkerTerminal::Stopped);
+                            }
+                            Ok(crate::platform::process::WorkerNormalReap::Nonzero) => {
+                                lanes.close();
+                                sketch.worker_ledger.record_reaped();
+                                return SketchWorkerTerminal::Failure(
+                                    SketchWorkerFailure::UnexpectedExit,
+                                );
+                            }
+                            Err(_) => {
+                                return force_join_result(
+                                    sketch,
+                                    &mut control,
+                                    lanes,
+                                    SketchWorkerFailure::ContainmentCleanup,
+                                )
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        return force_join_result(
+                            sketch,
+                            &mut control,
+                            lanes,
+                            SketchWorkerFailure::Protocol,
+                        )
                     }
                 }
-                WriterEvent::Cancel(Ok(())) => {
-                    cancel_written = true;
-                    sketch.worker_ledger.record_cancel_sent();
-                    grace_deadline =
-                        Some(std::time::Instant::now() + config.cooperative_cancel_grace());
-                }
-                WriterEvent::Hello(Err(())) | WriterEvent::Cancel(Err(())) => {
-                    return pipe_failure_result(
+            }
+            match control.try_wait() {
+                Ok(Some(code)) => {
+                    return exited_join_result(
                         sketch,
-                        &mut control,
                         lanes,
                         &mut receive_phase,
                         id,
                         selected,
+                        code == 0,
+                    )
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    return force_join_result(
+                        sketch,
+                        &mut control,
+                        lanes,
+                        SketchWorkerFailure::UnexpectedExit,
                     )
                 }
             }
-        }
-        if let Ok(result) = lanes.read_rx.try_recv() {
-            let message = match result {
-                Ok(message) => message,
-                Err(()) => {
-                    return pipe_failure_result(
-                        sketch,
-                        &mut control,
-                        lanes,
-                        &mut receive_phase,
-                        id,
-                        selected,
-                    )
+            if let Some(trigger) = selected {
+                if !receive_phase.upload_complete() {
+                    return force_join_terminal(sketch, &mut control, lanes, trigger);
                 }
-            };
-            match receive_phase.receive(message) {
-                Ok(ParentReceiveAction::QueueUpload) => {
+                if !cancel_written && !cancel_queued && receive_phase.is_upload_queued() {
                     if lanes
                         .write_tx
-                        .send(WriterCommand::Upload {
-                            request_id: id,
-                            source: sketch.worker_source(),
-                            metadata: metadata(sketch, deadline),
-                        })
+                        .send(WriterCommand::Cancel { request_id: id })
                         .is_err()
                     {
                         return force_join_result(
@@ -768,105 +894,52 @@ fn supervise(
                             SketchWorkerFailure::Protocol,
                         );
                     }
-                    receive_phase.upload_queued();
+                    cancel_queued = true;
+                    grace_deadline =
+                        Some(std::time::Instant::now() + config.cooperative_cancel_grace());
                 }
-                Ok(ParentReceiveAction::AwaitingUpload) => {}
-                Ok(ParentReceiveAction::ExecuteAcknowledged) => {}
-                Ok(ParentReceiveAction::Terminal(message)) => {
-                    let mapped = map_terminal(message, id);
-                    let mapped = match mapped {
-                        Ok(value) => value,
-                        Err(error) => return force_join_result(sketch, &mut control, lanes, error),
-                    };
-                    if matches!(
-                        mapped,
-                        SketchWorkerTerminal::Failure(SketchWorkerFailure::Protocol)
-                    ) {
-                        sketch.worker_ledger.record_protocol_failure();
-                    }
-                    match control.reap_clean(Duration::from_secs(5)) {
-                        Ok(crate::platform::process::WorkerNormalReap::Clean) => {
-                            lanes.close();
-                            sketch.worker_ledger.record_reaped();
-                            return selected.map_or(mapped, SketchWorkerTerminal::Stopped);
-                        }
-                        Ok(crate::platform::process::WorkerNormalReap::Nonzero) => {
-                            lanes.close();
-                            sketch.worker_ledger.record_reaped();
-                            return SketchWorkerTerminal::Failure(
-                                SketchWorkerFailure::UnexpectedExit,
-                            );
-                        }
-                        Err(_) => {
-                            return force_join_result(
-                                sketch,
-                                &mut control,
-                                lanes,
-                                SketchWorkerFailure::ContainmentCleanup,
-                            )
-                        }
+                if let Some(grace_deadline) = grace_deadline {
+                    if std::time::Instant::now() >= grace_deadline {
+                        sketch.worker_ledger.record_grace_expired();
+                        return force_join_terminal(sketch, &mut control, lanes, trigger);
                     }
                 }
-                Err(_) => {
-                    return force_join_result(
-                        sketch,
-                        &mut control,
-                        lanes,
-                        SketchWorkerFailure::Protocol,
-                    )
-                }
             }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        match control.try_wait() {
-            Ok(Some(code)) => {
-                return exited_join_result(
-                    sketch,
-                    lanes,
-                    &mut receive_phase,
-                    id,
-                    selected,
-                    code == 0,
-                )
-            }
-            Ok(None) => {}
-            Err(_) => {
-                return force_join_result(
-                    sketch,
-                    &mut control,
-                    lanes,
-                    SketchWorkerFailure::UnexpectedExit,
-                )
-            }
+    })();
+    // Every terminal path either reaped the worker or handed the entire owner
+    // to the durable cleanup dispatcher. Never extract staging from the latter.
+    let output = control
+        .ownership
+        .as_mut()
+        .and_then(|owner| owner.output.take());
+    finish_output(output, terminal, selected_stop(&cancellation, deadline))
+}
+
+fn finish_output(
+    output: Option<output::StagedOutput>,
+    terminal: SketchWorkerTerminal,
+    stop: Option<SketchWorkerStopReason>,
+) -> SketchWorkerTerminal {
+    let Some(output) = output else {
+        return terminal;
+    };
+    let terminal = if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
+        stop.map_or(terminal, SketchWorkerTerminal::Stopped)
+    } else {
+        terminal
+    };
+    if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
+        match output.commit() {
+            Ok(committed) if committed.cleanup.is_ok() => terminal,
+            Ok(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCleanup),
+            Err(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCommit),
         }
-        if let Some(trigger) = selected {
-            if !receive_phase.upload_complete() {
-                return force_join_terminal(sketch, &mut control, lanes, trigger);
-            }
-            if !cancel_written && !cancel_queued && receive_phase.is_upload_queued() {
-                if lanes
-                    .write_tx
-                    .send(WriterCommand::Cancel { request_id: id })
-                    .is_err()
-                {
-                    return force_join_result(
-                        sketch,
-                        &mut control,
-                        lanes,
-                        SketchWorkerFailure::Protocol,
-                    );
-                }
-                cancel_queued = true;
-                grace_deadline =
-                    Some(std::time::Instant::now() + config.cooperative_cancel_grace());
-            }
-            if let Some(grace_deadline) = grace_deadline {
-                if std::time::Instant::now() >= grace_deadline {
-                    sketch.worker_ledger.record_grace_expired();
-                    return force_join_terminal(sketch, &mut control, lanes, trigger);
-                }
-            }
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    } else if output.discard().is_err() {
+        SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCleanup)
+    } else {
+        terminal
     }
 }
 
@@ -1263,6 +1336,60 @@ mod tests {
     use std::io;
     use std::sync::{mpsc, Condvar, Mutex};
 
+    #[test]
+    fn parent_output_discards_on_failure_or_stop_and_commits_only_success() {
+        for (terminal, stop, publish) in [
+            (
+                SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+                None,
+                true,
+            ),
+            (
+                SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+                Some(SketchWorkerStopReason::Cancelled),
+                false,
+            ),
+            (
+                SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+                Some(SketchWorkerStopReason::DeadlineExceeded),
+                false,
+            ),
+            (
+                SketchWorkerTerminal::Execution(SketchExecutionError::Trapped),
+                None,
+                false,
+            ),
+            (
+                SketchWorkerTerminal::ForcedContainment {
+                    trigger: SketchWorkerStopReason::Cancelled,
+                },
+                None,
+                false,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("final");
+            std::fs::write(&destination, b"original").unwrap();
+            let output = output::StagedOutput::new(&destination).unwrap();
+            std::fs::write(output.worker_destination(), b"completed").unwrap();
+            let expected = if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
+                stop.map_or(terminal.clone(), SketchWorkerTerminal::Stopped)
+            } else {
+                terminal.clone()
+            };
+            assert_eq!(finish_output(Some(output), terminal, stop), expected);
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                if publish {
+                    &b"completed"[..]
+                } else {
+                    &b"original"[..]
+                }
+            );
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
     const TEST_WAIT: Duration = Duration::from_secs(2);
 
     struct DeferredFake {
@@ -1344,6 +1471,7 @@ mod tests {
         worker_gauge.drop_notification = released;
         ExecutionOwnership {
             control,
+            output: None,
             _lease: lease,
             _lease_gauge: ledger.live_lease(),
             _worker_gauge: worker_gauge,
@@ -1431,7 +1559,7 @@ mod tests {
         let (released_tx, released_rx) = mpsc::channel();
         let retry_gate = Arc::new((Mutex::new(false), Condvar::new()));
         let calls = Arc::new(AtomicU64::new(0));
-        let ownership = deferred_ownership(
+        let mut ownership = deferred_ownership(
             &ledger,
             DeferredFake {
                 calls: Arc::clone(&calls),
@@ -1443,12 +1571,23 @@ mod tests {
             },
             Some(released_tx),
         );
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("final");
+        std::fs::write(&final_path, b"original").unwrap();
+        let output = output::StagedOutput::new(&final_path).unwrap();
+        let staged = output.worker_destination();
+        std::fs::write(&staged, b"uncommitted").unwrap();
+        ownership.output = Some(output);
         let cleanup = CleanupDispatcher::start(Arc::clone(&ledger)).expect("cleanup dispatcher");
         cleanup.hand_off_pre_protocol(ownership);
         assert!(first_failure_rx.recv_timeout(TEST_WAIT).is_ok());
+        assert!(staged.exists(), "staging must survive an unreaped worker");
         release_retry(&retry_gate);
         assert!(successful_reap_rx.recv_timeout(TEST_WAIT).is_ok());
         assert!(released_rx.recv_timeout(TEST_WAIT).is_ok());
+        assert!(!staged.exists(), "staging must be discarded after reap");
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(ledger.snapshot().forced, 1);
         assert_eq!(ledger.snapshot().reaped, 1);

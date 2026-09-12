@@ -232,6 +232,40 @@ fn real_worker_classifies_normal_and_trap() {
 }
 
 #[test]
+#[ignore = "requires the artifact built by scripts/build-threaded-smoke"]
+fn cargo_built_threaded_guest_commits_parent_owned_output() {
+    let artifact =
+        std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM").expect("threaded artifact");
+    let compiler = compiler(Duration::from_secs(20), long_fuel());
+    let sketch = admit(&compiler, std::fs::read(artifact).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("output.png");
+    std::fs::write(&destination, b"original").unwrap();
+    let config = worker_config()
+        .with_output_destination(destination.clone())
+        .unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let terminal = async_engine::timeout(
+            Duration::from_secs(30),
+            sketch.execute_threaded_root_contained(runtime.handle(), &config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started)
+        );
+        assert_clean(&compiler, &sketch).await;
+    });
+    assert_eq!(std::fs::read(&destination).unwrap(), b"guest exact output");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn real_worker_classifies_fuel_cancellation_and_deadline() {
     run_case(
         threaded_fixture::looping_root_wasm(),

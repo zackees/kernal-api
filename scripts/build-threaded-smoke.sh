@@ -65,3 +65,7 @@ fi
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
   soldr --no-cache "$subcommand" test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
+
+KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
+  soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker \
+    --test wasm_worker_containment cargo_built_threaded_guest_runs_inside_killable_worker -- --ignored

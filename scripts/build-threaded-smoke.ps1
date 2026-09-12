@@ -96,6 +96,9 @@ try {
     }
     $env:KERNAL_API_THREADED_ARTIFACT_WASM = $artifact
     soldr --no-cache $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    soldr --no-cache $subcommand test --locked --features wasm-sketch-worker --test wasm_worker_containment cargo_built_threaded_guest_runs_inside_killable_worker -- --ignored
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 finally {
     if ($hadPrevious) {

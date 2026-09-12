@@ -178,6 +178,21 @@ fn run_case(
 }
 
 #[test]
+#[ignore = "requires the artifact built by scripts/build-threaded-smoke"]
+fn cargo_built_threaded_guest_runs_inside_killable_worker() {
+    let path = std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM")
+        .expect("explicit artifact proof must supply its Cargo-built Wasm");
+    let bytes = std::fs::read(path).expect("read real threaded guest");
+    run_case(
+        bytes,
+        Duration::from_secs(8),
+        normal_fuel(),
+        false,
+        SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+    );
+}
+
+#[test]
 fn real_worker_classifies_normal_and_trap() {
     run_case(
         threaded_fixture::threaded_root_wasm(None, false, false, false),

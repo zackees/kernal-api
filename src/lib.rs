@@ -59,6 +59,21 @@ pub mod daemon_registration_v2;
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 
+// The native implementation is intentionally private until #16's generated
+// operation and resource registry can own the semantic handles.  In
+// particular, no Tauri/Wry/platform type crosses this boundary.
+#[cfg(all(
+    feature = "tauri-webview",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
+mod tauri;
+
+#[cfg(all(
+    feature = "tauri-webview",
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows"))
+))]
+compile_error!("the `tauri-webview` feature supports native Linux, macOS, and Windows hosts only");
+
 /// Admission policy for opt-in Rust WebAssembly sketches.
 ///
 /// This module privately admits and starts the bounded threaded-root profile.

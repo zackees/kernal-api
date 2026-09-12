@@ -77,6 +77,18 @@ pty = ["dep:portable-pty"]
 # surface this crate owns; the graph reduction follows when the substrate
 # gates its own copy.
 window-icon = ["dep:png", "dep:x11rb"]
+# Untrusted external web content is an explicit, heavyweight native capability.
+# The private implementation uses tauri-runtime-wry directly because Tauri's
+# high-level WebviewWindowBuilder installs an IPC bridge even for an external
+# URL.  Keep the exact Tauri release in the resolved feature graph while the
+# raw runtime starts with no IPC handler, custom schemes, or init scripts.
+tauri-webview = [
+  "dep:tauri",
+  "dep:tauri-runtime",
+  "dep:tauri-runtime-wry",
+  "dep:tauri-utils",
+  "dep:url",
+]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
@@ -241,6 +253,15 @@ object = { version = "=0.36.7", default-features = false, features = ["read", "s
 # on the exact upstream `notify` release directly. Default features are kept
 # so macOS retains its `macos_fsevent` backend.
 notify = { version = "=7.0.0", optional = true }
+
+# A webview is a native desktop facility. Keeping these declarations target
+# scoped ensures enabling its feature for a Wasm guest never resolves a web
+# runtime for that guest target.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+tauri = { version = "=2.11.5", default-features = false, optional = true }
+tauri-runtime = { version = "=2.11.3", optional = true }
+tauri-runtime-wry = { version = "=2.11.4", default-features = false, optional = true }
+tauri-utils = { version = "=2.9.3", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

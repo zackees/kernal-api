@@ -37,9 +37,11 @@ total allocated memory, collection capacity, or simultaneous guest transfers.
   in-flight allocations, including retained capacity and completed results.
 - Complete ordering and progress-timeout behavior under multiple producers and
   consumers; exercise scheduler races through real guest threads.
-- Integrate output commit with the operation terminal winner. The synchronous
-  helper currently does not serialize revocation against final replacement,
-  reserve exclusive blob consumption, or own a cancellable commit operation.
+- Integrate output commit with the operation terminal winner. Final replacement
+  now serializes resource revocation under the hub lock, but the synchronous
+  helper still needs exclusive blob consumption and a cancellable commit
+  operation dispatched on the caller's blocking lane. A stalled filesystem
+  replacement holds the hub lock; worker containment must bound this case.
 - Grant output before guest execution and pass only its semantic handle.
 - Exercise 64 MiB through the real generated guest ABI, including slow-consumer
   backpressure, cancellation, forged/stale/cross-sketch handles, and teardown.

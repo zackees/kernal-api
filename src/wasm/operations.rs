@@ -936,8 +936,9 @@ impl OperationHub {
     }
 
     /// Stream one opaque blob into an authorized sibling temporary file and
-    /// atomically replace the exact final path only after flush and close. No
-    /// hub lock, Store, or guest memory reference survives a filesystem call.
+    /// atomically replace the exact final path only after flush and close.
+    /// Bulk writes run without the hub lock. Final replacement is serialized
+    /// with revocation; this synchronous helper belongs on a blocking lane.
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) fn commit_blob_to_output(
         &self,
@@ -983,15 +984,59 @@ impl OperationHub {
             }
             file.sync_all()?;
             drop(file);
-            crate::fs_replace_file(&temporary, &destination)?;
-            Ok(())
+            self.replace_authorized_output(store, blob, output, &temporary)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
             return result;
         }
-        self.close_resource(blob).map_err(hub_io_error)?;
-        self.close_resource(output).map_err(hub_io_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    fn replace_authorized_output(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+        temporary: &Path,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| hub_io_error(HubError::Closed))?;
+        if state.closed {
+            return Err(hub_io_error(HubError::Closed));
+        }
+        let resource = state
+            .resources
+            .get(&blob)
+            .ok_or_else(|| hub_io_error(HubError::Closed))?;
+        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)
+            .map_err(hub_io_error)?;
+        let resource = state
+            .resources
+            .get(&output)
+            .ok_or_else(|| hub_io_error(HubError::Closed))?;
+        Self::validate_resource(resource, store, OUTPUT_RESOURCE_KIND, OUTPUT_RIGHT_COMMIT)
+            .map_err(hub_io_error)?;
+        let ResourceValue::ExactOutput(destination) = &resource.value else {
+            return Err(hub_io_error(HubError::WrongKind));
+        };
+        // Revocation cannot interleave between this last authority check and
+        // the filesystem commit. No await, callback, or guest re-entry occurs.
+        crate::fs_replace_file(temporary, destination)?;
+        let mut wakes =
+            Self::close_resource_with_terminal_locked(&mut state, blob, Terminal::Closed)
+                .map_err(hub_io_error)?;
+        wakes.extend(
+            Self::close_resource_with_terminal_locked(&mut state, output, Terminal::Closed)
+                .map_err(hub_io_error)?,
+        );
+        drop(state);
+        for wake in wakes {
+            wake.notify_one();
+        }
         Ok(())
     }
 
@@ -1498,6 +1543,32 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn revoked_output_cannot_replace_final_after_the_temporary_is_flushed() {
+        for teardown in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let final_path = directory.path().join("final");
+            let temporary = directory.path().join("staged");
+            std::fs::write(&final_path, b"original").unwrap();
+            std::fs::write(&temporary, b"replacement").unwrap();
+            let hub = OperationHub::new(4, 4).unwrap();
+            let blob = hub.create_blob(1).unwrap();
+            let output = hub.grant_exact_output(1, &final_path).unwrap();
+            hub.seal_blob(1, blob).unwrap();
+            if teardown {
+                hub.close_all(Terminal::Cancelled);
+            } else {
+                hub.close_resource(output).unwrap();
+            }
+            assert!(hub
+                .replace_authorized_output(1, blob, output, &temporary)
+                .is_err());
+            assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
+            assert_eq!(std::fs::read(&temporary).unwrap(), b"replacement");
+        }
+    }
 
     #[test]
     fn read_submission_releases_capacity_before_its_result_is_collected() {

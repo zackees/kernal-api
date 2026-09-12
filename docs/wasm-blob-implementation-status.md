@@ -134,12 +134,18 @@ Version 5 also reserves an optional host-owned URL field for native worker
 integration. Its UTF-8 payload is bounded to 16 KiB before allocation;
 NUL-containing, oversized, and truncated values are rejected, and absent
 authority remains distinct from an invalid empty URL. This is transport
-preparation, not a working contained webview: the parent still emits no URL
-grant and the current worker returns `native-webview-worker-unavailable`
-before compiler construction if one is supplied. Native URL revalidation,
-main-thread UI execution, bounded renderer-child allowance, and contained
-screenshot execution remain required. No process limit was relaxed in this
-change, and no guest authority was added.
+preparation, not yet a working contained screenshot: the parent still emits no
+URL grant. A worker without `tauri-webview` returns
+`native-webview-worker-unavailable` before compiler construction if one is
+supplied. A native-enabled worker revalidates the URL and requires the private
+staged output, then runs the UI on process main and the root on its own async
+runtime. Its UI exit guard also runs on task unwind. Parent grant configuration,
+bounded renderer-child allowance, and actual contained screenshot validation
+remain required. No process limit was relaxed, and no guest authority was added.
+The worker's 20 unit tests pass both with and without native features on Linux;
+the native variant verifies invalid URL and missing-output rejection without
+starting UI or compiler work. Strict native-enabled worker Clippy also passes.
+These checks do not establish that a renderer runs inside containment.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning

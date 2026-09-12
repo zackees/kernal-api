@@ -78,9 +78,15 @@ fn execute_request(
     module: Vec<u8>,
     output: &mut impl io::Write,
 ) -> Result<(), String> {
+    #[cfg(not(feature = "tauri-webview"))]
     if metadata.webview_url.is_some() {
         return protocol_terminal(output, request_id, "native-webview-worker-unavailable");
     }
+    #[cfg(feature = "tauri-webview")]
+    let native_grant = match native_grant(&metadata) {
+        Ok(grant) => grant,
+        Err(error) => return protocol_terminal(output, request_id, error),
+    };
     let (config, policy) = reconstruct(&metadata).map_err(|text| {
         protocol_terminal(output, request_id, &text)
             .err()
@@ -99,7 +105,12 @@ fn execute_request(
         }
         control_done_thread.store(true, Ordering::Release);
     });
-    let runtime = RuntimeBuilder::current_thread()
+    let runtime_builder = if metadata.webview_url.is_some() {
+        RuntimeBuilder::multi_thread()
+    } else {
+        RuntimeBuilder::current_thread()
+    };
+    let runtime = runtime_builder
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -108,23 +119,38 @@ fn execute_request(
         Err(error) => return protocol_terminal(output, request_id, error.to_string().as_str()),
     };
     let sketch = match compiler.admit(&module, policy) {
-        Ok(value) => value,
+        Ok(value) => Arc::new(value),
         Err(error) => return protocol_terminal(output, request_id, error.to_string().as_str()),
     };
-    let result = runtime.run(async {
-        match metadata.staged_output {
-            Some(destination) => {
-                sketch
-                    .execute_threaded_root_with_output(runtime.handle(), token, destination)
-                    .await
+    let execute_plain = || {
+        runtime.run(async {
+            match metadata.staged_output {
+                Some(destination) => {
+                    sketch
+                        .execute_threaded_root_with_output(
+                            runtime.handle(),
+                            token.clone(),
+                            destination,
+                        )
+                        .await
+                }
+                None => {
+                    sketch
+                        .execute_threaded_root_cancellable(runtime.handle(), token.clone())
+                        .await
+                }
             }
-            None => {
-                sketch
-                    .execute_threaded_root_cancellable(runtime.handle(), token)
-                    .await
-            }
+        })
+    };
+    #[cfg(not(feature = "tauri-webview"))]
+    let result = execute_plain();
+    #[cfg(feature = "tauri-webview")]
+    let result = match native_grant {
+        Some((grant, destination)) => {
+            execute_native(&runtime, Arc::clone(&sketch), token, grant, destination)
         }
-    });
+        None => execute_plain(),
+    };
     let _ = sketch.close_threaded_root();
     drop(sketch);
     let counters = snapshot(&compiler);
@@ -151,6 +177,55 @@ fn execute_request(
     .map_err(protocol_text)?;
     let _ = control_done.load(Ordering::Acquire);
     Ok(())
+}
+
+#[cfg(feature = "tauri-webview")]
+fn native_grant(
+    metadata: &ExecuteMetadata,
+) -> Result<Option<(kernal_api::webview::WebviewUrlGrant, std::path::PathBuf)>, &'static str> {
+    let Some(url) = metadata.webview_url.as_deref() else {
+        return Ok(None);
+    };
+    let grant =
+        kernal_api::webview::WebviewUrlGrant::new(url).map_err(|_| "invalid-native-webview-url")?;
+    let destination = metadata
+        .staged_output
+        .clone()
+        .ok_or("native-webview-output-required")?;
+    Ok(Some((grant, destination)))
+}
+
+/// The UI loop stays on process main; the root runs on this worker's runtime.
+/// The parent remains responsible for the hard deadline and process-tree reap.
+#[cfg(feature = "tauri-webview")]
+fn execute_native(
+    runtime: &kernal_api::async_engine::Runtime,
+    sketch: Arc<kernal_api::wasm::AdmittedSketch>,
+    token: kernal_api::async_engine::CancellationToken,
+    grant: kernal_api::webview::WebviewUrlGrant,
+    destination: std::path::PathBuf,
+) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    let host = kernal_api::webview::ExternalWebviewHost::new(runtime.handle())
+        .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+    let client = host.client();
+    let handle = runtime.handle();
+    let task = handle.clone().launch(async move {
+        // Unwinding or dropping the task must also release the UI loop.
+        struct ExitOnDrop(kernal_api::webview::ExternalWebviewClient);
+        impl Drop for ExitOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.request_exit();
+            }
+        }
+        let _exit = ExitOnDrop(client.clone());
+        sketch
+            .execute_threaded_root_with_webview(handle, token, client.clone(), grant, destination)
+            .await
+    });
+    host.run();
+    runtime
+        .run(task)
+        .map_err(|_| SketchExecutionError::BlockingTaskFailed)?
 }
 
 fn reconstruct(
@@ -382,6 +457,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "tauri-webview"))]
     fn unsupported_native_authority_is_rejected_before_module_execution() {
         let mut request = metadata();
         request.webview_url = Some("https://example.test/".into());
@@ -395,6 +471,40 @@ mod tests {
             ..
         } if diagnostic == "native-webview-worker-unavailable")
         );
+    }
+
+    #[test]
+    #[cfg(feature = "tauri-webview")]
+    fn native_authority_is_revalidated_without_starting_ui_or_compiler() {
+        let mut request = metadata();
+        assert!(native_grant(&request).unwrap().is_none());
+        for url in [
+            "file:///tmp/input",
+            "javascript:alert(1)",
+            "",
+            "https://user:password@example.test/",
+        ] {
+            request.webview_url = Some(url.into());
+            assert!(matches!(
+                native_grant(&request),
+                Err("invalid-native-webview-url")
+            ));
+            let mut output = Vec::new();
+            execute_request(7, request.clone(), Vec::new(), &mut output).unwrap();
+            assert!(
+                matches!(read_message(&mut output.as_slice()).unwrap(), Message::Terminal {
+                kind: TerminalKind::ProtocolFailure, diagnostic, ..
+            } if diagnostic == "invalid-native-webview-url")
+            );
+        }
+        request.webview_url = Some("https://example.test/exact".into());
+        assert!(matches!(
+            native_grant(&request),
+            Err("native-webview-output-required")
+        ));
+        let destination = std::env::temp_dir().join("worker-native-grant-test.png");
+        request.staged_output = Some(destination.clone());
+        assert_eq!(native_grant(&request).unwrap().unwrap().1, destination);
     }
 
     fn metadata() -> ExecuteMetadata {

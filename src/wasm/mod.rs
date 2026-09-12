@@ -3397,8 +3397,8 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.live_resources, 0);
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
-        assert_eq!(operations.suspends, 4);
-        assert_eq!(operations.resumes, 4);
+        assert_eq!(operations.suspends, 6);
+        assert_eq!(operations.resumes, 6);
         assert_eq!(
             *prepared
                 .controller

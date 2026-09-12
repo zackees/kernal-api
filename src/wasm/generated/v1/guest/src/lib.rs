@@ -121,3 +121,11 @@ impl SyntheticResource {
     pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
 }
 pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
+
+/// Opaque host-owned bulk resource. No buffer or native path is carried here.
+pub struct BlobHandle { token: u64 }
+impl BlobHandle {
+    pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
+    pub fn from_create_payload(token: u64) -> Self { Self { token } }
+    pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
+}

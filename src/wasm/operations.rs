@@ -23,6 +23,7 @@ pub(crate) const OP_SYNTHETIC_YIELD: u32 = 1;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CREATE: u32 = 2;
 pub(crate) const OP_SYNTHETIC_RESOURCE_USE: u32 = 3;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
+pub(crate) const OP_BLOB_CREATE: u32 = 5;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -125,6 +126,7 @@ const DEFAULT_BLOB_LIMITS: BlobLimits = BlobLimits {
 /// backends.  It is intentionally closed: adding authority means adding a
 /// request here, rather than a second registry or scheduler.
 pub(crate) enum Request {
+    BlobCreate,
     SyntheticYield,
     SyntheticCreate {
         kind: u8,
@@ -282,6 +284,29 @@ impl OperationHub {
         request: Request,
     ) -> Result<OpaqueToken, HubError> {
         let (resource, created, close_after, kind, rights, completion) = match request {
+            Request::BlobCreate => {
+                let resource = self.create_resource_value(
+                    store,
+                    BLOB_RESOURCE_KIND,
+                    BLOB_RIGHT_READ | BLOB_RIGHT_WRITE,
+                    false,
+                    ResourceValue::Blob {
+                        buffer: VecDeque::new(),
+                        sealed: false,
+                    },
+                )?;
+                (
+                    None,
+                    true,
+                    None,
+                    BLOB_RESOURCE_KIND,
+                    BLOB_RIGHT_READ | BLOB_RIGHT_WRITE,
+                    TerminalResult {
+                        terminal: Terminal::Completed,
+                        resource: Some(resource),
+                    },
+                )
+            }
             Request::SyntheticYield => (
                 None,
                 false,
@@ -489,6 +514,7 @@ impl OperationHub {
         arg1: u64,
     ) -> Result<u64, HubError> {
         let request = match kind {
+            OP_BLOB_CREATE if arg0 == 0 && arg1 == 0 => Request::BlobCreate,
             OP_SYNTHETIC_YIELD => Request::SyntheticYield,
             OP_SYNTHETIC_RESOURCE_CREATE => Request::SyntheticCreate {
                 kind: SYNTHETIC_RESOURCE_KIND,
@@ -1794,6 +1820,47 @@ mod tests {
             Ok(Some((Terminal::Completed, b"full".to_vec())))
         );
         assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn wire_blob_creation_is_scoped_and_cancelled_creation_reclaims_capacity() {
+        let hub = OperationHub::new(4, 1).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(
+            hub.submit_wire(runtime.handle(), 1, OP_BLOB_CREATE, 1, 0),
+            Err(HubError::Invalid)
+        );
+        let cancelled = hub
+            .submit_wire(runtime.handle(), 1, OP_BLOB_CREATE, 0, 0)
+            .unwrap();
+        hub.cancel_wire(1, cancelled).unwrap();
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.poll_wire(1, cancelled) as u8, STATUS_CANCELLED);
+
+        let operation = hub
+            .submit_wire(runtime.handle(), 1, OP_BLOB_CREATE, 0, 0)
+            .unwrap();
+        let wake = hub.suspend_wire(1, operation).unwrap();
+        runtime.run(async { wake.notified().await });
+        let result = hub.poll_wire(1, operation);
+        assert_eq!(result as u8, STATUS_COMPLETED);
+        let blob = OpaqueToken(result >> 8);
+        assert_eq!(
+            hub.blob_write(2, blob, b"foreign"),
+            Err(HubError::WrongRights)
+        );
+        assert_eq!(hub.blob_write(1, blob, b"owned"), Ok(5));
+        let close = hub
+            .submit_wire(runtime.handle(), 1, OP_SYNTHETIC_RESOURCE_CLOSE, blob.0, 0)
+            .unwrap();
+        let wake = hub.suspend_wire(1, close).unwrap();
+        runtime.run(async { wake.notified().await });
+        assert_eq!(hub.poll_wire(1, close) as u8, STATUS_COMPLETED);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
     }
 
     #[test]

@@ -1,9 +1,10 @@
 # Issue 17 implementation status
 
 The blob implementation on this development branch is incomplete and is not
-release evidence for issue #17. The generated ABI still exposes only the
-synthetic operation family. Blob tests currently call the private operation
-hub directly.
+release evidence for issue #17. The generated ABI exposes blob creation and
+closure through the existing operation family, exercised by the threaded
+smoke guest. Bulk-transfer tests still call the private operation hub directly;
+chunk transfers and exact output are not yet exposed to the guest.
 
 ## Verified host behavior
 

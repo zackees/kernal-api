@@ -136,6 +136,11 @@ fn complete_operation(
 /// Explicit result marker for public artifact inspection.
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
+    let blob = kernal_api_v1_bindings::BlobHandle::from_create_payload(
+        complete_operation(kernal_api_v1_bindings::BlobHandle::create().expect("submit blob create"))
+            .expect("generated blob create"),
+    );
+    complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));
     // Use an explicit deterministic hasher: the closed threaded P1 surface

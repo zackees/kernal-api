@@ -960,6 +960,51 @@ impl OperationHub {
         blob: OpaqueToken,
         output: OpaqueToken,
     ) -> std::io::Result<()> {
+        self.commit_blob_operation(store, blob, output, None)
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) fn submit_output_commit(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        let (operation, _) = self.submit(
+            store,
+            Some(output),
+            OUTPUT_RESOURCE_KIND,
+            OUTPUT_RIGHT_COMMIT,
+        )?;
+        let hub = Arc::clone(self);
+        runtime
+            .launch_blocking(move || {
+                if hub
+                    .commit_blob_operation(store, blob, output, Some(operation))
+                    .is_err()
+                {
+                    let _ = hub.terminal(
+                        operation,
+                        TerminalResult {
+                            terminal: Terminal::Rejected,
+                            resource: None,
+                        },
+                    );
+                }
+            })
+            .detach();
+        Ok(operation)
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    fn commit_blob_operation(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+        operation: Option<OpaqueToken>,
+    ) -> std::io::Result<()> {
         let destination = self.exact_output_path(store, output)?;
         {
             let mut state = self
@@ -1010,7 +1055,7 @@ impl OperationHub {
             }
             file.sync_all()?;
             drop(file);
-            self.replace_authorized_output(store, blob, output, &temporary)
+            self.replace_output_operation(store, blob, output, &temporary, operation)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -1027,12 +1072,33 @@ impl OperationHub {
         output: OpaqueToken,
         temporary: &Path,
     ) -> std::io::Result<()> {
+        self.replace_output_operation(store, blob, output, temporary, None)
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    fn replace_output_operation(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+        temporary: &Path,
+        operation: Option<OpaqueToken>,
+    ) -> std::io::Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| hub_io_error(HubError::Closed))?;
         if state.closed {
             return Err(hub_io_error(HubError::Closed));
+        }
+        if let Some(token) = operation {
+            let slot = state
+                .operations
+                .get(&token)
+                .ok_or_else(|| hub_io_error(HubError::Closed))?;
+            if slot.owner.store != store || slot.terminal.is_some() {
+                return Err(hub_io_error(HubError::Closed));
+            }
         }
         let resource = state
             .resources
@@ -1052,9 +1118,25 @@ impl OperationHub {
         // Revocation cannot interleave between this last authority check and
         // the filesystem commit. No await, callback, or guest re-entry occurs.
         crate::fs_replace_file(temporary, destination)?;
-        let mut wakes =
+        let mut wakes = Vec::new();
+        if let Some(token) = operation {
+            if let Some(wake) = Self::terminal_locked(
+                &mut state,
+                token,
+                TerminalResult {
+                    terminal: Terminal::Completed,
+                    resource: None,
+                },
+            )
+            .map_err(hub_io_error)?
+            {
+                wakes.push(wake);
+            }
+        }
+        wakes.extend(
             Self::close_resource_with_terminal_locked(&mut state, blob, Terminal::Closed)
-                .map_err(hub_io_error)?;
+                .map_err(hub_io_error)?,
+        );
         wakes.extend(
             Self::close_resource_with_terminal_locked(&mut state, output, Terminal::Closed)
                 .map_err(hub_io_error)?,
@@ -1586,6 +1668,56 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn output_commit_runs_on_supplied_runtime_and_cancellation_wins_before_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("final");
+        let hub = OperationHub::new(8, 8).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"complete").unwrap();
+        hub.seal_blob(1, blob).unwrap();
+        let output = hub.grant_exact_output(1, &final_path).unwrap();
+        let commit = hub
+            .submit_output_commit(runtime.handle(), 1, blob, output)
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(result) = hub.take_terminal(commit, 1).unwrap() {
+                        assert_eq!(result.terminal, Terminal::Completed);
+                        break;
+                    }
+                    crate::async_engine::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"complete");
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"cancelled").unwrap();
+        hub.seal_blob(1, blob).unwrap();
+        let output = hub.grant_exact_output(1, &final_path).unwrap();
+        let (commit, _) = hub
+            .submit(1, Some(output), OUTPUT_RESOURCE_KIND, OUTPUT_RIGHT_COMMIT)
+            .unwrap();
+        hub.cancel_wire(1, commit.0).unwrap();
+        assert!(hub
+            .commit_blob_operation(1, blob, output, Some(commit))
+            .is_err());
+        assert_eq!(
+            hub.take_terminal(commit, 1).unwrap().unwrap().terminal,
+            Terminal::Cancelled
+        );
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"complete");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
 
     #[cfg(feature = "wasm-sketch-host")]
     #[test]

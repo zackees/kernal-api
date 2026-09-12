@@ -1151,6 +1151,7 @@ fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMet
         .max(Duration::from_millis(1));
     let policy = sketch.worker_policy();
     ExecuteMetadata {
+        staged_output: None,
         blob_limits: [
             blobs.maximum_chunk_bytes() as u64,
             blobs.maximum_blob_bytes() as u64,

@@ -99,6 +99,13 @@ not yet exercise a killed worker: production integration must retain staging
 with `ExecutionOwnership` through cleanup handoff and reap, transport only the
 staged destination in the private protocol, and commit only after successful
 execution and validated cleanup. Native macOS/Windows evidence is outstanding.
+The private protocol is now version 4, with an optional staging destination
+bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
+without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,
+oversized, and truncated inputs are rejected. The parent currently sends no
+grant and the worker explicitly rejects a supplied grant until ownership is
+wired. Twelve protocol tests and eighteen worker-binary tests pass on Linux;
+the Windows-specific unpaired-surrogate test is checked in but not run here.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
@@ -156,7 +163,7 @@ the host.
 
 The worker supervisor sends all seven limits, and the worker validates them
 through the same public constructor before compiler construction. Private
-worker protocol version 3 rejects older peers rather than silently using
+worker protocol version 4 rejects older peers rather than silently using
 default limits; rebuild the worker executable together with the host. This
 changes no guest ABI import signature or guest artifact. Pending inputs and
 completed reads still have separate byte budgets. Hosts can additionally set

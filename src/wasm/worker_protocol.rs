@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
@@ -193,8 +193,10 @@ pub(super) enum ProtocolError {
 }
 
 /// Facade semantic primitives needed to reconstruct compiler/limit settings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExecuteMetadata {
+    /// Parent-owned staging destination, never the final output path or guest data.
+    pub(super) staged_output: Option<std::path::PathBuf>,
     /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes, transfer bytes.
     pub(super) blob_limits: [u64; 7],
     pub(super) max_wasm_stack_bytes: u64,
@@ -301,7 +303,7 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
             ..
         } => {
             put_u64(&mut payload, *module_len);
-            put_metadata(&mut payload, metadata);
+            put_metadata(&mut payload, metadata)?;
         }
         Message::ModuleChunk {
             sequence, bytes, ..
@@ -621,7 +623,86 @@ fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
             .map_err(|_| ProtocolError::Truncated)?,
     ))
 }
-fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
+const MAX_OUTPUT_PATH_BYTES: usize = 65_536;
+
+fn put_output_path(out: &mut Vec<u8>, path: Option<&std::path::Path>) -> Result<(), ProtocolError> {
+    let Some(path) = path else {
+        put_u32(out, 0);
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.contains(&0) || bytes.len() > MAX_OUTPUT_PATH_BYTES {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        bytes.to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        let mut bytes = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            if unit == 0 || bytes.len() >= MAX_OUTPUT_PATH_BYTES {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    };
+    put_u32(out, bytes.len() as u32);
+    out.push(if cfg!(windows) { 2 } else { 1 });
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+fn take_output_path(input: &mut &[u8]) -> Result<Option<std::path::PathBuf>, ProtocolError> {
+    let length = take_u32(input)? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAX_OUTPUT_PATH_BYTES {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    if take_u8(input)? != if cfg!(windows) { 2 } else { 1 } {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    let bytes = take(input, length)?;
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        if bytes.contains(&0) {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        if units.contains(&0) {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units))
+    };
+    if !path.is_absolute() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    Ok(Some(path))
+}
+
+fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) -> Result<(), ProtocolError> {
+    put_output_path(out, value.staged_output.as_deref())?;
     for v in value.blob_limits {
         put_u64(out, v);
     }
@@ -641,9 +722,11 @@ fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
     }
     put_u32(out, value.max_shared_memory_pages);
     put_u64(out, value.max_guest_threads);
+    Ok(())
 }
 fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
     Ok(ExecuteMetadata {
+        staged_output: take_output_path(input)?,
         blob_limits: [
             take_u64(input)?,
             take_u64(input)?,
@@ -702,6 +785,7 @@ mod tests {
     }
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            staged_output: None,
             blob_limits: [12, 13, 14, 15, 16, 17, 18],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 2,
@@ -742,6 +826,68 @@ mod tests {
             },
         };
         assert_eq!(decode(&encode(&terminal).unwrap()).unwrap(), terminal);
+    }
+
+    #[test]
+    fn staged_output_round_trips_only_bounded_absolute_native_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("completed-output");
+        let mut configuration = metadata();
+        configuration.staged_output = Some(path.clone());
+        let start = Message::ExecuteStart {
+            request_id: 1,
+            module_len: 1,
+            metadata: configuration,
+        };
+        assert_eq!(decode(&encode(&start).unwrap()).unwrap(), start);
+        let mut bytes = Vec::new();
+        put_output_path(&mut bytes, Some(&path)).unwrap();
+        for length in 0..bytes.len() {
+            assert!(take_output_path(&mut &bytes[..length]).is_err());
+        }
+        let mut foreign = bytes.clone();
+        foreign[4] = if cfg!(windows) { 1 } else { 2 };
+        assert_eq!(
+            take_output_path(&mut &foreign[..]),
+            Err(ProtocolError::InvalidPayload)
+        );
+        assert!(put_output_path(&mut Vec::new(), Some(std::path::Path::new("relative"))).is_err());
+        let oversized = ((MAX_OUTPUT_PATH_BYTES + 1) as u32).to_le_bytes();
+        assert_eq!(
+            take_output_path(&mut &oversized[..]),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_output_preserves_non_utf8_unix_paths_and_rejects_nul() {
+        use std::os::unix::ffi::OsStringExt;
+        for bytes in [b"/output/\xff".to_vec(), b"/output/\0".to_vec()] {
+            let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+            let mut encoded = Vec::new();
+            if bytes.contains(&0) {
+                assert!(put_output_path(&mut encoded, Some(&path)).is_err());
+            } else {
+                put_output_path(&mut encoded, Some(&path)).unwrap();
+                assert_eq!(take_output_path(&mut &encoded[..]).unwrap(), Some(path));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_output_preserves_unpaired_utf16_windows_paths() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ]));
+        let mut encoded = Vec::new();
+        put_output_path(&mut encoded, Some(&path)).unwrap();
+        assert_eq!(take_output_path(&mut &encoded[..]).unwrap(), Some(path));
     }
     #[test]
     fn round_trip_module_chunk_consumes_its_payload() {

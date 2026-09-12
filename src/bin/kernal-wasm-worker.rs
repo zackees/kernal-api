@@ -78,7 +78,7 @@ fn execute_request(
     module: Vec<u8>,
     output: &mut impl io::Write,
 ) -> Result<(), String> {
-    let (config, policy) = reconstruct(metadata).map_err(|text| {
+    let (config, policy) = reconstruct(&metadata).map_err(|text| {
         protocol_terminal(output, request_id, &text)
             .err()
             .unwrap_or(text)
@@ -142,8 +142,12 @@ fn execute_request(
 }
 
 fn reconstruct(
-    metadata: ExecuteMetadata,
+    metadata: &ExecuteMetadata,
 ) -> Result<(SketchCompilerConfig, SketchModulePolicy), String> {
+    // Fail closed until supervisor staging ownership and execution are wired.
+    if metadata.staged_output.is_some() {
+        return Err("worker-output-not-enabled".into());
+    }
     let mut blob_values = [0_usize; 7];
     for (destination, source) in blob_values.iter_mut().zip(metadata.blob_limits) {
         *destination = usize::try_from(source).map_err(|_| "blob-limit-overflow")?;
@@ -346,7 +350,7 @@ mod tests {
         let mut metadata = metadata();
         metadata.reserved_memory_bytes = 1024 * 1024 * 1024;
         metadata.max_shared_memory_pages = 16_384;
-        let (config, _) = reconstruct(metadata).unwrap();
+        let (config, _) = reconstruct(&metadata).unwrap();
         assert_eq!(
             config.execution_limits().blob_limits(),
             kernal_api::wasm::SketchBlobLimits::new(4, 8, 16, 2, 3, 4)
@@ -355,13 +359,24 @@ mod tests {
                 .unwrap()
         );
         metadata.blob_limits[0] = 0;
-        assert!(reconstruct(metadata).is_err());
+        assert!(reconstruct(&metadata).is_err());
         metadata.blob_limits[0] = u64::MAX;
-        assert!(reconstruct(metadata).is_err());
+        assert!(reconstruct(&metadata).is_err());
+    }
+
+    #[test]
+    fn staging_grant_fails_closed_until_supervisor_ownership_is_enabled() {
+        let mut metadata = metadata();
+        metadata.staged_output = Some(std::env::temp_dir().join("completed-output"));
+        assert_eq!(
+            reconstruct(&metadata).unwrap_err(),
+            "worker-output-not-enabled"
+        );
     }
 
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            staged_output: None,
             blob_limits: [4, 8, 16, 2, 3, 4, 24],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 1,

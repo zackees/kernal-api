@@ -304,6 +304,16 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
         shell: pwsh
         run: ./scripts/build-threaded-smoke.ps1
+      - name: Build and admit the actual screenshot guest (Windows, no GUI)
+        if: runner.os == 'Windows'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-screenshot-build
+        shell: pwsh
+        run: |
+          ./examples/wasm-tauri-screenshot/build-guest.ps1
+          $env:KERNAL_API_SCREENSHOT_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+          soldr cargo test --locked --features wasm-sketch-host --test wasm_tauri_screenshot -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   wasm-abi-generation:
     runs-on: ubuntu-latest

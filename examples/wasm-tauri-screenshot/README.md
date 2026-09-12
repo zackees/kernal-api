@@ -43,6 +43,25 @@ KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-was
   soldr cargo test --locked --features wasm-sketch-host --test wasm_tauri_screenshot -- --ignored
 ```
 
+PowerShell 7 uses the equivalent checked-in entry point and absolute storage:
+
+```powershell
+soldr --no-cache rustup target add wasm32-wasip1-threads
+$env:CARGO_TARGET_DIR = Join-Path (Get-Location).Path 'target/screenshot-proof'
+./examples/wasm-tauri-screenshot/build-guest.ps1
+$env:KERNAL_API_SCREENSHOT_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+soldr cargo test --locked --features wasm-sketch-host --test wasm_tauri_screenshot -- --ignored
+```
+
+Both scripts require the pinned Wasm target to be installed, preserve the
+caller's build storage, and fail on build/metadata errors. The PowerShell
+entry restores the caller's working directory and `SOLDR_LINKER` setting.
+Building a guest this way does not prove native Windows webview execution.
+The existing Windows threaded-artifact CI lane invokes this script and the
+host-only admission test without enabling GUI dependencies. The script's
+actual build and caller-state restoration have been checked with PowerShell
+on Linux; native Windows validation remains separate.
+
 That test checks closed-profile admission and rejection without webview grants,
 not successful native capture. It also mutates the real artifact's import
 namespace and requires pre-compilation rejection. The original admission
@@ -140,4 +159,4 @@ the load timeout with a whole-root `deadline-exceeded` error.
 Actual traps remain `trapped`, distinct from these reported failures. The
 generated poll decoder preserves rejected status 7 rather than collapsing it
 to a generic failure; status 3 is preserved as `TimedOut`. The rest of the
-negative matrix remains required, as does a PowerShell build entry point.
+negative matrix and native Windows/macOS execution remain required.

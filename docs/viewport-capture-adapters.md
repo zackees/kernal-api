@@ -179,9 +179,21 @@ required generated-Wasm screenshot example. Windows x86-64 strict Clippy and
 Apple Silicon library/test compile checks also cover the shared dispatch.
 Native Windows/macOS execution and a focused abandoned-future/late-callback
 service stress matrix remain outstanding.
-Independent admission for queued/in-flight native captures also needs a stress
-proof: consuming cancelled hub operations must not permit unbounded UI work
-or native image retention while callbacks are still outstanding.
+Native admission is now independent of guest-visible operation terminals:
+at most four captures (or the hub operation limit if smaller) may be queued or
+in flight per hub. The UI closure/native completion owns the admission lease,
+not the awaiting future. Saturation returns `WebviewError::CaptureBusy`.
+Teardown does not zero the active-native-capture counter while leases remain.
+
+The Linux `kernal-tauri-smoke capture-cancel` scenario pauses the UI thread
+with an acceptance-only drop-released barrier, starts and drops four capture
+futures, and verifies that their consumed operation terminals do not free
+native admission. A fifth request must return `CaptureBusy`. Releasing the
+barrier drains the cancelled work; closing the view then verifies zero native
+captures, resources, operations, blobs, and retained transfer memory. This
+scenario passes under Xvfb. A hub unit test independently checks quota reuse
+and truthful counters through teardown. Native callbacks that are already
+executing still require the broader cross-platform failure/stress matrix.
 
 `src/tauri.rs` retains Wry webviews in the UI-thread `UI_WEBVIEWS` map. Native
 capture must dispatch there and keep native image objects on their permitted

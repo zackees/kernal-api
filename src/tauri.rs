@@ -582,6 +582,8 @@ fn is_allowed_url(url: &Url) -> bool {
 /// No native backend, runtime, or window value is exposed through this type.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WebviewError {
+    #[error("the native viewport capture queue is full")]
+    CaptureBusy,
     #[error("viewport capture exceeds its pixel limit or has invalid dimensions")]
     CapturePixelLimit,
     #[error("viewport capture exceeds its encoded-byte or blob quota")]
@@ -637,6 +639,8 @@ pub struct WebviewHandle {
 #[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WebviewTestObservation {
+    /// Queued UI captures and native callbacks still holding admission.
+    pub active_native_captures: usize,
     /// Encoded image resources retained by the shared hub.
     pub live_blobs: usize,
     /// Hub and native chunk allocations still charged to the transfer quota.
@@ -779,6 +783,7 @@ impl ExternalWebviewClient {
         let snapshot = self.service.hub.snapshot();
         let native_backings = self.service.native.lock().map_or(0, |native| native.len());
         WebviewTestObservation {
+            active_native_captures: snapshot.active_native_captures,
             live_blobs: snapshot.live_blobs,
             retained_transfer_capacity: snapshot.retained_transfer_capacity,
             native_backings,

@@ -136,6 +136,13 @@ impl NativeWebview {
         operation: OpaqueToken,
         limits: ViewportCaptureLimits,
     ) -> Result<CaptureRequest, WebviewError> {
+        let lease = hub.acquire_native_capture().map_err(|error| {
+            if error == HubError::Quota {
+                WebviewError::CaptureBusy
+            } else {
+                map_hub(error)
+            }
+        })?;
         let error = Arc::new(Mutex::new(None));
         let native_id = self.native_id;
         let request = CaptureRequest {
@@ -163,6 +170,7 @@ impl NativeWebview {
                         limits.maximum_pixels,
                         limits.maximum_encoded_bytes,
                         move |result| {
+                            let _lease = lease;
                             if let Err(error) = result {
                                 if let Ok(mut slot) = callback_error.lock() {
                                     *slot = Some(error);
@@ -301,5 +309,49 @@ fn map_capture(error: CaptureError) -> WebviewError {
         CaptureError::NativeFailure | CaptureError::EncodingFailure | CaptureError::InvalidPng => {
             WebviewError::CaptureFailed
         }
+    }
+}
+
+/// Acceptance-only pause released on drop, with a native-side timeout backstop.
+#[cfg(feature = "tauri-webview-test-support")]
+pub struct WebviewTestUiPause(Option<std::sync::mpsc::Sender<()>>);
+
+#[cfg(feature = "tauri-webview-test-support")]
+impl Drop for WebviewTestUiPause {
+    fn drop(&mut self) {
+        if let Some(release) = self.0.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+impl WebviewHandle {
+    /// Pause UI dispatch after acknowledging the barrier, for deterministic
+    /// cancellation/admission tests. Drop the guard to resume the UI thread.
+    pub async fn pause_ui_for_test(&self) -> Result<WebviewTestUiPause, WebviewError> {
+        let window = self
+            .service
+            .native
+            .lock()
+            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
+            .get(&self.resource)
+            .ok_or(WebviewError::WindowClosed)?
+            .window
+            .clone();
+        let (release, receive) = std::sync::mpsc::channel();
+        let pause = WebviewTestUiPause(Some(release));
+        let (ready, waiting) = async_engine::oneshot_channel();
+        window
+            .run_on_main_thread(move || {
+                let _ = ready.send(());
+                let _ = receive.recv_timeout(Duration::from_secs(20));
+            })
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        async_engine::timeout(Duration::from_secs(5), waiting)
+            .await
+            .map_err(|_| WebviewError::TimedOut)?
+            .map_err(|_| WebviewError::WindowClosed)?;
+        Ok(pause)
     }
 }

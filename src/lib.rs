@@ -90,6 +90,8 @@ pub(crate) use platform_imp::viewport_capture as native_viewport_capture;
 ))]
 pub mod webview {
     #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::capture::WebviewTestUiPause;
+    #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestObservation;
     pub use crate::tauri::{
         ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,

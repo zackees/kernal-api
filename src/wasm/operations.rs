@@ -101,6 +101,7 @@ pub(crate) struct HubSnapshot {
     pub(crate) peak_retained_transfer_capacity: usize,
     pub(crate) native_transfer_capacity: usize,
     pub(crate) active_output_jobs: usize,
+    pub(crate) active_native_captures: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -300,12 +301,22 @@ impl Drop for OutputJobLease {
     }
 }
 
+/// Admission retained until queued UI work and its native callback are gone.
+pub(crate) struct NativeCaptureLease(Arc<OperationHub>);
+
+impl Drop for NativeCaptureLease {
+    fn drop(&mut self) {
+        self.0.native_capture_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
     #[cfg(all(test, feature = "wasm-sketch-host"))]
     output_fault: Mutex<Option<OutputFault>>,
     output_job_failed: AtomicBool,
     output_job_count: AtomicU64,
+    native_capture_count: AtomicU64,
     scope: u64,
     maximum_operations: usize,
     maximum_resources: usize,
@@ -314,6 +325,22 @@ pub(crate) struct OperationHub {
 }
 
 impl OperationHub {
+    /// Keep native admission independent of consumed operation terminals.
+    /// At most four captures may be queued or in flight in a logical hub.
+    pub(crate) fn acquire_native_capture(self: &Arc<Self>) -> Result<NativeCaptureLease, HubError> {
+        let state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed {
+            return Err(HubError::Closed);
+        }
+        let limit = self.maximum_operations.min(4) as u64;
+        self.native_capture_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .map_err(|_| HubError::Quota)?;
+        Ok(NativeCaptureLease(Arc::clone(self)))
+    }
+
     pub(crate) fn new(
         maximum_operations: usize,
         maximum_resources: usize,
@@ -332,6 +359,7 @@ impl OperationHub {
             output_fault: Mutex::new(None),
             output_job_failed: AtomicBool::new(false),
             output_job_count: AtomicU64::new(0),
+            native_capture_count: AtomicU64::new(0),
             scope,
             maximum_operations,
             maximum_resources,
@@ -2203,6 +2231,7 @@ impl OperationHub {
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
             native_transfer_capacity: state.native_transfer_capacity,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
+            active_native_captures: self.native_capture_count.load(Ordering::Acquire) as usize,
         }
     }
 }
@@ -2631,6 +2660,36 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_capture_admission_survives_operation_consumption_and_teardown() {
+        let hub = OperationHub::new(8, 8).unwrap();
+        let mut leases = Vec::new();
+        for _ in 0..4 {
+            leases.push(hub.acquire_native_capture().unwrap());
+            let (operation, _) = hub.submit(7, None, 0, 0).unwrap();
+            hub.finish_external_operation(operation, Terminal::Cancelled);
+            hub.observe_terminal(7, operation).unwrap().unwrap();
+        }
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().active_native_captures, 4);
+        assert!(matches!(hub.acquire_native_capture(), Err(HubError::Quota)));
+        drop(leases.pop());
+        let last = hub.acquire_native_capture().unwrap();
+        hub.close_all(Terminal::Closed);
+        assert!(matches!(
+            hub.acquire_native_capture(),
+            Err(HubError::Closed)
+        ));
+        assert_eq!(
+            hub.snapshot().active_native_captures,
+            4,
+            "teardown must not hide live callbacks"
+        );
+        drop(last);
+        drop(leases);
+        assert_eq!(hub.snapshot().active_native_captures, 0);
+    }
 
     #[test]
     fn native_encoder_seek_overwrites_and_fills_holes_with_bounded_storage() {

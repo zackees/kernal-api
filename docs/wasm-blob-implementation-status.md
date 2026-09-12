@@ -70,6 +70,21 @@ transfers.
 
 ## Remaining acceptance work
 
+The shared hub now enforces independent live-blob, pending-read, and
+pending-write count limits (128 each by default). These limits are currently
+configurable only through the private `BlobLimits`, not the embedding API or
+worker metadata. Blob creation checks include reserved generated creations.
+Pending-write rejection occurs before copying input; cancellation frees the
+pending-I/O count even before the terminal result is collected. The separate
+operation-table limit still accounts for that uncollected result. Focused
+tests cover count reuse after cancellation/close and eight simultaneous host
+submissions competing for one pending-write slot. This is host concurrency,
+not yet the required concurrent guest-thread proof.
+All 42 hub tests pass. With the count limits enabled, the existing 64 MiB
+Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
+killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
+the host.
+
 The capacity audit now measures `retained_transfer_capacity` separately from
 payload lengths. A regression demonstrates why aggregate enforcement is still
 required: after writing 1,024 bytes and reading 512 without collection, the hub

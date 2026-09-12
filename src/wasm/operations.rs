@@ -84,6 +84,9 @@ pub(crate) struct HubSnapshot {
     pub(crate) scope: u64,
     pub(crate) pending_operations: usize,
     pub(crate) live_resources: usize,
+    pub(crate) live_blobs: usize,
+    pub(crate) pending_blob_reads: usize,
+    pub(crate) pending_blob_writes: usize,
     pub(crate) suspends: u64,
     pub(crate) resumes: u64,
     pub(crate) buffered_blob_bytes: usize,
@@ -105,6 +108,9 @@ pub(crate) struct BlobLimits {
     pub(crate) maximum_chunk_bytes: usize,
     pub(crate) maximum_blob_bytes: usize,
     pub(crate) maximum_sketch_bytes: usize,
+    pub(crate) maximum_live_blobs: usize,
+    pub(crate) maximum_pending_reads: usize,
+    pub(crate) maximum_pending_writes: usize,
 }
 
 impl BlobLimits {
@@ -123,6 +129,9 @@ impl BlobLimits {
             maximum_chunk_bytes,
             maximum_blob_bytes,
             maximum_sketch_bytes,
+            maximum_live_blobs: 128,
+            maximum_pending_reads: 128,
+            maximum_pending_writes: 128,
         })
     }
 }
@@ -131,6 +140,9 @@ const DEFAULT_BLOB_LIMITS: BlobLimits = BlobLimits {
     maximum_chunk_bytes: 64 * 1024,
     maximum_blob_bytes: 1024 * 1024,
     maximum_sketch_bytes: 4 * 1024 * 1024,
+    maximum_live_blobs: 128,
+    maximum_pending_reads: 128,
+    maximum_pending_writes: 128,
 };
 
 /// Private typed requests shared by the generated ABI and heavyweight native
@@ -838,6 +850,16 @@ impl OperationHub {
             self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
         {
             let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            if state
+                .operations
+                .values()
+                .filter(|op| op.pending_blob_write.is_some())
+                .count()
+                >= self.blob_limits.maximum_pending_writes
+            {
+                state.operations.remove(&operation);
+                return Err(HubError::Quota);
+            }
             let pending: usize = state
                 .operations
                 .values()
@@ -999,6 +1021,16 @@ impl OperationHub {
         let (token, _) = self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)?;
         {
             let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            if state
+                .operations
+                .values()
+                .filter(|op| op.pending_blob_read.is_some())
+                .count()
+                >= self.blob_limits.maximum_pending_reads
+            {
+                state.operations.remove(&token);
+                return Err(HubError::Quota);
+            }
             let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
             if operation.terminal.is_none() {
                 operation.pending_blob_read = Some(maximum);
@@ -1483,6 +1515,16 @@ impl OperationHub {
         if state.resources.len() >= self.maximum_resources {
             return Err(HubError::Quota);
         }
+        if matches!(&value, ResourceValue::Blob { .. })
+            && state
+                .resources
+                .values()
+                .filter(|resource| matches!(&resource.value, ResourceValue::Blob { .. }))
+                .count()
+                >= self.blob_limits.maximum_live_blobs
+        {
+            return Err(HubError::Quota);
+        }
         let slot = match state.free_resource_slots.pop() {
             Some(slot) => slot,
             None => {
@@ -1870,6 +1912,21 @@ impl OperationHub {
                 .filter(|operation| operation.terminal.is_none())
                 .count(),
             live_resources: state.resources.len(),
+            live_blobs: state
+                .resources
+                .values()
+                .filter(|resource| matches!(&resource.value, ResourceValue::Blob { .. }))
+                .count(),
+            pending_blob_reads: state
+                .operations
+                .values()
+                .filter(|op| op.pending_blob_read.is_some())
+                .count(),
+            pending_blob_writes: state
+                .operations
+                .values()
+                .filter(|op| op.pending_blob_write.is_some())
+                .count(),
             suspends: state.suspends,
             resumes: state.resumes,
             buffered_blob_bytes: state.buffered_blob_bytes,
@@ -2157,6 +2214,92 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn live_blob_quota_is_independent_of_other_resources_and_released_on_close() {
+        let mut limits = BlobLimits::new(4, 4, 8).unwrap();
+        limits.maximum_live_blobs = 1;
+        let hub = OperationHub::with_blob_limits(8, 8, limits).unwrap();
+        let first = hub.create_blob(1).unwrap();
+        assert_eq!(hub.create_blob(1), Err(HubError::Quota));
+        assert!(hub
+            .create_resource(1, SYNTHETIC_RESOURCE_KIND, 1, false)
+            .is_ok());
+        hub.close_resource(first).unwrap();
+        assert!(hub.create_blob(1).is_ok());
+    }
+
+    #[test]
+    fn pending_io_count_quotas_reject_before_copy_and_cancel_releases_them() {
+        let mut limits = BlobLimits::new(4, 4, 16).unwrap();
+        limits.maximum_pending_reads = 1;
+        limits.maximum_pending_writes = 1;
+        let hub = OperationHub::with_blob_limits(16, 4, limits).unwrap();
+        let empty = hub.create_blob(1).unwrap();
+        let full = hub.create_blob(1).unwrap();
+        hub.blob_write(1, full, b"full").unwrap();
+        let read = hub.submit_blob_read(1, empty, 4).unwrap();
+        assert_eq!(hub.submit_blob_read(1, empty, 4), Err(HubError::Quota));
+        let write = hub.submit_blob_write(1, full, b"next").unwrap();
+        assert_eq!(
+            hub.submit_blob_write_from(1, full, 1, || panic!("quota must reject before copying")),
+            Err(HubError::Quota)
+        );
+        assert_eq!(hub.snapshot().pending_operations, 2);
+        assert_eq!(hub.snapshot().pending_blob_reads, 1);
+        assert_eq!(hub.snapshot().pending_blob_writes, 1);
+        hub.cancel_wire(1, read.0).unwrap();
+        hub.cancel_wire(1, write.0).unwrap();
+        assert_eq!(hub.snapshot().pending_blob_reads, 0);
+        assert_eq!(hub.snapshot().pending_blob_writes, 0);
+        // Cancelled terminal results have not been collected. They no longer
+        // hold pending-I/O permits, but still count against the operation table.
+        assert!(hub.submit_blob_read(1, empty, 4).is_ok());
+        assert!(hub.submit_blob_write(1, full, b"next").is_ok());
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        assert_eq!(hub.snapshot().pending_blob_reads, 0);
+        assert_eq!(hub.snapshot().pending_blob_writes, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    }
+
+    #[test]
+    fn competing_host_submissions_cannot_overbook_pending_write_count() {
+        let mut limits = BlobLimits::new(4, 4, 64).unwrap();
+        limits.maximum_pending_writes = 1;
+        let hub = OperationHub::with_blob_limits(32, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let hub = Arc::clone(&hub);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    hub.submit_blob_write(1, blob, b"next")
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == Err(HubError::Quota))
+                .count(),
+            7
+        );
+        assert_eq!(hub.snapshot().pending_blob_writes, 1);
+        assert_eq!(hub.snapshot().pending_operations, 1);
+        assert_eq!(hub.snapshot().pending_write_bytes, 4);
+        hub.close_resource(blob).unwrap();
+        assert_eq!(hub.snapshot().pending_blob_writes, 0);
     }
 
     #[test]

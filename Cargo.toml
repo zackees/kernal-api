@@ -35,7 +35,7 @@ required-features = ["tauri-webview-test-support"]
 [[bin]]
 name = "kernal-api-wasm-tauri"
 path = "examples/wasm-tauri-screenshot/runner.rs"
-required-features = ["wasm-sketch-host", "tauri-webview"]
+required-features = ["wasm-sketch-worker", "tauri-webview"]
 
 [features]
 default = []

@@ -954,7 +954,7 @@ pub(crate) fn spawn_contained_worker(
     ))
 }
 
-#[cfg(feature = "tauri-webview")]
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
 pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
     for key in ["TMPDIR", "__CF_USER_TEXT_ENCODING"] {
         if let Some(value) = std::env::var_os(key) { command.env(key, value); }

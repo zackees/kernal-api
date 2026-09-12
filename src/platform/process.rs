@@ -498,7 +498,7 @@ pub(crate) struct WorkerLimits {
     pub(crate) job_memory_bytes: Option<u64>,
 }
 
-#[cfg(feature = "tauri-webview")]
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
 pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
     crate::platform_imp::configure_native_worker_environment(command);
 }

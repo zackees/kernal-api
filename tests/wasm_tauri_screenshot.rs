@@ -178,6 +178,7 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
 
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
+#[cfg(feature = "wasm-sketch-worker")]
 fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes() {
     let directory = tempfile::tempdir().unwrap();
     let output = directory.path().join("viewport.png");
@@ -232,6 +233,7 @@ fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes()
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
+#[cfg(feature = "wasm-sketch-worker")]
 fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
     run_native_screenshot_proof(NativeScenario::Capture);
 }
@@ -239,6 +241,7 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
+#[cfg(feature = "wasm-sketch-worker")]
 fn actual_screenshot_guest_rejects_redirect_and_drains_without_output() {
     run_native_screenshot_proof(NativeScenario::Redirect);
 }
@@ -246,6 +249,7 @@ fn actual_screenshot_guest_rejects_redirect_and_drains_without_output() {
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display, actual guest, and the real 30-second load deadline"]
+#[cfg(feature = "wasm-sketch-worker")]
 fn actual_screenshot_guest_times_out_and_drains_without_output() {
     run_native_screenshot_proof(NativeScenario::Timeout);
 }
@@ -253,6 +257,7 @@ fn actual_screenshot_guest_times_out_and_drains_without_output() {
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
+#[cfg(feature = "wasm-sketch-worker")]
 fn actual_screenshot_guest_write_failure_reclaims_capture_and_preserves_files() {
     run_native_screenshot_proof(NativeScenario::MissingOutputParent);
 }
@@ -260,21 +265,48 @@ fn actual_screenshot_guest_write_failure_reclaims_capture_and_preserves_files() 
 #[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the real guest built with proof-trap-after-capture"]
+#[cfg(feature = "wasm-sketch-worker")]
 fn actual_screenshot_guest_trap_reclaims_completed_native_capture() {
     run_native_screenshot_proof(NativeScenario::TrapAfterCapture);
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "wasm-sketch-worker")]
 enum NativeScenario {
     Capture,
     Redirect,
     Timeout,
     MissingOutputParent,
     TrapAfterCapture,
+    ContainedCapture,
+    ContainedTrap,
+    MissingWorker,
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn default_screenshot_cli_uses_containment_and_commits_output() {
+    run_native_screenshot_proof(NativeScenario::ContainedCapture);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual trap-after-capture artifact"]
+fn default_screenshot_cli_uses_containment_and_preserves_output_on_trap() {
+    run_native_screenshot_proof(NativeScenario::ContainedTrap);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires the actual built screenshot artifact"]
+fn default_screenshot_cli_missing_worker_never_falls_back() {
+    run_native_screenshot_proof(NativeScenario::MissingWorker);
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
+#[cfg(feature = "wasm-sketch-worker")]
 fn run_native_screenshot_proof(scenario: NativeScenario) {
     use std::io::{Read, Write};
     use std::sync::{
@@ -301,7 +333,10 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             let _ = self.0.wait();
         }
     }
-    let artifact_variable = if scenario == NativeScenario::TrapAfterCapture {
+    let artifact_variable = if matches!(
+        scenario,
+        NativeScenario::TrapAfterCapture | NativeScenario::ContainedTrap
+    ) {
         "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM"
     } else {
         "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
@@ -385,8 +420,21 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         thread: Some(thread),
     };
     let start = Instant::now();
+    let contained = matches!(
+        scenario,
+        NativeScenario::ContainedCapture
+            | NativeScenario::ContainedTrap
+            | NativeScenario::MissingWorker
+    );
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"));
+    if !contained {
+        command.arg("--diagnostic-in-process");
+    }
+    if scenario == NativeScenario::MissingWorker {
+        command.arg("--worker").arg(proof.join("missing-worker"));
+    }
     let mut child = Child(
-        std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
+        command
             .arg("--url")
             .arg(format!("http://{address}/"))
             .arg("--output")
@@ -422,6 +470,41 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         ),
     )
     .unwrap();
+    if contained {
+        let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
+        if scenario == NativeScenario::MissingWorker {
+            assert!(!status.success());
+            assert!(trace.contains("native worker missing"), "{trace}");
+            assert!(!trace.contains("kernal-webview-trace"), "{trace}");
+            assert!(!trace.contains("kernal-worker-trace"), "{trace}");
+            assert_eq!(std::fs::read(&output).unwrap(), b"original");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+            return;
+        }
+        assert_eq!(
+            status.success(),
+            scenario == NativeScenario::ContainedCapture,
+            "{trace}"
+        );
+        assert!(
+            trace.contains("spawned=1 reaped=1 forced=0 workers=0 tasks=0 leases=0"),
+            "{trace}"
+        );
+        if scenario == NativeScenario::ContainedCapture {
+            assert!(trace.contains("terminal=worker-completed"), "{trace}");
+            validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
+        } else {
+            assert!(trace.contains("terminal=trapped"), "{trace}");
+            assert_eq!(std::fs::read(&output).unwrap(), b"original");
+        }
+        assert!(std::fs::read(proof.join("runner.stdout.log"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+        return;
+    }
     if scenario != NativeScenario::Capture {
         assert!(!status.success(), "negative native scenario succeeded");
         if scenario == NativeScenario::Timeout {

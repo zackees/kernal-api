@@ -891,7 +891,7 @@ pub(crate) fn spawn_contained_worker(
     worker_from_spawned_child(child)
 }
 
-#[cfg(feature = "tauri-webview")]
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
 pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
     // Host-selected display/session and native loader settings, never guest input.
     // Do not inherit HOME, credentials, or the full ambient environment.

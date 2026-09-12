@@ -15,7 +15,7 @@ guest in a separate contained worker on Linux. The focused
 pixel capture and trap-after-capture output preservation when built with
 `wasm-sketch-worker,tauri-webview-test-support`. They use the same normal/trap
 artifact environment variables documented below. Windows/macOS native worker
-execution, exhaustive renderer-destruction evidence, and migration of the CLI
+execution and exhaustive renderer-destruction evidence
 remain pending. Linux also passes the forced-deadline proof described below.
 
 For the containment-only blocking variant, build with
@@ -23,7 +23,7 @@ For the containment-only blocking variant, build with
 set `KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM` to the admitted artifact under
 `kernal-api-wasm-tauri-guest-block`. This guest waits on an unnotified condition
 variable after receiving the native snapshot. Never run that variant in the
-in-process CLI: the `block_inside_containment` test exercises the worker's
+`--diagnostic-in-process` mode: the `block_inside_containment` test exercises the worker's
 20-second deadline and forced-reap path. Post-capture fault variants are
 source-only acceptance fixtures and are disabled in the normal build.
 
@@ -40,9 +40,11 @@ output grants, so the guest now proceeds directly to closing the view.
 This is still an in-progress #20/#21 implementation, not completion of the
 full acceptance matrix. Broader failure-path trace coverage,
 queued/cancelled native-creation destruction evidence, the complete
-failure matrix, CLI worker migration and renderer-destruction evidence, and native
-Windows/macOS execution remain outstanding. Do not treat this in-process
-diagnostic CLI as containment for arbitrary untrusted Wasm.
+failure matrix, renderer-destruction evidence, and native Windows/macOS execution
+remain outstanding. The CLI now defaults to the contained worker. Only builds
+with `tauri-webview-test-support` accept the explicit `--diagnostic-in-process`
+mode used by the detailed timing/failure proofs; that mode is not containment
+for arbitrary untrusted Wasm. Worker launch failure never falls back to it.
 
 Build the actual guest on a Unix host with the pinned target installed:
 
@@ -96,10 +98,11 @@ enable both capabilities on a host with a working native display:
 ```sh
 KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
 KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
-  soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
+KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest-block/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
+  soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
 ```
 
-The native test launches the CLI as a separate process, serves the checked-in
+The diagnostic-mode native test launches the CLI as a separate process, serves the checked-in
 fixture over loopback, verifies successful guest completion, decodes the PNG
 with portable Rust tooling, checks bounded dimensions and tolerant red/blue
 regions at six interior points, and checks exact-output replacement and
@@ -154,8 +157,8 @@ Focused formatting and lint checks:
 
 ```sh
 soldr cargo fmt --all -- --check
-soldr cargo clippy --locked --features wasm-sketch-host,tauri-webview-test-support --lib --tests --bins -- -D warnings
-soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot
+soldr cargo clippy --locked --features wasm-sketch-worker,tauri-webview-test-support --lib --tests --bins -- -D warnings
+soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot
 ```
 
 The generated command driver handles only
@@ -166,14 +169,18 @@ are rejected rather than busy-polled by an alternate scheduler.
 Run the native executable from this source checkout:
 
 ```sh
-soldr cargo run --locked --features wasm-sketch-host,tauri-webview --bin kernal-api-wasm-tauri -- --url http://127.0.0.1:8000/ --output screenshot.png
+soldr cargo build --locked --features wasm-sketch-worker,tauri-webview --bins
+soldr cargo run --locked --features wasm-sketch-worker,tauri-webview --bin kernal-api-wasm-tauri -- --url http://127.0.0.1:8000/ --output screenshot.png
 ```
 
 Without `--module`, the CLI builds the checked-in guest through Soldr and
 embeds its generated metadata. `--module <artifact>` selects an already-built
 diagnostic artifact; either path validates imports before instantiation.
-The default build-and-run path has also completed against the offline fixture
-on Linux x86-64, producing the same 800×600 red/blue viewport.
+The native-enabled `kernal-wasm-worker` must be beside the CLI executable, or
+selected explicitly with `--worker <path>`. Build both with the same features;
+the worker independently validates the module and grants. The earlier
+in-process build-and-run proof produced the same 800×600 red/blue viewport;
+the contained CLI proof currently supplies the built artifact explicitly.
 URL and exact-output grants are installed before module start. The UI service
 gets the root's existing hub and the same runtime, never copied tokens from a
 different client hub. Native jobs are bounded and joined; cancelled native

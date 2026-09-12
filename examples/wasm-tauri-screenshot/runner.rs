@@ -59,14 +59,27 @@ fn build_guest() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let (mut url, mut output, mut module) = (None, None, None);
+    let mut worker = None;
+    let diagnostic_in_process = false;
+    #[cfg(feature = "tauri-webview-test-support")]
+    let mut diagnostic_in_process = diagnostic_in_process;
     while let Some(flag) = arguments.next() {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if flag == "--diagnostic-in-process" && !diagnostic_in_process {
+            diagnostic_in_process = true;
+            continue;
+        }
         let value = arguments.next().ok_or("option requires a value")?;
         match flag.to_str() {
             Some("--url") if url.is_none() => url = Some(value),
             Some("--output") if output.is_none() => output = Some(PathBuf::from(value)),
             Some("--module") if module.is_none() => module = Some(PathBuf::from(value)),
-            _ => return Err("usage: kernal-api-wasm-tauri --url <http(s)-url> --output <png> [--module <built-wasm>]".into()),
+            Some("--worker") if worker.is_none() => worker = Some(PathBuf::from(value)),
+            _ => return Err("usage: kernal-api-wasm-tauri --url <http(s)-url> --output <png> [--module <built-wasm>] [--worker <native-worker>]".into()),
         }
+    }
+    if diagnostic_in_process && worker.is_some() {
+        return Err("--worker cannot be combined with --diagnostic-in-process".into());
     }
     let url = url.ok_or("--url is required")?;
     let grant = WebviewUrlGrant::new(url.to_str().ok_or("URL must be UTF-8")?)?;
@@ -100,8 +113,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             epochs.maximum_active_registrations(),
         )?,
     )?)?;
-    let sketch = compiler.admit(&bytes, policy)?;
+    let sketch = std::sync::Arc::new(compiler.admit(&bytes, policy)?);
     let runtime = RuntimeBuilder::multi_thread().enable_all().build()?;
+    if !diagnostic_in_process {
+        use kernal_api::wasm::{SketchWorkerConfig, SketchWorkerTerminal};
+        let executable = match worker {
+            Some(path) => std::path::absolute(path)?,
+            None => std::env::current_exe()?.with_file_name(format!(
+                "kernal-wasm-worker{}",
+                std::env::consts::EXE_SUFFIX
+            )),
+        };
+        if !executable.is_file() {
+            return Err("native worker missing; build both binaries with wasm-sketch-worker,tauri-webview or supply --worker".into());
+        }
+        let config = SketchWorkerConfig::new(executable, Duration::from_secs(2))?
+            .with_webview_capture(grant, output)?;
+        let terminal =
+            runtime.run(sketch.execute_threaded_root_contained(runtime.handle(), &config));
+        #[cfg(feature = "tauri-webview-test-support")]
+        {
+            let counts = sketch.worker_execution_snapshot();
+            eprintln!("kernal-worker-trace terminal={} spawned={} reaped={} forced={} workers={} tasks={} leases={}", terminal.code(), counts.spawned, counts.reaped, counts.forced, counts.live_workers, counts.live_protocol_tasks, counts.pending_root_leases);
+        }
+        return match terminal {
+            SketchWorkerTerminal::Completed(_) => Ok(()),
+            SketchWorkerTerminal::Execution(error) => Err(screenshot_error(error).into()),
+            other => Err(std::io::Error::other(other.code()).into()),
+        };
+    }
     let host = ExternalWebviewHost::new(runtime.handle())?;
     let client = host.client();
     let handle = runtime.handle();
@@ -137,19 +177,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     host.run();
     let result = receiver.recv_timeout(Duration::from_secs(60))?;
     runtime.run(task)?;
-    result.map_err(|error| {
-        if let kernal_api::wasm::SketchExecutionError::NonzeroExit { code } = error {
-            if let Some(failure) = status::Failure::from_code(code as u32) {
-                debug_assert_eq!(failure.code(), code as u32);
-                return std::io::Error::other(format!(
-                    "screenshot-{}-{}",
-                    failure.step.name(),
-                    failure.cause.name()
-                ));
-            }
-            return std::io::Error::other(format!("nonzero-exit:{code}"));
-        }
-        std::io::Error::other(error.code())
-    })?;
+    result.map_err(screenshot_error)?;
     Ok(())
+}
+
+fn screenshot_error(error: kernal_api::wasm::SketchExecutionError) -> std::io::Error {
+    if let kernal_api::wasm::SketchExecutionError::NonzeroExit { code } = error {
+        if let Some(failure) = status::Failure::from_code(code as u32) {
+            debug_assert_eq!(failure.code(), code as u32);
+            return std::io::Error::other(format!(
+                "screenshot-{}-{}",
+                failure.step.name(),
+                failure.cause.name()
+            ));
+        }
+        return std::io::Error::other(format!("nonzero-exit:{code}"));
+    }
+    std::io::Error::other(error.code())
 }

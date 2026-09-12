@@ -158,9 +158,8 @@ real trap is reported as `Execution(Trapped)`, leaves the original output and
 neighbor unchanged, removes staging, and drains those same parent counters.
 All 18 focused parent lifecycle/configuration unit tests also pass.
 The focused Linux CI lane now includes this ignored native proof. This is not
-Windows/macOS runtime evidence; the separate forced case follows below. The screenshot
-CLI still needs migration from its in-process path, and worker trace retention
-remains unfinished.
+Windows/macOS runtime evidence; the separate forced case follows below.
+Worker-internal trace transport remains unfinished.
 
 The source-built `proof-block-after-capture` guest then passed the Linux forced
 containment proof in 23.70 seconds. It receives the native snapshot before
@@ -175,6 +174,25 @@ every native renderer or a zero-counter report from a forcibly killed guest.
 The combined success/trap/block suite passes all three cases in 42.33 seconds;
 the focused test passes strict Clippy, and both build scripts produced the
 blocking artifact locally (PowerShell was run on Linux, not Windows).
+
+The screenshot CLI now selects this worker path by default, with a sibling
+native-enabled executable or explicit `--worker` path. Its Cargo target requires
+`wasm-sketch-worker` and `tauri-webview`. Missing workers are errors, never an
+in-process fallback. The detailed native timing/failure proofs explicitly select
+`--diagnostic-in-process`, accepted only with `tauri-webview-test-support`.
+Default-mode CLI success and trap proofs pass on Linux alongside the diagnostic
+capture proof (three tests, 26.71 seconds): they verify decoded output or original
+file preservation, clean stdout, and zero parent counters in the bounded terminal
+summary. Native callback traces still come from diagnostic mode, not the worker;
+this does not claim feature parity in contained diagnostics.
+The full Linux screenshot suite then passed all 15 tests in 123.76 seconds,
+including the explicit missing-worker/no-fallback regression, diagnostic load
+timeout and write failure, contained success/trap/block, and validator negative
+controls. The production CLI configuration also passes strict Clippy without
+the diagnostic feature enabled.
+The non-worker native test configuration passes strict Clippy too; it exposed
+and fixed an over-broad gate on native worker environment helpers. Those helpers
+now require both the native capability and worker support.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning

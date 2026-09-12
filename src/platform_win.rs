@@ -679,7 +679,7 @@ pub fn process_replace_current_image(_command: &mut std::process::Command) -> st
 pub const fn process_can_replace_current_image() -> bool {
     false
 }
-#[cfg(feature = "tauri-webview")]
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
 pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
     for key in ["SystemRoot", "WINDIR", "TEMP", "TMP", "LOCALAPPDATA"] {
         if let Some(value) = std::env::var_os(key) { command.env(key, value); }

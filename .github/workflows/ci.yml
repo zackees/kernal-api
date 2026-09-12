@@ -162,8 +162,9 @@ jobs:
   # A unit test does not own process main on every test harness, while Tauri
   # requires its event loop to start there.  These executable proofs
   # therefore use a real Xvfb display, a loopback page, and one supplied
-  # kernal-api async runtime.  They exercise matching Finished correlation,
-  # actual window destruction, popup denial, and a prohibited custom redirect.
+  # kernal-api async runtime. They exercise matching Finished correlation,
+  # actual window destruction, popup/redirect denial, timeout, cancellation,
+  # and window-close revocation with zero semantic/native resources.
   tauri-webview-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 8

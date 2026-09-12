@@ -6,7 +6,7 @@ use kernal_api::wasm::{
     SketchModulePolicy,
 };
 
-#[cfg(feature = "tauri-webview")]
+#[cfg(feature = "tauri-webview-test-support")]
 #[test]
 #[ignore = "requires a native display and the actual built screenshot guest"]
 fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
@@ -142,6 +142,7 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
     let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
     let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
     assert!(width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 4_000_000);
+    validate_fixture_png(&png).expect("decodable native viewport with expected color regions");
     assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
     assert_eq!(
         std::fs::read_dir(&directory).unwrap().count(),
@@ -157,6 +158,89 @@ fn actual_screenshot_cli_runs_the_offline_guest_and_commits_only_its_output() {
         png.len(),
         start.elapsed()
     );
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+fn validate_fixture_png(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.len() > 1024 * 1024 {
+        return Err("encoded image exceeds proof limit");
+    }
+    let mut decoder = png::Decoder::new_with_limits(
+        std::io::Cursor::new(bytes),
+        png::Limits {
+            bytes: 32 * 1024 * 1024,
+        },
+    );
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(|_| "invalid PNG header")?;
+    let info = reader.info();
+    if info.width < 4
+        || info.height < 4
+        || u64::from(info.width) * u64::from(info.height) > 4_000_000
+    {
+        return Err("invalid viewport dimensions");
+    }
+    if reader.output_buffer_size() > 16_000_000 {
+        return Err("decoded image exceeds proof limit");
+    }
+    let mut pixels = vec![0; reader.output_buffer_size()];
+    let frame = reader
+        .next_frame(&mut pixels)
+        .map_err(|_| "invalid PNG pixels")?;
+    let channels = match frame.color_type {
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+        _ => return Err("fixture requires RGB color regions"),
+    };
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    for y in [height / 4, height / 2, height * 3 / 4] {
+        for (x, expected) in [(width / 4, [255_u8, 0, 0]), (width * 3 / 4, [0, 0, 255])] {
+            let offset = (y * width + x) * channels;
+            let sample = &pixels[offset..offset + channels];
+            if sample[..3]
+                .iter()
+                .zip(expected)
+                .any(|(actual, expected)| actual.abs_diff(expected) > 35)
+                || (channels == 4 && sample[3] < 220)
+            {
+                return Err("unexpected viewport color region");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
+#[test]
+fn portable_png_assertions_reject_wrong_regions_and_corrupt_pixels() {
+    fn fixture(swapped: bool) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 8, 8);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels: Vec<u8> = (0..64)
+                .flat_map(|index| {
+                    if (index % 8 < 4) != swapped {
+                        [255, 0, 0]
+                    } else {
+                        [0, 0, 255]
+                    }
+                })
+                .collect();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        bytes
+    }
+    let valid = fixture(false);
+    assert_eq!(validate_fixture_png(&valid), Ok(()));
+    assert_eq!(
+        validate_fixture_png(&fixture(true)),
+        Err("unexpected viewport color region")
+    );
+    assert!(validate_fixture_png(&valid[..valid.len() / 2]).is_err());
 }
 
 #[test]

@@ -117,7 +117,7 @@ tauri-webview = [
 ]
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
-tauri-webview-test-support = ["tauri-webview"]
+tauri-webview-test-support = ["tauri-webview", "dep:png"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
@@ -199,6 +199,8 @@ full = [
 ]
 
 [dependencies]
+# Portable decoding is opt-in for native screenshot proofs and window icons.
+png = { version = "=0.17.16", optional = true }
 # `rayon` backs the parallel memory-mapped hashing path; its global pool is
 # constructed lazily, so a consumer that never hashes a large file never builds
 # one.
@@ -300,7 +302,6 @@ gio = { version = "=0.18.4", optional = true }
 cairo-rs = { version = "=0.18.5", features = ["png"], optional = true }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
-png = { version = "=0.17.16", optional = true }
 x11rb = { version = "=0.13.2", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]

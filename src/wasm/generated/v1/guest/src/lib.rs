@@ -122,6 +122,12 @@ impl SyntheticResource {
 }
 pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
 
+/// Sleep on the embedding kernel's monotonic timer. The guest imports no
+/// clock and creates no runtime; yield parks this Wasm execution on the host.
+pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError> {
+    OperationFuture::submit(12, u64::from(milliseconds), 0)
+}
+
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
 /// One exact destination authorized by the embedding host; never a guest path.

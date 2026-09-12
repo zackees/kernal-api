@@ -24,7 +24,16 @@ The tool pins `zackees/fp-bindgen` at `4e44d9e5408653e3c428ee3f855cc194d53f60b0`
 It is a development tool outside the published package, so ordinary
 `kernal-api` builds do not resolve the generator or its dependency graph.
 
-This initial generated contract has one scalar, authority-free import:
-`kernal-api:v1::kernel_yield`. Future submit/poll/yield/cancel and resource
-operations must extend this declaration and regenerate all outputs; they may
-not add a handwritten guest import path.
+The generated scalar contract provides `kernel_yield` and operation
+submit/poll/yield/cancel imports. Semantic resource operations are closed
+submit opcodes, not additional handwritten imports. Opcode 12 is
+`clock_sleep(milliseconds: u32)`: it uses the supplied kernel runtime's
+monotonic timer and the ordinary operation future. It has no resource payload
+or guest clock import. Reserved arguments and oversized durations are rejected.
+Cancellation releases semantic authority immediately, while queued timer tasks
+retain bounded admission until they drain. Logical-root finalization revokes
+and drains timers before returning.
+
+The threaded smoke guest exercises a ten-millisecond generated sleep. The
+five-second, post-load screenshot sequence and its native webview opcodes
+remain part of #20; this primitive alone does not establish that proof.

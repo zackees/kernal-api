@@ -30,6 +30,7 @@ pub(crate) const OP_BLOB_READ_COLLECT: u32 = 8;
 pub(crate) const OP_BLOB_SEAL: u32 = 9;
 pub(crate) const OP_OUTPUT_COMMIT: u32 = 10;
 pub(crate) const OP_OUTPUT_GRANT: u32 = 11;
+pub(crate) const OP_CLOCK_SLEEP: u32 = 12;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -102,6 +103,7 @@ pub(crate) struct HubSnapshot {
     pub(crate) native_transfer_capacity: usize,
     pub(crate) active_output_jobs: usize,
     pub(crate) active_native_captures: usize,
+    pub(crate) active_clocks: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -232,6 +234,7 @@ struct OperationSlot {
     pending_blob_read: Option<usize>,
     is_blob_read: bool,
     blob_read_result: Option<Vec<u8>>,
+    clock_cancel: Option<crate::async_engine::CancellationSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -304,6 +307,15 @@ impl Drop for OutputJobLease {
 /// Admission retained until queued UI work and its native callback are gone.
 pub(crate) struct NativeCaptureLease(Arc<OperationHub>);
 
+struct ClockLease(Arc<OperationHub>);
+
+impl Drop for ClockLease {
+    fn drop(&mut self) {
+        self.0.clock_count.fetch_sub(1, Ordering::AcqRel);
+        self.0.clock_drained.notify_one();
+    }
+}
+
 impl Drop for NativeCaptureLease {
     fn drop(&mut self) {
         self.0.native_capture_count.fetch_sub(1, Ordering::AcqRel);
@@ -317,6 +329,8 @@ pub(crate) struct OperationHub {
     output_job_failed: AtomicBool,
     output_job_count: AtomicU64,
     native_capture_count: AtomicU64,
+    clock_count: AtomicU64,
+    clock_drained: Notify,
     scope: u64,
     maximum_operations: usize,
     maximum_resources: usize,
@@ -360,6 +374,8 @@ impl OperationHub {
             output_job_failed: AtomicBool::new(false),
             output_job_count: AtomicU64::new(0),
             native_capture_count: AtomicU64::new(0),
+            clock_count: AtomicU64::new(0),
+            clock_drained: Notify::new(),
             scope,
             maximum_operations,
             maximum_resources,
@@ -679,6 +695,12 @@ impl OperationHub {
         arg0: u64,
         arg1: u64,
     ) -> Result<u64, HubError> {
+        if kind == OP_CLOCK_SLEEP {
+            if arg1 != 0 || arg0 > u64::from(u32::MAX) {
+                return Err(HubError::Invalid);
+            }
+            return self.submit_clock_sleep(runtime, store, arg0).map(|op| op.0);
+        }
         #[cfg(feature = "wasm-sketch-host")]
         if kind == OP_OUTPUT_COMMIT {
             return self
@@ -738,6 +760,68 @@ impl OperationHub {
             _ => return Err(HubError::Invalid),
         };
         Ok(self.dispatch(runtime, store, request)?.0)
+    }
+
+    /// Called after root revocation so no clock can be admitted while draining.
+    pub(crate) async fn join_clock_jobs(&self) {
+        debug_assert!(self.state.lock().is_ok_and(|state| state.closed));
+        while self.clock_count.load(Ordering::Acquire) != 0 {
+            self.clock_drained.notified().await;
+        }
+    }
+
+    fn submit_clock_sleep(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        milliseconds: u64,
+    ) -> Result<OpaqueToken, HubError> {
+        // Count physical timer tasks independently of consumable operations:
+        // cancel/poll/resubmit cannot grow a stalled runtime's task queue.
+        self.clock_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.maximum_operations as u64).then_some(active + 1)
+            })
+            .map_err(|_| HubError::Quota)?;
+        let lease = ClockLease(Arc::clone(self));
+        let cancellation = crate::async_engine::CancellationSource::new();
+        let token = cancellation.token();
+        let (operation, _) = self.submit(store, None, 0, 0)?;
+        {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state
+                .operations
+                .get_mut(&operation)
+                .ok_or(HubError::Closed)?;
+            if slot.terminal.is_some() {
+                // Teardown won between reservation and cancellation binding.
+                cancellation.cancel();
+            } else {
+                slot.clock_cancel = Some(cancellation);
+            }
+        }
+        let hub = Arc::clone(self);
+        runtime
+            .launch(async move {
+                let _lease = lease;
+                if crate::async_engine::cancellable(
+                    &token,
+                    crate::async_engine::sleep(std::time::Duration::from_millis(milliseconds)),
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = hub.terminal(
+                        operation,
+                        TerminalResult {
+                            terminal: Terminal::Completed,
+                            resource: None,
+                        },
+                    );
+                }
+            })
+            .detach();
+        Ok(operation)
     }
 
     pub(crate) fn poll_wire(&self, store: u64, operation: u64) -> u64 {
@@ -1888,6 +1972,7 @@ impl OperationHub {
                 pending_blob_read: None,
                 is_blob_read: false,
                 blob_read_result: None,
+                clock_cancel: None,
             },
         );
         Ok((token, notify))
@@ -2037,6 +2122,9 @@ impl OperationHub {
                 return Ok(None);
             }
             operation.terminal = Some(result);
+            if let Some(cancel) = operation.clock_cancel.take() {
+                cancel.cancel();
+            }
             operation.pending_blob_write = None;
             operation.pending_blob_read = None;
             (Arc::clone(&operation.notify), operation.created_resource)
@@ -2145,6 +2233,9 @@ impl OperationHub {
         state.free_resource_slots.clear();
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
+            if let Some(cancel) = operation.clock_cancel.take() {
+                cancel.cancel();
+            }
             operation.blob_read_result = None;
             if operation.terminal.is_none() {
                 operation.pending_blob_write = None;
@@ -2232,6 +2323,7 @@ impl OperationHub {
             native_transfer_capacity: state.native_transfer_capacity,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
             active_native_captures: self.native_capture_count.load(Ordering::Acquire) as usize,
+            active_clocks: self.clock_count.load(Ordering::Acquire) as usize,
         }
     }
 }
@@ -2660,6 +2752,95 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_clock_waits_on_kernel_time_and_resumes_its_owner() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(2, 2).unwrap();
+        runtime.run(async {
+            let started = std::time::Instant::now();
+            let operation = hub
+                .submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, 25, 0)
+                .unwrap();
+            assert_eq!(hub.poll_wire(7, operation), pack(STATUS_PENDING, None));
+            assert!(hub.suspend_wire(8, operation).is_err());
+            let wake = hub.suspend_wire(7, operation).unwrap();
+            crate::async_engine::timeout(std::time::Duration::from_secs(2), wake.notified())
+                .await
+                .unwrap();
+            assert!(started.elapsed() >= std::time::Duration::from_millis(25));
+            assert_eq!(hub.poll_wire(7, operation), pack(STATUS_COMPLETED, None));
+            assert_eq!(hub.snapshot().active_clocks, 0);
+            assert_eq!(hub.snapshot().pending_operations, 0);
+        });
+    }
+
+    #[test]
+    fn generated_clock_cancel_keeps_admission_until_task_drain() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(1, 1).unwrap();
+        // Do not drive the runtime until after cancellation and result
+        // consumption: this deterministically retains the queued task.
+        let operation = hub
+            .submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, u64::from(u32::MAX), 0)
+            .unwrap();
+        assert!(hub.cancel_wire(8, operation).is_err());
+        hub.cancel_wire(7, operation).unwrap();
+        assert_eq!(hub.poll_wire(7, operation), pack(STATUS_CANCELLED, None));
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().active_clocks, 1);
+        assert_eq!(
+            hub.submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, 0, 0),
+            Err(HubError::Quota)
+        );
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(2), async {
+                while hub.snapshot().active_clocks != 0 {
+                    crate::async_engine::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let operation = hub
+            .submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, u64::from(u32::MAX), 0)
+            .unwrap();
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.poll_wire(7, operation), pack(STATUS_CLOSED, None));
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(2), hub.join_clock_jobs())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            hub.submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, 0, 0),
+            Err(HubError::Closed)
+        );
+        assert_eq!(hub.snapshot().active_clocks, 0);
+    }
+
+    #[test]
+    fn generated_clock_rejects_noncanonical_arguments_without_reservation() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(1, 1).unwrap();
+        for (milliseconds, reserved) in [(u64::MAX, 0), (0, 1)] {
+            assert_eq!(
+                hub.submit_wire(runtime.handle(), 7, OP_CLOCK_SLEEP, milliseconds, reserved),
+                Err(HubError::Invalid)
+            );
+        }
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().active_clocks, 0);
+    }
 
     #[test]
     fn native_capture_admission_survives_operation_consumption_and_teardown() {

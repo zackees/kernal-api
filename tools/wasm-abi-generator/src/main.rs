@@ -113,6 +113,12 @@ impl SyntheticResource {
 }
 pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
 
+/// Sleep on the embedding kernel's monotonic timer. The guest imports no
+/// clock and creates no runtime; yield parks this Wasm execution on the host.
+pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError> {
+    OperationFuture::submit(12, u64::from(milliseconds), 0)
+}
+
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
 /// One exact destination authorized by the embedding host; never a guest path.
@@ -378,11 +384,15 @@ mod tests {
         include!("../../../src/wasm/generated/v1/guest/src/lib.rs");
     }
     static YIELD_RESPONSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+    std::thread_local! {
+        static SUBMISSION: std::cell::Cell<(i32, i64, i64)> = const { std::cell::Cell::new((0, 0, 0)) };
+    }
 
     // Exercise the checked-in guest facade against the scalar import boundary,
     // including the negative failure sentinel emitted by the async host linker.
     #[no_mangle]
-    extern "C" fn operation_submit(_kind: i32, _arg0: i64, _arg1: i64) -> i64 {
+    extern "C" fn operation_submit(kind: i32, arg0: i64, arg1: i64) -> i64 {
+        SUBMISSION.set((kind, arg0, arg1));
         1
     }
     #[no_mangle]
@@ -403,6 +413,13 @@ mod tests {
                 },
                 "host yield response {response}"
             );
+        }
+    }
+    #[test]
+    fn generated_clock_uses_only_the_scalar_operation_boundary() {
+        for milliseconds in [0, 5_000, u32::MAX] {
+            let _ = generated_guest::clock_sleep(milliseconds).unwrap();
+            assert_eq!(SUBMISSION.get(), (12, i64::from(milliseconds), 0));
         }
     }
     const MANIFEST: &str = include_str!("../../../src/wasm/generated/v1/kernal-api-v1.abi.toml");

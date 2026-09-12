@@ -3,7 +3,7 @@ export name=__main_void kind=function index=81 type=Some(13)
 export name=_start kind=function index=16 type=Some(0)
 export name=kernal-api-run kind=function index=78 type=Some(13)
 export name=memory kind=memory index=0 type=None
-export name=wasi_thread_start kind=function index=357 type=Some(3)
+export name=wasi_thread_start kind=function index=358 type=Some(3)
 import module=env name=memory kind=memory initial=17 maximum=Some(16384) shared=true memory64=false page-size-log2=None
 import module=kernal-api:v1 name=kernel_yield kind=function type=0
 import module=kernal-api:v1 name=operation_cancel kind=function type=10

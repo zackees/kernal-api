@@ -5,7 +5,7 @@ This is a standalone, source-only Rust 1.95 fixture for
 checked-in lockfile, but no Wasm binary or build output.
 
 It imports `kernal-api:v1::kernel_yield` through the checked-in generated guest
-crate, creates and joins two ordinary Rust
+crate, waits on a ten-millisecond generated kernel-clock operation, creates and joins two ordinary Rust
 child threads, and exercises `Arc<AtomicU32>`, `Mutex`, `mpsc`, TLS, and a
 deterministic `DashMap` result. It publishes that bounded result through a
 versioned atomics-only record in the imported shared memory; the host locates
@@ -14,7 +14,7 @@ manifest is deliberately exact: no validation metadata or report export
 expands the `threaded-rust-v1` admission surface. The root instance enters
 `_start` once; each child instance enters
 `wasi_thread_start(tid, arg)` once. It deliberately performs no output,
-environment, filesystem, network, clock, or randomness operations.
+environment, filesystem, network, ambient clock, or randomness operations.
 
 Run `scripts/build-threaded-smoke.ps1` on Windows or
 `scripts/build-threaded-smoke.sh` on Unix. Both scripts use Soldr's `rustup`

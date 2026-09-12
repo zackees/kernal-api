@@ -925,6 +925,7 @@ impl AdmittedSketch {
         operation_cleanup.close_all(operations::Terminal::Closed);
         let children = prepared.controller.join_completed();
         let output_cleanup = operation_cleanup.join_output_jobs().await;
+        operation_cleanup.join_clock_jobs().await;
         let rejections = prepared.controller.take_thread_spawn_rejections();
         #[cfg(test)]
         if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
@@ -1886,6 +1887,7 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         if matches!(
             kind,
             crate::operations::OP_BLOB_READ
+                | crate::operations::OP_CLOCK_SLEEP
                 | crate::operations::OP_BLOB_SEAL
                 | crate::operations::OP_OUTPUT_COMMIT
         ) {
@@ -3028,6 +3030,7 @@ mod threaded_root_observation_tests {
             .expect("root records lifecycle cleanup");
         assert_eq!(operations.pending_operations, 0);
         assert_eq!(operations.live_resources, 0);
+        assert_eq!(operations.active_clocks, 0);
     }
 
     #[test]
@@ -3644,10 +3647,13 @@ mod threaded_root_observation_tests {
             .expect("root records lifecycle cleanup after the real artifact exits");
         assert_eq!(operations.pending_operations, 0);
         assert_eq!(operations.live_resources, 0);
+        assert_eq!(operations.active_clocks, 0);
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
-        assert!((8..=9).contains(&operations.suspends));
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37);
+        // Output completion and the clock may win before waiter registration;
+        // each adds at most one suspension, but exactly one consumed result.
+        assert!((8..=10).contains(&operations.suspends), "{operations:?}");
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),

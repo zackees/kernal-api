@@ -139,6 +139,12 @@ fn complete_operation(
 /// Explicit result marker for public artifact inspection.
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
+    // A generated kernel operation is the only clock boundary. No WASI
+    // clock import or guest runtime is needed to suspend this real module.
+    let clock = kernal_api_v1_bindings::clock_sleep(10).expect("submit kernel clock");
+    while clock.poll().expect("poll kernel clock").is_none() {
+        clock.yield_now().expect("suspend on kernel clock");
+    }
     let blob = kernal_api_v1_bindings::BlobHandle::from_create_payload(
         complete_operation(
             kernal_api_v1_bindings::BlobHandle::create().expect("submit blob create"),

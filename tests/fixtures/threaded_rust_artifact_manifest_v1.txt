@@ -1,9 +1,9 @@
 threaded-artifact-manifest-v1
-export name=__main_void kind=function index=56 type=Some(13)
+export name=__main_void kind=function index=46 type=Some(13)
 export name=_start kind=function index=15 type=Some(1)
-export name=kernal-api-run kind=function index=45 type=Some(13)
+export name=kernal-api-run kind=function index=29 type=Some(13)
 export name=memory kind=memory index=0 type=None
-export name=wasi_thread_start kind=function index=344 type=Some(3)
+export name=wasi_thread_start kind=function index=343 type=Some(3)
 import module=env name=memory kind=memory initial=17 maximum=Some(16384) shared=true memory64=false page-size-log2=None
 import module=kernal-api:v1 name=kernel_yield kind=function type=1
 import module=kernal-api:v1 name=operation_poll kind=function type=11
@@ -27,8 +27,8 @@ type index=14 kind=function params=[I32, I32, I32, I64] results=[I32]
 type index=15 kind=function params=[I32, I32, I64, I32] results=[]
 type index=16 kind=function params=[I32, I32, I32, I32, I64, I32] results=[]
 type index=17 kind=function params=[I32, I64] results=[]
-type index=18 kind=function params=[I32, I32, I32, I32, I32, I32] results=[]
-type index=19 kind=function params=[I32, I32, I32, I32, I32, I32, I32] results=[]
+type index=18 kind=function params=[I32, I32, I32, I32, I32, I32, I32] results=[]
+type index=19 kind=function params=[I32, I32, I32, I32, I32, I32] results=[]
 type index=2 kind=function params=[I32] results=[I32]
 type index=20 kind=function params=[I32, I32, I32, I32, I32] results=[]
 type index=21 kind=function params=[] results=[I64]

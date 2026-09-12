@@ -1706,6 +1706,14 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
                 })
                 .unwrap_or(0));
         }
+        if kind == crate::operations::OP_BLOB_READ {
+            // Expected admission failures are guest-visible rejection, not
+            // Wasmtime traps. Match the bounded-write submission contract.
+            return Ok(self
+                .operations
+                .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
+                .unwrap_or(0));
+        }
         self.operations
             .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
             .map_err(|_| wasmtime::Error::msg("operation rejected"))

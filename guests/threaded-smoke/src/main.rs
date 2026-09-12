@@ -146,6 +146,11 @@ pub extern "C" fn kernal_api_run() -> u32 {
         .expect("generated blob create"),
     );
     const CHUNK_BYTES: usize = 64 * 1024;
+    assert!(blob.read_chunk(0).is_err(), "zero-length read is rejected");
+    assert!(
+        blob.read_chunk(64 * 1024 + 1).is_err(),
+        "oversized read is rejected"
+    );
     const CHUNKS: usize = 1024;
     let mut sent = [0_u8; CHUNK_BYTES];
     let mut received = [0_u8; CHUNK_BYTES];

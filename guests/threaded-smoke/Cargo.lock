@@ -45,7 +45,12 @@ name = "kernal-api-threaded-smoke"
 version = "0.1.0"
 dependencies = [
  "dashmap",
+ "kernal-api-v1-bindings",
 ]
+
+[[package]]
+name = "kernal-api-v1-bindings"
+version = "0.1.0"
 
 [[package]]
 name = "libc"

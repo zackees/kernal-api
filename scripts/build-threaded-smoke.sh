@@ -22,7 +22,8 @@ guest_target_is_materialized() {
 if [[ $# -eq 0 ]]; then
   : "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR to caller-managed writable storage}"
   target_directory="${CARGO_TARGET_DIR%/}/kernal-api-threaded-smoke"
-  artifact="$target_directory/$target/release/kernal-api-threaded-smoke.wasm"
+  built_artifact="$target_directory/$target/release/kernal-api-threaded-smoke.wasm"
+  artifact="$target_directory/$target/release/kernal-api-threaded-smoke.admitted.wasm"
   # Keep the guest build on Soldr's front door, but disable its cache for this
   # temporary output. Soldr's cached cross-target materialization is tracked
   # separately; a cache failure must not turn this admission characterization
@@ -56,6 +57,10 @@ if [[ $# -eq 0 ]]; then
     cd "$guest_dir"
     SOLDR_LINKER=default soldr --no-cache "$subcommand" build --locked --manifest-path Cargo.toml --target "$target" --release --target-dir "$target_directory"
   )
+  # Keep Cargo's output pristine: changing the generated ABI contract must
+  # not require recompiling an otherwise unchanged guest to replace metadata.
+  cp -- "$built_artifact" "$artifact"
+  soldr cargo run --locked --manifest-path "$repo/tools/wasm-abi-generator/Cargo.toml" -- --embed-threaded-metadata "$artifact"
 fi
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \

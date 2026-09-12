@@ -49,7 +49,7 @@ pub(crate) fn threaded_root_wasm(
     leb(17, &mut imports);
     leb(16_384, &mut imports);
     text("kernal-api:v1", &mut imports);
-    text("kernel-yield", &mut imports);
+    text("kernel_yield", &mut imports);
     imports.extend([0, 0]);
     text("wasi", &mut imports);
     text("thread-spawn", &mut imports);
@@ -144,6 +144,11 @@ pub(crate) fn threaded_root_wasm(
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
+    let metadata = format!(
+        "capabilities=0\n{}",
+        include_str!("../../src/wasm/generated/v1/kernal-api-v1.abi.toml")
+    );
+    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
     wasm
 }
 #[allow(dead_code)] // used by the sibling wasm_epoch_cancellation integration crate.

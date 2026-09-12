@@ -5,6 +5,12 @@ use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy,
 };
 
+const GENERATED_V1_MANIFEST: &str = include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml");
+
+fn generated_abi_metadata() -> Vec<u8> {
+    format!("capabilities=0\n{GENERATED_V1_MANIFEST}").into_bytes()
+}
+
 fn compiler() -> SketchCompiler {
     SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler")
 }
@@ -62,6 +68,7 @@ struct F {
     wrong_thread_signature: bool,
     wrong_yield_signature: bool,
     non_function_yield: bool,
+    legacy_yield_name: bool,
     non_function_entry: bool,
 }
 impl Default for F {
@@ -87,6 +94,7 @@ impl Default for F {
             wrong_thread_signature: false,
             wrong_yield_signature: false,
             non_function_yield: false,
+            legacy_yield_name: false,
             non_function_entry: false,
         }
     }
@@ -168,7 +176,14 @@ fn wasm(f: F) -> Vec<u8> {
     };
     if f.yield_ {
         text("kernal-api:v1", &mut i);
-        text("kernel-yield", &mut i);
+        text(
+            if f.legacy_yield_name {
+                "kernel-yield"
+            } else {
+                "kernel_yield"
+            },
+            &mut i,
+        );
         i.push(0);
         let non_function_index = 2 + u64::from(f.entry_param);
         leb(
@@ -221,13 +236,18 @@ fn wasm(f: F) -> Vec<u8> {
         section(8, vec![imports as u8], &mut w)
     };
     section(10, vec![1, 2, 0, 0x0b], &mut w);
-    custom(
-        "kernal-api.abi",
-        if f.bad_meta { b"vX" } else { b"v1" },
-        &mut w,
-    );
+    let mut metadata = generated_abi_metadata();
+    if f.bad_meta {
+        let declaration = b"abi_version = 1\n";
+        let offset = metadata
+            .windows(declaration.len())
+            .position(|window| window == declaration)
+            .expect("generated ABI version declaration");
+        metadata[offset + declaration.len() - 2] = b'X';
+    }
+    custom("kernal-api.abi", &metadata, &mut w);
     if f.duplicate {
-        custom("kernal-api.abi", b"v1", &mut w)
+        custom("kernal-api.abi", &generated_abi_metadata(), &mut w)
     };
     if f.oversized_metadata {
         custom("kernal-api.profile", &[b'x'; 129], &mut w)
@@ -251,6 +271,18 @@ fn rejected_module_never_compiles() {
     assert!(matches!(
         c.admit(&wasm(f), policy()),
         Err(SketchModuleError::MissingRequiredImport { .. })
+    ));
+    assert_eq!(c.compiled_module_count(), 0);
+}
+#[test]
+fn handwritten_legacy_import_name_is_rejected_before_compilation() {
+    let c = compiler();
+    let mut f = F::default();
+    f.legacy_yield_name = true;
+    assert!(matches!(
+        c.admit(&wasm(f), policy()),
+        Err(SketchModuleError::ForbiddenImport { module, name })
+            if module == "kernal-api:v1" && name == "kernel-yield"
     ));
     assert_eq!(c.compiled_module_count(), 0);
 }

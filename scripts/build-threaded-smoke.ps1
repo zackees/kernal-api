@@ -89,6 +89,10 @@ try {
         }
         $built = Join-Path $targetDirectory "$target/release/kernal-api-threaded-smoke.wasm"
         Copy-Item -LiteralPath $built -Destination $artifact
+        soldr cargo run --locked --manifest-path (Join-Path $repo 'tools/wasm-abi-generator/Cargo.toml') -- --embed-threaded-metadata $artifact
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
     }
     $env:KERNAL_API_THREADED_ARTIFACT_WASM = $artifact
     soldr --no-cache $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile

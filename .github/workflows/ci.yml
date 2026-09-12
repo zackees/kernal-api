@@ -202,6 +202,20 @@ jobs:
         shell: pwsh
         run: ./scripts/build-threaded-smoke.ps1
 
+  wasm-abi-generation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          toolchain: 1.95.0
+      - name: Verify checked-in guest, host, and ABI manifest generation
+        run: bash ci/check_wasm_abi_generation.sh
+      - name: Test the explicit ABI generator
+        run: >-
+          soldr cargo test --locked
+          --manifest-path tools/wasm-abi-generator/Cargo.toml
+
   compilation-boundary-dependencies:
     runs-on: ubuntu-latest
     steps:
@@ -265,6 +279,17 @@ jobs:
         run: >-
           soldr build
           --target ${{ matrix.target }} --all-features
+      - name: Compile the explicit ABI generator for the supported target
+        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tools/wasm-abi-generator/Cargo.toml
+          --target ${{ matrix.target }}
+      - name: Compile the explicit ABI generator on native Linux ARM64
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tools/wasm-abi-generator/Cargo.toml
 
   dylints:
     runs-on: ubuntu-latest

@@ -35,5 +35,14 @@ retain bounded admission until they drain. Logical-root finalization revokes
 and drains timers before returning.
 
 The threaded smoke guest exercises a ten-millisecond generated sleep. The
-five-second, post-load screenshot sequence and its native webview opcodes
-remain part of #20; this primitive alone does not establish that proof.
+five-second, post-load screenshot sequence remains part of #20; this primitive
+alone does not establish that proof.
+
+The screenshot guest contract reserves opcodes 13–17 for URL-grant discovery,
+open, matching load wait, viewport capture, and close. These generated guest
+methods exchange only opaque tokens. Their native host dispatch is not yet
+implemented. `OperationFuture::wait` and `run` provide composition for this
+single generated command; the async host yield suspends the Wasm stack rather
+than constructing a guest runtime. The driver rejects unrelated futures that
+return `Pending`. See `examples/wasm-tauri-screenshot` for the actual Rust
+application and the remaining native-runner evidence.

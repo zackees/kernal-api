@@ -102,6 +102,57 @@ impl OperationFuture {
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
+    /// The async host import parks this Wasm stack until the operation wakes.
+    /// No native thread blocks and no guest-side scheduler is constructed.
+    pub async fn wait(self) -> Result<u64, OperationError> {
+        loop {
+            if let Some(payload) = self.poll()? { return Ok(payload); }
+            self.yield_now()?;
+        }
+    }
+}
+
+/// Drive a command composed exclusively of generated kernel futures.
+/// Suspension happens inside the generated async host import, not through a
+/// second guest executor. A foreign future returning Pending is unsupported.
+pub fn run<T>(future: impl std::future::Future<Output = Result<T, OperationError>>) -> Result<T, OperationError> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(OperationError::Failed),
+    }
+}
+
+/// One pre-authorized native URL, never a guest URL string or network grant.
+pub struct WebviewUrl { token: u64 }
+/// Opaque native viewport authority owned by this logical sketch.
+pub struct Webview { token: u64 }
+impl WebviewUrl {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(13, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
+    pub async fn open(&self) -> Result<Webview, OperationError> {
+        let token = OperationFuture::submit(14, self.token, 0)?.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(Webview { token })
+    }
+}
+impl Webview {
+    pub async fn wait_until_loaded(&self) -> Result<(), OperationError> {
+        OperationFuture::submit(15, self.token, 0)?.wait().await?;
+        Ok(())
+    }
+    pub async fn capture_visible_png(&self) -> Result<BlobHandle, OperationError> {
+        let token = OperationFuture::submit(16, self.token, 0)?.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(BlobHandle { token })
+    }
+    pub async fn close(self) -> Result<(), OperationError> {
+        OperationFuture::submit(17, self.token, 0)?.wait().await?;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy)]
 pub struct SyntheticResource { token: u64 }
@@ -386,6 +437,7 @@ mod tests {
     static YIELD_RESPONSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
     std::thread_local! {
         static SUBMISSION: std::cell::Cell<(i32, i64, i64)> = const { std::cell::Cell::new((0, 0, 0)) };
+        static POLL_RESPONSE: std::cell::Cell<i64> = const { std::cell::Cell::new((42 << 8) | 1) };
     }
 
     // Exercise the checked-in guest facade against the scalar import boundary,
@@ -398,6 +450,42 @@ mod tests {
     #[no_mangle]
     extern "C" fn operation_yield(_operation: i64) -> i32 {
         YIELD_RESPONSE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[no_mangle]
+    extern "C" fn operation_poll(_operation: i64) -> i64 {
+        POLL_RESPONSE.get()
+    }
+    #[test]
+    fn generated_webview_sequence_exchanges_only_opaque_scalars() {
+        POLL_RESPONSE.set((42 << 8) | 1);
+        generated_guest::run(async {
+            let url = generated_guest::WebviewUrl::granted()?.unwrap();
+            assert_eq!(SUBMISSION.get(), (13, 0, 0));
+            let view = url.open().await?;
+            assert_eq!(SUBMISSION.get(), (14, 1, 0));
+            view.wait_until_loaded().await?;
+            assert_eq!(SUBMISSION.get(), (15, 42, 0));
+            generated_guest::clock_sleep(5_000)?.wait().await?;
+            assert_eq!(SUBMISSION.get(), (12, 5_000, 0));
+            let snapshot = view.capture_visible_png().await?;
+            assert_eq!(SUBMISSION.get(), (16, 42, 0));
+            generated_guest::OutputFile::from_granted_token(7)
+                .write_blob(&snapshot)?.wait().await?;
+            assert_eq!(SUBMISSION.get(), (10, 42, 7));
+            view.close().await?;
+            assert_eq!(SUBMISSION.get(), (17, 42, 0));
+            Ok(())
+        }).unwrap();
+    }
+    #[test]
+    fn generated_driver_rejects_foreign_pending_and_zero_resource_results() {
+        assert_eq!(
+            generated_guest::run(std::future::pending::<Result<(), generated_guest::OperationError>>()),
+            Err(generated_guest::OperationError::Failed),
+        );
+        POLL_RESPONSE.set(1);
+        let url = generated_guest::WebviewUrl::granted().unwrap().unwrap();
+        assert!(matches!(generated_guest::run(url.open()), Err(generated_guest::OperationError::Failed)));
     }
     #[test]
     fn generated_guest_yield_accepts_only_host_success() {

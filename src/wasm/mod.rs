@@ -5331,20 +5331,12 @@ fn preflight_threaded_rust(
     if memory_export != Some((ExternalKind::Memory, 0)) {
         return Err(SketchModuleError::MemoryExportMismatch);
     }
-    let required = [
-        (ABI_MODULE, ABI_YIELD),
-        (THREAD_MODULE, THREAD_SPAWN),
-        ("wasi_snapshot_preview1", "clock_time_get"),
-        ("wasi_snapshot_preview1", "environ_get"),
-        ("wasi_snapshot_preview1", "environ_sizes_get"),
-        ("wasi_snapshot_preview1", "fd_write"),
-        ("wasi_snapshot_preview1", "proc_exit"),
-        ("wasi_snapshot_preview1", "sched_yield"),
-    ];
-    // The legacy generated artifact contains only `kernel_yield`; the
-    // lifecycle is an all-or-nothing additive declaration.  This preserves
-    // old admitted artifacts while preventing a guest from presenting a
-    // partial submit/poll/yield protocol.
+    // Every present import already passed the exact name/signature allowlist
+    // above. Do not require dead stdlib imports from the smoke application's
+    // particular link graph: a screenshot guest need not spawn a child, read
+    // a compatibility clock, or use the legacy authority-free yield.
+    // Require either the legacy kernel boundary or the complete generated
+    // lifecycle, and continue rejecting partial submit/poll/yield protocols.
     let lifecycle = [
         (ABI_MODULE, "operation_submit"),
         (ABI_MODULE, "operation_poll"),
@@ -5352,10 +5344,9 @@ fn preflight_threaded_rust(
     ];
     let lifecycle_present = lifecycle.iter().filter(|pair| seen.contains(*pair)).count();
     let cancellation_present = usize::from(seen.contains(&(ABI_MODULE, "operation_cancel")));
-    if !required.iter().all(|pair| seen.contains(pair))
+    if (lifecycle_present == 0 && !seen.contains(&(ABI_MODULE, ABI_YIELD)))
         || !matches!(lifecycle_present, 0 | 3)
         || (cancellation_present != 0 && lifecycle_present != 3)
-        || seen.len() != required.len() + lifecycle_present + cancellation_present
     {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",

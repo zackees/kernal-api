@@ -111,6 +111,57 @@ impl OperationFuture {
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
+    /// The async host import parks this Wasm stack until the operation wakes.
+    /// No native thread blocks and no guest-side scheduler is constructed.
+    pub async fn wait(self) -> Result<u64, OperationError> {
+        loop {
+            if let Some(payload) = self.poll()? { return Ok(payload); }
+            self.yield_now()?;
+        }
+    }
+}
+
+/// Drive a command composed exclusively of generated kernel futures.
+/// Suspension happens inside the generated async host import, not through a
+/// second guest executor. A foreign future returning Pending is unsupported.
+pub fn run<T>(future: impl std::future::Future<Output = Result<T, OperationError>>) -> Result<T, OperationError> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => Err(OperationError::Failed),
+    }
+}
+
+/// One pre-authorized native URL, never a guest URL string or network grant.
+pub struct WebviewUrl { token: u64 }
+/// Opaque native viewport authority owned by this logical sketch.
+pub struct Webview { token: u64 }
+impl WebviewUrl {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(13, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
+    pub async fn open(&self) -> Result<Webview, OperationError> {
+        let token = OperationFuture::submit(14, self.token, 0)?.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(Webview { token })
+    }
+}
+impl Webview {
+    pub async fn wait_until_loaded(&self) -> Result<(), OperationError> {
+        OperationFuture::submit(15, self.token, 0)?.wait().await?;
+        Ok(())
+    }
+    pub async fn capture_visible_png(&self) -> Result<BlobHandle, OperationError> {
+        let token = OperationFuture::submit(16, self.token, 0)?.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(BlobHandle { token })
+    }
+    pub async fn close(self) -> Result<(), OperationError> {
+        OperationFuture::submit(17, self.token, 0)?.wait().await?;
+        Ok(())
+    }
 }
 #[derive(Clone, Copy)]
 pub struct SyntheticResource { token: u64 }

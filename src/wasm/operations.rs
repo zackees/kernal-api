@@ -166,7 +166,10 @@ struct ResourceSlot {
 enum ResourceValue {
     Synthetic,
     ExternalWebview,
-    Blob(VecDeque<u8>),
+    Blob {
+        buffer: VecDeque<u8>,
+        sealed: bool,
+    },
     #[cfg(feature = "wasm-sketch-host")]
     ExactOutput(PathBuf),
 }
@@ -592,7 +595,10 @@ impl OperationHub {
             BLOB_RESOURCE_KIND,
             BLOB_RIGHT_READ | BLOB_RIGHT_WRITE,
             false,
-            ResourceValue::Blob(VecDeque::new()),
+            ResourceValue::Blob {
+                buffer: VecDeque::new(),
+                sealed: false,
+            },
         )?;
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         state
@@ -623,9 +629,12 @@ impl OperationHub {
         }
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
         Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
-        let ResourceValue::Blob(buffer) = &mut resource.value else {
+        let ResourceValue::Blob { buffer, sealed } = &mut resource.value else {
             return Err(HubError::WrongKind);
         };
+        if *sealed {
+            return Err(HubError::Closed);
+        }
         if buffer.len().saturating_add(bytes.len()) > self.blob_limits.maximum_blob_bytes {
             return Err(HubError::Quota);
         }
@@ -652,13 +661,25 @@ impl OperationHub {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
         Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)?;
-        let ResourceValue::Blob(buffer) = &mut resource.value else {
+        let ResourceValue::Blob { buffer, .. } = &mut resource.value else {
             return Err(HubError::WrongKind);
         };
         let count = maximum_bytes.min(buffer.len());
         let result: Vec<_> = buffer.drain(..count).collect();
         state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
         Ok(result)
+    }
+
+    /// Publish EOF explicitly. An empty, unsealed blob can still receive data.
+    pub(crate) fn seal_blob(&self, store: u64, blob: OpaqueToken) -> Result<(), HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
+        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        let ResourceValue::Blob { sealed, .. } = &mut resource.value else {
+            return Err(HubError::WrongKind);
+        };
+        *sealed = true;
+        Ok(())
     }
 
     /// Canonicalize one host-authorized final destination and represent it
@@ -701,12 +722,32 @@ impl OperationHub {
         output: OpaqueToken,
     ) -> std::io::Result<()> {
         let destination = self.exact_output_path(store, output)?;
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| hub_io_error(HubError::Closed))?;
+            let resource = state
+                .resources
+                .get(&blob)
+                .ok_or_else(|| hub_io_error(HubError::Invalid))?;
+            Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)
+                .map_err(hub_io_error)?;
+            if !matches!(resource.value, ResourceValue::Blob { sealed: true, .. }) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "blob producer has not published EOF",
+                ));
+            }
+        }
         let temporary = self.temporary_output_path(&destination)?;
+        // Only clean up a file this operation successfully created. A
+        // competing creator must never have its file removed on open failure.
+        let mut file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
         let result = (|| {
-            let mut file = File::options()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
             loop {
                 let chunk = self
                     .blob_read(store, blob, self.blob_limits.maximum_chunk_bytes)
@@ -1090,7 +1131,7 @@ impl OperationHub {
                 Err(HubError::Invalid)
             };
         };
-        if let ResourceValue::Blob(buffer) = &resource.value {
+        if let ResourceValue::Blob { buffer, .. } = &resource.value {
             state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(buffer.len());
         }
         state.closed_resources.insert(token);
@@ -1568,6 +1609,7 @@ mod tests {
         let output = hub.grant_exact_output(11, &final_path).unwrap();
         hub.blob_write(11, blob, b"png-").unwrap();
         hub.blob_write(11, blob, b"byte").unwrap();
+        hub.seal_blob(11, blob).unwrap();
         hub.commit_blob_to_output(11, blob, output).unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"png-byte");
         assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
@@ -1609,6 +1651,7 @@ mod tests {
         let blob = hub.create_blob(1).unwrap();
         let output = hub.grant_exact_output(1, &final_path).unwrap();
         hub.blob_write(1, blob, b"data").unwrap();
+        hub.seal_blob(1, blob).unwrap();
         assert!(hub.commit_blob_to_output(1, blob, output).is_err());
         assert!(
             final_path.is_dir(),
@@ -1626,5 +1669,29 @@ mod tests {
         assert_eq!(snapshot.live_resources, 0);
         assert_eq!(snapshot.buffered_blob_bytes, 0);
         assert_eq!(snapshot.pending_operations, 0);
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn empty_unsealed_blob_cannot_commit_a_truncated_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("output");
+        std::fs::write(&destination, b"previous").unwrap();
+        let hub = OperationHub::new(4, 4).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let output = hub.grant_exact_output(1, &destination).unwrap();
+        assert_eq!(
+            hub.commit_blob_to_output(1, blob, output)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"previous");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        hub.blob_write(1, blob, b"complete").unwrap();
+        hub.seal_blob(1, blob).unwrap();
+        assert_eq!(hub.blob_write(1, blob, b"late"), Err(HubError::Closed));
+        hub.commit_blob_to_output(1, blob, output).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
     }
 }

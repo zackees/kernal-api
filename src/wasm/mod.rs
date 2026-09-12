@@ -924,6 +924,7 @@ impl AdmittedSketch {
         // errors must reach this same finalization path.
         operation_cleanup.close_all(operations::Terminal::Closed);
         let children = prepared.controller.join_completed();
+        let output_cleanup = operation_cleanup.join_output_jobs().await;
         let rejections = prepared.controller.take_thread_spawn_rejections();
         #[cfg(test)]
         if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
@@ -948,7 +949,9 @@ impl AdmittedSketch {
             .controller
             .last_root_remaining_fuel
             .store(store.get_fuel().unwrap_or(0), Ordering::Release);
-        resolve_threaded_result(outcome, children, report, rejections)
+        let result = resolve_threaded_result(outcome, children, report, rejections)?;
+        output_cleanup.map_err(|_| SketchExecutionError::OutputCleanupFailed)?;
+        Ok(result)
     }
     fn prepare_threaded_root_with_permit(
         &self,
@@ -1189,6 +1192,7 @@ pub enum SketchExecutionError {
     SharedMemoryUnavailable,
     PrelinkFailed,
     OutputGrantRejected,
+    OutputCleanupFailed,
     NonzeroExit {
         code: i32,
     },
@@ -1221,6 +1225,7 @@ impl SketchExecutionError {
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
             Self::OutputGrantRejected => "output-grant-rejected",
+            Self::OutputCleanupFailed => "output-cleanup-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",

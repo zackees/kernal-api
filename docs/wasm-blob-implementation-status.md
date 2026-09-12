@@ -113,8 +113,22 @@ chunk's charge. Plain-`Vec` pull/collection helpers exist only in unit-test
 builds; the production generated collector copies synchronously into guest
 memory and native output uses the charged chunk. Allocator-internal
 reallocation scratch is still outside this capacity ledger, which is not a
-total process-memory limit. Execution teardown must also wait for native jobs
-to release their chunks before claiming all transfer memory is reclaimed.
+total process-memory limit. Root finalization now revokes authority, drains
+guest children, and joins retained output jobs before recording final cleanup.
+Output jobs have a separate lifetime count and are capped by the operation
+limit even after guest cancellation/result consumption. Job completion releases
+that count, not cancellation. A join error has the facade-owned
+`output-cleanup-failed` result when no earlier execution failure takes priority.
+Native blocking syscalls cannot be interrupted in-process: joining a wedged
+filesystem operation can wait indefinitely. The required worker-owned output
+grant and parent cleanup protocol remain necessary for bounded containment.
+Validation now includes 46 hub tests and 25 root-observation tests. Controlled
+blocking work proves that joining remains pending while a native chunk is
+held, that the job cap rejects additional output admission, and that job and
+memory counters reach zero after release. An injected unwind remains visible
+to cleanup even after completed task handles are pruned. The reused Cargo
+guest passed in-process (6.19 seconds, including exact output) and in the worker
+(10.44 seconds including test-side compilation/admission) on Linux x86-64.
 Both 64 MiB Cargo guest paths also pass with an explicit 2,228,224-byte
 combined hub limit; the in-process proof retains its exact 1,179,648-byte peak
 assertion. The version-3 protocol tests, reconstruction test, and host-policy

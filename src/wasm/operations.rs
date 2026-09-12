@@ -11,7 +11,7 @@ use std::fs::{self, File};
 use std::io::Write;
 #[cfg(feature = "wasm-sketch-host")]
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -99,6 +99,7 @@ pub(crate) struct HubSnapshot {
     /// High-water mark of hub-owned capacities, including copy overlap.
     pub(crate) peak_retained_transfer_capacity: usize,
     pub(crate) native_transfer_capacity: usize,
+    pub(crate) active_output_jobs: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -237,6 +238,8 @@ struct DeferredCompletion {
 }
 
 struct State {
+    #[cfg(feature = "wasm-sketch-host")]
+    output_jobs: Vec<crate::async_engine::Task<()>>,
     resources: BTreeMap<OpaqueToken, ResourceSlot>,
     operations: BTreeMap<OpaqueToken, OperationSlot>,
     next_resource_slot: u32,
@@ -282,7 +285,23 @@ impl Drop for NativeBlobChunk<'_> {
 }
 
 /// Private logical authority shared only by explicitly authorized instances.
+#[cfg(feature = "wasm-sketch-host")]
+struct OutputJobLease(Arc<OperationHub>);
+
+#[cfg(feature = "wasm-sketch-host")]
+impl Drop for OutputJobLease {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.output_job_failed.store(true, Ordering::Release);
+        }
+        self.0.output_job_count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
+    output_job_failed: AtomicBool,
+    output_job_count: AtomicU64,
     scope: u64,
     maximum_operations: usize,
     maximum_resources: usize,
@@ -305,11 +324,15 @@ impl OperationHub {
     ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
+            output_job_failed: AtomicBool::new(false),
+            output_job_count: AtomicU64::new(0),
             scope,
             maximum_operations,
             maximum_resources,
             blob_limits,
             state: Mutex::new(State {
+                #[cfg(feature = "wasm-sketch-host")]
+                output_jobs: Vec::new(),
                 resources: BTreeMap::new(),
                 operations: BTreeMap::new(),
                 next_resource_slot: 0,
@@ -470,6 +493,27 @@ impl OperationHub {
             })
             .detach();
         Ok(operation)
+    }
+
+    /// Called after revocation, which prevents any new output job admission.
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) async fn join_output_jobs(&self) -> Result<(), HubError> {
+        let jobs = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            if !state.closed {
+                return Err(HubError::WrongRights);
+            }
+            std::mem::take(&mut state.output_jobs)
+        };
+        let mut failed = false;
+        for job in jobs {
+            failed |= job.await.is_err();
+        }
+        if failed || self.output_job_failed.load(Ordering::Acquire) {
+            Err(HubError::Closed)
+        } else {
+            Ok(())
+        }
     }
 
     /// Reserve a generation-safe external-webview resource and its open
@@ -1331,22 +1375,38 @@ impl OperationHub {
             OUTPUT_RIGHT_COMMIT,
         )?;
         let hub = Arc::clone(self);
-        runtime
-            .launch_blocking(move || {
-                if hub
-                    .commit_blob_operation(store, blob, output, Some(operation))
-                    .is_err()
-                {
-                    let _ = hub.terminal(
-                        operation,
-                        TerminalResult {
-                            terminal: Terminal::Rejected,
-                            resource: None,
-                        },
-                    );
-                }
-            })
-            .detach();
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        // Guest cancellation does not cancel a running filesystem syscall.
+        // Bound queued/running jobs independently of consumed operations.
+        state.output_jobs.retain(|job| !job.is_finished());
+        if state.closed
+            || self.output_job_count.load(Ordering::Acquire) >= self.maximum_operations as u64
+        {
+            state.operations.remove(&operation);
+            return Err(if state.closed {
+                HubError::Closed
+            } else {
+                HubError::Quota
+            });
+        }
+        self.output_job_count.fetch_add(1, Ordering::AcqRel);
+        let job_lease = OutputJobLease(Arc::clone(self));
+        let job = runtime.launch_blocking(move || {
+            let _job_lease = job_lease;
+            if hub
+                .commit_blob_operation(store, blob, output, Some(operation))
+                .is_err()
+            {
+                let _ = hub.terminal(
+                    operation,
+                    TerminalResult {
+                        terminal: Terminal::Rejected,
+                        resource: None,
+                    },
+                );
+            }
+        });
+        state.output_jobs.push(job);
         Ok(operation)
     }
 
@@ -2011,6 +2071,7 @@ impl OperationHub {
             retained_transfer_capacity: Self::transfer_capacity(&state),
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
             native_transfer_capacity: state.native_transfer_capacity,
+            active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
         }
     }
 }
@@ -2125,6 +2186,82 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn output_job_panic_survives_completed_handle_pruning() {
+        let hub = OperationHub::new(1, 1).unwrap();
+        hub.output_job_count.fetch_add(1, Ordering::AcqRel);
+        let lease = OutputJobLease(Arc::clone(&hub));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _lease = lease;
+                panic!("injected output job panic");
+            }))
+            .is_err()
+        );
+        assert_eq!(hub.snapshot().active_output_jobs, 0);
+        hub.close_all(Terminal::Closed);
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.run(hub.join_output_jobs()), Err(HubError::Closed));
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn output_job_quota_and_teardown_track_work_until_native_buffer_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let hub = OperationHub::new(1, 2).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"data").unwrap();
+        let output = hub
+            .grant_exact_output(1, &directory.path().join("output"))
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        hub.output_job_count.fetch_add(1, Ordering::AcqRel);
+        let lease = OutputJobLease(Arc::clone(&hub));
+        let worker_hub = Arc::clone(&hub);
+        let job = runtime.handle().launch_blocking(move || {
+            let _lease = lease;
+            let _chunk = worker_hub.read_blob_chunk(1, blob, 4, false).unwrap();
+            started_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        });
+        hub.state.lock().unwrap().output_jobs.push(job);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(hub.snapshot().active_output_jobs, 1);
+        assert_eq!(
+            hub.submit_output_commit(runtime.handle(), 1, blob, output),
+            Err(HubError::Quota)
+        );
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        hub.close_all(Terminal::Cancelled);
+        runtime.run(async {
+            let joining_hub = Arc::clone(&hub);
+            let joining = runtime
+                .handle()
+                .launch(async move { joining_hub.join_output_jobs().await });
+            crate::async_engine::yield_now().await;
+            assert!(!joining.is_finished());
+            assert_eq!(hub.snapshot().active_output_jobs, 1);
+            assert_eq!(hub.snapshot().native_transfer_capacity, 4);
+            release_tx.send(()).unwrap();
+            assert_eq!(joining.await.unwrap(), Ok(()));
+        });
+        assert_eq!(hub.snapshot().active_output_jobs, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
     }
 
     #[cfg(feature = "wasm-sketch-host")]

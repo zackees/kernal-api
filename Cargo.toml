@@ -27,6 +27,11 @@ name = "kernal-wasm-worker"
 path = "src/bin/kernal-wasm-worker.rs"
 required-features = ["wasm-sketch-worker"]
 
+[[bin]]
+name = "kernal-tauri-smoke"
+path = "src/bin/kernal-tauri-smoke.rs"
+required-features = ["tauri-webview"]
+
 [features]
 default = []
 # Advisory locking and modification-time setting are implemented natively

@@ -58,6 +58,16 @@ pub(crate) struct NativeWebviewRequest {
 
 impl NativeWebviewRequest {
     pub(crate) fn parse(url: &str) -> Result<Self, NativeWebviewError> {
+        // `url::Url` intentionally repairs `https:///name` into
+        // `https://name/`. That is useful for browsers but violates this
+        // capability's before-effects policy: the caller did not provide a
+        // syntactically valid authority, so reject the original spelling.
+        let Some((_, authority_and_path)) = url.split_once("://") else {
+            return Err(NativeWebviewError::InvalidUrl);
+        };
+        if authority_and_path.is_empty() || authority_and_path.starts_with('/') {
+            return Err(NativeWebviewError::InvalidUrl);
+        }
         let url = Url::parse(url).map_err(|_| NativeWebviewError::InvalidUrl)?;
         if is_allowed_url(&url) {
             Ok(Self { url })
@@ -106,6 +116,15 @@ impl NativeWebviewLoop {
 }
 
 impl NativeWebviewBackend {
+    /// Stops the raw Wry event loop after its resources have been released.
+    /// Test/application shell code owns this decision; webview operations only
+    /// dispatch through the existing loop.
+    pub(crate) fn request_exit(&self) -> Result<(), NativeWebviewError> {
+        self.wry
+            .request_exit(0)
+            .map_err(|error| NativeWebviewError::HostFailure(error.to_string()))
+    }
+
     /// Validates before dispatching any native work, then asks raw Wry to make
     /// a window on the event-loop thread.  This function itself does not make
     /// a generated operation: the caller owns the operation/resource token.
@@ -119,9 +138,9 @@ impl NativeWebviewBackend {
             .launch_blocking(move || backend.create_on_wry_thread(request, created_sender))
             .detach();
 
-        created_receiver
-            .await
-            .map_err(|_| NativeWebviewError::HostFailure("event loop stopped during creation".into()))?
+        created_receiver.await.map_err(|_| {
+            NativeWebviewError::HostFailure("event loop stopped during creation".into())
+        })?
     }
 
     fn create_on_wry_thread(
@@ -130,7 +149,12 @@ impl NativeWebviewBackend {
         created_sender: OneshotSender<Result<NativeWebview, NativeWebviewError>>,
     ) {
         let (completion, load_waiter) = LoadCompletion::new(request.url.clone());
-        let label = format!("kernal-api-webview-{}", NEXT_LABEL.fetch_add(1, Ordering::Relaxed));
+        let (terminal, terminal_waiter) = TerminalCompletion::new();
+        let (closed, close_waiter) = CloseCompletion::new();
+        let label = format!(
+            "kernal-api-webview-{}",
+            NEXT_LABEL.fetch_add(1, Ordering::Relaxed)
+        );
         let target = request.url.clone();
         let mut pending_webview = match PendingWebview::<(), Wry<()>>::new(
             external_webview_attributes(target.clone()),
@@ -138,7 +162,8 @@ impl NativeWebviewBackend {
         ) {
             Ok(webview) => webview,
             Err(error) => {
-                let _ = created_sender.send(Err(NativeWebviewError::HostFailure(error.to_string())));
+                let _ =
+                    created_sender.send(Err(NativeWebviewError::HostFailure(error.to_string())));
                 return;
             }
         };
@@ -148,25 +173,30 @@ impl NativeWebviewBackend {
         // defaults; setting either would give remote content a host bridge.
         debug_assert!(pending_webview.ipc_handler.is_none());
         debug_assert!(pending_webview.uri_scheme_protocols.is_empty());
-        debug_assert!(pending_webview.webview_attributes.initialization_scripts.is_empty());
+        debug_assert!(pending_webview
+            .webview_attributes
+            .initialization_scripts
+            .is_empty());
 
         let completion_for_navigation = Arc::clone(&completion);
+        let terminal_for_navigation = Arc::clone(&terminal);
         pending_webview.navigation_handler = Some(Box::new(move |url| {
             if is_allowed_url(url) {
                 true
             } else {
-                completion_for_navigation.finish(Err(NativeWebviewError::RejectedNavigation(
-                    url.scheme().to_owned(),
-                )));
+                let error = NativeWebviewError::RejectedNavigation(url.scheme().to_owned());
+                completion_for_navigation.finish(Err(error.clone()));
+                terminal_for_navigation.finish(Err(error));
                 false
             }
         }));
         let completion_for_popup = Arc::clone(&completion);
+        let terminal_for_popup = Arc::clone(&terminal);
         pending_webview.new_window_handler = Some(Box::new(move |url, _| {
-            completion_for_popup.finish(Err(NativeWebviewError::RejectedNavigation(format!(
-                "popup to {}",
-                url.scheme()
-            ))));
+            let error =
+                NativeWebviewError::RejectedNavigation(format!("popup to {}", url.scheme()));
+            completion_for_popup.finish(Err(error.clone()));
+            terminal_for_popup.finish(Err(error));
             tauri_runtime::webview::NewWindowResponse::Deny
         }));
         let completion_for_load = Arc::clone(&completion);
@@ -175,35 +205,37 @@ impl NativeWebviewBackend {
             // navigation.  Match the requested navigation and only its final
             // `Finished` event; a Started event or another URL cannot resolve
             // the operation.
-            if event == PageLoadEvent::Finished && completion_for_load.matches_requested(&loaded_url) {
+            if event == PageLoadEvent::Finished
+                && completion_for_load.matches_requested(&loaded_url)
+            {
                 completion_for_load.finish(Ok(()));
             }
         }));
         pending_webview.download_handler = Some(Arc::new(|_| false));
 
-        let mut pending_window = match PendingWindow::<(), Wry<()>>::new(
-            WindowBuilderWrapper::new(),
-            label,
-        ) {
-            Ok(window) => window,
-            Err(error) => {
-                let _ = created_sender.send(Err(NativeWebviewError::HostFailure(error.to_string())));
-                return;
-            }
-        };
+        let mut pending_window =
+            match PendingWindow::<(), Wry<()>>::new(WindowBuilderWrapper::new(), label) {
+                Ok(window) => window,
+                Err(error) => {
+                    let _ = created_sender
+                        .send(Err(NativeWebviewError::HostFailure(error.to_string())));
+                    return;
+                }
+            };
         pending_window.set_webview(pending_webview);
 
         // This call intentionally occurs off the UI thread.  Wry documents
         // that its handle synchronously routes `create_window` to the event
         // loop, which avoids the Windows callback deadlock caused by invoking
         // it inside a Wry event-loop callback.
-        let detached = match self
-            .wry
-            .create_window(pending_window, None::<for<'a> fn(tauri_runtime::window::RawWindow<'a>)>)
-        {
+        let detached = match self.wry.create_window(
+            pending_window,
+            None::<for<'a> fn(tauri_runtime::window::RawWindow<'a>)>,
+        ) {
             Ok(window) => window,
             Err(error) => {
-                let _ = created_sender.send(Err(NativeWebviewError::HostFailure(error.to_string())));
+                let _ =
+                    created_sender.send(Err(NativeWebviewError::HostFailure(error.to_string())));
                 return;
             }
         };
@@ -219,9 +251,13 @@ impl NativeWebviewBackend {
             }
         };
         let completion_on_close = Arc::clone(&completion);
+        let terminal_on_close = Arc::clone(&terminal);
+        let closed_on_close = Arc::clone(&closed);
         dispatcher.on_window_event(move |event| {
             if matches!(event, tauri_runtime::window::WindowEvent::Destroyed) {
                 completion_on_close.finish(Err(NativeWebviewError::WindowClosed));
+                terminal_on_close.finish(Err(NativeWebviewError::WindowClosed));
+                closed_on_close.finish();
             }
         });
 
@@ -230,7 +266,9 @@ impl NativeWebviewBackend {
             webview: webview_dispatcher,
             completion,
             load_waiter: Some(load_waiter),
-            closed: AtomicBool::new(false),
+            terminal_waiter: Some(terminal_waiter),
+            close_waiter: Some(close_waiter),
+            close_requested: AtomicBool::new(false),
         }));
     }
 }
@@ -242,7 +280,9 @@ pub(crate) struct NativeWebview {
     webview: tauri_runtime_wry::WryWebviewDispatcher<()>,
     completion: Arc<LoadCompletion>,
     load_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
-    closed: AtomicBool,
+    terminal_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
+    close_waiter: Option<OneshotReceiver<()>>,
+    close_requested: AtomicBool,
 }
 
 impl NativeWebview {
@@ -273,21 +313,40 @@ impl NativeWebview {
         Ok(receiver)
     }
 
+    /// Receives an isolation or host-terminal fault even when the page-load
+    /// operation has already completed.  The generated registry uses this to
+    /// revoke its resource generation and wake later operations.
+    pub(crate) fn wait_until_terminal(
+        &mut self,
+    ) -> Result<OneshotReceiver<Result<(), NativeWebviewError>>, NativeWebviewError> {
+        self.terminal_waiter.take().ok_or_else(|| {
+            NativeWebviewError::HostFailure("terminal waiter already consumed".into())
+        })
+    }
+
+    /// Resolves only once the native window has actually been destroyed.
+    pub(crate) fn wait_until_closed(&mut self) -> Result<OneshotReceiver<()>, NativeWebviewError> {
+        self.close_waiter
+            .take()
+            .ok_or_else(|| NativeWebviewError::HostFailure("close waiter already consumed".into()))
+    }
+
     /// Requests native close once and wakes a pending waiter.  Wry routes the
     /// close to the event-loop thread; no async or native runtime is created.
     pub(crate) fn close(&self) -> Result<(), NativeWebviewError> {
         if self
-            .closed
+            .close_requested
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
             if let Err(error) = self.window.close() {
-                self.closed.store(false, Ordering::Release);
+                self.close_requested.store(false, Ordering::Release);
                 let error = NativeWebviewError::HostFailure(error.to_string());
                 self.completion.finish(Err(error.clone()));
                 return Err(error);
             }
-            self.completion.finish(Err(NativeWebviewError::WindowClosed));
+            self.completion
+                .finish(Err(NativeWebviewError::WindowClosed));
         }
         Ok(())
     }
@@ -304,6 +363,60 @@ struct LoadCompletion {
     sender: Mutex<Option<OneshotSender<Result<(), NativeWebviewError>>>>,
 }
 
+struct TerminalCompletion {
+    sender: Mutex<Option<OneshotSender<Result<(), NativeWebviewError>>>>,
+}
+
+impl TerminalCompletion {
+    fn new() -> (Arc<Self>, OneshotReceiver<Result<(), NativeWebviewError>>) {
+        let (sender, receiver) = async_engine::oneshot_channel();
+        (
+            Arc::new(Self {
+                sender: Mutex::new(Some(sender)),
+            }),
+            receiver,
+        )
+    }
+
+    fn finish(&self, result: Result<(), NativeWebviewError>) {
+        let sender = self
+            .sender
+            .lock()
+            .expect("terminal completion lock poisoned")
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+struct CloseCompletion {
+    sender: Mutex<Option<OneshotSender<()>>>,
+}
+
+impl CloseCompletion {
+    fn new() -> (Arc<Self>, OneshotReceiver<()>) {
+        let (sender, receiver) = async_engine::oneshot_channel();
+        (
+            Arc::new(Self {
+                sender: Mutex::new(Some(sender)),
+            }),
+            receiver,
+        )
+    }
+
+    fn finish(&self) {
+        let sender = self
+            .sender
+            .lock()
+            .expect("close completion lock poisoned")
+            .take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+}
+
 impl LoadCompletion {
     fn new(target: Url) -> (Arc<Self>, OneshotReceiver<Result<(), NativeWebviewError>>) {
         let (sender, receiver) = async_engine::oneshot_channel();
@@ -317,7 +430,11 @@ impl LoadCompletion {
     }
 
     fn finish(&self, result: Result<(), NativeWebviewError>) {
-        let sender = self.sender.lock().expect("load completion lock poisoned").take();
+        let sender = self
+            .sender
+            .lock()
+            .expect("load completion lock poisoned")
+            .take();
         if let Some(sender) = sender {
             let _ = sender.send(result);
         }

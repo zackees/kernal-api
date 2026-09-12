@@ -28,11 +28,19 @@ fn actual_screenshot_guest_times_out_and_drains_without_output() {
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
+#[test]
+#[ignore = "requires a native display and the actual built screenshot guest"]
+fn actual_screenshot_guest_write_failure_reclaims_capture_and_preserves_files() {
+    run_native_screenshot_proof(NativeScenario::MissingOutputParent);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeScenario {
     Capture,
     Redirect,
     Timeout,
+    MissingOutputParent,
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
@@ -64,6 +72,26 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     }
     let artifact = std::env::var_os("KERNAL_API_SCREENSHOT_ARTIFACT_WASM")
         .expect("actual guest artifact required");
+    // Diagnostic logs remain outside the exact-output directory.
+    let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix("screenshot-")
+            .tempdir_in(root)
+            .unwrap()
+            .keep()
+    });
+    let temporary = tempfile::tempdir().unwrap();
+    let proof = retained.as_deref().unwrap_or(temporary.path());
+    let directory = proof.join("output");
+    std::fs::create_dir(&directory).unwrap();
+    let output = directory.join("viewport.png");
+    let sentinel = directory.join("untouched");
+    std::fs::write(&output, b"original").unwrap();
+    std::fs::write(&sentinel, b"unchanged").unwrap();
+    let fixture_output_directory = directory.clone();
+    let preserved_directory = proof.join("preserved-output");
+    let fixture_preserved_directory = preserved_directory.clone();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -71,6 +99,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     let stopping = Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
         let page = include_str!("../examples/wasm-tauri-screenshot/fixtures/viewport.html");
+        let mut relocated = false;
         while !stopping.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -83,6 +112,18 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).is_ok() {
+                        if scenario == NativeScenario::MissingOutputParent && !relocated {
+                            // Reaching this HTTP request proves URL/output grants
+                            // were already installed and the guest opened its view.
+                            // Preserve the files while making the granted parent
+                            // unavailable to the later real output job.
+                            std::fs::rename(
+                                &fixture_output_directory,
+                                &fixture_preserved_directory,
+                            )
+                            .unwrap();
+                            relocated = true;
+                        }
                         if scenario == NativeScenario::Timeout {
                             // Hold the real HTTP request open without finishing
                             // navigation; only the production host deadline may
@@ -108,24 +149,6 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         stop,
         thread: Some(thread),
     };
-    // Opt-in diagnostic retention is outside the exact-output directory, so
-    // logs cannot accidentally weaken the no-extra-output assertion below.
-    let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
-        std::fs::create_dir_all(&root).unwrap();
-        tempfile::Builder::new()
-            .prefix("screenshot-")
-            .tempdir_in(root)
-            .unwrap()
-            .keep()
-    });
-    let temporary = tempfile::tempdir().unwrap();
-    let proof = retained.as_deref().unwrap_or(temporary.path());
-    let directory = proof.join("output");
-    std::fs::create_dir(&directory).unwrap();
-    let output = directory.join("viewport.png");
-    let sentinel = directory.join("untouched");
-    std::fs::write(&output, b"original").unwrap();
-    std::fs::write(&sentinel, b"unchanged").unwrap();
     let start = Instant::now();
     let mut child = Child(
         std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
@@ -173,6 +196,32 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             );
         }
         let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
+        if scenario == NativeScenario::MissingOutputParent {
+            assert!(
+                trace.contains("screenshot-write-rejected"),
+                "wrong output failure: {trace}"
+            );
+            assert!(
+                trace.contains("phase=capture-requested"),
+                "write failure bypassed real capture"
+            );
+            validate_teardown_trace(&trace)
+                .expect("write failure must reclaim captured blob and output job");
+            assert!(
+                !directory.exists(),
+                "output job recreated its missing parent"
+            );
+            assert_eq!(
+                std::fs::read(preserved_directory.join("viewport.png")).unwrap(),
+                b"original"
+            );
+            assert_eq!(
+                std::fs::read(preserved_directory.join("untouched")).unwrap(),
+                b"unchanged"
+            );
+            assert_eq!(std::fs::read_dir(&preserved_directory).unwrap().count(), 2);
+            return;
+        }
         assert!(
             !trace.contains("phase=capture-requested"),
             "failed navigation reached capture"

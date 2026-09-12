@@ -77,6 +77,13 @@ unrelated file, and applies the same zero-resource teardown assertions.
 The timeout proof holds the real HTTP request open for the production
 30-second load deadline, requires `screenshot-load-timed-out`, forbids capture,
 and applies the same output-preservation and teardown checks.
+The write-failure proof relocates the fixture-owned output directory only
+after the guest's HTTP request, so grants and native execution have already
+started. The guest completes real capture before its output job encounters
+the now-missing parent. The proof requires `screenshot-write-rejected`, no
+recreated parent or sibling temporary file, unchanged preserved files, and
+zero captured blobs/output jobs/native/Wasm resources. This is a missing-parent
+I/O failure, not yet a portable permissions or disk-exhaustion proof.
 These observations do not establish the remaining failure matrix.
 Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.

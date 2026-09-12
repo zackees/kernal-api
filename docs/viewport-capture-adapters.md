@@ -33,6 +33,12 @@ operation cannot publish a snapshot. The checked-in load-as-capture regression
 failed before this separation and passes with it. Additional tests reject
 unactivated, foreign-store, and revoked views, and a foreign encoder cannot
 complete another store's capture.
+The Linux adapter attaches its reserved blob to the capture operation before
+requesting the native snapshot. Cancellation and view closure therefore reclaim
+partial hub-owned encoding immediately, even while the callback still holds its
+encoder. A RED-to-GREEN regression checks both revocation paths before dropping
+the encoder, including buffered-byte accounting and rejection of later writes.
+Native browser image ownership still lasts until the callback releases it.
 
 Linux validation: `soldr cargo check --features tauri-webview --lib`, the
 five `viewport_capture::tests` unit tests, and strict Clippy for the native

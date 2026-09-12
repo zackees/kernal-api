@@ -52,8 +52,11 @@ pub(crate) fn capture(
         native.scale_factor(),
         maximum_pixels,
     )?;
-    let encoder = NativeBlobEncoder::new(hub, store, maximum_encoded_bytes)
-        .map_err(|_| CaptureError::BlobLimit)?;
+    let encoder = NativeBlobEncoder::for_operation(hub, store, operation, maximum_encoded_bytes)
+        .map_err(|error| match error {
+            crate::operations::HubError::Closed | crate::operations::HubError::Invalid => CaptureError::Cancelled,
+            _ => CaptureError::BlobLimit,
+        })?;
     let cancellation = gio::Cancellable::new();
     let callback_cancellation = cancellation.clone();
     native.snapshot(

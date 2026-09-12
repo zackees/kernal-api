@@ -2769,9 +2769,12 @@ mod threaded_root_observation_tests {
             );
         });
         assert_eq!(compiler.compiled_module_count(), 1);
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared root observation");
         assert_eq!(
-            sketch.root_execution_observation_for_test(),
-            Some(RootExecutionObservation {
+            observation,
+            RootExecutionObservation {
                 preparations: 1,
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
@@ -2780,9 +2783,15 @@ mod threaded_root_observation_tests {
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                operation_snapshot: observation.operation_snapshot,
                 ..RootExecutionObservation::default()
-            })
+            }
         );
+        let operations = observation
+            .operation_snapshot
+            .expect("root records lifecycle cleanup");
+        assert_eq!(operations.pending_operations, 0);
+        assert_eq!(operations.live_resources, 0);
     }
 
     #[test]

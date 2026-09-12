@@ -19,6 +19,7 @@ pub use worker::{
 // builds consume this checked-in private host linker.
 #[rustfmt::skip]
 #[path = "generated/v1/wasmtime45_host_linker.rs"]
+#[allow(dead_code, clippy::drop_non_drop)]
 mod generated_v1;
 #[rustfmt::skip]
 #[path = "generated/v1/admission_contract.rs"]

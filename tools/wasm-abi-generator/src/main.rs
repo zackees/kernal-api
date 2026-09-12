@@ -74,13 +74,13 @@ fn make_operation_yield_async(output: &Path) -> std::io::Result<()> {
         "operation_yield",
         |mut caller: wasmtime::Caller<'_, T>, (operation,): (i64,)| {
             let waiter = caller.data_mut().operation_yield(operation as u64);
-            drop(caller);
             Box::new(async move {
                 match waiter { Ok(waiter) => { waiter.notified().await; 1_i32 }, Err(_) => -1_i32 }
             })
         },
     )?;"#;
-    fs::write(path, source.replace(old, new))
+    let source = source.replace(old, new);
+    fs::write(path, format!("{}\n", source.trim_end()))
 }
 
 fn append_semantic_lifecycle(output: &Path) -> std::io::Result<()> {
@@ -179,6 +179,43 @@ impl Contract {
             .and_then(toml::Value::as_array)
             .ok_or("missing imports")?;
         if imports.is_empty() { return Err("missing imports".into()); }
+        let namespace = string("namespace")?;
+        let mut import_names = std::collections::BTreeSet::new();
+        for import in imports {
+            let import = import.as_table().ok_or("import must be a table")?;
+            if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
+                return Err("import namespace disagrees with manifest namespace".into());
+            }
+            if import.get("direction").and_then(toml::Value::as_str) != Some("guest-to-host") {
+                return Err("unexpected import direction".into());
+            }
+            let name = import
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or("missing import name")?;
+            if !import_names.insert(name) {
+                return Err("duplicate import name".into());
+            }
+            for field in ["params", "results"] {
+                let values = import
+                    .get(field)
+                    .and_then(toml::Value::as_array)
+                    .ok_or_else(|| format!("missing import {field}"))?;
+                for value in values {
+                    let value = value.as_table().ok_or("ABI value must be a table")?;
+                    let semantic = value.get("semantic").and_then(toml::Value::as_str);
+                    let abi = value.get("abi").and_then(toml::Value::as_str);
+                    if !matches!(
+                        (semantic, abi),
+                        (Some("()"), Some("unit"))
+                            | (Some("i32" | "u32"), Some("i32"))
+                            | (Some("u64"), Some("i64"))
+                    ) {
+                        return Err("unsupported semantic/ABI value shape".into());
+                    }
+                }
+            }
+        }
         if root
             .get("exports")
             .is_some_and(|value| value.as_array().is_none_or(|values| !values.is_empty()))
@@ -186,7 +223,6 @@ impl Contract {
             return Err("this admission adapter does not yet support generated exports".into());
         }
         let import = imports[0].as_table().ok_or("import must be a table")?;
-        let namespace = string("namespace")?;
         if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
             return Err("import namespace disagrees with manifest namespace".into());
         }

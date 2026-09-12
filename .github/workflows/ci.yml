@@ -178,6 +178,9 @@ jobs:
       - name: Run real semantic webview lifecycle proofs
         env:
           GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          NO_AT_BRIDGE: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
           xvfb-run -a bash -c '
@@ -301,6 +304,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+      - name: Install native webview development packages
+        if: matrix.legacy_cargo
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - if: matrix.legacy_cargo
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - if: ${{ !matrix.legacy_cargo }}
@@ -339,6 +347,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native webview development packages
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0

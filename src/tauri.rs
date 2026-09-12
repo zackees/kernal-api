@@ -43,9 +43,6 @@ use wry::raw_window_handle::{HandleError, HasWindowHandle, WindowHandle};
 ))]
 use wry::WebViewBuilderExtUnix as _;
 
-#[cfg(target_os = "macos")]
-use wry::WebViewBuilderExtMacos as _;
-
 use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
 use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
 

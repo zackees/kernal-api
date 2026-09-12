@@ -79,7 +79,6 @@ where
         "operation_yield",
         |mut caller: wasmtime::Caller<'_, T>, (operation,): (i64,)| {
             let waiter = caller.data_mut().operation_yield(operation as u64);
-            drop(caller);
             Box::new(async move {
                 match waiter { Ok(waiter) => { waiter.notified().await; 1_i32 }, Err(_) => -1_i32 }
             })
@@ -87,5 +86,3 @@ where
     )?;
     Ok(())
 }
-
-

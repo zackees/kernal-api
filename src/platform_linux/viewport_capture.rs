@@ -157,6 +157,37 @@ mod tests {
     }
 
     #[test]
+    fn png_encoder_limit_is_typed_and_reclaims_partial_encoding() {
+        let hub = OperationHub::with_blob_limits(
+            4, 2, crate::operations::BlobLimits::new(4, 32, 32).unwrap(),
+        ).unwrap();
+        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
+        // The PNG signature fits, but the complete encoding cannot. This
+        // exercises Cairo's actual writer failure propagation, not a mock.
+        let encoder = NativeBlobEncoder::new(Arc::clone(&hub), 1, 8).unwrap();
+        assert_eq!(encode_surface(image.as_ref().clone(), encoder, 64, &gio::Cancellable::new()),
+            Err(CaptureError::BlobLimit));
+        let snapshot = hub.snapshot();
+        assert!(snapshot.peak_buffered_blob_bytes <= 8);
+        assert_eq!(snapshot.retained_transfer_capacity, 0);
+        assert_eq!(snapshot.live_blobs, 0);
+    }
+
+    #[test]
+    fn late_image_after_hub_teardown_cannot_publish_a_blob() {
+        let hub = OperationHub::with_blob_limits(
+            4, 2, crate::operations::BlobLimits::new(256, 65_536, 65_536).unwrap(),
+        ).unwrap();
+        let image = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
+        let encoder = NativeBlobEncoder::new(Arc::clone(&hub), 1, 65_536).unwrap();
+        hub.close_all(crate::operations::Terminal::Cancelled);
+        assert_eq!(encode_surface(image.as_ref().clone(), encoder, 64, &gio::Cancellable::new()),
+            Err(CaptureError::Cancelled));
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        assert_eq!(hub.snapshot().live_blobs, 0);
+    }
+
+    #[test]
     fn actual_surface_limit_and_cancel_reclaim_reserved_blob() {
         for cancelled in [false, true] {
             let hub = OperationHub::with_blob_limits(

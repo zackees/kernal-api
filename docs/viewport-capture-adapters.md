@@ -26,10 +26,14 @@ completion callback. Operation-bound publication/cancellation and a live
 webpage capture proof are still required.
 
 Linux validation: `soldr cargo check --features tauri-webview --lib`, the
-three `viewport_capture::tests` unit tests, and strict Clippy for the native
+five `viewport_capture::tests` unit tests, and strict Clippy for the native
 feature's library/tests passed inside the repo's Nix GTK/WebKitGTK shell.
 The tests decode an encoded Cairo image and verify pixel-limit/cancellation
-cleanup; they do not yet request a live browser snapshot. Windows/macOS
+cleanup. The encoded-limit regression uses Cairo's real PNG writer with an
+eight-byte admission limit and verifies a typed blob-limit error and zero
+remaining storage. A late-image regression closes the hub before encoding and
+verifies cancellation without publication. They do not yet request a live
+browser snapshot. Windows/macOS
 adapter builds and native proofs remain outstanding.
 
 ## Exact dependency boundary

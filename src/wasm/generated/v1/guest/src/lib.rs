@@ -109,7 +109,7 @@ impl OperationFuture {
         let packed = imports::operation_poll(self.operation).map_err(|_| OperationError::Failed)?;
         match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), _ => Err(OperationError::Failed) }
     }
-    pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? != 0 { Ok(()) } else { Err(OperationError::Failed) } }
+    pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
 }
 #[derive(Clone, Copy)]

@@ -88,6 +88,13 @@ transfers.
 
 ## Remaining acceptance work
 
+The generated guest yield facade now accepts only the host's success sentinel
+`1`. A native scalar-import regression reproduced `-1` incorrectly returning
+success before the fix; it now verifies success, failure, zero, and unknown
+responses through the checked-in generated guest facade. All eight generator
+tests, strict all-target generator Clippy, and generated-artifact drift checks
+pass. This is error-boundary coverage, not evidence of worker output support.
+
 Strict lint validation passes for `soldr cargo clippy --locked --features
 wasm-sketch-worker --all-targets -- -D warnings` and the host-only library
 variant (`--features wasm-sketch-host --lib`). Worker-only helpers now match

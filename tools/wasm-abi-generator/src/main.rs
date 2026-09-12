@@ -100,7 +100,7 @@ impl OperationFuture {
         let packed = imports::operation_poll(self.operation).map_err(|_| OperationError::Failed)?;
         match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), _ => Err(OperationError::Failed) }
     }
-    pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? != 0 { Ok(()) } else { Err(OperationError::Failed) } }
+    pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
 }
 #[derive(Clone, Copy)]
@@ -234,7 +234,9 @@ impl Contract {
             .get("imports")
             .and_then(toml::Value::as_array)
             .ok_or("missing imports")?;
-        if imports.is_empty() { return Err("missing imports".into()); }
+        if imports.is_empty() {
+            return Err("missing imports".into());
+        }
         let namespace = string("namespace")?;
         let mut import_names = std::collections::BTreeSet::new();
         for import in imports {
@@ -371,6 +373,38 @@ fn push_leb(mut value: usize, output: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(dead_code)]
+    mod generated_guest {
+        include!("../../../src/wasm/generated/v1/guest/src/lib.rs");
+    }
+    static YIELD_RESPONSE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+    // Exercise the checked-in guest facade against the scalar import boundary,
+    // including the negative failure sentinel emitted by the async host linker.
+    #[no_mangle]
+    extern "C" fn operation_submit(_kind: i32, _arg0: i64, _arg1: i64) -> i64 {
+        1
+    }
+    #[no_mangle]
+    extern "C" fn operation_yield(_operation: i64) -> i32 {
+        YIELD_RESPONSE.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[test]
+    fn generated_guest_yield_accepts_only_host_success() {
+        let operation = generated_guest::synthetic_yield().unwrap();
+        for response in [1, -1, 0, 2, i32::MIN, i32::MAX] {
+            YIELD_RESPONSE.store(response, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                operation.yield_now(),
+                if response == 1 {
+                    Ok(())
+                } else {
+                    Err(generated_guest::OperationError::Failed)
+                },
+                "host yield response {response}"
+            );
+        }
+    }
     const MANIFEST: &str = include_str!("../../../src/wasm/generated/v1/kernal-api-v1.abi.toml");
     const EMPTY: &[u8] = b"\0asm\x01\0\0\0";
 

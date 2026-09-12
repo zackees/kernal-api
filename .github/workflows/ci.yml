@@ -24,7 +24,20 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+      # `--all-features` now includes the opt-in raw Wry backend.  Keep its
+      # GTK/WebKit headers out of ordinary/default builds, but install them
+      # before this deliberately heavyweight Linux lane compiles it.
+      - name: Install native webview development packages
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+      - name: Restore native pkg-config search path
+        if: runner.os == 'Linux'
+        run: |
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+          echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy
@@ -137,13 +150,57 @@ jobs:
           - symbolize-split
           - symbolize-worker
           - tokio-console
+          - tauri-webview
           - window-icon
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native webview development packages
+        if: matrix.feature == 'tauri-webview'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+      - name: Restore native pkg-config search path
+        if: matrix.feature == 'tauri-webview'
+        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - run: >-
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
+
+  # A unit test does not own process main on every test harness, while Tauri
+  # requires its event loop to start there.  These executable proofs
+  # therefore use a real Xvfb display, a loopback page, and one supplied
+  # kernal-api async runtime. They exercise matching Finished correlation,
+  # actual window destruction, popup/redirect denial, timeout, cancellation,
+  # and window-close revocation with zero semantic/native resources.
+  tauri-webview-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native webview development packages
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+      - name: Restore native pkg-config search path
+        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - name: Run real semantic webview lifecycle proofs
+        env:
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          NO_AT_BRIDGE: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+        run: |
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a bash -c '
+            soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
+            for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
+            test -n "$window"; sleep 1; xdotool mousemove --window "$window" 150 150 click 1; wait "$proof"'
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- redirect
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it
@@ -257,6 +314,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+      - name: Install native webview development packages
+        if: matrix.legacy_cargo
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - if: matrix.legacy_cargo
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - if: ${{ !matrix.legacy_cargo }}
@@ -265,13 +327,15 @@ jobs:
           # Apple SDK preparation has no archive payload to cache.
           cache: false
           cross-targets: ${{ matrix.target }}
-      - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
-        run: >-
-          soldr cargo build
-          --locked --target ${{ matrix.target }} --all-features
-      # The managed GNU ARM bundle is intentionally x86_64-hosted. Until
-      # Soldr distinguishes a native ARM host, validate this lane natively.
-      - if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Restore native pkg-config search path
+        if: matrix.legacy_cargo
+        run: |
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+          echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      # These Linux runners already match their declared target. Building
+      # natively lets WebKitGTK use the host ABI instead of trying to combine
+      # Ubuntu libraries with Soldr's portable glibc cross sysroot.
+      - if: matrix.legacy_cargo
         run: >-
           soldr cargo build
           --locked --all-features
@@ -295,6 +359,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native webview development packages
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0
@@ -305,6 +373,8 @@ jobs:
           dylint-toolchain: nightly-2026-05-28
           cargo-dylint-version: 6.0.3
           dylint-link-version: 6.0.3
+      - name: Restore native pkg-config search path
+        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - name: Select the pinned Dylint compiler
         shell: bash
         run: |

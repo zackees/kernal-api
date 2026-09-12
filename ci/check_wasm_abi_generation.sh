@@ -10,4 +10,4 @@ trap 'rm -rf "${scratch_root}"' EXIT
 # checked-in artifacts.
 KERNAL_API_ABI_OUTPUT="${scratch_root}/generated" \
   soldr cargo run --locked --manifest-path "${repo_root}/tools/wasm-abi-generator/Cargo.toml"
-diff -ru "${generated_dir}" "${scratch_root}/generated"
+diff -ru -x target "${generated_dir}" "${scratch_root}/generated"

@@ -251,6 +251,17 @@ impl RuntimeHandle {
         Task::new(self.inner.spawn_blocking(operation))
     }
     #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) fn block_on_wasm<F>(&self, future: F) -> F::Output
+    where
+        F: Future,
+    {
+        // Guest child instances are owned by native threads.  They must drive
+        // Wasmtime's async API through the runtime selected by the caller,
+        // rather than constructing a nested Tokio runtime.  This is called
+        // only from those owner threads, never from a runtime worker.
+        self.inner.block_on(future)
+    }
+    #[cfg(feature = "wasm-sketch-host")]
     pub(crate) fn same_runtime_for_wasm(&self, other: &Self) -> bool {
         // `tokio::runtime::Id` deliberately has no public numeric conversion.
         // Preserve it as opaque backend identity and compare only through

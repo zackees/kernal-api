@@ -19,10 +19,13 @@ pub use worker::{
 // builds consume this checked-in private host linker.
 #[rustfmt::skip]
 #[path = "generated/v1/wasmtime45_host_linker.rs"]
+#[allow(dead_code, clippy::drop_non_drop)]
 mod generated_v1;
 #[rustfmt::skip]
 #[path = "generated/v1/admission_contract.rs"]
 mod generated_v1_contract;
+
+use crate::operations::{self, OperationHub};
 
 use std::cell::UnsafeCell;
 use std::fmt;
@@ -37,6 +40,16 @@ use wasmtime::{
     Caller, Config, Engine, InstancePre, Linker, MemoryType, Module, SharedMemory, Store, Strategy,
     UpdateDeadline,
 };
+
+#[cfg(test)]
+#[test]
+fn wasm_host_uses_the_root_shared_operation_authority_module() {
+    assert_eq!(
+        std::any::type_name::<OperationHub>(),
+        "kernal_api::operations::OperationHub",
+        "the Wasm host and native facade must not compile separate operation hubs"
+    );
+}
 
 const PAGE_BYTES: u64 = 64 * 1024;
 const ABI_MODULE: &str = generated_v1_contract::NAMESPACE;
@@ -63,6 +76,8 @@ const MAX_P1_IOVECS: usize = 1024;
 /// Absolute v1 ceiling. This bounds native JoinHandles and the facade-owned
 /// child-outcome vector independently of a caller's requested quota.
 const MAX_GUEST_THREADS_V1: usize = 16;
+const MAX_PENDING_OPERATIONS_V1: usize = 64;
+const MAX_RESOURCES_V1: usize = 64;
 const DEFAULT_MAX_GUEST_THREADS: usize = MAX_GUEST_THREADS_V1;
 const EPOCH_PENDING: u8 = 0;
 const EPOCH_CANCELLED: u8 = 1;
@@ -675,7 +690,9 @@ impl AdmittedSketch {
         let logical = registration.logical();
         let blocking_runtime = runtime.clone();
         let blocking = runtime.launch_blocking(move || {
-            sketch.execute_threaded_root_blocking(blocking_runtime, logical)
+            blocking_runtime.block_on_wasm(
+                sketch.execute_threaded_root_async(blocking_runtime.clone(), logical),
+            )
         });
         let outcome = match blocking.await {
             Ok(outcome) => outcome,
@@ -690,7 +707,7 @@ impl AdmittedSketch {
         }
         outcome
     }
-    fn execute_threaded_root_blocking(
+    async fn execute_threaded_root_async(
         &self,
         runtime: crate::async_engine::RuntimeHandle,
         logical_epoch: Arc<LogicalEpoch>,
@@ -706,6 +723,12 @@ impl AdmittedSketch {
             Arc::clone(&prepared.controller.execution_ledger),
             LedgerCounter::Stores,
         );
+        // A logical root owns exactly one operation/resource authority.  It
+        // is shared explicitly with authorized child Stores, never with a
+        // cached Store or a different root execution.
+        let operations = OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let operation_cleanup = Arc::clone(&operations);
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -713,6 +736,8 @@ impl AdmittedSketch {
                 runtime: Some(runtime),
                 fuel_generation: root.fuel_generation,
                 epoch: Arc::clone(&logical_epoch),
+                operations,
+                store_owner: 0,
             },
         );
         install_epoch_deadline(&mut store);
@@ -725,32 +750,33 @@ impl AdmittedSketch {
         // drain every accepted native child.
         let mut validation_getter = None;
         let mut _instance_observation = None;
-        let outcome = match store.set_fuel(root.root_fuel) {
-            Err(_) => Err(SketchExecutionError::PrelinkFailed),
-            Ok(()) => (|| {
-                let instance = match prepared.prelink.instantiate(&mut store) {
-                    Ok(instance) => instance,
-                    Err(error) => return map_root_error(&error, &logical_epoch),
-                };
-                _instance_observation = Some(CounterObservation::new(
-                    Arc::clone(&prepared.controller.execution_ledger),
-                    LedgerCounter::Instances,
-                ));
-                let start = instance
-                    .get_typed_func::<(), ()>(&mut store, "_start")
-                    .map_err(|_| SketchExecutionError::Trapped)?;
-                if self.validation {
-                    validation_getter = Some(
-                        instance
-                            .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
-                            .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
-                    );
-                }
-                start
-                    .call(&mut store, ())
-                    .map(|_| ThreadedRootOutcome::Started)
-                    .or_else(|error| map_root_error(&error, &logical_epoch))
-            })(),
+        let outcome = if store.set_fuel(root.root_fuel).is_err() {
+            Err(SketchExecutionError::PrelinkFailed)
+        } else {
+            let instance = match prepared.prelink.instantiate_async(&mut store).await {
+                Ok(instance) => instance,
+                Err(error) => return map_root_error(&error, &logical_epoch),
+            };
+            _instance_observation = Some(CounterObservation::new(
+                Arc::clone(&prepared.controller.execution_ledger),
+                LedgerCounter::Instances,
+            ));
+            let start = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                Ok(start) => start,
+                Err(_) => return Err(SketchExecutionError::Trapped),
+            };
+            if self.validation {
+                validation_getter = Some(
+                    instance
+                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                );
+            }
+            start
+                .call_async(&mut store, ())
+                .await
+                .map(|_| ThreadedRootOutcome::Started)
+                .or_else(|error| map_root_error(&error, &logical_epoch))
         };
         let outcome = if matches!(&outcome, Err(SketchExecutionError::OutOfFuel)) {
             outcome
@@ -762,13 +788,19 @@ impl AdmittedSketch {
         // execution result rather than a detached native-thread panic.
         let children = prepared.controller.join_completed();
         let rejections = prepared.controller.take_thread_spawn_rejections();
+        operation_cleanup.close_all(operations::Terminal::Closed);
+        #[cfg(test)]
+        if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
+            *snapshot = Some(operation_cleanup.snapshot());
+        }
         // Finalization always drains children, but the root call is the
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
         let report = if self.validation && outcome.is_ok() && children.is_ok() {
             match validation_getter {
                 Some(getter) => getter
-                    .call(&mut store, ())
+                    .call_async(&mut store, ())
+                    .await
                     .map_err(|_| SketchExecutionError::ValidationReportInvalid)
                     .and_then(|offset| validate_report(&prepared.controller.memory, offset)),
                 None => Err(SketchExecutionError::ValidationReportInvalid),
@@ -838,6 +870,8 @@ impl AdmittedSketch {
             session: Mutex::new(SessionState::default()),
             #[cfg(test)]
             threaded_smoke_report: Mutex::new(None),
+            #[cfg(test)]
+            operation_snapshot: Mutex::new(None),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -855,6 +889,9 @@ impl AdmittedSketch {
                     deadline: Instant::now() + self.epoch_broker.limits.wall_clock_deadline,
                     winner: AtomicU8::new(EPOCH_COMPLETED),
                 }),
+                operations: OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
+                    .map_err(|_| SketchExecutionError::PrelinkFailed)?,
+                store_owner: 0,
             },
         );
         linker
@@ -901,6 +938,7 @@ impl AdmittedSketch {
         let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
         let controller = &prepared.controller;
         let workers = controller.workers.lock().ok()?;
+        let operation_snapshot = *controller.operation_snapshot.lock().ok()?;
         Some(RootExecutionObservation {
             preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
@@ -913,6 +951,7 @@ impl AdmittedSketch {
             accepted_child_registrations: workers.accepted,
             live_threads: workers.live,
             queued_join_handles: workers.handles.len(),
+            operation_snapshot,
         })
     }
     #[allow(dead_code)]
@@ -1342,6 +1381,8 @@ struct ThreadController {
     workers: Mutex<Workers>,
     #[cfg(test)]
     threaded_smoke_report: Mutex<Option<[u32; 12]>>,
+    #[cfg(test)]
+    operation_snapshot: Mutex<Option<operations::HubSnapshot>>,
 }
 
 #[derive(Default)]
@@ -1573,6 +1614,8 @@ struct ThreadStoreState {
     // The callback owns only an Arc to facade state. The broker retains weak
     // entries, never a Store, Instance, Caller, or guest memory.
     epoch: Arc<LogicalEpoch>,
+    operations: Arc<OperationHub>,
+    store_owner: u64,
 }
 
 impl generated_v1::KernalApiV1Imports for ThreadStoreState {
@@ -1621,6 +1664,39 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         }
         let _ = controller.prelink.get();
         Ok(())
+    }
+
+    fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        let Some(runtime) = self.runtime.clone() else {
+            return Ok(0);
+        };
+        self.operations
+            .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
+            .map_err(|_| wasmtime::Error::msg("operation rejected"))
+    }
+
+    fn operation_poll(&mut self, operation: u64) -> wasmtime::Result<u64> {
+        Ok(self.operations.poll_wire(self.store_owner, operation))
+    }
+
+    fn operation_yield(
+        &mut self,
+        operation: u64,
+    ) -> wasmtime::Result<Arc<crate::async_engine::Notify>> {
+        // The generated future calls this only after submit/poll. The async
+        // owner driver will replace this scalar acknowledgement with its
+        // parked Wasmtime yield glue; no Caller escapes this boundary.
+        self.operations
+            .suspend_wire(self.store_owner, operation)
+            .map_err(|_| wasmtime::Error::msg("operation cannot suspend"))
+    }
+
+    fn operation_cancel(&mut self, operation: u64) -> wasmtime::Result<i32> {
+        Ok(i32::from(
+            self.operations
+                .cancel_wire(self.store_owner, operation)
+                .is_ok(),
+        ))
     }
 }
 
@@ -2229,6 +2305,7 @@ struct RootExecutionObservation {
     accepted_child_registrations: usize,
     live_threads: usize,
     queued_join_handles: usize,
+    operation_snapshot: Option<operations::HubSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2252,6 +2329,7 @@ fn define_closed_imports(
                 // a separate bounded semantic reason.
                 let generation = caller.data().fuel_generation;
                 let epoch = Arc::clone(&caller.data().epoch);
+                let operations = Arc::clone(&caller.data().operations);
                 if epoch.winner.load(Ordering::Acquire) != EPOCH_PENDING {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.epoch_rejections = workers.epoch_rejections.saturating_add(1);
@@ -2314,6 +2392,9 @@ fn define_closed_imports(
                             Arc::clone(&child.execution_ledger),
                             LedgerCounter::Stores,
                         );
+                        let Some(store_runtime) = runtime.clone() else {
+                            return ChildOutcome::Trapped;
+                        };
                         let mut store = Store::new(
                             &child.engine,
                             ThreadStoreState {
@@ -2321,6 +2402,8 @@ fn define_closed_imports(
                                 runtime,
                                 fuel_generation: generation,
                                 epoch: Arc::clone(&epoch),
+                                operations,
+                                store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
                             },
                         );
                         install_epoch_deadline(&mut store);
@@ -2331,7 +2414,9 @@ fn define_closed_imports(
                             let Some(prelink) = child.prelink.get() else {
                                 return ChildOutcome::Trapped;
                             };
-                            let instance = match prelink.instantiate(&mut store) {
+                            let instance = match store_runtime
+                                .block_on_wasm(prelink.instantiate_async(&mut store))
+                            {
                                 Ok(instance) => instance,
                                 Err(error) => return map_child_error(&error, &epoch),
                             };
@@ -2346,7 +2431,9 @@ fn define_closed_imports(
                             let Some(entry) = entry else {
                                 return ChildOutcome::Trapped;
                             };
-                            match entry.call(&mut store, (tid, arg)) {
+                            match store_runtime
+                                .block_on_wasm(entry.call_async(&mut store, (tid, arg)))
+                            {
                                 Ok(()) => ChildOutcome::Completed,
                                 Err(error) => map_child_error(&error, &epoch),
                             }
@@ -2691,9 +2778,12 @@ mod threaded_root_observation_tests {
             );
         });
         assert_eq!(compiler.compiled_module_count(), 1);
+        let observation = sketch
+            .root_execution_observation_for_test()
+            .expect("prepared root observation");
         assert_eq!(
-            sketch.root_execution_observation_for_test(),
-            Some(RootExecutionObservation {
+            observation,
+            RootExecutionObservation {
                 preparations: 1,
                 kernel_yields: 2,
                 supplied_runtime_handles: 2,
@@ -2702,9 +2792,15 @@ mod threaded_root_observation_tests {
                 accepted_child_registrations: 0,
                 live_threads: 0,
                 queued_join_handles: 0,
+                operation_snapshot: observation.operation_snapshot,
                 ..RootExecutionObservation::default()
-            })
+            }
         );
+        let operations = observation
+            .operation_snapshot
+            .expect("root records lifecycle cleanup");
+        assert_eq!(operations.pending_operations, 0);
+        assert_eq!(operations.live_resources, 0);
     }
 
     #[test]
@@ -3294,6 +3390,15 @@ mod threaded_root_observation_tests {
         assert_eq!(observation.accepted_child_registrations, 0);
         assert_eq!(observation.live_threads, 0);
         assert_eq!(observation.queued_join_handles, 0);
+        let operations = observation
+            .operation_snapshot
+            .expect("root records lifecycle cleanup after the real artifact exits");
+        assert_eq!(operations.pending_operations, 0);
+        assert_eq!(operations.live_resources, 0);
+        // One create, two child uses, and one close must each prove a real
+        // Pending -> async yield wake -> one terminal poll transition.
+        assert_eq!(operations.suspends, 4);
+        assert_eq!(operations.resumes, 4);
         assert_eq!(
             *prepared
                 .controller
@@ -4918,7 +5023,20 @@ fn preflight_threaded_rust(
         ("wasi_snapshot_preview1", "proc_exit"),
         ("wasi_snapshot_preview1", "sched_yield"),
     ];
-    if !required.iter().all(|pair| seen.contains(pair)) || seen.len() != required.len() {
+    // The legacy generated artifact contains only `kernel_yield`; the
+    // lifecycle is an all-or-nothing additive declaration.  This preserves
+    // old admitted artifacts while preventing a guest from presenting a
+    // partial submit/poll/yield protocol.
+    let lifecycle = [
+        (ABI_MODULE, "operation_submit"),
+        (ABI_MODULE, "operation_poll"),
+        (ABI_MODULE, "operation_yield"),
+    ];
+    let lifecycle_present = lifecycle.iter().filter(|pair| seen.contains(*pair)).count();
+    if !required.iter().all(|pair| seen.contains(pair))
+        || !matches!(lifecycle_present, 0 | 3)
+        || seen.len() != required.len() + lifecycle_present
+    {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",
             name: "closed-import-set",
@@ -5054,6 +5172,22 @@ fn threaded_import_signature(
         (ABI_MODULE, ABI_YIELD) => Signature {
             params: generated_v1_contract::KERNEL_YIELD_PARAMS,
             results: generated_v1_contract::KERNEL_YIELD_RESULTS,
+        },
+        // These are the closed scalar lifecycle imports generated from the
+        // admitted v1 manifest.  Resource operations remain opcode variants
+        // of `operation_submit`; admission deliberately grants no additional
+        // resource or native-backend import surface.
+        (ABI_MODULE, "operation_submit") => Signature {
+            params: &[ValType::I32, ValType::I64, ValType::I64],
+            results: &[ValType::I64],
+        },
+        (ABI_MODULE, "operation_poll") => Signature {
+            params: &[ValType::I64],
+            results: &[ValType::I64],
+        },
+        (ABI_MODULE, "operation_yield") | (ABI_MODULE, "operation_cancel") => Signature {
+            params: &[ValType::I64],
+            results: I32,
         },
         (THREAD_MODULE, THREAD_SPAWN) => Signature {
             params: I32,

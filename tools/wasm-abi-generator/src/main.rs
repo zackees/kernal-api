@@ -5,7 +5,13 @@ use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
 const METADATA_SECTION: &str = "kernal-api.abi";
-fp_import! { fn kernel_yield(); }
+fp_import! {
+    fn kernel_yield();
+    fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> u64;
+    fn operation_poll(operation: u64) -> u64;
+    fn operation_yield(operation: u64) -> i32;
+    fn operation_cancel(operation: u64) -> i32;
+}
 fp_export! {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,6 +42,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("generator output path is not UTF-8")?,
     });
     relocate_guest_package(&output)?;
+    append_semantic_lifecycle(&output)?;
+    make_operation_yield_async(&output)?;
     let manifest = fs::read_to_string(output.join("kernal-api-v1.abi.toml"))?;
     fs::write(
         output.join("admission_contract.rs"),
@@ -44,12 +52,94 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn make_operation_yield_async(output: &Path) -> std::io::Result<()> {
+    let path = output.join("wasmtime45_host_linker.rs");
+    let source = fs::read_to_string(&path)?;
+    let source = source.replace(
+        "fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<i32>;",
+        "fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<std::sync::Arc<crate::async_engine::Notify>>;",
+    );
+    let old = r#"linker.func_wrap(
+        "kernal-api:v1",
+        "operation_yield",
+        |mut caller: wasmtime::Caller<'_, T>,
+         operation: i64|
+         -> wasmtime::Result<i32> {
+            let operation = u64_from_i64(operation)?;
+            Ok(i32_to_i32(caller.data_mut().operation_yield(operation)?))
+        },
+    )?;"#;
+    let new = r#"linker.func_wrap_async(
+        "kernal-api:v1",
+        "operation_yield",
+        |mut caller: wasmtime::Caller<'_, T>, (operation,): (i64,)| {
+            let waiter = caller.data_mut().operation_yield(operation as u64);
+            Box::new(async move {
+                match waiter { Ok(waiter) => { waiter.notified().await; 1_i32 }, Err(_) => -1_i32 }
+            })
+        },
+    )?;"#;
+    let source = source.replace(old, new);
+    fs::write(path, format!("{}\n", source.trim_end()))
+}
+
+fn append_semantic_lifecycle(output: &Path) -> std::io::Result<()> {
+    // This stays generator-owned: the semantic facade is derived from the
+    // scalar declarations above and never introduces another guest ABI.
+    const LIFECYCLE: &str = r#"
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationError { Rejected, Cancelled, Closed, Failed }
+pub struct OperationFuture { operation: u64 }
+impl OperationFuture {
+    fn submit(kind: u32, arg0: u64, arg1: u64) -> Result<Self, OperationError> {
+        let operation = imports::operation_submit(kind, arg0, arg1).map_err(|_| OperationError::Failed)?;
+        if operation == 0 { Err(OperationError::Rejected) } else { Ok(Self { operation }) }
+    }
+    pub fn poll(&self) -> Result<Option<u64>, OperationError> {
+        let packed = imports::operation_poll(self.operation).map_err(|_| OperationError::Failed)?;
+        match packed as u8 { 0 => Ok(None), 1 => Ok(Some(packed >> 8)), 2 => Err(OperationError::Cancelled), 6 => Err(OperationError::Closed), _ => Err(OperationError::Failed) }
+    }
+    pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? != 0 { Ok(()) } else { Err(OperationError::Failed) } }
+    pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
+}
+#[derive(Clone, Copy)]
+pub struct SyntheticResource { token: u64 }
+impl SyntheticResource {
+    pub fn create(shareable: bool) -> Result<OperationFuture, OperationError> { OperationFuture::submit(2, u64::from(shareable), 1) }
+    pub fn from_create_payload(token: u64) -> Self { Self { token } }
+    pub fn use_(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(3, self.token, 1) }
+    pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
+}
+pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationFuture::submit(1, 0, 0) }
+"#;
+    let path = output.join("guest/src/lib.rs");
+    let source = fs::read_to_string(&path)?;
+    // The pinned scalar generator emits its conversion helpers at crate scope
+    // but its `imports` module only imports raw_imports/AbiError.  Primitive
+    // argument imports therefore need these explicit lexical imports.
+    let source = source.replace(
+        "use super::{raw_imports, AbiError};",
+        "use super::{raw_imports, AbiError, i32_from_i32, u32_to_i32, u64_from_i64, u64_to_i64};",
+    );
+    fs::write(&path, source)?;
+    use std::io::Write as _;
+    let mut file = fs::OpenOptions::new().append(true).open(path)?;
+    file.write_all(LIFECYCLE.as_bytes())
+}
+
 fn relocate_guest_package(output: &Path) -> std::io::Result<()> {
     let guest = output.join("guest");
     fs::create_dir_all(guest.join("src"))?;
     // Replace only the two files owned by generation, preserving build output.
     fs::copy(output.join("Cargo.toml"), guest.join("Cargo.toml"))?;
     fs::copy(output.join("src/lib.rs"), guest.join("src/lib.rs"))?;
+    // Keep the standalone generated guest check reproducible without letting
+    // Cargo synthesize an untracked lockfile in the checked-in output tree.
+    fs::write(
+        guest.join("Cargo.lock"),
+        "# This file is automatically @generated by Cargo.\n# It is not intended for manual editing.\nversion = 4\n\n[[package]]\nname = \"kernal-api-v1-bindings\"\nversion = \"0.1.0\"\n",
+    )?;
     fs::remove_file(output.join("Cargo.toml"))?;
     fs::remove_file(output.join("src/lib.rs"))?;
     fs::remove_dir(output.join("src"))?;
@@ -88,8 +178,43 @@ impl Contract {
             .get("imports")
             .and_then(toml::Value::as_array)
             .ok_or("missing imports")?;
-        if imports.len() != 1 {
-            return Err("this admission adapter requires exactly one scalar yield import".into());
+        if imports.is_empty() { return Err("missing imports".into()); }
+        let namespace = string("namespace")?;
+        let mut import_names = std::collections::BTreeSet::new();
+        for import in imports {
+            let import = import.as_table().ok_or("import must be a table")?;
+            if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
+                return Err("import namespace disagrees with manifest namespace".into());
+            }
+            if import.get("direction").and_then(toml::Value::as_str) != Some("guest-to-host") {
+                return Err("unexpected import direction".into());
+            }
+            let name = import
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or("missing import name")?;
+            if !import_names.insert(name) {
+                return Err("duplicate import name".into());
+            }
+            for field in ["params", "results"] {
+                let values = import
+                    .get(field)
+                    .and_then(toml::Value::as_array)
+                    .ok_or_else(|| format!("missing import {field}"))?;
+                for value in values {
+                    let value = value.as_table().ok_or("ABI value must be a table")?;
+                    let semantic = value.get("semantic").and_then(toml::Value::as_str);
+                    let abi = value.get("abi").and_then(toml::Value::as_str);
+                    if !matches!(
+                        (semantic, abi),
+                        (Some("()"), Some("unit"))
+                            | (Some("i32" | "u32"), Some("i32"))
+                            | (Some("u64"), Some("i64"))
+                    ) {
+                        return Err("unsupported semantic/ABI value shape".into());
+                    }
+                }
+            }
         }
         if root
             .get("exports")
@@ -98,7 +223,6 @@ impl Contract {
             return Err("this admission adapter does not yet support generated exports".into());
         }
         let import = imports[0].as_table().ok_or("import must be a table")?;
-        let namespace = string("namespace")?;
         if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
             return Err("import namespace disagrees with manifest namespace".into());
         }
@@ -108,26 +232,6 @@ impl Contract {
             .ok_or("missing import name")?;
         if import.get("direction").and_then(toml::Value::as_str) != Some("guest-to-host") {
             return Err("unexpected import direction".into());
-        }
-        if !import
-            .get("params")
-            .and_then(toml::Value::as_array)
-            .is_some_and(Vec::is_empty)
-        {
-            return Err("yield import must have no parameters".into());
-        }
-        let results = import
-            .get("results")
-            .and_then(toml::Value::as_array)
-            .ok_or("missing results")?;
-        if results.len() != 1
-            || results[0].as_table().is_none_or(|result| {
-                result.len() != 2
-                    || result.get("semantic").and_then(toml::Value::as_str) != Some("()")
-                    || result.get("abi").and_then(toml::Value::as_str) != Some("unit")
-            })
-        {
-            return Err("yield import must have exactly one unit result declaration".into());
         }
         Ok(Self {
             schema: string("schema")?,

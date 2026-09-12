@@ -1,5 +1,6 @@
 /dist/
 /target/
+/src/wasm/generated/v1/guest/target/
 /tools/wasm-abi-generator/target/
 /guests/threaded-smoke/target/
 /.extern-repos/

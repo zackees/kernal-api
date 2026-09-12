@@ -139,13 +139,15 @@ async fn lifecycle(
                 "expected typed load timeout, got {timed_out:?}"
             )));
         }
-        // The resource token remains opaque, but another semantic operation
-        // through this façade must observe the revoked generation.
-        if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::WindowClosed) {
+        // The already-reserved terminal operation preserves the reason that
+        // revoked the resource. A new semantic operation below must then see
+        // the generation as stale.
+        if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::TimedOut) {
             return Err(WebviewError::HostFailure(
-                "timed-out handle remained usable".into(),
+                "timeout did not publish its typed terminal outcome".into(),
             ));
         }
+        require_stale(&webview).await?;
         return assert_clean(client);
     }
     let loaded = webview.wait_until_loaded(Duration::from_secs(5)).await;

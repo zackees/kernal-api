@@ -570,7 +570,7 @@ fn host_failure(error: impl std::fmt::Display) -> NativeWebviewError {
 fn is_allowed_url(url: &Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.host_str().is_some()
-        && url.cannot_be_a_base() == false
+        && !url.cannot_be_a_base()
         && url.username().is_empty()
         && url.password().is_none()
 }

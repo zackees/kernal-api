@@ -428,7 +428,7 @@ impl OperationHub {
     }
 
     pub(crate) fn cancel_wire(&self, store: u64, operation: u64) -> Result<(), HubError> {
-        let _ = self.take_owner(OpaqueToken(operation), store)?;
+        self.take_owner(OpaqueToken(operation), store)?;
         self.terminal(
             OpaqueToken(operation),
             TerminalResult {

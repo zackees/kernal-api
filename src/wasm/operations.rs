@@ -93,6 +93,8 @@ pub(crate) struct HubSnapshot {
     /// Actual buffer capacities currently retained by the hub, including
     /// unused blob capacity, pending inputs, and uncollected read results.
     pub(crate) retained_transfer_capacity: usize,
+    /// High-water mark of hub-owned capacities, including copy overlap.
+    pub(crate) peak_retained_transfer_capacity: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -224,6 +226,7 @@ struct State {
     resumes: u64,
     buffered_blob_bytes: usize,
     peak_buffered_blob_bytes: usize,
+    peak_retained_transfer_capacity: usize,
     closed: bool,
 }
 
@@ -267,6 +270,7 @@ impl OperationHub {
                 resumes: 0,
                 buffered_blob_bytes: 0,
                 peak_buffered_blob_bytes: 0,
+                peak_retained_transfer_capacity: 0,
                 closed: false,
             }),
         }))
@@ -774,6 +778,7 @@ impl OperationHub {
             return Err(HubError::Quota);
         }
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let retained_before_read = Self::transfer_capacity(&state);
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
         if resource.committing != committing {
             return Err(HubError::WrongRights);
@@ -789,6 +794,9 @@ impl OperationHub {
             // while its length-based byte ledger reports zero.
             *buffer = VecDeque::new();
         }
+        state.peak_retained_transfer_capacity = state
+            .peak_retained_transfer_capacity
+            .max(retained_before_read.saturating_add(result.capacity()));
         state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
         drop(state);
         self.drive_blob_writes()?;
@@ -848,6 +856,7 @@ impl OperationHub {
                 // Copy only after authority and capacity checks, without
                 // retaining the producer or guest-memory view in the hub.
                 slot.pending_blob_write = Some(copy());
+                Self::record_transfer_capacity(&mut state);
             }
         }
         self.drive_blob_writes()?;
@@ -885,7 +894,11 @@ impl OperationHub {
         // Avoid VecDeque's geometric growth retaining uncharged spare bytes.
         buffer
             .try_reserve_exact(additional)
-            .map_err(|_| HubError::Exhausted)
+            .map_err(|_| HubError::Exhausted)?;
+        // Pending input is still alive here. Measure before terminalization
+        // drops it, so the copy's two backing allocations are both charged.
+        Self::record_transfer_capacity(state);
+        Ok(())
     }
 
     fn drive_blob_writes(&self) -> Result<(), HubError> {
@@ -1014,6 +1027,7 @@ impl OperationHub {
             let operation = &state.operations[&token];
             let resource = operation.resource.ok_or(HubError::Invalid)?;
             let maximum = operation.pending_blob_read.ok_or(HubError::Invalid)?;
+            let retained_before_read = Self::transfer_capacity(&state);
             let retained: usize = state
                 .operations
                 .values()
@@ -1034,10 +1048,13 @@ impl OperationHub {
             if retained.saturating_add(count) > self.blob_limits.maximum_sketch_bytes {
                 continue;
             }
-            let bytes = buffer.drain(..count).collect();
+            let bytes: Vec<_> = buffer.drain(..count).collect();
             if buffer.is_empty() {
                 *buffer = VecDeque::new();
             }
+            state.peak_retained_transfer_capacity = state
+                .peak_retained_transfer_capacity
+                .max(retained_before_read.saturating_add(bytes.capacity()));
             state.buffered_blob_bytes -= count;
             state
                 .operations
@@ -1819,6 +1836,30 @@ impl OperationHub {
         }
     }
 
+    fn transfer_capacity(state: &State) -> usize {
+        state
+            .resources
+            .values()
+            .map(|resource| match &resource.value {
+                ResourceValue::Blob { buffer, .. } => buffer.capacity(),
+                _ => 0,
+            })
+            .chain(state.operations.values().map(|operation| {
+                operation
+                    .pending_blob_write
+                    .as_ref()
+                    .map_or(0, Vec::capacity)
+                    .saturating_add(operation.blob_read_result.as_ref().map_or(0, Vec::capacity))
+            }))
+            .fold(0_usize, usize::saturating_add)
+    }
+
+    fn record_transfer_capacity(state: &mut State) {
+        state.peak_retained_transfer_capacity = state
+            .peak_retained_transfer_capacity
+            .max(Self::transfer_capacity(state));
+    }
+
     pub(crate) fn snapshot(&self) -> HubSnapshot {
         let state = self.state.lock().expect("operation hub mutex poisoned");
         HubSnapshot {
@@ -1845,23 +1886,8 @@ impl OperationHub {
                 .filter_map(|operation| operation.blob_read_result.as_ref())
                 .map(Vec::len)
                 .sum(),
-            retained_transfer_capacity: state
-                .resources
-                .values()
-                .map(|resource| match &resource.value {
-                    ResourceValue::Blob { buffer, .. } => buffer.capacity(),
-                    _ => 0,
-                })
-                .chain(state.operations.values().map(|operation| {
-                    operation
-                        .pending_blob_write
-                        .as_ref()
-                        .map_or(0, Vec::capacity)
-                        .saturating_add(
-                            operation.blob_read_result.as_ref().map_or(0, Vec::capacity),
-                        )
-                }))
-                .fold(0_usize, usize::saturating_add),
+            retained_transfer_capacity: Self::transfer_capacity(&state),
+            peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
         }
     }
 }
@@ -2131,6 +2157,24 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn transfer_peak_records_copy_overlap_and_survives_teardown() {
+        let hub = OperationHub::with_blob_limits(4, 1, BlobLimits::new(1024, 1024, 1024).unwrap())
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let write = hub.submit_blob_write(1, blob, &[7; 1024]).unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 1024);
+        assert_eq!(hub.snapshot().peak_retained_transfer_capacity, 2048);
+        hub.take_terminal(write, 1).unwrap().unwrap();
+        let read = hub.submit_blob_read(1, blob, 1024).unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 1024);
+        assert_eq!(hub.snapshot().peak_retained_transfer_capacity, 2048);
+        hub.take_blob_read(1, read).unwrap().unwrap();
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        assert_eq!(hub.snapshot().peak_retained_transfer_capacity, 2048);
     }
 
     #[test]

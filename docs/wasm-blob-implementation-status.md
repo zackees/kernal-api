@@ -87,8 +87,21 @@ The existing Cargo-built 64 MiB guest also passed with this accounting change
 on Linux x86-64: 5.95 seconds in-process and 9.47 seconds through the killable
 worker. These runs reused the admitted guest artifact and rebuilt the host.
 
-The counter covers hub-owned allocations only, not temporary buffers held by
-the output writer or caller. It is a current measurement, not a peak or quota.
+`peak_retained_transfer_capacity` now retains a high-water mark across teardown.
+It samples input admission and storage growth before pending inputs are dropped,
+and includes the overlap while a pull allocates its result before releasing
+an empty blob's backing buffer. A regression observes a 2,048-byte peak for a
+1,024-byte asynchronous write/read even though snapshots after each operation
+retain only 1,024 bytes. All 39 focused hub tests pass.
+The in-process Cargo guest proof additionally asserts an exact 1,179,648-byte
+peak (1 MiB blob storage plus two 64 KiB chunks) during its pressure phase and
+zero retained capacity after teardown. That proof passed in 6.03 seconds on
+Linux x86-64 with the existing admitted artifact and rebuilt host.
+
+These counters cover hub-owned buffer capacities, not allocator-internal
+reallocation scratch or buffers retained by the output writer/caller after a
+native pull returns. The high-water mark is instrumentation, not yet an
+aggregate quota or a process-memory peak.
 
 - Extend the sole generated ABI with bounded guest-memory transfers and
   semantic blob/output APIs; retain no guest pointer across suspension.

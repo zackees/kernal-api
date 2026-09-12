@@ -3522,6 +3522,13 @@ mod threaded_root_observation_tests {
             1
         );
         assert_eq!(operations.peak_buffered_blob_bytes, 1024 * 1024);
+        // The pressure phase overlaps one full blob, one pending input,
+        // and one bounded pull result. Measure allocations, not just payload.
+        assert_eq!(
+            operations.peak_retained_transfer_capacity,
+            1024 * 1024 + 2 * 64 * 1024
+        );
+        assert_eq!(operations.retained_transfer_capacity, 0);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(
             *prepared

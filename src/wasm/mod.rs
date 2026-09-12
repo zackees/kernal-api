@@ -29,8 +29,27 @@ use wasmtime::{
     UpdateDeadline,
 };
 
+#[allow(dead_code)]
+mod generated_core_abi {
+    include!("../../abi/generated/wasmtime45_host_linker.rs");
+}
+#[allow(dead_code)]
+mod generated_contract {
+    include!("../../abi/generated/contract.rs");
+}
+
+struct GeneratedImport {
+    name: &'static str,
+    params: &'static [ValType],
+    results: &'static [ValType],
+}
+mod generated_admission {
+    use super::{GeneratedImport, ValType};
+    include!("../../abi/generated/admission.rs");
+}
+
 const PAGE_BYTES: u64 = 64 * 1024;
-const ABI_MODULE: &str = "kernal-api:v1";
+const ABI_MODULE: &str = generated_admission::ABI_NAMESPACE;
 const ABI_YIELD: &str = "kernel-yield";
 const THREAD_MODULE: &str = "wasi";
 const THREAD_SPAWN: &str = "thread-spawn";
@@ -39,6 +58,8 @@ const MEMORY_NAME: &str = "memory";
 const ENTRY: &str = "kernal-api-run";
 const ABI_METADATA: &str = "kernal-api.abi";
 const ABI_METADATA_VALUE: &[u8] = b"v1";
+const CORE_ABI_METADATA: &str = "kernal-api.core-abi";
+const CORE_ABI_METADATA_VALUE: &[u8] = generated_contract::CORE_ABI_METADATA;
 const PROFILE_METADATA: &str = "kernal-api.profile";
 const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
 const VALIDATION_PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-validation-v1";
@@ -1296,6 +1317,43 @@ struct ThreadController {
     threaded_smoke_report: Mutex<Option<[u32; 12]>>,
 }
 
+// The generated ABI is linked to the same private Store state as the legacy
+// threaded compatibility import.  #36 reserves deterministic no-effect
+// responses only; lifecycle/resource behavior is introduced by #37/#38.
+impl generated_core_abi::KernalApiV1Imports for ThreadStoreState {
+    fn abi_version(&mut self) -> wasmtime::Result<u32> {
+        Ok(generated_contract::ABI_VERSION)
+    }
+    fn capability_bits(&mut self) -> wasmtime::Result<u64> {
+        Ok(generated_contract::CAPABILITIES)
+    }
+    fn submit(&mut self, _: u32, _: u64, _: u64, _: u64) -> wasmtime::Result<u64> {
+        Ok(generated_contract::INVALID_REQUEST)
+    }
+    fn poll(&mut self, _: u64) -> wasmtime::Result<u32> {
+        Ok(generated_contract::POLL_REJECTED)
+    }
+    fn completion_word(&mut self, _: u64, field: u32) -> wasmtime::Result<u64> {
+        // Field zero is the reserved stale/forged status; other invalid data
+        // fields use an unmistakable all-ones sentinel. A caller must observe
+        // a terminal poll status before consuming a completion value.
+        Ok(if field == 0 {
+            u64::from(generated_contract::ERROR_STALE_OR_FORGED)
+        } else {
+            u64::MAX
+        })
+    }
+    fn release(&mut self, _: u64) -> wasmtime::Result<u32> {
+        Ok(u32::from(generated_contract::ERROR_STALE_OR_FORGED))
+    }
+    fn yield_now(&mut self) -> wasmtime::Result<u32> {
+        Ok(u32::from(generated_contract::ERROR_UNSUPPORTED))
+    }
+    fn cancel(&mut self, _: u64) -> wasmtime::Result<u32> {
+        Ok(u32::from(generated_contract::ERROR_STALE_OR_FORGED))
+    }
+}
+
 #[derive(Default)]
 struct SessionState {
     active_roots: usize,
@@ -2141,6 +2199,8 @@ struct ProcExitSentinel(i32);
 fn define_closed_imports(
     linker: &mut Linker<ThreadStoreState>,
 ) -> Result<(), SketchExecutionError> {
+    generated_core_abi::link_kernal_api_v1(linker)
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
     linker
         .func_wrap(
             ABI_MODULE,
@@ -4501,6 +4561,11 @@ fn preflight(
             }
             Payload::StartSection { .. } => return Err(SketchModuleError::StartFunctionForbidden),
             Payload::CustomSection(section) => {
+                if section.name() == CORE_ABI_METADATA {
+                    return Err(SketchModuleError::MetadataMismatch {
+                        name: CORE_ABI_METADATA,
+                    });
+                }
                 let (count, expected, name) = if section.name() == ABI_METADATA {
                     (&mut abi, ABI_METADATA_VALUE, ABI_METADATA)
                 } else if section.name() == PROFILE_METADATA {
@@ -4614,6 +4679,7 @@ fn preflight_threaded_rust(
     let mut start = None;
     let mut target_features = None;
     let mut validation_metadata = 0_u8;
+    let mut core_abi_metadata = 0_u8;
     let mut seen = std::collections::BTreeSet::new();
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
@@ -4697,6 +4763,24 @@ fn preflight_threaded_rust(
             }
             Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => match section.name() {
+                CORE_ABI_METADATA => {
+                    core_abi_metadata += 1;
+                    if core_abi_metadata > 1 {
+                        return Err(SketchModuleError::DuplicateMetadata {
+                            name: CORE_ABI_METADATA,
+                        });
+                    }
+                    if section.data().len() > MAX_METADATA_BYTES {
+                        return Err(SketchModuleError::MetadataTooLarge {
+                            name: CORE_ABI_METADATA,
+                        });
+                    }
+                    if section.data() != CORE_ABI_METADATA_VALUE {
+                        return Err(SketchModuleError::MetadataMismatch {
+                            name: CORE_ABI_METADATA,
+                        });
+                    }
+                }
                 PROFILE_METADATA if validation => {
                     validation_metadata += 1;
                     if validation_metadata > 1 {
@@ -4752,20 +4836,47 @@ fn preflight_threaded_rust(
     if memory_export != Some((ExternalKind::Memory, 0)) {
         return Err(SketchModuleError::MemoryExportMismatch);
     }
-    let required = [
-        (ABI_MODULE, ABI_YIELD),
-        (THREAD_MODULE, THREAD_SPAWN),
-        ("wasi_snapshot_preview1", "clock_time_get"),
-        ("wasi_snapshot_preview1", "environ_get"),
-        ("wasi_snapshot_preview1", "environ_sizes_get"),
-        ("wasi_snapshot_preview1", "fd_write"),
-        ("wasi_snapshot_preview1", "proc_exit"),
-        ("wasi_snapshot_preview1", "sched_yield"),
-    ];
+    let generated = seen.contains(&(ABI_MODULE, "abi_version"));
+    let required = if generated {
+        generated_admission::GENERATED_IMPORTS
+            .iter()
+            .map(|entry| (ABI_MODULE, entry.name))
+            .chain([
+                (THREAD_MODULE, THREAD_SPAWN),
+                ("wasi_snapshot_preview1", "clock_time_get"),
+                ("wasi_snapshot_preview1", "environ_get"),
+                ("wasi_snapshot_preview1", "environ_sizes_get"),
+                ("wasi_snapshot_preview1", "fd_write"),
+                ("wasi_snapshot_preview1", "proc_exit"),
+                ("wasi_snapshot_preview1", "sched_yield"),
+            ])
+            .collect()
+    } else {
+        vec![
+            (ABI_MODULE, ABI_YIELD),
+            (THREAD_MODULE, THREAD_SPAWN),
+            ("wasi_snapshot_preview1", "clock_time_get"),
+            ("wasi_snapshot_preview1", "environ_get"),
+            ("wasi_snapshot_preview1", "environ_sizes_get"),
+            ("wasi_snapshot_preview1", "fd_write"),
+            ("wasi_snapshot_preview1", "proc_exit"),
+            ("wasi_snapshot_preview1", "sched_yield"),
+        ]
+    };
     if !required.iter().all(|pair| seen.contains(pair)) || seen.len() != required.len() {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",
             name: "closed-import-set",
+        });
+    }
+    if generated && core_abi_metadata != 1 {
+        return Err(SketchModuleError::MissingMetadata {
+            name: CORE_ABI_METADATA,
+        });
+    }
+    if !generated && core_abi_metadata != 0 {
+        return Err(SketchModuleError::MetadataMismatch {
+            name: CORE_ABI_METADATA,
         });
     }
     let features = target_features.ok_or(SketchModuleError::MissingTargetFeatures)?;
@@ -4894,6 +5005,24 @@ fn threaded_import_signature(
     types: &[TypeEntry],
     index: u32,
 ) -> Result<bool, SketchModuleError> {
+    if module == ABI_MODULE {
+        if let Some(generated) = generated_admission::GENERATED_IMPORTS
+            .iter()
+            .find(|generated| generated.name == name)
+        {
+            check_signature(
+                types,
+                index,
+                Signature {
+                    params: generated.params,
+                    results: generated.results,
+                },
+                module,
+                name,
+            )?;
+            return Ok(true);
+        }
+    }
     let signature = match (module, name) {
         (ABI_MODULE, ABI_YIELD) => Signature {
             params: EMPTY,

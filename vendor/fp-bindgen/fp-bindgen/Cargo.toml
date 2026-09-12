@@ -1,0 +1,54 @@
+[package]
+name = "fp-bindgen"
+description = "Bindings generator for full-stack WASM plugins"
+homepage = { workspace = true }
+repository = { workspace = true }
+readme = "../README.md"
+keywords = ["WebAssembly", "WASM", "bindgen"]
+categories = ["development-tools::ffi", "wasm"]
+version = "3.0.0"
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+bytes-compat = ["bytes"]
+default = [
+    "bytes-compat",
+    "http-compat",
+    "rmpv-compat",
+    "serde-bytes-compat",
+    "serde-json-compat",
+    "time-compat",
+]
+http-compat = ["http"]
+rmpv-compat = ["rmpv"]
+serde-bytes-compat = ["serde_bytes"]
+serde-json-compat = ["serde_json"]
+time-compat = ["time"]
+generators = ["rustfmt-wrapper", "toml_edit"]
+wasmtime-core-wasm = []
+wasmtime45-integration = ["wasmtime-core-wasm", "dep:wasmtime"]
+
+[dependencies]
+bytes = { version = "1", features = ["serde"], optional = true }
+fp-bindgen-macros = { workspace = true }
+http = { version = "0.2", optional = true }
+Inflector = "0.11"
+pretty_assertions = "1"
+proc-macro2 = "1"
+quote = "1"
+rmpv = { version = "1.0.0", features = ["with-serde"], optional = true }
+serde_bytes = { version = "0.11", optional = true }
+serde_json = { version = "1.0", optional = true }
+syn = { version = "1", features = ["full", "extra-traits"] }
+time = { version = "0.3", features = ["serde-human-readable"], optional = true }
+toml_edit = { version = "0.19", optional = true }
+rustfmt-wrapper = { version = "0.2.0", optional = true }
+wasmtime = { version = "45", optional = true }
+
+[dev-dependencies]
+toml = "0.8"

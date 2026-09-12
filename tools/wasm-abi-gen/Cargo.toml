@@ -1,0 +1,16 @@
+[package]
+name = "kernal-api-wasm-abi-gen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The generator is deliberately an explicit, isolated Cargo project rather
+# than a member of the facade's build graph.
+[workspace]
+
+[dependencies]
+# This explicit tool is intentionally outside kernal-api's normal dependency
+# graph.  Keep defaults off: the owned Core-Wasm generator accepts scalar
+# declarations only and must never revive fp-bindgen's legacy transports.
+fp-bindgen = { path = "../../vendor/fp-bindgen/fp-bindgen", default-features = false, features = ["wasmtime-core-wasm"] }
+toml = "=0.8.23"

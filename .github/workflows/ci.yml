@@ -30,6 +30,9 @@ jobs:
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - run: soldr cargo fmt --all -- --check
+      - name: Verify generated Core-Wasm ABI is current
+        shell: bash
+        run: bash scripts/regenerate-wasm-abi.sh --check
 
   # Compile the aarch64-apple-darwin test binaries on Linux. Nothing here
   # needs a Mac: Soldr carries its own LLVM and macOS SDK, and clippy is a
@@ -201,6 +204,12 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
         shell: pwsh
         run: ./scripts/build-threaded-smoke.ps1
+      - name: Build and execute generated Core-Wasm guest
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-generated-proof
+        run: |
+          bash scripts/build-generated-core-smoke.sh
 
   compilation-boundary-dependencies:
     runs-on: ubuntu-latest

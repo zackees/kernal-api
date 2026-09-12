@@ -5,6 +5,26 @@ process. Its direct dependency requirements are exact and release tests keep
 them aligned with the checked-in lockfile. Clients do not select parallel
 implementations of these facilities.
 
+## Generated Core-Wasm ABI v1
+
+`abi/kernal-api-v1.rs` is the sole declaration source for the private
+`kernal-api:v1` scalar Core-Wasm control ABI. `bash scripts/regenerate-wasm-abi.sh`
+regenerates its checked-in guest crate, Wasmtime 45 linker glue, and manifest;
+`bash scripts/regenerate-wasm-abi.sh --check` fails on drift. The generator is
+vendored from fp-bindgen revision
+`4e44d9e5408653e3c428ee3f855cc194d53f60b0` with a documented generator-source
+helper-scope correction. It runs only when explicitly called and is outside
+the facade's normal dependency graph. See `abi/README.md` and the vendor
+provenance record for reproduction commands and the exact local delta.
+
+Version 1 carries only bounded scalar controls. A host assigns opaque request
+identities; completion, error/status, operation, scope, and resource identity
+fields are specified beside the declarations. It conveys neither bulk values
+nor authority. Lifecycle and resource execution remain reserved for #37 and
+#38. The generated guest compiles for `wasm32-wasip1-threads`; CI runs that
+compile on Linux and Windows. macOS compilation is covered by Soldr's
+cross-target lane; macOS execution remains gated by `ENABLE_MACOS_RUNNERS`.
+
 | Contract | Supported baseline |
 |---|---|
 | Rust | exactly the project's 1.95.0 MSRV/toolchain floor or newer |

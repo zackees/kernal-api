@@ -1,0 +1,61 @@
+schema = "fp-bindgen.core-wasm-abi"
+schema_revision = 1
+generator_revision = 1
+abi_version = 1
+namespace = "kernal-api:v1"
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "abi_version"
+direction = "guest-to-host"
+params = []
+results = [{ semantic = "u32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "cancel"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "capability_bits"
+direction = "guest-to-host"
+params = []
+results = [{ semantic = "u64", abi = "i64" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "completion_word"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }, { semantic = "u32", abi = "i32" }]
+results = [{ semantic = "u64", abi = "i64" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "poll"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "release"
+direction = "guest-to-host"
+params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "submit"
+direction = "guest-to-host"
+params = [{ semantic = "u32", abi = "i32" }, { semantic = "u64", abi = "i64" }, { semantic = "u64", abi = "i64" }, { semantic = "u64", abi = "i64" }]
+results = [{ semantic = "u64", abi = "i64" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "yield_now"
+direction = "guest-to-host"
+params = []
+results = [{ semantic = "u32", abi = "i32" }]

@@ -1,5 +1,6 @@
 /dist/
 /target/
+**/target/
 /.extern-repos/
 *.egg-info/
 __pycache__/
@@ -9,3 +10,7 @@ __pycache__/
 # guest manifest. Only the checked-in target config belongs to the repository.
 /guests/threaded-smoke/.cargo/*
 !/guests/threaded-smoke/.cargo/config.toml
+# The generated-core guest also runs as an isolated workspace. Cargo records
+# registry and package cache state beside its required target configuration.
+/guests/generated-core-smoke/.cargo/*
+!/guests/generated-core-smoke/.cargo/config.toml

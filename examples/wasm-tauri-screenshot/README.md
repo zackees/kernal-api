@@ -123,13 +123,16 @@ unrelated file, and applies the same zero-resource teardown assertions.
 The timeout proof holds the real HTTP request open for the production
 30-second load deadline, requires `screenshot-load-timed-out`, forbids capture,
 and applies the same output-preservation and teardown checks.
+Both load-failure proofs now run through the default contained CLI and assert
+transported worker traces plus zero parent worker/task/lease counters.
 The write-failure proof relocates the fixture-owned output directory only
 after the guest's HTTP request, so grants and native execution have already
 started. The guest completes real capture before its output job encounters
 the now-missing parent. The proof requires `screenshot-write-rejected`, no
 recreated parent or sibling temporary file, unchanged preserved files, and
 zero captured blobs/output jobs/native/Wasm resources. This is a missing-parent
-I/O failure, not yet a portable permissions or disk-exhaustion proof.
+I/O failure in explicit diagnostic mode, not yet a contained permissions or
+disk-exhaustion proof.
 The trap proof compiles the same actual guest with the explicit
 `proof-trap-after-capture` feature. It traps only after the native capture
 result returns through the generated ABI, before output commit. The test

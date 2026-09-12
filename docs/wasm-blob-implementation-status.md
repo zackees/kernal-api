@@ -214,6 +214,15 @@ The non-native worker's 21 binary/protocol tests and four containment regression
 also pass with version 6. The acceptance recorder test verifies destructive
 retrieval and duplicate/request rejection; final formatting and diff checks pass.
 
+The real redirect and production 30-second load-timeout proofs now use the
+default contained CLI, not diagnostic in-process execution. Both pass with the
+admission control (three tests, 39.79 seconds): the guest retains its distinct
+load-rejected/load-timed-out status, no capture is requested, the original output
+and neighbor are unchanged, staging is absent, and the transported hub/compiler
+trace plus parent worker/task/lease counters are zero. The old unreachable
+in-process load-failure assertions were removed rather than counting two modes
+as separate acceptance evidence.
+
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
 success before the fix; it now verifies success, failure, zero, and unknown

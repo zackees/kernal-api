@@ -425,6 +425,8 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         NativeScenario::ContainedCapture
             | NativeScenario::ContainedTrap
             | NativeScenario::MissingWorker
+            | NativeScenario::Redirect
+            | NativeScenario::Timeout
     );
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"));
     if !contained {
@@ -495,6 +497,23 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             validate_execution_trace(&trace).expect("contained ABI and timing trace");
             assert!(trace.contains("terminal=worker-completed"), "{trace}");
             validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
+        } else if matches!(scenario, NativeScenario::Redirect | NativeScenario::Timeout) {
+            validate_teardown_trace(&trace).expect("contained load failure cleanup trace");
+            let expected = if scenario == NativeScenario::Timeout {
+                assert!(
+                    start.elapsed() >= Duration::from_secs(30),
+                    "load deadline bypassed"
+                );
+                "screenshot-load-timed-out"
+            } else {
+                "screenshot-load-rejected"
+            };
+            assert!(trace.contains(expected), "{trace}");
+            assert!(
+                !trace.contains("phase=capture-requested"),
+                "capture after load failure"
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), b"original");
         } else {
             validate_teardown_trace(&trace).expect("contained trap cleanup trace");
             assert!(trace.contains("terminal=trapped"), "{trace}");
@@ -509,12 +528,6 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     }
     if scenario != NativeScenario::Capture {
         assert!(!status.success(), "negative native scenario succeeded");
-        if scenario == NativeScenario::Timeout {
-            assert!(
-                start.elapsed() >= Duration::from_secs(30),
-                "load timeout bypassed the production deadline"
-            );
-        }
         let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
         if scenario == NativeScenario::TrapAfterCapture {
             assert!(
@@ -565,24 +578,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             assert_eq!(std::fs::read_dir(&preserved_directory).unwrap().count(), 2);
             return;
         }
-        assert!(
-            !trace.contains("phase=capture-requested"),
-            "failed navigation reached capture"
-        );
-        let expected = if scenario == NativeScenario::Redirect {
-            "screenshot-load-rejected"
-        } else {
-            "screenshot-load-timed-out"
-        };
-        assert!(
-            trace.contains(expected),
-            "wrong typed native error (expected {expected}): {trace}"
-        );
-        validate_teardown_trace(&trace).expect("native failure must drain the actual root");
-        assert_eq!(std::fs::read(&output).unwrap(), b"original");
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
-        return;
+        panic!("non-contained failure scenario needs explicit assertions");
     }
     assert!(
         status.success(),

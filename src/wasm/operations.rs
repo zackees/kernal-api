@@ -186,6 +186,7 @@ struct OperationSlot {
     suspended: bool,
     notify: Arc<Notify>,
     created_resource: Option<OpaqueToken>,
+    pending_blob_write: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -667,7 +668,111 @@ impl OperationHub {
         let count = maximum_bytes.min(buffer.len());
         let result: Vec<_> = buffer.drain(..count).collect();
         state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
+        drop(state);
+        self.drive_blob_writes()?;
         Ok(result)
+    }
+
+    /// Reserve a capacity-awaited write in the shared operation table.
+    pub(crate) fn submit_blob_write(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        bytes: &[u8],
+    ) -> Result<OpaqueToken, HubError> {
+        if bytes.len() > self.blob_limits.maximum_chunk_bytes {
+            return Err(HubError::Quota);
+        }
+        let (operation, _) =
+            self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let pending: usize = state
+                .operations
+                .values()
+                .filter_map(|op| op.pending_blob_write.as_ref())
+                .map(Vec::len)
+                .sum();
+            if pending.saturating_add(bytes.len()) > self.blob_limits.maximum_sketch_bytes {
+                state.operations.remove(&operation);
+                return Err(HubError::Quota);
+            }
+            let slot = state
+                .operations
+                .get_mut(&operation)
+                .ok_or(HubError::Invalid)?;
+            if slot.terminal.is_none() {
+                slot.pending_blob_write = Some(bytes.to_vec());
+            }
+        }
+        self.drive_blob_writes()?;
+        Ok(operation)
+    }
+
+    fn drive_blob_writes(&self) -> Result<(), HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let tokens: Vec<_> = state
+            .operations
+            .iter()
+            .filter(|(_, op)| op.pending_blob_write.is_some() && op.terminal.is_none())
+            .map(|(token, _)| *token)
+            .collect();
+        let mut wakes = Vec::new();
+        for token in tokens {
+            let operation = &state.operations[&token];
+            let resource = operation.resource.ok_or(HubError::Invalid)?;
+            let count = operation
+                .pending_blob_write
+                .as_ref()
+                .ok_or(HubError::Invalid)?
+                .len();
+            let terminal = match state.resources.get(&resource).map(|slot| &slot.value) {
+                Some(ResourceValue::Blob { sealed: true, .. }) | None => Terminal::Closed,
+                Some(ResourceValue::Blob { buffer, .. }) => {
+                    if buffer.len().saturating_add(count) > self.blob_limits.maximum_blob_bytes
+                        || state.buffered_blob_bytes.saturating_add(count)
+                            > self.blob_limits.maximum_sketch_bytes
+                    {
+                        continue;
+                    }
+                    Terminal::Completed
+                }
+                _ => Terminal::Rejected,
+            };
+            if terminal == Terminal::Completed {
+                let bytes = state
+                    .operations
+                    .get_mut(&token)
+                    .unwrap()
+                    .pending_blob_write
+                    .take()
+                    .unwrap();
+                if let ResourceValue::Blob { buffer, .. } =
+                    &mut state.resources.get_mut(&resource).unwrap().value
+                {
+                    buffer.extend(bytes);
+                }
+                state.buffered_blob_bytes += count;
+                state.peak_buffered_blob_bytes = state
+                    .peak_buffered_blob_bytes
+                    .max(state.buffered_blob_bytes);
+            }
+            if let Some(wake) = Self::terminal_locked(
+                &mut state,
+                token,
+                TerminalResult {
+                    terminal,
+                    resource: None,
+                },
+            )? {
+                wakes.push(wake);
+            }
+        }
+        drop(state);
+        for wake in wakes {
+            wake.notify_one();
+        }
+        Ok(())
     }
 
     /// Publish EOF explicitly. An empty, unsealed blob can still receive data.
@@ -679,6 +784,8 @@ impl OperationHub {
             return Err(HubError::WrongKind);
         };
         *sealed = true;
+        drop(state);
+        self.drive_blob_writes()?;
         Ok(())
     }
 
@@ -934,6 +1041,7 @@ impl OperationHub {
                 suspended: false,
                 notify: Arc::clone(&notify),
                 created_resource: None,
+                pending_blob_write: None,
             },
         );
         Ok((token, notify))
@@ -1075,6 +1183,7 @@ impl OperationHub {
                 return Ok(None);
             }
             operation.terminal = Some(result);
+            operation.pending_blob_write = None;
             (Arc::clone(&operation.notify), operation.created_resource)
         };
         if let Some(resource) = created {
@@ -1116,6 +1225,7 @@ impl OperationHub {
         for notify in notifications {
             notify.notify_one();
         }
+        self.drive_blob_writes()?;
         Ok(())
     }
 
@@ -1145,6 +1255,7 @@ impl OperationHub {
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
             if operation.resource == Some(token) && operation.terminal.is_none() {
+                operation.pending_blob_write = None;
                 operation.terminal = Some(TerminalResult {
                     terminal,
                     resource: None,
@@ -1166,6 +1277,7 @@ impl OperationHub {
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
             if operation.terminal.is_none() {
+                operation.pending_blob_write = None;
                 operation.terminal = Some(TerminalResult {
                     terminal,
                     resource: None,
@@ -1251,6 +1363,60 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_blob_write_resumes_after_pull_and_cancellation_reclaims_input() {
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        assert_eq!(hub.take_terminal(write, 1), Ok(None));
+        let wake = hub.suspend(write, 1).unwrap();
+        assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"full");
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        let cancelled = hub.submit_blob_write(1, blob, b"lost").unwrap();
+        hub.cancel_wire(1, cancelled.0).unwrap();
+        assert!(hub.state.lock().unwrap().operations[&cancelled]
+            .pending_blob_write
+            .is_none());
+        assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+        assert!(hub.blob_read(1, blob, 4).unwrap().is_empty());
+        assert_eq!(
+            hub.take_terminal(cancelled, 1).unwrap().unwrap().terminal,
+            Terminal::Cancelled
+        );
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+    }
+
+    #[test]
+    fn closing_a_blob_releases_shared_capacity_to_another_pending_writer() {
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let first = hub.create_blob(1).unwrap();
+        let second = hub.create_blob(1).unwrap();
+        hub.blob_write(1, first, b"full").unwrap();
+        let write = hub.submit_blob_write(1, second, b"next").unwrap();
+        assert_eq!(hub.take_terminal(write, 1), Ok(None));
+        hub.close_resource(first).unwrap();
+        assert_eq!(
+            hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        assert_eq!(hub.blob_read(1, second, 4).unwrap(), b"next");
+    }
 
     #[test]
     fn stale_cross_owner_and_close_races_are_typed_and_bounded() {

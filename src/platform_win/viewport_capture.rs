@@ -10,14 +10,7 @@ use wry::WebViewExtWindows as _;
 
 use crate::operations::{HubError, NativeBlobEncoder, OpaqueToken, OperationHub};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CaptureError {
-    PixelLimit,
-    BlobLimit,
-    Cancelled,
-    NativeFailure,
-    InvalidPng,
-}
+use crate::tauri::capture::{CaptureError, NativeCancellation};
 
 struct Encoding {
     encoder: Option<NativeBlobEncoder>,
@@ -205,10 +198,9 @@ fn map_hub(error: HubError) -> CaptureError {
     }
 }
 
-// Native service integration is pending. Cancellation revokes the hub operation;
+// Service cancellation revokes the hub operation;
 // WebView2 has no CapturePreview cancellation method. Late writes are rejected
 // by the revoked reservation and the eventual callback releases COM storage.
-#[allow(dead_code)]
 pub(crate) fn capture(
     view: &wry::WebView,
     hub: Arc<OperationHub>,
@@ -217,7 +209,7 @@ pub(crate) fn capture(
     maximum_pixels: u64,
     maximum_bytes: usize,
     completed: impl FnOnce(Result<OpaqueToken, CaptureError>) + 'static,
-) -> Result<(), CaptureError> {
+) -> Result<NativeCancellation, CaptureError> {
     let mut bounds = RECT::default();
     unsafe { view.controller().Bounds(&mut bounds) }.map_err(|_| CaptureError::NativeFailure)?;
     let width = i64::from(bounds.right) - i64::from(bounds.left);
@@ -250,7 +242,8 @@ pub(crate) fn capture(
     unsafe { view.webview().CapturePreview(
         webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
         &stream, &callback,
-    ) }.map_err(|_| CaptureError::NativeFailure)
+    ) }.map_err(|_| CaptureError::NativeFailure)?;
+    Ok(NativeCancellation::new(|| {}))
 }
 
 #[cfg(test)]

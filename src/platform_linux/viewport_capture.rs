@@ -8,15 +8,7 @@ use std::sync::Arc;
 use webkit2gtk::{SnapshotOptions, SnapshotRegion, WebViewExt};
 use wry::WebViewExtUnix;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CaptureError {
-    InvalidDimensions,
-    PixelLimit,
-    BlobLimit,
-    Cancelled,
-    NativeFailure,
-    EncodingFailure,
-}
+use crate::tauri::capture::{CaptureError, NativeCancellation};
 
 fn check_pixels(width: i32, height: i32, scale: i32, maximum: u64) -> Result<(), CaptureError> {
     if width <= 0 || height <= 0 || scale <= 0 || maximum == 0 {
@@ -33,9 +25,8 @@ fn check_pixels(width: i32, height: i32, scale: i32, maximum: u64) -> Result<(),
     Ok(())
 }
 
-// The native operation service will retain/cancel the returned cancellable on
-// its UI thread. This adapter is not yet exposed as a generated operation.
-#[allow(dead_code)]
+// The native operation service retains/cancels this handle on its UI thread.
+// This adapter is not yet exposed as a generated Wasm operation.
 pub(crate) fn capture(
     view: &wry::WebView,
     hub: Arc<OperationHub>,
@@ -44,7 +35,7 @@ pub(crate) fn capture(
     maximum_pixels: u64,
     maximum_encoded_bytes: usize,
     completed: impl FnOnce(Result<OpaqueToken, CaptureError>) + 'static,
-) -> Result<gio::Cancellable, CaptureError> {
+) -> Result<NativeCancellation, CaptureError> {
     let native = view.webview();
     check_pixels(
         native.allocated_width(),
@@ -77,7 +68,7 @@ pub(crate) fn capture(
             completed(result);
         },
     );
-    Ok(cancellation)
+    Ok(NativeCancellation::new(move || cancellation.cancel()))
 }
 
 #[cfg(test)]

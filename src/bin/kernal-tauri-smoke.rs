@@ -155,6 +155,55 @@ async fn lifecycle(
     }
     let loaded = webview.wait_until_loaded(Duration::from_secs(30)).await;
     match (scenario, loaded) {
+        (SmokeScenario::Capture, Ok(())) => {
+            let snapshot = webview
+                .capture_visible_png(Default::default(), Duration::from_secs(20))
+                .await?;
+            let first = snapshot.read_chunk(64 * 1024)?;
+            if first.len() < 24 || &first[..8] != b"\x89PNG\r\n\x1a\n" {
+                return Err(WebviewError::HostFailure(
+                    "capture did not return a PNG".into(),
+                ));
+            }
+            drop(first);
+            loop {
+                let chunk = snapshot.read_chunk(64 * 1024)?;
+                if chunk.is_empty() {
+                    break;
+                }
+            }
+            drop(snapshot);
+            let tiny = kernal_api::webview::ViewportCaptureLimits {
+                maximum_pixels: 4_000_000,
+                maximum_encoded_bytes: 8,
+            };
+            if !matches!(
+                webview
+                    .capture_visible_png(tiny, Duration::from_secs(20))
+                    .await,
+                Err(WebviewError::CaptureByteLimit)
+            ) {
+                return Err(WebviewError::HostFailure(
+                    "capture byte limit did not return its typed failure".into(),
+                ));
+            }
+            let tiny = kernal_api::webview::ViewportCaptureLimits {
+                maximum_pixels: 1,
+                maximum_encoded_bytes: 1024 * 1024,
+            };
+            if !matches!(
+                webview
+                    .capture_visible_png(tiny, Duration::from_secs(20))
+                    .await,
+                Err(WebviewError::CapturePixelLimit)
+            ) {
+                return Err(WebviewError::HostFailure(
+                    "capture pixel limit did not return its typed failure".into(),
+                ));
+            }
+            webview.close().await?;
+            assert_clean(client)
+        }
         (SmokeScenario::Close, Ok(())) => webview.close().await,
         (SmokeScenario::Cancel, Ok(())) => {
             webview.cancel();
@@ -218,6 +267,7 @@ async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeScenario {
+    Capture,
     Close,
     Popup,
     ProhibitedRedirect,
@@ -230,13 +280,14 @@ impl SmokeScenario {
     fn from_args() -> Result<Self, Box<dyn std::error::Error>> {
         match std::env::args().nth(1).as_deref() {
             None | Some("close") => Ok(Self::Close),
+            Some("capture") => Ok(Self::Capture),
             Some("popup") => Ok(Self::Popup),
             Some("redirect") => Ok(Self::ProhibitedRedirect),
             Some("timeout") => Ok(Self::Timeout),
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use capture, close, popup, redirect, timeout, cancel, or window-close"
             )
             .into()),
         }
@@ -244,7 +295,7 @@ impl SmokeScenario {
 
     fn page(self, address: &str) -> String {
         let action = match self {
-            Self::Close => "",
+            Self::Close | Self::Capture => "",
             Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with
@@ -269,6 +320,8 @@ impl SmokeScenario {
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
     let observation = client.test_observation();
     if observation.native_backings == 0
+        && observation.live_blobs == 0
+        && observation.retained_transfer_capacity == 0
         && observation.live_resources == 0
         && observation.pending_operations == 0
     {

@@ -15,14 +15,7 @@ use wry::WebViewExtMacOS as _;
 
 use crate::operations::{HubError, NativeBlobEncoder, OpaqueToken, OperationHub};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CaptureError {
-    PixelLimit,
-    BlobLimit,
-    Cancelled,
-    NativeFailure,
-    EncodingFailure,
-}
+use crate::tauri::capture::{CaptureError, NativeCancellation};
 
 type Encoding = Arc<Mutex<Option<NativeBlobEncoder>>>;
 
@@ -152,7 +145,6 @@ fn encode_image(
 
 // Service dispatch must call this on the AppKit thread. Revoking the hub
 // operation prevents publication; WKWebView supplies no snapshot cancel handle.
-#[allow(dead_code)]
 pub(crate) fn capture(
     view: &wry::WebView,
     hub: Arc<OperationHub>,
@@ -161,7 +153,7 @@ pub(crate) fn capture(
     maximum_pixels: u64,
     maximum_bytes: usize,
     completed: impl FnOnce(Result<OpaqueToken, CaptureError>) + 'static,
-) -> Result<(), CaptureError> {
+) -> Result<NativeCancellation, CaptureError> {
     let native = view.webview();
     let bounds = native.bounds();
     let window = native.window().ok_or(CaptureError::NativeFailure)?;
@@ -190,7 +182,7 @@ pub(crate) fn capture(
     unsafe {
         native.takeSnapshotWithConfiguration_completionHandler(None, &callback);
     }
-    Ok(())
+    Ok(NativeCancellation::new(|| {}))
 }
 
 #[cfg(test)]

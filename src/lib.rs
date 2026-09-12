@@ -77,6 +77,9 @@ pub(crate) mod operations;
 ))]
 mod tauri;
 
+#[cfg(feature = "tauri-webview")]
+pub(crate) use platform_imp::viewport_capture as native_viewport_capture;
+
 /// Semantic, opt-in external-webview operations.
 ///
 /// This module exposes no Tauri, Wry, Tokio, or platform-window types.  It
@@ -89,7 +92,8 @@ pub mod webview {
     #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestObservation;
     pub use crate::tauri::{
-        ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewHandle,
+        ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,
+        WebviewHandle, WebviewSnapshot, WebviewSnapshotChunk,
     };
 }
 

@@ -46,6 +46,9 @@ use wry::WebViewBuilderExtUnix as _;
 use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
 use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
 
+pub(crate) mod capture;
+pub use capture::{ViewportCaptureLimits, WebviewSnapshot, WebviewSnapshotChunk};
+
 static NEXT_LABEL: AtomicU64 = AtomicU64::new(1);
 static NEXT_WEBVIEW_STORE: AtomicU64 = AtomicU64::new(1);
 
@@ -253,6 +256,7 @@ impl NativeWebviewBackend {
         let closed_on_close = Arc::clone(&closed);
         dispatcher.on_window_event(move |event| {
             if matches!(event, tauri_runtime::window::WindowEvent::Destroyed) {
+                capture::cancel_for_view(native_id);
                 let removed = UI_WEBVIEWS.with(|webviews| webviews.borrow_mut().remove(&native_id));
                 drop(removed);
                 completion_on_close.finish(Err(NativeWebviewError::WindowClosed));
@@ -376,6 +380,7 @@ impl NativeWebview {
             }
             let native_id = self.native_id;
             let _ = self.window.run_on_main_thread(move || {
+                capture::cancel_for_view(native_id);
                 let removed = UI_WEBVIEWS.with(|webviews| webviews.borrow_mut().remove(&native_id));
                 drop(removed);
             });
@@ -577,6 +582,12 @@ fn is_allowed_url(url: &Url) -> bool {
 /// No native backend, runtime, or window value is exposed through this type.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WebviewError {
+    #[error("viewport capture exceeds its pixel limit or has invalid dimensions")]
+    CapturePixelLimit,
+    #[error("viewport capture exceeds its encoded-byte or blob quota")]
+    CaptureByteLimit,
+    #[error("native viewport capture or PNG encoding failed")]
+    CaptureFailed,
     #[error("webview URL is malformed or not an HTTP(S) URL")]
     InvalidUrl,
     #[error("webview navigation was rejected: {0}")]
@@ -626,6 +637,10 @@ pub struct WebviewHandle {
 #[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WebviewTestObservation {
+    /// Encoded image resources retained by the shared hub.
+    pub live_blobs: usize,
+    /// Hub and native chunk allocations still charged to the transfer quota.
+    pub retained_transfer_capacity: usize,
     /// Private physical WebView backings retained by the facade.
     pub native_backings: usize,
     /// Live generation-safe semantic resources in the shared hub.
@@ -764,6 +779,8 @@ impl ExternalWebviewClient {
         let snapshot = self.service.hub.snapshot();
         let native_backings = self.service.native.lock().map_or(0, |native| native.len());
         WebviewTestObservation {
+            live_blobs: snapshot.live_blobs,
+            retained_transfer_capacity: snapshot.retained_transfer_capacity,
             native_backings,
             live_resources: snapshot.live_resources,
             pending_operations: snapshot.pending_operations,
@@ -961,11 +978,11 @@ impl WebviewService {
     }
 
     fn revoke_with_terminal(&self, resource: OpaqueToken, terminal: Terminal) {
+        let _ = self.hub.revoke_external_resource(resource, terminal);
         if let Some(native) = self.take_native(resource) {
             let _ = native.close();
             drop(native);
         }
-        let _ = self.hub.revoke_external_resource(resource, terminal);
     }
 
     fn mark_explicitly_closing(&self, resource: OpaqueToken) {

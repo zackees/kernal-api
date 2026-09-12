@@ -260,7 +260,7 @@ struct State {
 
 /// Native consumers borrow bytes without taking ownership of an unaccounted
 /// Vec. The allocation stays charged even if its source resource is revoked.
-struct NativeBlobChunk<'a> {
+pub(crate) struct NativeBlobChunk<'a> {
     hub: &'a OperationHub,
     bytes: Vec<u8>,
 }
@@ -911,7 +911,7 @@ impl OperationHub {
             .map(|chunk| chunk.to_vec())
     }
 
-    fn read_blob_chunk(
+    pub(crate) fn read_blob_chunk(
         &self,
         store: u64,
         blob: OpaqueToken,

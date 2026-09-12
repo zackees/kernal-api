@@ -1,7 +1,7 @@
 # Native viewport capture ownership (#19)
 
-Status: the Linux, Windows, and macOS callback adapters are implemented, but are
-not yet wired to the webview operation service. The generated snapshot operation
+Status: the Linux, Windows, and macOS callback adapters are implemented and wired
+to the semantic webview operation service. The generated snapshot operation
 remains unimplemented. This note does not establish full native
 capture acceptance or close #19.
 The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
@@ -25,9 +25,8 @@ completion callback. Successful publication and operation completion now share
 one hub lock: cancellation or view closure that wins first prevents publication
 and releases the reserved blob. A regression covers all three terminal outcomes
 and verifies zero retained storage after teardown. The callback uses this
-operation-bound publication path, but service dispatch, native cancellation
-handle ownership in the service, and an end-to-end generated sketch proof are
-still required.
+operation-bound publication path. The shared service owns UI dispatch and native
+cancellation handles; an end-to-end generated sketch proof remains required.
 Capture has a distinct hub permission and submission method; a load or close
 operation cannot publish a snapshot. The checked-in load-as-capture regression
 failed before this separation and passes with it. Additional tests reject
@@ -161,6 +160,29 @@ remain required. Cross-compilation does not establish those outcomes.
 
 ### Shared service integration
 
+`WebviewHandle::capture_visible_png` now dispatches through the existing native
+UI thread and the root-selected adapter. `ViewportCaptureLimits` carries pixel
+and encoded-byte bounds; `WebviewSnapshot` owns the resulting opaque blob.
+Its bounded `WebviewSnapshotChunk` keeps pulled memory charged until the caller
+drops that chunk. The capture future waits on the hub's terminal notification,
+so revocation need not wait for a native callback. Dropping the request revokes
+pending publication and reclaims an unconsumed successful result if completion
+won first. UI cancellation objects are removed on completion, request drop,
+and native view closure. Native objects remain confined to the UI thread.
+
+The `kernal-tauri-smoke capture` scenario passes on Linux under the same Nix/Xvfb
+environment as the existing smoke scenarios. It captures an isolated external
+loopback page, verifies the PNG signature, drains bounded chunks, exercises
+typed pixel and encoded-byte failures, and asserts clean semantic resources.
+This service smoke does not replace the adapter's decoded-color proof or the
+required generated-Wasm screenshot example. Windows x86-64 strict Clippy and
+Apple Silicon library/test compile checks also cover the shared dispatch.
+Native Windows/macOS execution and a focused abandoned-future/late-callback
+service stress matrix remain outstanding.
+Independent admission for queued/in-flight native captures also needs a stress
+proof: consuming cancelled hub operations must not permit unbounded UI work
+or native image retention while callbacks are still outstanding.
+
 `src/tauri.rs` retains Wry webviews in the UI-thread `UI_WEBVIEWS` map. Native
 capture must dispatch there and keep native image objects on their permitted
 thread. A completion must enter the existing `OperationHub`; it must not
@@ -188,7 +210,7 @@ is actually released, even if the guest already consumed cancellation.
 ## Required evidence still missing
 
 - A checked-in RED regression for the absent generated capture operation.
-- Shared native adapter dispatch and operation/resource integration.
+- Generated capture dispatch within the same Wasm resource context.
 - Decodable viewport PNGs at native scale without window chrome.
 - Pixel/encoded-byte admission, stale and cross-instance rejection, cancellation,
   late callbacks, and teardown tests with truthful final resource counters.

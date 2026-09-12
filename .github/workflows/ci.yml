@@ -334,7 +334,9 @@ jobs:
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - if: matrix.legacy_cargo && matrix.target != 'aarch64-unknown-linux-gnu'
         env:
-          RUSTFLAGS: -L native=/usr/lib/x86_64-linux-gnu
+          RUSTFLAGS: >-
+            -C link-arg=-L/usr/lib/x86_64-linux-gnu
+            -C link-arg=-L/lib/x86_64-linux-gnu
         run: >-
           soldr cargo build
           --locked --target ${{ matrix.target }} --all-features

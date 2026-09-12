@@ -334,7 +334,7 @@ enum WriterCommand {
     Upload {
         request_id: u64,
         source: Arc<[u8]>,
-        metadata: ExecuteMetadata,
+        metadata: Box<ExecuteMetadata>,
     },
     Cancel {
         request_id: u64,
@@ -394,7 +394,7 @@ enum ParentReceiveAction {
     QueueUpload,
     AwaitingUpload,
     ExecuteAcknowledged,
-    Terminal(Message),
+    Terminal(Box<Message>),
 }
 
 impl ParentReceivePhase {
@@ -461,7 +461,7 @@ impl ParentReceivePhase {
                 }
             }
             message @ Message::Terminal { .. } if self.execute_acked => {
-                Ok(ParentReceiveAction::Terminal(message))
+                Ok(ParentReceiveAction::Terminal(Box::new(message)))
             }
             _ => Err(SketchWorkerFailure::Protocol),
         }
@@ -668,7 +668,7 @@ fn supervise(
                         source,
                         metadata,
                     } => {
-                        let result = write_upload(&mut input, request_id, source, metadata);
+                        let result = write_upload(&mut input, request_id, source, *metadata);
                         WriterEvent::Upload(result)
                     }
                     WriterCommand::Cancel { request_id } => WriterEvent::Cancel(
@@ -797,7 +797,7 @@ fn supervise(
                                         .as_ref()
                                         .and_then(|owner| owner.output.as_ref())
                                         .map(output::StagedOutput::worker_destination);
-                                    metadata
+                                    Box::new(metadata)
                                 },
                             })
                             .is_err()
@@ -814,7 +814,7 @@ fn supervise(
                     Ok(ParentReceiveAction::AwaitingUpload) => {}
                     Ok(ParentReceiveAction::ExecuteAcknowledged) => {}
                     Ok(ParentReceiveAction::Terminal(message)) => {
-                        let mapped = map_terminal(message, id);
+                        let mapped = map_terminal(*message, id);
                         let mapped = match mapped {
                             Ok(value) => value,
                             Err(error) => {
@@ -1121,7 +1121,7 @@ fn exited_join_result(
     while let Ok(Ok(message)) = read_rx.try_recv() {
         match receive_phase.receive(message) {
             Ok(ParentReceiveAction::Terminal(message)) => {
-                reported = Some(message);
+                reported = Some(*message);
                 break;
             }
             // The worker is already gone, so an upload can no longer be
@@ -1228,6 +1228,7 @@ fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMet
         .max(Duration::from_millis(1));
     let policy = sketch.worker_policy();
     ExecuteMetadata {
+        webview_url: None,
         staged_output: None,
         blob_limits: [
             blobs.maximum_chunk_bytes() as u64,

@@ -121,7 +121,7 @@ succeeded, and `worker-output-cleanup` when discard failed without publication.
 The RED/GREEN regression checks both error codes and actual final bytes;
 all 22 worker unit tests pass. This injection tests error classification, not
 a native filesystem driver's cleanup failure or eventual cleanup retry.
-The private protocol is now version 4, with an optional staging destination
+The private protocol is now version 5, with an optional staging destination
 bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
 without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,
 oversized, and truncated inputs are rejected. The worker grants the staged
@@ -129,6 +129,17 @@ destination before guest instantiation through the existing opaque output ABI.
 All eighteen worker-binary tests, including the twelve protocol tests and
 updated grant reconstruction, pass on Linux with the integration enabled.
 The Windows-specific unpaired-surrogate test is checked in but not run here.
+
+Version 5 also reserves an optional host-owned URL field for native worker
+integration. Its UTF-8 payload is bounded to 16 KiB before allocation;
+NUL-containing, oversized, and truncated values are rejected, and absent
+authority remains distinct from an invalid empty URL. This is transport
+preparation, not a working contained webview: the parent still emits no URL
+grant and the current worker returns `native-webview-worker-unavailable`
+before compiler construction if one is supplied. Native URL revalidation,
+main-thread UI execution, bounded renderer-child allowance, and contained
+screenshot execution remain required. No process limit was relaxed in this
+change, and no guest authority was added.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
@@ -186,7 +197,7 @@ the host.
 
 The worker supervisor sends all seven limits, and the worker validates them
 through the same public constructor before compiler construction. Private
-worker protocol version 4 rejects older peers rather than silently using
+worker protocol version 5 rejects older peers rather than silently using
 default limits; rebuild the worker executable together with the host. This
 changes no guest ABI import signature or guest artifact. Pending inputs and
 completed reads still have separate byte budgets. Hosts can additionally set

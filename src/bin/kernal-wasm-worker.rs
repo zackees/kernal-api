@@ -78,6 +78,9 @@ fn execute_request(
     module: Vec<u8>,
     output: &mut impl io::Write,
 ) -> Result<(), String> {
+    if metadata.webview_url.is_some() {
+        return protocol_terminal(output, request_id, "native-webview-worker-unavailable");
+    }
     let (config, policy) = reconstruct(&metadata).map_err(|text| {
         protocol_terminal(output, request_id, &text)
             .err()
@@ -378,8 +381,25 @@ mod tests {
         assert!(reconstruct(&metadata).is_ok());
     }
 
+    #[test]
+    fn unsupported_native_authority_is_rejected_before_module_execution() {
+        let mut request = metadata();
+        request.webview_url = Some("https://example.test/".into());
+        let mut output = Vec::new();
+        execute_request(7, request, Vec::new(), &mut output).unwrap();
+        assert!(
+            matches!(read_message(&mut output.as_slice()).unwrap(), Message::Terminal {
+            request_id: 7,
+            kind: TerminalKind::ProtocolFailure,
+            diagnostic,
+            ..
+        } if diagnostic == "native-webview-worker-unavailable")
+        );
+    }
+
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            webview_url: None,
             staged_output: None,
             blob_limits: [4, 8, 16, 2, 3, 4, 24],
             max_wasm_stack_bytes: 1,

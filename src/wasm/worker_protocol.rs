@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
@@ -195,6 +195,9 @@ pub(super) enum ProtocolError {
 /// Facade semantic primitives needed to reconstruct compiler/limit settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExecuteMetadata {
+    /// Host-owned URL authority, never guest bytes. Native workers must
+    /// revalidate it before creating their per-root grant.
+    pub(super) webview_url: Option<String>,
     /// Parent-owned staging destination, never the final output path or guest data.
     pub(super) staged_output: Option<std::path::PathBuf>,
     /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes, transfer bytes.
@@ -701,7 +704,41 @@ fn take_output_path(input: &mut &[u8]) -> Result<Option<std::path::PathBuf>, Pro
     Ok(Some(path))
 }
 
+const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+
+fn put_webview_url(out: &mut Vec<u8>, url: Option<&str>) -> Result<(), ProtocolError> {
+    match url {
+        None => put_u32(out, 0),
+        Some(url) => {
+            if url.is_empty() || url.len() > MAX_WEBVIEW_URL_BYTES || url.as_bytes().contains(&0) {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            put_u32(out, url.len() as u32);
+            out.extend_from_slice(url.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn take_webview_url(input: &mut &[u8]) -> Result<Option<String>, ProtocolError> {
+    let length = take_u32(input)? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAX_WEBVIEW_URL_BYTES || length > input.len() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    let (bytes, rest) = input.split_at(length);
+    let url = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidPayload)?;
+    if bytes.contains(&0) {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    *input = rest;
+    Ok(Some(url.to_owned()))
+}
+
 fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) -> Result<(), ProtocolError> {
+    put_webview_url(out, value.webview_url.as_deref())?;
     put_output_path(out, value.staged_output.as_deref())?;
     for v in value.blob_limits {
         put_u64(out, v);
@@ -726,6 +763,7 @@ fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) -> Result<(), Protoc
 }
 fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
     Ok(ExecuteMetadata {
+        webview_url: take_webview_url(input)?,
         staged_output: take_output_path(input)?,
         blob_limits: [
             take_u64(input)?,
@@ -783,8 +821,44 @@ mod tests {
         trailing.push(0);
         assert_eq!(decode(&trailing), Err(ProtocolError::TrailingBytes));
     }
+    #[test]
+    fn webview_url_transport_is_bounded_and_preserves_absence() {
+        for url in [
+            None,
+            Some("https://example.test/exact?q=1"),
+            Some("https://例え.test/"),
+        ] {
+            let mut bytes = Vec::new();
+            put_webview_url(&mut bytes, url).unwrap();
+            let mut input = bytes.as_slice();
+            assert_eq!(take_webview_url(&mut input).unwrap().as_deref(), url);
+            assert!(input.is_empty());
+        }
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_WEBVIEW_URL_BYTES + 1),
+            "https://example.test/\0".into(),
+        ] {
+            assert!(put_webview_url(&mut Vec::new(), Some(&invalid)).is_err());
+        }
+        for invalid in [
+            vec![1, 0, 0, 0, 0xff],
+            vec![2, 0, 0, 0, b'x'],
+            vec![1, 0, 0, 0, 0],
+            u32::MAX.to_le_bytes().to_vec(),
+        ] {
+            assert!(take_webview_url(&mut invalid.as_slice()).is_err());
+        }
+        let mut original = metadata();
+        original.webview_url = Some("https://example.test/exact".into());
+        let mut bytes = Vec::new();
+        put_metadata(&mut bytes, &original).unwrap();
+        assert_eq!(take_metadata(&mut bytes.as_slice()).unwrap(), original);
+    }
+
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            webview_url: None,
             staged_output: None,
             blob_limits: [12, 13, 14, 15, 16, 17, 18],
             max_wasm_stack_bytes: 1,

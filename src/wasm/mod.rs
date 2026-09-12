@@ -3514,14 +3514,14 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.live_resources, 0);
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
-        assert!((7..=8).contains(&operations.suspends));
-        assert_eq!(operations.resumes, 12 + 2 * 1024);
+        assert!((8..=9).contains(&operations.suspends));
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 35);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),
             1
         );
-        assert_eq!(operations.peak_buffered_blob_bytes, 64 * 1024);
+        assert_eq!(operations.peak_buffered_blob_bytes, 1024 * 1024);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(
             *prepared

@@ -53,10 +53,16 @@ On Linux x86-64 on 2026-09-12, the in-process proof passed in 5.52 seconds and
 the worker proof in 9.33 seconds, including compilation/admission overhead
 inside each test. The transfer uses an explicit finite fuel budget of
 1.7 trillion aggregate and 100 billion for each root/child Store slice.
-The asserted 64 KiB peak is the blob buffer only; pending write inputs and
+The guest now also fills the 1 MiB per-blob capacity, submits another 64 KiB
+write, and proves that write remains pending across a scheduler turn with no
+consumption. One bounded pull then completes the waiting write. It drains all
+17 chunks before the 64 MiB round trip. The combined proof therefore asserts
+a 1 MiB peak blob buffer; the earlier 64 KiB peak was for the sequential-only
+proof. This is a controlled consumer pause in one Store, not a concurrent
+multi-producer/consumer stress test. Pending write inputs and
 retained read results have separate snapshot counters. This does not establish
 a bound on total allocated memory, collection capacity, or simultaneous guest
-transfers, and the sequential proof does not exercise a slow consumer.
+transfers.
 
 ## Remaining acceptance work
 

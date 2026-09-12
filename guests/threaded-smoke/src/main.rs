@@ -154,6 +154,29 @@ pub extern "C" fn kernal_api_run() -> u32 {
     const CHUNKS: usize = 1024;
     let mut sent = [0_u8; CHUNK_BYTES];
     let mut received = [0_u8; CHUNK_BYTES];
+    // The default per-blob capacity is 1 MiB. Pause consumption and prove
+    // the seventeenth write cannot finish, even after a scheduler turn.
+    for _ in 0..16 {
+        assert!(blob.write_chunk(&sent).unwrap().poll().unwrap().is_some());
+    }
+    let blocked = blob.write_chunk(&sent).expect("capacity-awaited write");
+    assert!(blocked.poll().unwrap().is_none());
+    complete_operation(kernal_api_v1_bindings::synthetic_yield().unwrap()).unwrap();
+    assert!(
+        blocked.poll().unwrap().is_none(),
+        "producer must wait for consumption"
+    );
+    let first = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+    assert_eq!(first.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
+    assert!(
+        blocked.poll().unwrap().is_some(),
+        "bounded pull releases write capacity"
+    );
+    for _ in 0..16 {
+        let read = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+        assert_eq!(read.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
+        assert_eq!(received, sent);
+    }
     for chunk in 0..CHUNKS {
         for (index, byte) in sent.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_add(chunk as u8);

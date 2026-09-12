@@ -155,6 +155,33 @@ async fn lifecycle(
     }
     let loaded = webview.wait_until_loaded(Duration::from_secs(30)).await;
     match (scenario, loaded) {
+        (SmokeScenario::OpenCancel, Ok(())) => {
+            use std::future::Future as _;
+            let baseline = client.test_observation();
+            let pause = webview.pause_ui_for_test().await?;
+            let mut opening = Box::pin(client.open_webview(url));
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(opening.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            if !pending {
+                return Err(WebviewError::HostFailure(
+                    "paused UI open unexpectedly completed".into(),
+                ));
+            }
+            drop(opening);
+            let observation = client.test_observation();
+            if observation.pending_operations != baseline.pending_operations
+                || observation.live_resources != baseline.live_resources
+            {
+                return Err(WebviewError::HostFailure(format!(
+                    "abandoned open retained semantic authority: {observation:?}"
+                )));
+            }
+            drop(pause);
+            webview.close().await?;
+            assert_clean(client)
+        }
         (SmokeScenario::CaptureCancel, Ok(())) => {
             use std::future::Future as _;
             let baseline = client.test_observation().pending_operations;
@@ -314,6 +341,7 @@ async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeScenario {
+    OpenCancel,
     CaptureCancel,
     Capture,
     Close,
@@ -330,13 +358,14 @@ impl SmokeScenario {
             None | Some("close") => Ok(Self::Close),
             Some("capture") => Ok(Self::Capture),
             Some("capture-cancel") => Ok(Self::CaptureCancel),
+            Some("open-cancel") => Ok(Self::OpenCancel),
             Some("popup") => Ok(Self::Popup),
             Some("redirect") => Ok(Self::ProhibitedRedirect),
             Some("timeout") => Ok(Self::Timeout),
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use capture, capture-cancel, close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, or window-close"
             )
             .into()),
         }
@@ -344,7 +373,7 @@ impl SmokeScenario {
 
     fn page(self, address: &str) -> String {
         let action = match self {
-            Self::Close | Self::Capture | Self::CaptureCancel => "",
+            Self::Close | Self::Capture | Self::CaptureCancel | Self::OpenCancel => "",
             Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with

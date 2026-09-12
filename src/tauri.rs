@@ -667,6 +667,33 @@ struct WebviewService {
     closing: Mutex<BTreeSet<OpaqueToken>>,
 }
 
+// Own the semantic reservation across the native creation await. Native
+// creation separately closes its window if the oneshot receiver disappears;
+// that physical cleanup cannot reclaim this hub's operation or resource.
+struct PendingWebviewOpen {
+    service: Arc<WebviewService>,
+    store: u64,
+    resource: OpaqueToken,
+    operation: OpaqueToken,
+    transferred: bool,
+}
+
+impl Drop for PendingWebviewOpen {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.service
+                .hub
+                .finish_external_operation(self.operation, Terminal::Cancelled);
+            let _ = self
+                .service
+                .hub
+                .observe_terminal(self.store, self.operation);
+            self.service
+                .revoke_with_terminal(self.resource, Terminal::Cancelled);
+        }
+    }
+}
+
 impl ExternalWebviewHost {
     /// Create the private event loop and one root semantic instance.
     pub fn new(runtime: RuntimeHandle) -> Result<Self, WebviewError> {
@@ -716,6 +743,13 @@ impl ExternalWebviewClient {
             .hub
             .begin_external_webview_open(self.store)
             .map_err(map_hub)?;
+        let mut pending = PendingWebviewOpen {
+            service: Arc::clone(&self.service),
+            store: self.store,
+            resource,
+            operation,
+            transferred: false,
+        };
         let mut native = match self.service.backend.open(request).await {
             Ok(native) => native,
             Err(error) => {
@@ -757,6 +791,7 @@ impl ExternalWebviewClient {
                     .hub
                     .begin_external_webview_wait(self.store, resource)
                     .map_err(map_hub)?;
+                pending.transferred = true;
                 Ok(WebviewHandle {
                     service: Arc::clone(&self.service),
                     store: self.store,

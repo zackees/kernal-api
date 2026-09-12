@@ -204,6 +204,7 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
 
   # Compile the two external facade consumers. Each is its own `[workspace]`

@@ -45,7 +45,7 @@ nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_
 ```
 
 Replace `close` with `popup`, `redirect`, `timeout`, `cancel`,
-`window-close`, `capture`, or `capture-cancel` to exercise isolation and cleanup paths. The test-support
+`window-close`, `capture`, `capture-cancel`, or `open-cancel` to exercise isolation and cleanup paths. The test-support
 feature is accepted only for this executable proof and exposes aggregate
 semantic counts, never backend types.
 
@@ -54,7 +54,13 @@ ignored live WebKitGTK image test explicitly. `capture` verifies the opaque
 snapshot service, bounded reads, typed pixel/byte failures, and final cleanup.
 `capture-cancel` pauses native UI dispatch, abandons four requests, verifies
 the fifth is rejected while native admission remains held, and then drains
-the queue. The live image test separately decodes PNG pixels and verifies
+the queue. `open-cancel` abandons an open while UI dispatch is paused and
+requires the reserved operation and resource counts to return immediately
+to their pre-open baseline. Before the reservation guard, this real Linux
+runner failed with two resources and two pending operations instead of one
+of each; the guard now releases that semantic authority on future drop.
+This counter check does not claim that native creation has already drained.
+The live image test separately decodes PNG pixels and verifies
 viewport dimensions and fixture colors. These Linux gates do not establish
 the still-required Windows/macOS runtime proofs or the generated Wasm sketch.
 See [adapter ownership and remaining evidence](viewport-capture-adapters.md).

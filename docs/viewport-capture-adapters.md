@@ -16,7 +16,7 @@ stays reserved and unreadable until successful finish, which publishes a
 sealed read-only blob. Encoded-byte overflow is rejected before that write is
 copied, failures remain terminal, and drop/teardown reclaim the reservation.
 Tests cover hidden partial output, read-only publication, cross-store rejection,
-size overflow, and teardown; all 51 hub tests pass on Linux. This sink does not
+size overflow, and teardown. This sink does not
 bound native images or encoder-internal scratch allocations. The private Linux adapter now calls
 WebKitGTK's visible-region snapshot API, validates scaled requested dimensions
 and returned image dimensions, and encodes the Cairo image into this sink.
@@ -27,6 +27,11 @@ and releases the reserved blob. A regression covers all three terminal outcomes
 and verifies zero retained storage after teardown. The callback uses this
 operation-bound publication path, but service dispatch, native cancellation
 handle ownership, and a live webpage capture proof are still required.
+Capture has a distinct hub permission and submission method; a load or close
+operation cannot publish a snapshot. The checked-in load-as-capture regression
+failed before this separation and passes with it. Additional tests reject
+unactivated, foreign-store, and revoked views, and a foreign encoder cannot
+complete another store's capture.
 
 Linux validation: `soldr cargo check --features tauri-webview --lib`, the
 five `viewport_capture::tests` unit tests, and strict Clippy for the native

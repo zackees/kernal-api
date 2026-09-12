@@ -33,6 +33,7 @@ pub(crate) const OP_OUTPUT_GRANT: u32 = 11;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
+const EXTERNAL_WEBVIEW_RIGHT_CAPTURE: u8 = 0b10;
 const BLOB_RESOURCE_KIND: u8 = 3;
 const BLOB_RIGHT_READ: u8 = 0b01;
 const BLOB_RIGHT_WRITE: u8 = 0b10;
@@ -216,6 +217,7 @@ enum ResourceValue {
 struct OperationSlot {
     owner: Owner,
     resource: Option<OpaqueToken>,
+    required_rights: u8,
     terminal: Option<TerminalResult>,
     // A generated close must not complete before its guest future has parked.
     // The scheduler may run its detached task before the synchronous import
@@ -531,7 +533,7 @@ impl OperationHub {
         let resource = self.create_resource_value(
             store,
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
-            EXTERNAL_WEBVIEW_RIGHT_LOAD,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD | EXTERNAL_WEBVIEW_RIGHT_CAPTURE,
             false,
             ResourceValue::ExternalWebview,
         )?;
@@ -552,11 +554,29 @@ impl OperationHub {
         store: u64,
         resource: OpaqueToken,
     ) -> Result<OpaqueToken, HubError> {
+        self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_LOAD)
+    }
+
+    /// Reserve capture authority separately from load observation and close.
+    pub(crate) fn begin_external_webview_capture(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_CAPTURE)
+    }
+
+    fn begin_external_webview_operation(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+        required_rights: u8,
+    ) -> Result<OpaqueToken, HubError> {
         match self.submit(
             store,
             Some(resource),
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
-            EXTERNAL_WEBVIEW_RIGHT_LOAD,
+            required_rights,
         ) {
             Ok((operation, _)) => Ok(operation),
             // A revoked external handle has a bounded tombstone. Preserve
@@ -1826,6 +1846,7 @@ impl OperationHub {
             OperationSlot {
                 owner: Owner { store },
                 resource,
+                required_rights,
                 terminal: None,
                 deferred_completion: None,
                 suspended: false,
@@ -2275,13 +2296,16 @@ impl NativeBlobEncoder {
             if pending.created_resource.is_some() {
                 return Err(HubError::WrongRights);
             }
+            if pending.required_rights != EXTERNAL_WEBVIEW_RIGHT_CAPTURE {
+                return Err(HubError::WrongRights);
+            }
             let view = pending.resource.ok_or(HubError::WrongKind)?;
             let view = state.resources.get(&view).ok_or(HubError::Closed)?;
             OperationHub::validate_resource(
                 view,
                 self.store,
                 EXTERNAL_WEBVIEW_RESOURCE_KIND,
-                EXTERNAL_WEBVIEW_RIGHT_LOAD,
+                EXTERNAL_WEBVIEW_RIGHT_CAPTURE,
             )?;
         }
         let resource = state.resources.get_mut(&token).ok_or(HubError::Closed)?;
@@ -2471,6 +2495,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_encoder_rejects_load_operation_as_capture_authority() {
+        use std::io::Write as _;
+        let hub = OperationHub::with_blob_limits(4, 3, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let (view, open) = hub.begin_external_webview_open(7).unwrap();
+        hub.finish_external_open(open, view);
+        hub.observe_terminal(7, open).unwrap().unwrap();
+        let load = hub.begin_external_webview_wait(7, view).unwrap();
+        let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 8).unwrap();
+        encoder.write_all(b"encoded").unwrap();
+        assert_eq!(
+            encoder.finish_for_operation(load),
+            Err(HubError::WrongRights)
+        );
+        assert!(hub.observe_terminal(7, load).unwrap().is_none());
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        hub.close_all(Terminal::Closed);
+    }
+
+    #[test]
+    fn native_capture_rejects_foreign_and_revoked_view_authority() {
+        let hub = OperationHub::with_blob_limits(4, 3, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let (view, open) = hub.begin_external_webview_open(7).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_capture(7, view),
+            Err(HubError::Closed)
+        );
+        hub.finish_external_open(open, view);
+        hub.observe_terminal(7, open).unwrap().unwrap();
+        assert_eq!(
+            hub.begin_external_webview_capture(8, view),
+            Err(HubError::WrongRights)
+        );
+        let capture = hub.begin_external_webview_capture(7, view).unwrap();
+        let encoder = NativeBlobEncoder::new(Arc::clone(&hub), 8, 8).unwrap();
+        assert_eq!(
+            encoder.finish_for_operation(capture),
+            Err(HubError::WrongRights)
+        );
+        assert!(hub.observe_terminal(7, capture).unwrap().is_none());
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        hub.close_resource(view).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_capture(7, view),
+            Err(HubError::Closed)
+        );
+        assert_eq!(
+            hub.observe_terminal(7, capture).unwrap().unwrap().terminal,
+            Terminal::Closed
+        );
+        assert_eq!(hub.snapshot().pending_operations, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    }
+
+    #[test]
     fn native_encoder_operation_publication_has_one_terminal_winner() {
         use std::io::Write as _;
         for revoke in [0, 1, 2] {
@@ -2479,7 +2558,7 @@ mod tests {
             let (view, open) = hub.begin_external_webview_open(7).unwrap();
             hub.finish_external_open(open, view);
             hub.observe_terminal(7, open).unwrap().unwrap();
-            let operation = hub.begin_external_webview_wait(7, view).unwrap();
+            let operation = hub.begin_external_webview_capture(7, view).unwrap();
             let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 8).unwrap();
             encoder.write_all(b"encoded").unwrap();
             match revoke {

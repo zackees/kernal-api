@@ -86,13 +86,15 @@ window-icon = ["dep:png", "dep:x11rb"]
 # The private implementation uses tauri-runtime-wry directly because Tauri's
 # high-level WebviewWindowBuilder installs an IPC bridge even for an external
 # URL.  Keep the exact Tauri release in the resolved feature graph while the
-# raw runtime starts with no IPC handler, custom schemes, or init scripts.
+# runtime supplies the canonical event loop, while Wry's builder is attached
+# directly to its plain native window without an IPC handler.
 tauri-webview = [
   "dep:tauri",
   "dep:tauri-runtime",
   "dep:tauri-runtime-wry",
   "dep:tauri-utils",
   "dep:url",
+  "dep:wry",
 ]
 conpty-sidecar = [
   "pty",
@@ -267,6 +269,7 @@ tauri = { version = "=2.11.5", default-features = false, optional = true }
 tauri-runtime = { version = "=2.11.3", optional = true }
 tauri-runtime-wry = { version = "=2.11.4", default-features = false, optional = true }
 tauri-utils = { version = "=2.9.3", optional = true }
+wry = { version = "=0.57.0", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
@@ -375,3 +378,13 @@ codegen-units = 1
 
 [profile.test]
 codegen-units = 1
+
+# Temporary exact upstream fix for the native external-content backend.  The
+# forked runtime-Wry revision makes its Wry IPC bridge optional, so the direct
+# Wry builder can remain bridge-free while sharing the canonical Tauri loop.
+[patch.crates-io]
+tauri = { git = "https://github.com/zackees/tauri.git", rev = "1c1472ff16cce30fa2748b53857268a132549e1f" }
+tauri-runtime = { git = "https://github.com/zackees/tauri.git", rev = "1c1472ff16cce30fa2748b53857268a132549e1f" }
+tauri-runtime-wry = { git = "https://github.com/zackees/tauri.git", rev = "1c1472ff16cce30fa2748b53857268a132549e1f" }
+tauri-utils = { git = "https://github.com/zackees/tauri.git", rev = "1c1472ff16cce30fa2748b53857268a132549e1f" }
+wry = { git = "https://github.com/zackees/wry.git", rev = "29a2228b594d45c0ae9710866e46a6f898120151" }

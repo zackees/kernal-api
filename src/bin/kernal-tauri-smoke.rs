@@ -21,9 +21,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = SmokeScenario::from_args()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
-    let page = scenario.page();
+    let page = scenario.page(&address.to_string());
     let server = std::thread::spawn(move || -> std::io::Result<()> {
-        let (mut stream, _) = listener.accept()?;
+        listener.set_nonblocking(true)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(16);
+        let accept = || loop {
+            match listener.accept() {
+                Ok(connection) => return Ok(connection),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "webview did not complete loopback isolation proof",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let (mut stream, _) = accept()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut request = [0_u8; 4096];
         let _ = stream.read(&mut request)?;
         write!(
@@ -31,6 +49,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
             page.len()
         )?;
+        let (mut report, _) = accept()?;
+        report.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let mut report_request = [0_u8; 4096];
+        let read = report.read(&mut report_request)?;
+        let report_request = String::from_utf8_lossy(&report_request[..read]);
+        if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
+            return Err(std::io::Error::other(format!(
+                "page observed a prohibited host bridge: {report_request:?}"
+            )));
+        }
+        report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
         Ok(())
     });
 
@@ -45,7 +74,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime
         .handle()
         .launch(async move {
-            let result = lifecycle(&task_backend, &url, scenario).await;
+            // Keep the whole operation bounded.  A load callback that never
+            // arrives must not leave the Wry event loop running forever in CI
+            // or in an embedding shell.  Dropping `lifecycle` drops a created
+            // NativeWebview, whose Drop requests native close.
+            let result = async_engine::timeout(
+                Duration::from_secs(15),
+                lifecycle(&task_backend, &url, scenario),
+            )
+            .await
+            .map_err(|_| NativeWebviewError::HostFailure("lifecycle timed out".into()))
+            .and_then(|result| result);
             let _ = result_sender.send(result);
             let _ = task_backend.request_exit();
         })
@@ -88,7 +127,7 @@ async fn lifecycle(
             (
                 SmokeScenario::ProhibitedRedirect,
                 Err(NativeWebviewError::RejectedNavigation(reason)),
-            ) if reason == "file" => {}
+            ) if reason == "tauri" => {}
             (_, other) => {
                 return Err(NativeWebviewError::HostFailure(format!(
                     "unexpected security terminal result: {other:?}"
@@ -139,20 +178,26 @@ impl SmokeScenario {
         }
     }
 
-    fn page(self) -> &'static str {
-        match self {
-            Self::Close => "<!doctype html><title>kernal-api</title>",
-            Self::Popup => concat!(
-                "<!doctype html><title>kernal-api</title><script>",
-                "setTimeout(() => window.open('https://example.test/'), 50);",
-                "</script>"
-            ),
-            Self::ProhibitedRedirect => concat!(
-                "<!doctype html><title>kernal-api</title><script>",
-                "setTimeout(() => location.href = 'file:///etc/passwd', 50);",
-                "</script>"
-            ),
-        }
+    fn page(self, address: &str) -> String {
+        let action = match self {
+            Self::Close => "",
+            // WebKit requires a genuine user activation before it invokes the
+            // new-window callback. The Linux Xvfb proof clicks this link with
+            // xdotool; no host script or IPC is injected into the page.
+            Self::Popup => "",
+            Self::ProhibitedRedirect => "location.href = 'tauri://localhost/';",
+        };
+        format!(
+            "<!doctype html><title>kernal-api</title>\
+             <a id=\"popup\" target=\"_blank\" href=\"https://example.test/\" \
+             style=\"display:block;position:absolute;left:100px;top:100px;width:200px;height:100px\">popup</a><script>\
+             const probe = `ipc=${{Number(typeof window.ipc !== 'undefined')}}&\
+             tauri=${{Number(typeof window.__TAURI_INTERNALS__ !== 'undefined')}}&\
+             platform=${{Number(Boolean(window.webkit?.messageHandlers?.ipc))}}`;\
+             const xhr = new XMLHttpRequest();\
+             xhr.open('GET', 'http://{address}/_isolation?' + probe, false); xhr.send();\
+             {action}</script>"
+        )
     }
 }
 

@@ -120,6 +120,19 @@ fn publish_report_to_host() {
     }
 }
 
+/// Drive the generated operation lifecycle. `operation_yield` is an async
+/// Wasmtime host import: the host drops its Caller before waiting, then wakes
+/// this guest only after the hub has published one terminal outcome.
+fn complete_operation(
+    operation: kernal_api_v1_bindings::OperationFuture,
+) -> Result<u64, kernal_api_v1_bindings::OperationError> {
+    assert!(operation.poll()?.is_none(), "synthetic operation begins pending");
+    operation.yield_now()?;
+    Ok(operation
+        .poll()?
+        .expect("woken operation must have one terminal result"))
+}
+
 /// Explicit result marker for public artifact inspection.
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
@@ -131,17 +144,27 @@ pub extern "C" fn kernal_api_run() -> u32 {
         BuildHasherDefault::default(),
     ));
     let (tx, rx) = mpsc::channel();
+    let resource = kernal_api_v1_bindings::SyntheticResource::from_create_payload(
+        complete_operation(
+            kernal_api_v1_bindings::SyntheticResource::create(true)
+                .expect("submit generated resource create"),
+        )
+        .expect("generated resource create"),
+    );
     let mut workers = Vec::new();
     for key in 0..2_u32 {
         let counter = Arc::clone(&counter);
         let totals = Arc::clone(&totals);
         let map = Arc::clone(&map);
         let tx = tx.clone();
+        let resource = resource;
         workers.push(std::thread::spawn(move || {
             // Each native child crosses the kernel boundary too, proving the
             // supplied runtime handle is observed in every guest Store.
             kernal_api_v1_bindings::imports::kernel_yield()
                 .expect("generated kernel yield ABI");
+            complete_operation(resource.use_().expect("submit generated shared resource use"))
+                .expect("generated shared resource use");
             counter.fetch_add(1, Ordering::SeqCst);
             *totals.lock().expect("mutex") += 1;
             map.insert(key, 1_u32);
@@ -164,6 +187,8 @@ pub extern "C" fn kernal_api_run() -> u32 {
         });
     let map_sum: u32 = map.iter().map(|entry| *entry.value()).sum();
     let mutex_total = *totals.lock().expect("mutex");
+    complete_operation(resource.close().expect("submit generated resource close"))
+        .expect("generated resource close");
     kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
     let result = joined
         + counter.load(Ordering::SeqCst)

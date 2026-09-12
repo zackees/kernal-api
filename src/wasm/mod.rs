@@ -780,6 +780,10 @@ impl AdmittedSketch {
         let children = prepared.controller.join_completed();
         let rejections = prepared.controller.take_thread_spawn_rejections();
         operation_cleanup.close_all(operations::Terminal::Closed);
+        #[cfg(test)]
+        if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
+            *snapshot = Some(operation_cleanup.snapshot());
+        }
         // Finalization always drains children, but the root call is the
         // primary operation: its typed failure must not be masked by a
         // concurrent child or report diagnostic.
@@ -857,6 +861,8 @@ impl AdmittedSketch {
             session: Mutex::new(SessionState::default()),
             #[cfg(test)]
             threaded_smoke_report: Mutex::new(None),
+            #[cfg(test)]
+            operation_snapshot: Mutex::new(None),
         });
         let mut linker = Linker::new(&self.engine);
         define_closed_imports(&mut linker)?;
@@ -923,6 +929,7 @@ impl AdmittedSketch {
         let prepared = self.prepared_root.lock().ok()?.as_ref()?.clone();
         let controller = &prepared.controller;
         let workers = controller.workers.lock().ok()?;
+        let operation_snapshot = *controller.operation_snapshot.lock().ok()?;
         Some(RootExecutionObservation {
             preparations: self.preparation_count.load(Ordering::Relaxed),
             kernel_yields: controller.kernel_yield_count.load(Ordering::Relaxed),
@@ -935,6 +942,7 @@ impl AdmittedSketch {
             accepted_child_registrations: workers.accepted,
             live_threads: workers.live,
             queued_join_handles: workers.handles.len(),
+            operation_snapshot,
         })
     }
     #[allow(dead_code)]
@@ -1364,6 +1372,8 @@ struct ThreadController {
     workers: Mutex<Workers>,
     #[cfg(test)]
     threaded_smoke_report: Mutex<Option<[u32; 12]>>,
+    #[cfg(test)]
+    operation_snapshot: Mutex<Option<operations::HubSnapshot>>,
 }
 
 #[derive(Default)]
@@ -2286,6 +2296,7 @@ struct RootExecutionObservation {
     accepted_child_registrations: usize,
     live_threads: usize,
     queued_join_handles: usize,
+    operation_snapshot: Option<operations::HubSnapshot>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -3361,6 +3372,15 @@ mod threaded_root_observation_tests {
         assert_eq!(observation.accepted_child_registrations, 0);
         assert_eq!(observation.live_threads, 0);
         assert_eq!(observation.queued_join_handles, 0);
+        let operations = observation
+            .operation_snapshot
+            .expect("root records lifecycle cleanup after the real artifact exits");
+        assert_eq!(operations.pending_operations, 0);
+        assert_eq!(operations.live_resources, 0);
+        // One create, two child uses, and one close must each prove a real
+        // Pending -> async yield wake -> one terminal poll transition.
+        assert_eq!(operations.suspends, 4);
+        assert_eq!(operations.resumes, 4);
         assert_eq!(
             *prepared
                 .controller
@@ -4985,7 +5005,20 @@ fn preflight_threaded_rust(
         ("wasi_snapshot_preview1", "proc_exit"),
         ("wasi_snapshot_preview1", "sched_yield"),
     ];
-    if !required.iter().all(|pair| seen.contains(pair)) || seen.len() != required.len() {
+    // The legacy generated artifact contains only `kernel_yield`; the
+    // lifecycle is an all-or-nothing additive declaration.  This preserves
+    // old admitted artifacts while preventing a guest from presenting a
+    // partial submit/poll/yield protocol.
+    let lifecycle = [
+        (ABI_MODULE, "operation_submit"),
+        (ABI_MODULE, "operation_poll"),
+        (ABI_MODULE, "operation_yield"),
+    ];
+    let lifecycle_present = lifecycle.iter().filter(|pair| seen.contains(*pair)).count();
+    if !required.iter().all(|pair| seen.contains(pair))
+        || !matches!(lifecycle_present, 0 | 3)
+        || seen.len() != required.len() + lifecycle_present
+    {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",
             name: "closed-import-set",
@@ -5121,6 +5154,22 @@ fn threaded_import_signature(
         (ABI_MODULE, ABI_YIELD) => Signature {
             params: generated_v1_contract::KERNEL_YIELD_PARAMS,
             results: generated_v1_contract::KERNEL_YIELD_RESULTS,
+        },
+        // These are the closed scalar lifecycle imports generated from the
+        // admitted v1 manifest.  Resource operations remain opcode variants
+        // of `operation_submit`; admission deliberately grants no additional
+        // resource or native-backend import surface.
+        (ABI_MODULE, "operation_submit") => Signature {
+            params: &[ValType::I32, ValType::I64, ValType::I64],
+            results: &[ValType::I64],
+        },
+        (ABI_MODULE, "operation_poll") => Signature {
+            params: &[ValType::I64],
+            results: &[ValType::I64],
+        },
+        (ABI_MODULE, "operation_yield") | (ABI_MODULE, "operation_cancel") => Signature {
+            params: &[ValType::I64],
+            results: I32,
         },
         (THREAD_MODULE, THREAD_SPAWN) => Signature {
             params: I32,

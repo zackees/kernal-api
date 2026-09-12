@@ -236,7 +236,12 @@ impl OperationHub {
                     0,
                     0,
                     TerminalResult {
-                        terminal: Terminal::Closed,
+                        // Closing is a successful operation. The resource
+                        // becomes closed as its side effect; reporting that
+                        // resource state as this operation's terminal error
+                        // would make the generated semantic close future
+                        // unusable.
+                        terminal: Terminal::Completed,
                         resource: None,
                     },
                 )

@@ -112,6 +112,7 @@ impl OperationFuture {
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? != 0 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
 }
+#[derive(Clone, Copy)]
 pub struct SyntheticResource { token: u64 }
 impl SyntheticResource {
     pub fn create(shareable: bool) -> Result<OperationFuture, OperationError> { OperationFuture::submit(2, u64::from(shareable), 1) }

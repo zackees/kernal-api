@@ -15,6 +15,15 @@ pub use worker::{
     SketchWorkerTerminal,
 };
 
+// Regenerated explicitly by `tools/wasm-abi-generator`; ordinary facade
+// builds consume this checked-in private host linker.
+#[rustfmt::skip]
+#[path = "generated/v1/wasmtime45_host_linker.rs"]
+mod generated_v1;
+#[rustfmt::skip]
+#[path = "generated/v1/admission_contract.rs"]
+mod generated_v1_contract;
+
 use std::cell::UnsafeCell;
 use std::fmt;
 use std::mem::align_of;
@@ -30,15 +39,15 @@ use wasmtime::{
 };
 
 const PAGE_BYTES: u64 = 64 * 1024;
-const ABI_MODULE: &str = "kernal-api:v1";
-const ABI_YIELD: &str = "kernel-yield";
+const ABI_MODULE: &str = generated_v1_contract::NAMESPACE;
+const ABI_YIELD: &str = generated_v1_contract::KERNEL_YIELD;
 const THREAD_MODULE: &str = "wasi";
 const THREAD_SPAWN: &str = "thread-spawn";
 const MEMORY_MODULE: &str = "env";
 const MEMORY_NAME: &str = "memory";
 const ENTRY: &str = "kernal-api-run";
 const ABI_METADATA: &str = "kernal-api.abi";
-const ABI_METADATA_VALUE: &[u8] = b"v1";
+const ABI_METADATA_VALUE: &[u8] = generated_v1_contract::METADATA;
 const PROFILE_METADATA: &str = "kernal-api.profile";
 const PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-v1";
 const VALIDATION_PROFILE_METADATA_VALUE: &[u8] = b"threaded-core-wasm-validation-v1";
@@ -59,6 +68,45 @@ const EPOCH_PENDING: u8 = 0;
 const EPOCH_CANCELLED: u8 = 1;
 const EPOCH_DEADLINE_EXCEEDED: u8 = 2;
 const EPOCH_COMPLETED: u8 = 3;
+
+#[cfg(test)]
+const GENERATED_V1_MANIFEST: &str = include_str!("generated/v1/kernal-api-v1.abi.toml");
+
+#[cfg(test)]
+#[test]
+fn generated_v1_manifest_matches_the_closed_admission_contract() {
+    // The explicit drift command proves the whole generated directory. This
+    // focused assertion makes any admission-name/signature change fail in the
+    // host test suite before Wasmtime can compile a module.
+    assert!(
+        GENERATED_V1_MANIFEST.contains(&format!("schema = \"{}\"", generated_v1_contract::SCHEMA))
+    );
+    assert!(GENERATED_V1_MANIFEST.contains(&format!(
+        "schema_revision = {}",
+        generated_v1_contract::SCHEMA_REVISION
+    )));
+    assert!(GENERATED_V1_MANIFEST.contains(&format!(
+        "generator_revision = {}",
+        generated_v1_contract::GENERATOR_REVISION
+    )));
+    assert!(GENERATED_V1_MANIFEST.contains(&format!(
+        "abi_version = {}",
+        generated_v1_contract::ABI_VERSION
+    )));
+    assert!(GENERATED_V1_MANIFEST.contains(&format!("namespace = \"{ABI_MODULE}\"")));
+    assert!(GENERATED_V1_MANIFEST.contains(&format!("name = \"{ABI_YIELD}\"")));
+    assert!(GENERATED_V1_MANIFEST.contains("params = []"));
+    assert!(GENERATED_V1_MANIFEST.contains("results = [{ semantic = \"()\", abi = \"unit\" }]"));
+    assert!(!GENERATED_V1_MANIFEST.contains("kernel-yield"));
+    // Admission compares the complete declarative contract, rather than a
+    // hand-maintained summary or a lossy fingerprint.  Keep this assertion
+    // byte-for-byte so a generated manifest change cannot silently broaden
+    // the accepted threaded guest ABI.
+    assert_eq!(
+        ABI_METADATA_VALUE,
+        format!("capabilities=0\n{GENERATED_V1_MANIFEST}").as_bytes()
+    );
+}
 
 /// Semantic admission contracts. The default remains the narrow synthetic
 /// profile; Rust's standard threaded output is opt-in and versioned.
@@ -1527,6 +1575,55 @@ struct ThreadStoreState {
     epoch: Arc<LogicalEpoch>,
 }
 
+impl generated_v1::KernalApiV1Imports for ThreadStoreState {
+    fn kernel_yield(&mut self) -> wasmtime::Result<()> {
+        // The facade handle is deliberately supplied by the caller. This
+        // scalar slice has no scheduler yet, so it must never construct one.
+        let controller = &self.controller;
+        controller
+            .kernel_yield_count
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_HOST_BLOCK_MARKER") {
+            // This test-only seam characterizes the exact generated host
+            // boundary, after which an in-process epoch interrupt cannot
+            // reclaim a host-blocked thread.
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::File::create(marker) {
+                let _ = file.write_all(b"entered");
+                let _ = file.sync_all();
+            }
+            std::thread::park();
+        }
+        #[cfg(test)]
+        if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_ATOMIC_WAIT_MARKER") {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::File::create(marker) {
+                let _ = file.write_all(b"entered");
+                let _ = file.sync_all();
+            }
+        }
+        if let Some(actual) = &self.runtime {
+            controller
+                .runtime_handle_count
+                .fetch_add(1, Ordering::Relaxed);
+            let matches = controller
+                .runtime_identity
+                .lock()
+                .ok()
+                .and_then(|identity| identity.as_ref().cloned())
+                .is_none_or(|expected| actual.same_runtime_for_wasm(&expected));
+            if !matches {
+                controller
+                    .runtime_identity_mismatches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let _ = controller.prelink.get();
+        Ok(())
+    }
+}
+
 fn install_epoch_deadline(store: &mut Store<ThreadStoreState>) {
     store.set_epoch_deadline(1);
     // Wasmtime 45 installs this callback infallibly and the callback returns
@@ -2141,58 +2238,7 @@ struct ProcExitSentinel(i32);
 fn define_closed_imports(
     linker: &mut Linker<ThreadStoreState>,
 ) -> Result<(), SketchExecutionError> {
-    linker
-        .func_wrap(
-            ABI_MODULE,
-            ABI_YIELD,
-            |caller: Caller<'_, ThreadStoreState>| {
-                // The facade handle is deliberately supplied by the caller. This
-                // slice has no scheduler yet, but must never construct a runtime.
-                let controller = &caller.data().controller;
-                controller
-                    .kernel_yield_count
-                    .fetch_add(1, Ordering::Relaxed);
-                #[cfg(test)]
-                if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_HOST_BLOCK_MARKER") {
-                    // This test-only seam characterizes the exact boundary:
-                    // Wasm reached a closed host import, after which an
-                    // in-process epoch interrupt cannot reclaim the thread.
-                    use std::io::Write as _;
-                    if let Ok(mut file) = std::fs::File::create(marker) {
-                        let _ = file.write_all(b"entered");
-                        let _ = file.sync_all();
-                    }
-                    std::thread::park();
-                }
-                #[cfg(test)]
-                if let Some(marker) = std::env::var_os("KERNAL_API_EPOCH_ATOMIC_WAIT_MARKER") {
-                    use std::io::Write as _;
-                    if let Ok(mut file) = std::fs::File::create(marker) {
-                        let _ = file.write_all(b"entered");
-                        let _ = file.sync_all();
-                    }
-                }
-                if caller.data().runtime.is_some() {
-                    controller
-                        .runtime_handle_count
-                        .fetch_add(1, Ordering::Relaxed);
-                    let actual = caller.data().runtime.as_ref().expect("checked runtime");
-                    let matches = controller
-                        .runtime_identity
-                        .lock()
-                        .ok()
-                        .and_then(|identity| identity.as_ref().cloned())
-                        .is_none_or(|expected| actual.same_runtime_for_wasm(&expected));
-                    if !matches {
-                        controller
-                            .runtime_identity_mismatches
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                let _ = controller.prelink.get();
-            },
-        )
-        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+    generated_v1::link_kernal_api_v1(linker).map_err(|_| SketchExecutionError::PrelinkFailed)?;
     linker
         .func_wrap(
             THREAD_MODULE,
@@ -3103,6 +3149,69 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
+    fn threaded_profile_rejects_generated_abi_metadata_mutations_precompile() {
+        let absent = threaded_fixture_with_abi_metadata(None);
+        let mut future_abi = ABI_METADATA_VALUE.to_vec();
+        replace_metadata_byte(&mut future_abi, b"abi_version = 1\n", b'2');
+        let mut schema_skew = ABI_METADATA_VALUE.to_vec();
+        replace_metadata_byte(&mut schema_skew, b"schema_revision = 1\n", b'2');
+        let mut capability_skew = ABI_METADATA_VALUE.to_vec();
+        replace_metadata_byte(&mut capability_skew, b"capabilities=0\n", b'1');
+        let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
+        let duplicate = {
+            let mut bytes = threaded_yield_fixture();
+            custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
+            bytes
+        };
+
+        let cases = [
+            (
+                "absent",
+                absent,
+                SketchModuleError::MissingMetadata { name: ABI_METADATA },
+            ),
+            (
+                "future ABI version",
+                threaded_fixture_with_abi_metadata(Some(&future_abi)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "schema skew",
+                threaded_fixture_with_abi_metadata(Some(&schema_skew)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "capability skew",
+                threaded_fixture_with_abi_metadata(Some(&capability_skew)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "duplicate",
+                duplicate,
+                SketchModuleError::DuplicateMetadata { name: ABI_METADATA },
+            ),
+            (
+                "malformed",
+                threaded_fixture_with_abi_metadata(Some(&malformed)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+        ];
+
+        for (case, bytes, expected) in cases {
+            let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+            let policy =
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .expect("policy");
+            let error = match compiler.admit(&bytes, policy) {
+                Ok(_) => panic!("{case} metadata mutation admitted"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected, "{case}");
+            assert_eq!(compiler.compiled_module_count(), 0, "{case}");
+        }
+    }
+
+    #[test]
     fn supplied_threaded_artifact_admits_and_executes_the_public_profile() {
         // This is deliberately supplied by the explicit diagnostic workflow:
         // ordinary source-only test runs must neither build a cross-target
@@ -3437,7 +3546,35 @@ mod threaded_root_observation_tests {
         section(0, body, output);
     }
 
-    // Minimal exact ThreadedRustV1 profile whose start calls kernel-yield.
+    fn encoded_custom(name: &str, value: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        custom(name, value, &mut output);
+        output
+    }
+
+    fn threaded_fixture_with_abi_metadata(value: Option<&[u8]>) -> Vec<u8> {
+        let mut bytes = threaded_yield_fixture();
+        let original = encoded_custom(ABI_METADATA, ABI_METADATA_VALUE);
+        assert!(
+            bytes.ends_with(&original),
+            "fixture ABI metadata is terminal"
+        );
+        bytes.truncate(bytes.len() - original.len());
+        if let Some(value) = value {
+            custom(ABI_METADATA, value, &mut bytes);
+        }
+        bytes
+    }
+
+    fn replace_metadata_byte(metadata: &mut [u8], declaration: &[u8], replacement: u8) {
+        let declaration_at = metadata
+            .windows(declaration.len())
+            .position(|window| window == declaration)
+            .expect("generated metadata declaration");
+        metadata[declaration_at + declaration.len() - 2] = replacement;
+    }
+
+    // Minimal exact ThreadedRustV1 profile whose start calls kernel_yield.
     // Keeping it in this private unit module prevents test instrumentation
     // from becoming a public sketch-host API.
     pub(super) fn threaded_yield_fixture() -> Vec<u8> {
@@ -3525,6 +3662,7 @@ mod threaded_root_observation_tests {
             text(name, &mut features);
         }
         custom("target_features", &features, &mut wasm);
+        custom(ABI_METADATA, ABI_METADATA_VALUE, &mut wasm);
         wasm
     }
 
@@ -4466,8 +4604,8 @@ fn preflight(
                                 &types,
                                 i,
                                 Signature {
-                                    params: EMPTY,
-                                    results: EMPTY,
+                                    params: generated_v1_contract::KERNEL_YIELD_PARAMS,
+                                    results: generated_v1_contract::KERNEL_YIELD_RESULTS,
                                 },
                                 ABI_MODULE,
                                 ABI_YIELD,
@@ -4512,7 +4650,12 @@ fn preflight(
                 if *count > 1 {
                     return Err(SketchModuleError::DuplicateMetadata { name });
                 }
-                if section.data().len() > MAX_METADATA_BYTES {
+                // The generated ABI contract is intentionally admitted as
+                // complete TOML bytes, which is larger than the compact
+                // profile marker.  Retain the small DoS ceiling for ordinary
+                // metadata, while allowing precisely the checked-in contract
+                // to set its own bounded size.
+                if section.data().len() > expected.len().max(MAX_METADATA_BYTES) {
                     return Err(SketchModuleError::MetadataTooLarge { name });
                 }
                 if section.data() != expected {
@@ -4614,6 +4757,7 @@ fn preflight_threaded_rust(
     let mut start = None;
     let mut target_features = None;
     let mut validation_metadata = 0_u8;
+    let mut abi_metadata = 0_u8;
     let mut seen = std::collections::BTreeSet::new();
     for item in Parser::new(0).parse_all(bytes) {
         match item.map_err(|_| SketchModuleError::InvalidBinary)? {
@@ -4697,6 +4841,15 @@ fn preflight_threaded_rust(
             }
             Payload::StartSection { func, .. } => start = Some(func),
             Payload::CustomSection(section) => match section.name() {
+                ABI_METADATA => {
+                    abi_metadata += 1;
+                    if abi_metadata > 1 {
+                        return Err(SketchModuleError::DuplicateMetadata { name: ABI_METADATA });
+                    }
+                    if section.data() != ABI_METADATA_VALUE {
+                        return Err(SketchModuleError::MetadataMismatch { name: ABI_METADATA });
+                    }
+                }
                 PROFILE_METADATA if validation => {
                     validation_metadata += 1;
                     if validation_metadata > 1 {
@@ -4734,6 +4887,9 @@ fn preflight_threaded_rust(
         }
     }
     let memory = memory.ok_or(SketchModuleError::MissingSharedMemory)?;
+    if abi_metadata == 0 {
+        return Err(SketchModuleError::MissingMetadata { name: ABI_METADATA });
+    }
     if memory.minimum_pages != THREADED_RUST_INITIAL_PAGES
         || memory.maximum_pages != THREADED_RUST_MAX_PAGES
     {
@@ -4896,8 +5052,8 @@ fn threaded_import_signature(
 ) -> Result<bool, SketchModuleError> {
     let signature = match (module, name) {
         (ABI_MODULE, ABI_YIELD) => Signature {
-            params: EMPTY,
-            results: EMPTY,
+            params: generated_v1_contract::KERNEL_YIELD_PARAMS,
+            results: generated_v1_contract::KERNEL_YIELD_RESULTS,
         },
         (THREAD_MODULE, THREAD_SPAWN) => Signature {
             params: I32,

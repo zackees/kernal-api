@@ -98,7 +98,7 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
         &mut imports,
     );
     text("kernal-api:v1", &mut imports);
-    text("kernel-yield", &mut imports);
+    text("kernel_yield", &mut imports);
     imports.extend([0, 0]);
     text("wasi", &mut imports);
     text("thread-spawn", &mut imports);
@@ -230,6 +230,11 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
+    let metadata = format!(
+        "capabilities=0\n{}",
+        include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml")
+    );
+    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
     wasm
 }
 

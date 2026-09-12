@@ -11,4 +11,5 @@ publish = false
 [workspace]
 
 [dependencies]
+kernal-api-v1-bindings = { path = "../../src/wasm/generated/v1/guest" }
 dashmap = "=6.1.0"

@@ -217,7 +217,7 @@ fn legacy_threaded_root_wasm(
     leb(17, &mut imports);
     leb(16_384, &mut imports);
     text("kernal-api:v1", &mut imports);
-    text("kernel-yield", &mut imports);
+    text("kernel_yield", &mut imports);
     imports.extend([0, 0]);
     text("wasi", &mut imports);
     text("thread-spawn", &mut imports);
@@ -325,6 +325,11 @@ fn legacy_threaded_root_wasm(
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
+    let metadata = format!(
+        "capabilities=0\n{}",
+        include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml")
+    );
+    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
     wasm
 }
 
@@ -342,7 +347,7 @@ fn synthetic_root_wasm() -> Vec<u8> {
     leb(17, &mut imports);
     leb(16_384, &mut imports);
     text("kernal-api:v1", &mut imports);
-    text("kernel-yield", &mut imports);
+    text("kernel_yield", &mut imports);
     imports.extend([0, 0]);
     text("wasi", &mut imports);
     text("thread-spawn", &mut imports);
@@ -355,7 +360,11 @@ fn synthetic_root_wasm() -> Vec<u8> {
     exports.extend([0, 2]);
     section(7, exports, &mut wasm);
     section(10, vec![1, 2, 0, 0x0b], &mut wasm);
-    custom("kernal-api.abi", b"v1", &mut wasm);
+    let metadata = format!(
+        "capabilities=0\n{}",
+        include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml")
+    );
+    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
     custom("kernal-api.profile", b"threaded-core-wasm-v1", &mut wasm);
     wasm
 }

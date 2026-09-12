@@ -1,0 +1,13 @@
+schema = "fp-bindgen.core-wasm-abi"
+schema_revision = 1
+generator_revision = 1
+abi_version = 1
+namespace = "kernal-api:v1"
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "kernel_yield"
+direction = "guest-to-host"
+params = []
+results = [{ semantic = "()", abi = "unit" }]
+

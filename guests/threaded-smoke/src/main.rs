@@ -100,12 +100,6 @@ struct Iovec {
     len: u32,
 }
 
-#[link(wasm_import_module = "kernal-api:v1")]
-extern "C" {
-    #[link_name = "kernel-yield"]
-    fn kernel_yield();
-}
-
 #[link(wasm_import_module = "wasi_snapshot_preview1")]
 extern "C" {
     #[link_name = "fd_write"]
@@ -146,7 +140,8 @@ pub extern "C" fn kernal_api_run() -> u32 {
         workers.push(std::thread::spawn(move || {
             // Each native child crosses the kernel boundary too, proving the
             // supplied runtime handle is observed in every guest Store.
-            unsafe { kernel_yield() };
+            kernal_api_v1_bindings::imports::kernel_yield()
+                .expect("generated kernel yield ABI");
             counter.fetch_add(1, Ordering::SeqCst);
             *totals.lock().expect("mutex") += 1;
             map.insert(key, 1_u32);
@@ -169,7 +164,7 @@ pub extern "C" fn kernal_api_run() -> u32 {
         });
     let map_sum: u32 = map.iter().map(|entry| *entry.value()).sum();
     let mutex_total = *totals.lock().expect("mutex");
-    unsafe { kernel_yield() };
+    kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
     let result = joined
         + counter.load(Ordering::SeqCst)
         + mutex_total

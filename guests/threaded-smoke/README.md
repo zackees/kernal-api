@@ -4,7 +4,8 @@ This is a standalone, source-only Rust 1.95 fixture for
 `wasm32-wasip1-threads`. It is intentionally not a workspace member and has a
 checked-in lockfile, but no Wasm binary or build output.
 
-It imports `kernal-api:v1::kernel-yield`, creates and joins two ordinary Rust
+It imports `kernal-api:v1::kernel_yield` through the checked-in generated guest
+crate, creates and joins two ordinary Rust
 child threads, and exercises `Arc<AtomicU32>`, `Mutex`, `mpsc`, TLS, and a
 deterministic `DashMap` result. It publishes that bounded result through a
 versioned atomics-only record in the imported shared memory; the host locates

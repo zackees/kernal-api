@@ -621,6 +621,34 @@ pub struct ExternalWebviewClient {
     store: u64,
 }
 
+/// One host-validated HTTP(S) URL to authorize before guest instantiation.
+/// This grants no filesystem, arbitrary navigation, or network API authority.
+#[derive(Clone)]
+pub struct WebviewUrlGrant {
+    url: Arc<str>,
+}
+
+impl WebviewUrlGrant {
+    /// Validate without creating a window or starting native work. Both the
+    /// input and canonical URL must fit the fixed 16 KiB authority bound.
+    pub fn new(url: &str) -> Result<Self, WebviewError> {
+        if url.len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
+            return Err(WebviewError::InvalidUrl);
+        }
+        let request = NativeWebviewRequest::parse(url).map_err(map_native)?;
+        if request.url.as_str().len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
+            return Err(WebviewError::InvalidUrl);
+        }
+        Ok(Self {
+            url: Arc::from(request.url.as_str()),
+        })
+    }
+
+    pub(crate) fn bind(&self, hub: &OperationHub, store: u64) -> Result<OpaqueToken, HubError> {
+        hub.grant_webview_url(store, Arc::clone(&self.url))
+    }
+}
+
 /// Opaque, generation-safe external-webview resource.
 ///
 /// It is intentionally non-cloneable: dropping it revokes the generation and
@@ -676,6 +704,17 @@ struct PendingWebviewOpen {
     resource: OpaqueToken,
     operation: OpaqueToken,
     transferred: bool,
+}
+
+struct PendingUrlGrant {
+    hub: Arc<OperationHub>,
+    resource: OpaqueToken,
+}
+
+impl Drop for PendingUrlGrant {
+    fn drop(&mut self) {
+        let _ = self.hub.close_resource(self.resource);
+    }
 }
 
 impl Drop for PendingWebviewOpen {
@@ -737,11 +776,24 @@ impl ExternalWebviewClient {
 
     /// Validate and asynchronously create an isolated external webview.
     pub async fn open_webview(&self, url: &str) -> Result<WebviewHandle, WebviewError> {
-        let request = NativeWebviewRequest::parse(url).map_err(map_native)?;
-        let (resource, operation) = self
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_webview(&grant).await
+    }
+
+    /// Open a prevalidated host URL. The temporary registry grant is scoped
+    /// to this instance and revoked on completion, error, or future drop.
+    pub async fn open_granted_webview(
+        &self,
+        grant: &WebviewUrlGrant,
+    ) -> Result<WebviewHandle, WebviewError> {
+        let grant = PendingUrlGrant {
+            hub: Arc::clone(&self.service.hub),
+            resource: grant.bind(&self.service.hub, self.store).map_err(map_hub)?,
+        };
+        let (resource, operation, url) = self
             .service
             .hub
-            .begin_external_webview_open(self.store)
+            .begin_granted_webview_open(self.store, grant.resource)
             .map_err(map_hub)?;
         let mut pending = PendingWebviewOpen {
             service: Arc::clone(&self.service),
@@ -750,6 +802,7 @@ impl ExternalWebviewClient {
             operation,
             transferred: false,
         };
+        let request = NativeWebviewRequest::parse(&url).map_err(map_native)?;
         let mut native = match self.service.backend.open(request).await {
             Ok(native) => native,
             Err(error) => {
@@ -1098,6 +1151,38 @@ fn map_hub(error: HubError) -> WebviewError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prevalidated_url_grant_is_bounded_and_rejects_ambient_authority() {
+        for url in [
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "javascript:alert(1)",
+            "tauri://localhost",
+            "https:///bad",
+            "https://user@example.test/",
+        ] {
+            assert!(matches!(
+                WebviewUrlGrant::new(url),
+                Err(WebviewError::InvalidUrl)
+            ));
+        }
+        let huge = format!(
+            "https://example.test/{}",
+            "a".repeat(crate::operations::MAX_WEBVIEW_URL_BYTES)
+        );
+        assert!(matches!(
+            WebviewUrlGrant::new(&huge),
+            Err(WebviewError::InvalidUrl)
+        ));
+        let grant = WebviewUrlGrant::new("HTTPS://EXAMPLE.TEST:443/exact?q=1").unwrap();
+        let hub = OperationHub::new(4, 4).unwrap();
+        let token = grant.bind(&hub, 7).unwrap();
+        let (_, _, url) = hub.begin_granted_webview_open(7, token).unwrap();
+        assert_eq!(&*url, "https://example.test/exact?q=1");
+        hub.close_all(Terminal::Cancelled);
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
 
     #[test]
     fn external_url_policy_admits_loopback_and_refuses_ambient_schemes() {

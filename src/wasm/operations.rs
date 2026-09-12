@@ -31,6 +31,12 @@ pub(crate) const OP_BLOB_SEAL: u32 = 9;
 pub(crate) const OP_OUTPUT_COMMIT: u32 = 10;
 pub(crate) const OP_OUTPUT_GRANT: u32 = 11;
 pub(crate) const OP_CLOCK_SLEEP: u32 = 12;
+pub(crate) const OP_WEBVIEW_URL_GRANT: u32 = 13;
+pub(crate) const OP_WEBVIEW_OPEN: u32 = 14;
+pub(crate) const OP_WEBVIEW_LOAD: u32 = 15;
+pub(crate) const OP_WEBVIEW_CAPTURE: u32 = 16;
+pub(crate) const OP_WEBVIEW_CLOSE: u32 = 17;
+pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -40,6 +46,8 @@ const BLOB_RIGHT_READ: u8 = 0b01;
 const BLOB_RIGHT_WRITE: u8 = 0b10;
 const OUTPUT_RESOURCE_KIND: u8 = 4;
 const OUTPUT_RIGHT_COMMIT: u8 = 0b01;
+const WEBVIEW_URL_RESOURCE_KIND: u8 = 5;
+const WEBVIEW_URL_RIGHT_OPEN: u8 = 1;
 const STATUS_PENDING: u8 = 0;
 const STATUS_COMPLETED: u8 = 1;
 const STATUS_CANCELLED: u8 = 2;
@@ -209,6 +217,7 @@ struct ResourceSlot {
 enum ResourceValue {
     Synthetic,
     ExternalWebview,
+    WebviewUrl(Arc<str>),
     Blob {
         buffer: VecDeque<u8>,
         sealed: bool,
@@ -592,6 +601,76 @@ impl OperationHub {
         Ok((resource, operation))
     }
 
+    /// Store a URL already validated by the native facade. The guest receives
+    /// only this scoped token; URL text never crosses the generated boundary.
+    pub(crate) fn grant_webview_url(
+        &self,
+        store: u64,
+        url: Arc<str>,
+    ) -> Result<OpaqueToken, HubError> {
+        if url.is_empty() || url.len() > MAX_WEBVIEW_URL_BYTES {
+            return Err(HubError::Quota);
+        }
+        let resource = self.create_resource_value(
+            store,
+            WEBVIEW_URL_RESOURCE_KIND,
+            WEBVIEW_URL_RIGHT_OPEN,
+            false,
+            ResourceValue::WebviewUrl(url),
+        )?;
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        state
+            .resources
+            .get_mut(&resource)
+            .ok_or(HubError::Closed)?
+            .reserved = false;
+        Ok(resource)
+    }
+
+    /// Reserve open against the URL grant itself, so grant revocation also
+    /// cancels an in-flight open and reclaims its unpublished view resource.
+    pub(crate) fn begin_granted_webview_open(
+        &self,
+        store: u64,
+        grant: OpaqueToken,
+    ) -> Result<(OpaqueToken, OpaqueToken, Arc<str>), HubError> {
+        let url = {
+            let state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state.resources.get(&grant).ok_or(HubError::Invalid)?;
+            Self::validate_resource(
+                slot,
+                store,
+                WEBVIEW_URL_RESOURCE_KIND,
+                WEBVIEW_URL_RIGHT_OPEN,
+            )?;
+            let ResourceValue::WebviewUrl(url) = &slot.value else {
+                return Err(HubError::WrongKind);
+            };
+            Arc::clone(url)
+        };
+        let resource = self.create_resource_value(
+            store,
+            EXTERNAL_WEBVIEW_RESOURCE_KIND,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD | EXTERNAL_WEBVIEW_RIGHT_CAPTURE,
+            false,
+            ResourceValue::ExternalWebview,
+        )?;
+        let operation = match self.submit(
+            store,
+            Some(grant),
+            WEBVIEW_URL_RESOURCE_KIND,
+            WEBVIEW_URL_RIGHT_OPEN,
+        ) {
+            Ok((operation, _)) => operation,
+            Err(error) => {
+                let _ = self.close_resource(resource);
+                return Err(error);
+            }
+        };
+        self.attach_created_resource(operation, resource)?;
+        Ok((resource, operation, url))
+    }
+
     /// Submit a load observation operation for an already activated webview.
     pub(crate) fn begin_external_webview_wait(
         &self,
@@ -887,6 +966,24 @@ impl OperationHub {
         resource: OpaqueToken,
     ) -> Result<(), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        // This handoff precedes publication of the operation token. A
+        // borrowed grant may nevertheless be revoked concurrently. Reclaim
+        // both unpublished reservations if terminalization won that race.
+        if state
+            .operations
+            .get(&operation)
+            .is_none_or(|slot| slot.terminal.is_some())
+        {
+            state.operations.remove(&operation);
+            if let Some(slot) = state.resources.remove(&resource) {
+                if let ResourceValue::Blob { buffer, .. } = &slot.value {
+                    state.buffered_blob_bytes =
+                        state.buffered_blob_bytes.saturating_sub(buffer.len());
+                }
+                state.free_resource_slots.push(slot.identity.slot);
+            }
+            return Err(HubError::Closed);
+        }
         state
             .operations
             .get_mut(&operation)
@@ -2752,6 +2849,131 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_revocation_before_resource_attachment_reclaims_both_reservations() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let grant = hub
+            .grant_webview_url(7, Arc::from("https://example.test/"))
+            .unwrap();
+        let view = hub
+            .create_resource_value(
+                7,
+                EXTERNAL_WEBVIEW_RESOURCE_KIND,
+                EXTERNAL_WEBVIEW_RIGHT_LOAD,
+                false,
+                ResourceValue::ExternalWebview,
+            )
+            .unwrap();
+        let (operation, _) = hub
+            .submit(
+                7,
+                Some(grant),
+                WEBVIEW_URL_RESOURCE_KIND,
+                WEBVIEW_URL_RIGHT_OPEN,
+            )
+            .unwrap();
+        hub.close_resource(grant).unwrap();
+        assert_eq!(
+            hub.attach_created_resource(operation, view),
+            Err(HubError::Closed)
+        );
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
+    #[test]
+    fn url_grant_open_is_scoped_and_revocation_reclaims_the_reserved_view() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let other = OperationHub::new(4, 4).unwrap();
+        let grant = hub
+            .grant_webview_url(7, Arc::from("https://example.test/exact?q=1"))
+            .unwrap();
+        assert!(matches!(
+            hub.begin_granted_webview_open(8, grant),
+            Err(HubError::WrongRights)
+        ));
+        assert!(matches!(
+            other.begin_granted_webview_open(7, grant),
+            Err(HubError::Invalid)
+        ));
+        assert_eq!(hub.snapshot().live_resources, 1);
+        let (view, operation, url) = hub.begin_granted_webview_open(7, grant).unwrap();
+        assert_eq!(&*url, "https://example.test/exact?q=1");
+        assert_eq!(hub.snapshot().live_resources, 2);
+        hub.close_resource(grant).unwrap();
+        assert_eq!(hub.snapshot().live_resources, 0);
+        hub.finish_external_open(operation, view);
+        let terminal = hub.observe_terminal(7, operation).unwrap().unwrap();
+        assert_eq!(terminal.terminal, Terminal::Closed);
+        assert_eq!(terminal.resource, None);
+        assert!(hub.begin_external_webview_wait(7, view).is_err());
+        assert!(hub.begin_granted_webview_open(7, grant).is_err());
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
+    #[test]
+    fn url_grant_has_fixed_storage_and_operation_quota_rollback() {
+        let hub = OperationHub::new(0, 2).unwrap();
+        assert!(matches!(
+            hub.grant_webview_url(7, Arc::from("")),
+            Err(HubError::Quota)
+        ));
+        assert!(matches!(
+            hub.grant_webview_url(7, Arc::from("x".repeat(MAX_WEBVIEW_URL_BYTES + 1))),
+            Err(HubError::Quota)
+        ));
+        let grant = hub
+            .grant_webview_url(7, Arc::from("https://example.test/"))
+            .unwrap();
+        assert!(matches!(
+            hub.begin_granted_webview_open(7, grant),
+            Err(HubError::Quota)
+        ));
+        assert_eq!(
+            hub.snapshot().live_resources,
+            1,
+            "failed open must roll back its view reservation"
+        );
+        hub.close_all(Terminal::Cancelled);
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[test]
+    fn cancelling_url_open_does_not_revoke_the_authorized_url() {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let grant = hub
+            .grant_webview_url(7, Arc::from("https://example.test/"))
+            .unwrap();
+        let (view, operation, _) = hub.begin_granted_webview_open(7, grant).unwrap();
+        hub.cancel_wire(7, operation.0).unwrap();
+        hub.finish_external_open(operation, view);
+        assert_eq!(
+            hub.observe_terminal(7, operation)
+                .unwrap()
+                .unwrap()
+                .terminal,
+            Terminal::Cancelled
+        );
+        assert_eq!(hub.snapshot().live_resources, 1);
+        let (view, operation, _) = hub.begin_granted_webview_open(7, grant).unwrap();
+        hub.finish_external_open(operation, view);
+        assert_eq!(
+            hub.observe_terminal(7, operation)
+                .unwrap()
+                .unwrap()
+                .resource,
+            Some(view)
+        );
+        hub.close_resource(grant).unwrap();
+        assert_eq!(
+            hub.snapshot().live_resources,
+            1,
+            "completed open owns independent view authority"
+        );
+        hub.close_resource(view).unwrap();
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
 
     #[test]
     fn generated_clock_waits_on_kernel_time_and_resumes_its_owner() {

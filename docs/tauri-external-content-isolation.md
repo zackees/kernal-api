@@ -22,6 +22,15 @@ rejected by the native policy. A
 requested top-level URL. A user close, failed close, popup, or rejected
 navigation completes the owned callback with a typed private reason.
 
+`WebviewUrlGrant::new` validates a URL before effects and bounds both its input
+and canonical form to 16 KiB. `open_granted_webview` binds that value to the
+client's instance in the same operation/resource hub. Its open borrows the URL
+grant; revocation cancels an unfinished open and reclaims the unpublished view.
+Cancellation before resource attachment also rolls back both reservations.
+`open_webview(&str)` uses this same path, with a temporary grant released on
+success, error, or future drop. An already completed view owns its separate
+view authority, so releasing the temporary URL grant does not close it.
+
 Wry owns the platform event loop and must be initialized and driven on its UI
 thread. Creation uses Wry's supported handle routing from the facade-owned
 async runtime's blocking lane; it never blocks the event loop and avoids the
@@ -32,9 +41,10 @@ operations. They share the generated kernel operation/resource hub without
 exposing a Tauri/Wry type or inventing a second registry. Timeout,
 cancellation, user close, and rejected navigation revoke the resource
 generation and wake pending operations with typed facade errors. The current
-scalar guest ABI intentionally remains synthetic: it has no bounded URL
-request transport, so native-only acceptance tests use this same hub path
-until a generated URL capability is added.
+generated screenshot guest contract now names URL-grant/open/load/capture/close
+operations, but Wasm-root grant installation and native opcode dispatch are
+still incomplete. Native-only acceptance tests exercise the URL-grant hub
+path; they are not evidence of an end-to-end Wasm screenshot run.
 
 For a repeatable Linux proof outside CI, use the Nix development shell below.
 The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built

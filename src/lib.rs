@@ -95,7 +95,7 @@ pub mod webview {
     pub use crate::tauri::WebviewTestObservation;
     pub use crate::tauri::{
         ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,
-        WebviewHandle, WebviewSnapshot, WebviewSnapshotChunk,
+        WebviewHandle, WebviewSnapshot, WebviewSnapshotChunk, WebviewUrlGrant,
     };
 }
 

@@ -105,10 +105,16 @@ smaller chunks. All 43 hub tests pass, including a tight 16-byte combined
 budget that rejects input before copying, remains drainable, and resumes the
 writer after result collection.
 
-This combined limit does not yet account for native chunks retained after
-return from a hub pull (including output-writer chunks), or allocator-internal
-reallocation scratch. Those remain necessary for the complete in-flight
-allocation contract; the hub limit is not a total process-memory limit.
+Native pulls now return a private read-only chunk whose backing capacity stays
+charged until drop, including chunks held by the output writer during blocking
+I/O. Drop frees the buffer before releasing its credits and driving waiting
+operations. Teardown revokes resources but does not erase a still-live native
+chunk's charge. Plain-`Vec` pull/collection helpers exist only in unit-test
+builds; the production generated collector copies synchronously into guest
+memory and native output uses the charged chunk. Allocator-internal
+reallocation scratch is still outside this capacity ledger, which is not a
+total process-memory limit. Execution teardown must also wait for native jobs
+to release their chunks before claiming all transfer memory is reclaimed.
 Both 64 MiB Cargo guest paths also pass with an explicit 2,228,224-byte
 combined hub limit; the in-process proof retains its exact 1,179,648-byte peak
 assertion. The version-3 protocol tests, reconstruction test, and host-policy
@@ -147,10 +153,14 @@ peak (1 MiB blob storage plus two 64 KiB chunks) during its pressure phase and
 zero retained capacity after teardown. That proof passed in 6.03 seconds on
 Linux x86-64 with the existing admitted artifact and rebuilt host.
 
-These counters cover hub-owned buffer capacities, not allocator-internal
-reallocation scratch or buffers retained by the output writer/caller after a
-native pull returns. The high-water mark is instrumentation, not yet an
-aggregate quota or a process-memory peak.
+These counters now include native chunk capacity until drop, exposed separately
+as `native_transfer_capacity`. All 44 hub tests pass, including retained-native
+chunk pressure, drop-triggered writer progress, and truthful accounting across
+teardown. Allocator-internal reallocation scratch is excluded; the high-water
+mark is not a process-memory peak.
+The existing Cargo guest remains green with native chunk charging: 6.24 seconds
+in-process (including exact-output commit) and 9.61 seconds through the worker
+on Linux x86-64. The admitted artifact was reused and the host rebuilt.
 
 - Extend the sole generated ABI with bounded guest-memory transfers and
   semantic blob/output APIs; retain no guest pointer across suspension.

@@ -98,6 +98,7 @@ pub(crate) struct HubSnapshot {
     pub(crate) retained_transfer_capacity: usize,
     /// High-water mark of hub-owned capacities, including copy overlap.
     pub(crate) peak_retained_transfer_capacity: usize,
+    pub(crate) native_transfer_capacity: usize,
 }
 
 /// Private limits for the opaque bulk-data boundary.  They deliberately live
@@ -248,7 +249,36 @@ struct State {
     buffered_blob_bytes: usize,
     peak_buffered_blob_bytes: usize,
     peak_retained_transfer_capacity: usize,
+    native_transfer_capacity: usize,
     closed: bool,
+}
+
+/// Native consumers borrow bytes without taking ownership of an unaccounted
+/// Vec. The allocation stays charged even if its source resource is revoked.
+struct NativeBlobChunk<'a> {
+    hub: &'a OperationHub,
+    bytes: Vec<u8>,
+}
+
+impl std::ops::Deref for NativeBlobChunk<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for NativeBlobChunk<'_> {
+    fn drop(&mut self) {
+        let capacity = self.bytes.capacity();
+        // Free the allocation before making its credits available to writers.
+        drop(std::mem::take(&mut self.bytes));
+        if let Ok(mut state) = self.hub.state.lock() {
+            state.native_transfer_capacity =
+                state.native_transfer_capacity.saturating_sub(capacity);
+        }
+        let _ = self.hub.drive_blob_writes();
+        let _ = self.hub.drive_blob_reads();
+    }
 }
 
 /// Private logical authority shared only by explicitly authorized instances.
@@ -292,6 +322,7 @@ impl OperationHub {
                 buffered_blob_bytes: 0,
                 peak_buffered_blob_bytes: 0,
                 peak_retained_transfer_capacity: 0,
+                native_transfer_capacity: 0,
                 closed: false,
             }),
         }))
@@ -780,6 +811,7 @@ impl OperationHub {
     /// Pull at most one configured chunk. Nothing is copied or produced until
     /// the logical guest explicitly asks, and capacity is released before the
     /// next producer attempt observes it.
+    #[cfg(test)]
     pub(crate) fn blob_read(
         &self,
         store: u64,
@@ -787,6 +819,7 @@ impl OperationHub {
         maximum_bytes: usize,
     ) -> Result<Vec<u8>, HubError> {
         self.read_blob_chunk(store, blob, maximum_bytes, false)
+            .map(|chunk| chunk.to_vec())
     }
 
     fn read_blob_chunk(
@@ -795,7 +828,7 @@ impl OperationHub {
         blob: OpaqueToken,
         maximum_bytes: usize,
         committing: bool,
-    ) -> Result<Vec<u8>, HubError> {
+    ) -> Result<NativeBlobChunk<'_>, HubError> {
         if maximum_bytes > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
@@ -824,6 +857,11 @@ impl OperationHub {
             .peak_retained_transfer_capacity
             .max(retained_before_read.saturating_add(result.capacity()));
         state.buffered_blob_bytes = state.buffered_blob_bytes.saturating_sub(count);
+        state.native_transfer_capacity += result.capacity();
+        let result = NativeBlobChunk {
+            hub: self,
+            bytes: result,
+        };
         drop(state);
         self.drive_blob_writes()?;
         Ok(result)
@@ -1179,6 +1217,7 @@ impl OperationHub {
         Ok(packed)
     }
 
+    #[cfg(test)]
     pub(crate) fn take_blob_read(
         &self,
         store: u64,
@@ -1919,7 +1958,7 @@ impl OperationHub {
                     .map_or(0, Vec::capacity)
                     .saturating_add(operation.blob_read_result.as_ref().map_or(0, Vec::capacity))
             }))
-            .fold(0_usize, usize::saturating_add)
+            .fold(state.native_transfer_capacity, usize::saturating_add)
     }
 
     fn record_transfer_capacity(state: &mut State) {
@@ -1971,6 +2010,7 @@ impl OperationHub {
                 .sum(),
             retained_transfer_capacity: Self::transfer_capacity(&state),
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
+            native_transfer_capacity: state.native_transfer_capacity,
         }
     }
 }
@@ -2166,7 +2206,7 @@ mod tests {
             .committing = true;
         assert_eq!(hub.blob_read(1, blob, 4), Err(HubError::WrongRights));
         assert_eq!(hub.submit_blob_read(1, blob, 4), Err(HubError::WrongRights));
-        assert_eq!(hub.read_blob_chunk(1, blob, 4, true).unwrap(), b"data");
+        assert_eq!(&*hub.read_blob_chunk(1, blob, 4, true).unwrap(), b"data");
     }
 
     #[cfg(feature = "wasm-sketch-host")]
@@ -2240,6 +2280,41 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn native_chunk_holds_budget_until_drop_and_then_wakes_writer() {
+        let mut limits = BlobLimits::new(4, 8, 8).unwrap();
+        limits.maximum_transfer_bytes = 16;
+        let hub = OperationHub::with_blob_limits(8, 1, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        let chunk = hub.read_blob_chunk(1, blob, 4, false).unwrap();
+        assert_eq!(&*chunk, b"full");
+        assert_eq!(hub.snapshot().native_transfer_capacity, 4);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 16);
+        assert_eq!(hub.take_terminal(write, 1).unwrap(), None);
+        drop(chunk);
+        assert_eq!(
+            hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        assert_eq!(hub.snapshot().native_transfer_capacity, 0);
+
+        let chunk = hub.read_blob_chunk(1, blob, 4, false).unwrap();
+        hub.close_all(Terminal::Cancelled);
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        assert_eq!(
+            hub.snapshot().retained_transfer_capacity,
+            4,
+            "teardown must not release a still-live native allocation"
+        );
+        drop(chunk);
+        assert_eq!(hub.snapshot().native_transfer_capacity, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        assert_eq!(hub.snapshot().peak_retained_transfer_capacity, 16);
     }
 
     #[test]

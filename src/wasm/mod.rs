@@ -325,9 +325,9 @@ impl SketchBlobLimits {
     pub fn maximum_pending_writes(self) -> usize {
         self.limits.maximum_pending_writes
     }
-    /// Bounds combined hub-owned blob, pending-input and read-result capacity.
-    /// One chunk is reserved for pull progress. Buffers handed to native
-    /// callers and allocator-internal scratch are not covered by this limit.
+    /// Bounds combined blob, pending-input, read-result and native-chunk capacity.
+    /// One chunk is reserved for pull progress. Native chunks stay charged
+    /// until dropped; allocator-internal scratch is not covered by this limit.
     pub fn with_maximum_transfer_bytes(
         mut self,
         maximum: usize,

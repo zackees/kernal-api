@@ -1357,7 +1357,14 @@ impl OperationHub {
                 return Err(HubError::Stale);
             }
             if operation.terminal.is_some() {
-                return Err(HubError::Closed);
+                // Poll and yield are separate guest imports. Native I/O can
+                // complete between them. Preserve the result for the next
+                // poll and return a ready waiter, not an import failure.
+                let notify = Arc::clone(&operation.notify);
+                state.suspends = state.suspends.saturating_add(1);
+                drop(state);
+                notify.notify_one();
+                return Ok(notify);
             }
             (Arc::clone(&operation.notify), operation.deferred_completion)
         };
@@ -1373,9 +1380,9 @@ impl OperationHub {
     }
 
     /// Complete a synthetic operation only after its generated guest future
-    /// has registered a suspension. This is needed for close because its
-    /// detached scheduler task can otherwise win the synchronous import path
-    /// and make `operation_yield` reject an already-terminal operation.
+    /// has registered a suspension. Synthetic fixtures deliberately exercise
+    /// a pending outcome; real native I/O may complete before suspension and
+    /// is handled by the ready-waiter path above.
     fn complete_after_suspend(
         &self,
         token: OpaqueToken,
@@ -2148,6 +2155,41 @@ mod tests {
             let snapshot = hub.snapshot();
             assert_eq!(snapshot.pending_operations, 0, "{terminal:?}");
             assert_eq!(snapshot.live_resources, 0, "{terminal:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_between_guest_poll_and_yield_still_wakes_the_owner() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for terminal in [Terminal::Completed, Terminal::Cancelled, Terminal::Closed] {
+            let hub = OperationHub::new(1, 1).unwrap();
+            let (operation, _) = hub.submit(4, None, 0, 0).unwrap();
+            assert_eq!(hub.poll_wire(4, operation.0), 0);
+            hub.terminal(
+                operation,
+                TerminalResult {
+                    terminal,
+                    resource: None,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                hub.suspend_wire(5, operation.0),
+                Err(HubError::Stale)
+            ));
+            let wake = hub
+                .suspend_wire(4, operation.0)
+                .expect("completion must not reject yield");
+            runtime.run(async {
+                crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                    .await
+                    .expect("terminal operation must wake immediately");
+            });
+            assert_eq!(hub.poll_wire(4, operation.0) as u8, status(terminal));
+            assert!(hub.suspend_wire(4, operation.0).is_err());
         }
     }
 

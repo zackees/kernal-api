@@ -5,6 +5,12 @@
 
 use crate::async_engine::Notify;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+#[cfg(feature = "wasm-sketch-host")]
+use std::fs::{self, File};
+#[cfg(feature = "wasm-sketch-host")]
+use std::io::Write;
+#[cfg(feature = "wasm-sketch-host")]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -23,6 +29,8 @@ const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
 const BLOB_RESOURCE_KIND: u8 = 3;
 const BLOB_RIGHT_READ: u8 = 0b01;
 const BLOB_RIGHT_WRITE: u8 = 0b10;
+const OUTPUT_RESOURCE_KIND: u8 = 4;
+const OUTPUT_RIGHT_COMMIT: u8 = 0b01;
 const STATUS_PENDING: u8 = 0;
 const STATUS_COMPLETED: u8 = 1;
 const STATUS_CANCELLED: u8 = 2;
@@ -159,6 +167,8 @@ enum ResourceValue {
     Synthetic,
     ExternalWebview,
     Blob(VecDeque<u8>),
+    #[cfg(feature = "wasm-sketch-host")]
+    ExactOutput(PathBuf),
 }
 
 struct OperationSlot {
@@ -651,6 +661,118 @@ impl OperationHub {
         Ok(result)
     }
 
+    /// Canonicalize one host-authorized final destination and represent it
+    /// only as an opaque resource. The generated guest ABI receives the
+    /// returned token, never this path or a directory capability.
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) fn grant_exact_output(
+        &self,
+        store: u64,
+        destination: &Path,
+    ) -> Result<OpaqueToken, HubError> {
+        let parent = destination.parent().ok_or(HubError::Invalid)?;
+        let name = destination.file_name().ok_or(HubError::Invalid)?;
+        let parent = fs::canonicalize(parent).map_err(|_| HubError::Invalid)?;
+        let destination = parent.join(name);
+        let token = self.create_resource_value(
+            store,
+            OUTPUT_RESOURCE_KIND,
+            OUTPUT_RIGHT_COMMIT,
+            false,
+            ResourceValue::ExactOutput(destination),
+        )?;
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        state
+            .resources
+            .get_mut(&token)
+            .ok_or(HubError::Invalid)?
+            .reserved = false;
+        Ok(token)
+    }
+
+    /// Stream one opaque blob into an authorized sibling temporary file and
+    /// atomically replace the exact final path only after flush and close. No
+    /// hub lock, Store, or guest memory reference survives a filesystem call.
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) fn commit_blob_to_output(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        output: OpaqueToken,
+    ) -> std::io::Result<()> {
+        let destination = self.exact_output_path(store, output)?;
+        let temporary = self.temporary_output_path(&destination)?;
+        let result = (|| {
+            let mut file = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            loop {
+                let chunk = self
+                    .blob_read(store, blob, self.blob_limits.maximum_chunk_bytes)
+                    .map_err(hub_io_error)?;
+                if chunk.is_empty() {
+                    break;
+                }
+                file.write_all(&chunk)?;
+            }
+            file.sync_all()?;
+            drop(file);
+            crate::fs_replace_file(&temporary, &destination)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+            return result;
+        }
+        self.close_resource(blob).map_err(hub_io_error)?;
+        self.close_resource(output).map_err(hub_io_error)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    fn exact_output_path(&self, store: u64, output: OpaqueToken) -> std::io::Result<PathBuf> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| hub_io_error(HubError::Closed))?;
+        let resource = state
+            .resources
+            .get(&output)
+            .ok_or_else(|| hub_io_error(HubError::Invalid))?;
+        Self::validate_resource(resource, store, OUTPUT_RESOURCE_KIND, OUTPUT_RIGHT_COMMIT)
+            .map_err(hub_io_error)?;
+        match &resource.value {
+            ResourceValue::ExactOutput(path) => Ok(path.clone()),
+            _ => Err(hub_io_error(HubError::WrongKind)),
+        }
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    fn temporary_output_path(&self, destination: &Path) -> std::io::Result<PathBuf> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| hub_io_error(HubError::Invalid))?;
+        let name = destination
+            .file_name()
+            .ok_or_else(|| hub_io_error(HubError::Invalid))?;
+        for _ in 0..16 {
+            let mut temporary_name = name.to_os_string();
+            temporary_name.push(format!(
+                ".kernal-api-{}.tmp",
+                next_token().map_err(hub_io_error)?
+            ));
+            let temporary = parent.join(temporary_name);
+            if !temporary.exists() {
+                return Ok(temporary);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique exact-output temporary path",
+        ))
+    }
+
     fn validate_resource(
         resource: &ResourceSlot,
         store: u64,
@@ -1069,6 +1191,22 @@ fn pack(status: u8, payload: Option<OpaqueToken>) -> u64 {
     (payload << 8) | u64::from(status)
 }
 
+#[cfg(feature = "wasm-sketch-host")]
+fn hub_io_error(error: HubError) -> std::io::Error {
+    let kind = match error {
+        HubError::Quota => std::io::ErrorKind::WouldBlock,
+        HubError::Invalid | HubError::Stale | HubError::WrongKind | HubError::WrongRights => {
+            std::io::ErrorKind::PermissionDenied
+        }
+        HubError::Closed => std::io::ErrorKind::BrokenPipe,
+        HubError::Exhausted => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(
+        kind,
+        format!("opaque resource operation rejected: {error:?}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1416,5 +1554,45 @@ mod tests {
         hub.close_all(Terminal::Trapped);
         assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
         assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn exact_output_commits_only_the_authorized_path_after_bounded_blob_flush() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("capture.png");
+        std::fs::write(&final_path, b"old").unwrap();
+        let limits = BlobLimits::new(4, 8, 8).unwrap();
+        let hub = OperationHub::with_blob_limits(4, 4, limits).unwrap();
+        let blob = hub.create_blob(11).unwrap();
+        let output = hub.grant_exact_output(11, &final_path).unwrap();
+        hub.blob_write(11, blob, b"png-").unwrap();
+        hub.blob_write(11, blob, b"byte").unwrap();
+        hub.commit_blob_to_output(11, blob, output).unwrap();
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"png-byte");
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("kernal-api-")));
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn exact_output_handle_cannot_be_used_by_another_instance() {
+        let directory = tempfile::tempdir().unwrap();
+        let final_path = directory.path().join("capture.png");
+        let hub = OperationHub::with_blob_limits(4, 4, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let output = hub.grant_exact_output(1, &final_path).unwrap();
+        hub.blob_write(1, blob, b"data").unwrap();
+        let error = hub.commit_blob_to_output(2, blob, output).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!final_path.exists());
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 4);
     }
 }

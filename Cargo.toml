@@ -157,7 +157,7 @@ symbolize-worker = [
 # The sketch host is intentionally isolated from ordinary async/process users.
 # It uses core Wasm plus Cranelift; WASI, the Component Model, pooling, Winch,
 # and a second executor remain out of this first admission-only slice.
-wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser"]
+wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser", "fs"]
 # Private one-request worker protocol; the executable/supervisor follows in
 # phase B. Keeping this separate preserves default-feature isolation.
 wasm-sketch-worker = ["wasm-sketch-host"]

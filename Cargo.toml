@@ -386,8 +386,8 @@ codegen-units = 1
 # forked runtime-Wry revision makes its Wry IPC bridge optional, so the direct
 # Wry builder can remain bridge-free while sharing the canonical Tauri loop.
 [patch.crates-io]
-tauri = { git = "https://github.com/zackees/tauri.git", rev = "bc18e69bbaafe69543fcea39bdb7cbed79d3aec0" }
-tauri-runtime = { git = "https://github.com/zackees/tauri.git", rev = "bc18e69bbaafe69543fcea39bdb7cbed79d3aec0" }
-tauri-runtime-wry = { git = "https://github.com/zackees/tauri.git", rev = "bc18e69bbaafe69543fcea39bdb7cbed79d3aec0" }
-tauri-utils = { git = "https://github.com/zackees/tauri.git", rev = "bc18e69bbaafe69543fcea39bdb7cbed79d3aec0" }
+tauri = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
+tauri-runtime = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
+tauri-runtime-wry = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
+tauri-utils = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
 wry = { git = "https://github.com/zackees/wry.git", rev = "29a2228b594d45c0ae9710866e46a6f898120151" }

@@ -187,6 +187,8 @@ struct OperationSlot {
     notify: Arc<Notify>,
     created_resource: Option<OpaqueToken>,
     pending_blob_write: Option<Vec<u8>>,
+    pending_blob_read: Option<usize>,
+    blob_read_result: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy)]
@@ -644,6 +646,8 @@ impl OperationHub {
         state.peak_buffered_blob_bytes = state
             .peak_buffered_blob_bytes
             .max(state.buffered_blob_bytes);
+        drop(state);
+        self.drive_blob_reads()?;
         Ok(bytes.len())
     }
 
@@ -772,7 +776,111 @@ impl OperationHub {
         for wake in wakes {
             wake.notify_one();
         }
+        self.drive_blob_reads()?;
         Ok(())
+    }
+
+    pub(crate) fn submit_blob_read(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        maximum: usize,
+    ) -> Result<OpaqueToken, HubError> {
+        if maximum == 0 || maximum > self.blob_limits.maximum_chunk_bytes {
+            return Err(HubError::Quota);
+        }
+        let (token, _) = self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_READ)?;
+        {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
+            if operation.terminal.is_none() {
+                operation.pending_blob_read = Some(maximum);
+            }
+        }
+        self.drive_blob_reads()?;
+        Ok(token)
+    }
+
+    fn drive_blob_reads(&self) -> Result<(), HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let tokens: Vec<_> = state
+            .operations
+            .iter()
+            .filter(|(_, op)| op.pending_blob_read.is_some() && op.terminal.is_none())
+            .map(|(token, _)| *token)
+            .collect();
+        let mut wakes = Vec::new();
+        for token in tokens {
+            let operation = &state.operations[&token];
+            let resource = operation.resource.ok_or(HubError::Invalid)?;
+            let maximum = operation.pending_blob_read.ok_or(HubError::Invalid)?;
+            let retained: usize = state
+                .operations
+                .values()
+                .filter_map(|op| op.blob_read_result.as_ref())
+                .map(Vec::len)
+                .sum();
+            let Some(ResourceSlot {
+                value: ResourceValue::Blob { buffer, sealed },
+                ..
+            }) = state.resources.get_mut(&resource)
+            else {
+                continue;
+            };
+            if buffer.is_empty() && !*sealed {
+                continue;
+            }
+            let count = maximum.min(buffer.len());
+            if retained.saturating_add(count) > self.blob_limits.maximum_sketch_bytes {
+                continue;
+            }
+            let bytes = buffer.drain(..count).collect();
+            state.buffered_blob_bytes -= count;
+            state
+                .operations
+                .get_mut(&token)
+                .ok_or(HubError::Invalid)?
+                .blob_read_result = Some(bytes);
+            if let Some(wake) = Self::terminal_locked(
+                &mut state,
+                token,
+                TerminalResult {
+                    terminal: Terminal::Completed,
+                    resource: None,
+                },
+            )? {
+                wakes.push(wake);
+            }
+        }
+        drop(state);
+        for wake in wakes {
+            wake.notify_one();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_blob_read(
+        &self,
+        store: u64,
+        token: OpaqueToken,
+    ) -> Result<Option<(Terminal, Vec<u8>)>, HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
+        if operation.owner.store != store {
+            return Err(HubError::Stale);
+        }
+        let Some(result) = operation.terminal else {
+            return Ok(None);
+        };
+        let operation = state.operations.remove(&token).ok_or(HubError::Invalid)?;
+        state.resumes = state.resumes.saturating_add(1);
+        drop(state);
+        self.drive_blob_writes()?;
+        self.drive_blob_reads()?;
+        Ok(Some((
+            result.terminal,
+            operation.blob_read_result.unwrap_or_default(),
+        )))
     }
 
     /// Publish EOF explicitly. An empty, unsealed blob can still receive data.
@@ -786,6 +894,7 @@ impl OperationHub {
         *sealed = true;
         drop(state);
         self.drive_blob_writes()?;
+        self.drive_blob_reads()?;
         Ok(())
     }
 
@@ -1042,6 +1151,8 @@ impl OperationHub {
                 notify: Arc::clone(&notify),
                 created_resource: None,
                 pending_blob_write: None,
+                pending_blob_read: None,
+                blob_read_result: None,
             },
         );
         Ok((token, notify))
@@ -1184,6 +1295,7 @@ impl OperationHub {
             }
             operation.terminal = Some(result);
             operation.pending_blob_write = None;
+            operation.pending_blob_read = None;
             (Arc::clone(&operation.notify), operation.created_resource)
         };
         if let Some(resource) = created {
@@ -1256,6 +1368,7 @@ impl OperationHub {
         for operation in state.operations.values_mut() {
             if operation.resource == Some(token) && operation.terminal.is_none() {
                 operation.pending_blob_write = None;
+                operation.pending_blob_read = None;
                 operation.terminal = Some(TerminalResult {
                     terminal,
                     resource: None,
@@ -1278,6 +1391,7 @@ impl OperationHub {
         for operation in state.operations.values_mut() {
             if operation.terminal.is_none() {
                 operation.pending_blob_write = None;
+                operation.pending_blob_read = None;
                 operation.terminal = Some(TerminalResult {
                     terminal,
                     resource: None,
@@ -1363,6 +1477,42 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_reads_distinguish_data_eof_and_cancellation() {
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let read = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert_eq!(hub.take_blob_read(1, read), Ok(None));
+        let wake = hub.suspend(read, 1).unwrap();
+        hub.submit_blob_write(1, blob, b"data").unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            hub.take_blob_read(1, read),
+            Ok(Some((Terminal::Completed, b"data".to_vec())))
+        );
+        let cancelled = hub.submit_blob_read(1, blob, 4).unwrap();
+        hub.cancel_wire(1, cancelled.0).unwrap();
+        assert_eq!(
+            hub.take_blob_read(1, cancelled),
+            Ok(Some((Terminal::Cancelled, vec![])))
+        );
+        let eof = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert_eq!(hub.take_blob_read(1, eof), Ok(None));
+        hub.seal_blob(1, blob).unwrap();
+        assert_eq!(
+            hub.take_blob_read(1, eof),
+            Ok(Some((Terminal::Completed, vec![])))
+        );
+    }
 
     #[test]
     fn pending_blob_write_resumes_after_pull_and_cancellation_reclaims_input() {

@@ -43,12 +43,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     relocate_guest_package(&output)?;
     append_semantic_lifecycle(&output)?;
+    make_operation_yield_async(&output)?;
     let manifest = fs::read_to_string(output.join("kernal-api-v1.abi.toml"))?;
     fs::write(
         output.join("admission_contract.rs"),
         Contract::parse(&manifest)?.render(),
     )?;
     Ok(())
+}
+
+fn make_operation_yield_async(output: &Path) -> std::io::Result<()> {
+    let path = output.join("wasmtime45_host_linker.rs");
+    let source = fs::read_to_string(&path)?;
+    let source = source.replace(
+        "fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<i32>;",
+        "fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<std::sync::Arc<crate::async_engine::Notify>>;",
+    );
+    let old = r#"linker.func_wrap(
+        "kernal-api:v1",
+        "operation_yield",
+        |mut caller: wasmtime::Caller<'_, T>,
+         operation: i64|
+         -> wasmtime::Result<i32> {
+            let operation = u64_from_i64(operation)?;
+            Ok(i32_to_i32(caller.data_mut().operation_yield(operation)?))
+        },
+    )?;"#;
+    let new = r#"linker.func_wrap_async(
+        "kernal-api:v1",
+        "operation_yield",
+        |mut caller: wasmtime::Caller<'_, T>, (operation,): (i64,)| {
+            let waiter = caller.data_mut().operation_yield(operation as u64);
+            drop(caller);
+            Box::new(async move {
+                match waiter { Ok(waiter) => { waiter.notified().await; 1_i32 }, Err(_) => -1_i32 }
+            })
+        },
+    )?;"#;
+    fs::write(path, source.replace(old, new))
 }
 
 fn append_semantic_lifecycle(output: &Path) -> std::io::Result<()> {

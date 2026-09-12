@@ -1660,15 +1660,16 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         Ok(self.operations.poll_wire(self.store_owner, operation))
     }
 
-    fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<i32> {
+    fn operation_yield(
+        &mut self,
+        operation: u64,
+    ) -> wasmtime::Result<Arc<crate::async_engine::Notify>> {
         // The generated future calls this only after submit/poll. The async
         // owner driver will replace this scalar acknowledgement with its
         // parked Wasmtime yield glue; no Caller escapes this boundary.
-        Ok(i32::from(
-            self.operations
-                .suspend_wire(self.store_owner, operation)
-                .is_ok(),
-        ))
+        self.operations
+            .suspend_wire(self.store_owner, operation)
+            .map_err(|_| wasmtime::Error::msg("operation cannot suspend"))
     }
 
     fn operation_cancel(&mut self, operation: u64) -> wasmtime::Result<i32> {

@@ -1595,4 +1595,36 @@ mod tests {
         assert!(!final_path.exists());
         assert_eq!(hub.snapshot().buffered_blob_bytes, 4);
     }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn failed_exact_output_replace_removes_the_temporary_and_never_replaces_final() {
+        let directory = tempfile::tempdir().unwrap();
+        // A directory is a canonical, exact host object but not a replaceable
+        // file. It gives this test a real platform rename failure without a
+        // test-only filesystem side channel.
+        let final_path = directory.path().join("not-a-file");
+        std::fs::create_dir(&final_path).unwrap();
+        let hub = OperationHub::with_blob_limits(4, 4, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let output = hub.grant_exact_output(1, &final_path).unwrap();
+        hub.blob_write(1, blob, b"data").unwrap();
+        assert!(hub.commit_blob_to_output(1, blob, output).is_err());
+        assert!(
+            final_path.is_dir(),
+            "a failed commit must not replace final"
+        );
+        assert!(std::fs::read_dir(directory.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("kernal-api-")));
+        hub.close_all(Terminal::Cancelled);
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.live_resources, 0);
+        assert_eq!(snapshot.buffered_blob_bytes, 0);
+        assert_eq!(snapshot.pending_operations, 0);
+    }
 }

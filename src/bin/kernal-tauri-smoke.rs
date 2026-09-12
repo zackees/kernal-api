@@ -18,14 +18,18 @@ use std::time::Duration;
 use tauri::{NativeWebviewBackend, NativeWebviewError, NativeWebviewLoop, NativeWebviewRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let scenario = SmokeScenario::from_args()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
+    let page = scenario.page();
     let server = std::thread::spawn(move || -> std::io::Result<()> {
         let (mut stream, _) = listener.accept()?;
         let mut request = [0_u8; 4096];
         let _ = stream.read(&mut request)?;
-        stream.write_all(
-            b"HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n<!doctype html><title>kernal-api</title>",
+        write!(
+            stream,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
+            page.len()
         )?;
         Ok(())
     });
@@ -41,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime
         .handle()
         .launch(async move {
-            let result = lifecycle(&task_backend, &url).await;
+            let result = lifecycle(&task_backend, &url, scenario).await;
             let _ = result_sender.send(result);
             let _ = task_backend.request_exit();
         })
@@ -58,27 +62,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn lifecycle(backend: &NativeWebviewBackend, url: &str) -> Result<(), NativeWebviewError> {
+async fn lifecycle(
+    backend: &NativeWebviewBackend,
+    url: &str,
+    scenario: SmokeScenario,
+) -> Result<(), NativeWebviewError> {
     let request = NativeWebviewRequest::parse(url)?;
     let mut webview = backend.open(request).await?;
-    let terminal = webview.wait_until_terminal()?;
+    let mut terminal = Some(webview.wait_until_terminal()?);
     let loaded = webview.wait_until_loaded()?;
     loaded
         .await
         .map_err(|_| NativeWebviewError::HostFailure("load completion dropped".into()))??;
+    if scenario != SmokeScenario::Close {
+        let terminal_result = async_engine::timeout(
+            Duration::from_secs(5),
+            terminal.take().expect("terminal receiver is present"),
+        )
+        .await
+        .map_err(|_| NativeWebviewError::HostFailure("security callback timed out".into()))?
+        .map_err(|_| NativeWebviewError::HostFailure("terminal completion dropped".into()))?;
+        match (scenario, terminal_result) {
+            (SmokeScenario::Popup, Err(NativeWebviewError::RejectedNavigation(reason)))
+                if reason.starts_with("popup to ") => {}
+            (
+                SmokeScenario::ProhibitedRedirect,
+                Err(NativeWebviewError::RejectedNavigation(reason)),
+            ) if reason == "file" => {}
+            (_, other) => {
+                return Err(NativeWebviewError::HostFailure(format!(
+                    "unexpected security terminal result: {other:?}"
+                )));
+            }
+        }
+    }
     webview.close()?;
     webview
         .wait_until_closed()?
         .await
         .map_err(|_| NativeWebviewError::HostFailure("close completion dropped".into()))?;
-    match terminal
-        .await
-        .map_err(|_| NativeWebviewError::HostFailure("terminal completion dropped".into()))?
-    {
-        Err(NativeWebviewError::WindowClosed) => Ok(()),
-        other => Err(NativeWebviewError::HostFailure(format!(
-            "unexpected terminal result: {other:?}"
-        ))),
+    if scenario == SmokeScenario::Close {
+        match terminal
+            .take()
+            .expect("close scenario retains terminal receiver")
+            .await
+            .map_err(|_| NativeWebviewError::HostFailure("terminal completion dropped".into()))?
+        {
+            Err(NativeWebviewError::WindowClosed) => {}
+            other => {
+                return Err(NativeWebviewError::HostFailure(format!(
+                    "unexpected close terminal result: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmokeScenario {
+    Close,
+    Popup,
+    ProhibitedRedirect,
+}
+
+impl SmokeScenario {
+    fn from_args() -> Result<Self, Box<dyn std::error::Error>> {
+        match std::env::args().nth(1).as_deref() {
+            None | Some("close") => Ok(Self::Close),
+            Some("popup") => Ok(Self::Popup),
+            Some("redirect") => Ok(Self::ProhibitedRedirect),
+            Some(other) => Err(format!(
+                "unknown smoke scenario {other:?}; use close, popup, or redirect"
+            )
+            .into()),
+        }
+    }
+
+    fn page(self) -> &'static str {
+        match self {
+            Self::Close => "<!doctype html><title>kernal-api</title>",
+            Self::Popup => concat!(
+                "<!doctype html><title>kernal-api</title><script>",
+                "setTimeout(() => window.open('https://example.test/'), 50);",
+                "</script>"
+            ),
+            Self::ProhibitedRedirect => concat!(
+                "<!doctype html><title>kernal-api</title><script>",
+                "setTimeout(() => location.href = 'file:///etc/passwd', 50);",
+                "</script>"
+            ),
+        }
     }
 }
 

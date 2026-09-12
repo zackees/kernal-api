@@ -71,9 +71,12 @@ transfers.
 ## Remaining acceptance work
 
 The shared hub now enforces independent live-blob, pending-read, and
-pending-write count limits (128 each by default). These limits are currently
-configurable only through the private `BlobLimits`, not the embedding API or
-worker metadata. Blob creation checks include reserved generated creations.
+pending-write count limits (128 each by default). Hosts configure these and
+chunk/per-blob/per-sketch byte limits through facade-owned `SketchBlobLimits`
+and `SketchExecutionLimits::with_blob_limits`. Zero count limits disable the
+corresponding admission. Byte limits must be nonzero and ordered
+chunk <= blob <= sketch, with chunk lengths representable in the generated
+32-bit transfer fields. Blob creation checks include reserved generated creations.
 Pending-write rejection occurs before copying input; cancellation frees the
 pending-I/O count even before the terminal result is collected. The separate
 operation-table limit still accounts for that uncollected result. Focused
@@ -84,6 +87,19 @@ All 42 hub tests pass. With the count limits enabled, the existing 64 MiB
 Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
 the host.
+
+The worker supervisor sends all six limits, and the worker validates them
+through the same public constructor before compiler construction. Private
+worker protocol version 2 rejects version-1 peers rather than silently using
+default limits; rebuild the worker executable together with the host. This
+changes no guest ABI import signature or guest artifact. Pending inputs and
+completed reads still have separate byte budgets; this configuration does not
+claim an aggregate allocation ceiling.
+The non-default policy (64 KiB chunks, 1 MiB per blob, 2 MiB sketch storage,
+one live blob/read/write) passed the existing 64 MiB Cargo guest in-process
+(6.98 seconds) and in the rebuilt worker (11.07 seconds including test-side
+compilation/admission), on Linux x86-64. Protocol round-trip/version rejection
+and worker reconstruction of non-default/invalid limits also passed.
 
 The capacity audit now measures `retained_transfer_capacity` separately from
 payload lengths. A regression demonstrates why aggregate enforcement is still

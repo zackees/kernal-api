@@ -1139,12 +1139,21 @@ fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMet
     let config = sketch.worker_compiler_config();
     let limits = config.execution_limits();
     let fuel = limits.fuel_limits();
+    let blobs = limits.blob_limits();
     let epoch = limits.epoch_limits();
     let remaining = deadline
         .saturating_duration_since(std::time::Instant::now())
         .max(Duration::from_millis(1));
     let policy = sketch.worker_policy();
     ExecuteMetadata {
+        blob_limits: [
+            blobs.maximum_chunk_bytes() as u64,
+            blobs.maximum_blob_bytes() as u64,
+            blobs.maximum_sketch_bytes() as u64,
+            blobs.maximum_live_blobs() as u64,
+            blobs.maximum_pending_reads() as u64,
+            blobs.maximum_pending_writes() as u64,
+        ],
         max_wasm_stack_bytes: config.max_wasm_stack_bytes() as u64,
         reserved_memory_bytes: limits.maximum_reserved_shared_memory_bytes(),
         maximum_active_roots: limits.maximum_active_root_executions() as u64,

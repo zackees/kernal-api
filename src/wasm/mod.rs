@@ -192,6 +192,7 @@ pub struct SketchExecutionLimits {
     maximum_active_root_executions: usize,
     fuel_limits: SketchFuelLimits,
     epoch_limits: SketchEpochLimits,
+    blob_limits: SketchBlobLimits,
 }
 impl SketchExecutionLimits {
     pub fn new(
@@ -203,6 +204,7 @@ impl SketchExecutionLimits {
             maximum_active_root_executions,
             fuel_limits: SketchFuelLimits::default(),
             epoch_limits: SketchEpochLimits::default(),
+            blob_limits: SketchBlobLimits::default(),
         };
         limits
             .is_valid()
@@ -243,6 +245,14 @@ impl SketchExecutionLimits {
     pub fn epoch_limits(self) -> SketchEpochLimits {
         self.epoch_limits
     }
+    /// Sets per-logical-sketch opaque blob and pending-I/O limits.
+    pub fn with_blob_limits(mut self, limits: SketchBlobLimits) -> Self {
+        self.blob_limits = limits;
+        self
+    }
+    pub fn blob_limits(self) -> SketchBlobLimits {
+        self.blob_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
@@ -259,7 +269,66 @@ impl Default for SketchExecutionLimits {
             maximum_active_root_executions: 1,
             fuel_limits: SketchFuelLimits::default(),
             epoch_limits: SketchEpochLimits::default(),
+            blob_limits: SketchBlobLimits::default(),
         }
+    }
+}
+
+/// Host-selected bounds for opaque blob storage and pending I/O.
+/// Pending input and read-result byte budgets are each bounded by
+/// `maximum_sketch_bytes`; this is not a combined process-memory limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchBlobLimits {
+    limits: operations::BlobLimits,
+}
+impl SketchBlobLimits {
+    pub fn new(
+        maximum_chunk_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_sketch_bytes: usize,
+        maximum_live_blobs: usize,
+        maximum_pending_reads: usize,
+        maximum_pending_writes: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let mut limits = operations::BlobLimits::new(
+            maximum_chunk_bytes,
+            maximum_blob_bytes,
+            maximum_sketch_bytes,
+        )
+        .map_err(|_| SketchCompilerError::InvalidExecutionLimits)?;
+        // The generated ABI encodes lengths in u32; do not accept a host
+        // policy that requires an unrepresentable bounded request.
+        if maximum_chunk_bytes > u32::MAX as usize {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        limits.maximum_live_blobs = maximum_live_blobs;
+        limits.maximum_pending_reads = maximum_pending_reads;
+        limits.maximum_pending_writes = maximum_pending_writes;
+        Ok(Self { limits })
+    }
+    pub fn maximum_chunk_bytes(self) -> usize {
+        self.limits.maximum_chunk_bytes
+    }
+    pub fn maximum_blob_bytes(self) -> usize {
+        self.limits.maximum_blob_bytes
+    }
+    pub fn maximum_sketch_bytes(self) -> usize {
+        self.limits.maximum_sketch_bytes
+    }
+    pub fn maximum_live_blobs(self) -> usize {
+        self.limits.maximum_live_blobs
+    }
+    pub fn maximum_pending_reads(self) -> usize {
+        self.limits.maximum_pending_reads
+    }
+    pub fn maximum_pending_writes(self) -> usize {
+        self.limits.maximum_pending_writes
+    }
+}
+impl Default for SketchBlobLimits {
+    fn default() -> Self {
+        Self::new(64 * 1024, 1024 * 1024, 4 * 1024 * 1024, 128, 128, 128)
+            .expect("valid default blob limits")
     }
 }
 
@@ -752,8 +821,12 @@ impl AdmittedSketch {
         // A logical root owns exactly one operation/resource authority.  It
         // is shared explicitly with authorized child Stores, never with a
         // cached Store or a different root execution.
-        let operations = OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
-            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let operations = OperationHub::with_blob_limits(
+            MAX_PENDING_OPERATIONS_V1,
+            MAX_RESOURCES_V1,
+            self.execution_ledger.limits.blob_limits.limits,
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         // Grant before constructing or instantiating the root Store: even a
         // module start section sees only the already-authorized resource.
         let initial_output = destination
@@ -1294,6 +1367,22 @@ impl Drop for RootExecutionPermit {
 #[cfg(test)]
 mod execution_ledger_tests {
     use super::*;
+
+    #[test]
+    fn blob_limits_validate_and_survive_compiler_configuration() {
+        for (chunk, blob, sketch) in [(0, 4, 8), (8, 4, 8), (4, 8, 4)] {
+            assert!(SketchBlobLimits::new(chunk, blob, sketch, 1, 1, 1).is_err());
+        }
+        // Zero count limits intentionally disable the corresponding admission.
+        let blobs = SketchBlobLimits::new(4, 8, 16, 0, 2, 3).unwrap();
+        let compiler = SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(SketchExecutionLimits::default().with_blob_limits(blobs))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(compiler.execution_limits().blob_limits(), blobs);
+    }
 
     #[test]
     fn fuel_limits_require_a_complete_nonzero_root_and_child_partition() {
@@ -3427,7 +3516,10 @@ mod threaded_root_observation_tests {
                 SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
                     .expect("finite transfer fuel"),
             )
-            .expect("transfer limits");
+            .expect("transfer limits")
+            .with_blob_limits(
+                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 1, 1, 1).unwrap(),
+            );
         let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
         assert_eq!(
             manifest,

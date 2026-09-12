@@ -144,6 +144,13 @@ fn execute_request(
 fn reconstruct(
     metadata: ExecuteMetadata,
 ) -> Result<(SketchCompilerConfig, SketchModulePolicy), String> {
+    let mut blob_values = [0_usize; 6];
+    for (destination, source) in blob_values.iter_mut().zip(metadata.blob_limits) {
+        *destination = usize::try_from(source).map_err(|_| "blob-limit-overflow")?;
+    }
+    let [chunk, blob, sketch, live, reads, writes] = blob_values;
+    let blobs = kernal_api::wasm::SketchBlobLimits::new(chunk, blob, sketch, live, reads, writes)
+        .map_err(|e| e.to_string())?;
     let roots =
         usize::try_from(metadata.maximum_active_roots).map_err(|_| "active-roots-overflow")?;
     let stack = usize::try_from(metadata.max_wasm_stack_bytes).map_err(|_| "stack-overflow")?;
@@ -163,7 +170,8 @@ fn reconstruct(
         .with_fuel_limits(fuel)
         .map_err(|e| e.to_string())?
         .with_epoch_limits(epoch)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .with_blob_limits(blobs);
     let config = SketchCompilerConfig::new(stack)
         .map_err(|e| e.to_string())?
         .with_execution_limits(limits)
@@ -331,8 +339,25 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn reconstruction_preserves_nondefault_blob_limits_and_rejects_invalid_ones() {
+        let mut metadata = metadata();
+        metadata.reserved_memory_bytes = 1024 * 1024 * 1024;
+        metadata.max_shared_memory_pages = 16_384;
+        let (config, _) = reconstruct(metadata).unwrap();
+        assert_eq!(
+            config.execution_limits().blob_limits(),
+            kernal_api::wasm::SketchBlobLimits::new(4, 8, 16, 2, 3, 4).unwrap()
+        );
+        metadata.blob_limits[0] = 0;
+        assert!(reconstruct(metadata).is_err());
+        metadata.blob_limits[0] = u64::MAX;
+        assert!(reconstruct(metadata).is_err());
+    }
+
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            blob_limits: [4, 8, 16, 2, 3, 4],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 1,
             maximum_active_roots: 1,

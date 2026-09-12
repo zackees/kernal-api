@@ -71,7 +71,18 @@ fn compiler(deadline: Duration, fuel: SketchFuelLimits) -> SketchCompiler {
         .with_fuel_limits(fuel)
         .expect("fuel limits")
         .with_epoch_limits(epoch)
-        .expect("epoch limits");
+        .expect("epoch limits")
+        .with_blob_limits(
+            kernal_api::wasm::SketchBlobLimits::new(
+                64 * 1024,
+                1024 * 1024,
+                2 * 1024 * 1024,
+                1,
+                1,
+                1,
+            )
+            .unwrap(),
+        );
     SketchCompiler::new(
         SketchCompilerConfig::default()
             .with_execution_limits(limits)

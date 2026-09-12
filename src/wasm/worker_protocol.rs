@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
@@ -195,6 +195,8 @@ pub(super) enum ProtocolError {
 /// Facade semantic primitives needed to reconstruct compiler/limit settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExecuteMetadata {
+    /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes.
+    pub(super) blob_limits: [u64; 6],
     pub(super) max_wasm_stack_bytes: u64,
     pub(super) reserved_memory_bytes: u64,
     pub(super) maximum_active_roots: u64,
@@ -620,6 +622,9 @@ fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
     ))
 }
 fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
+    for v in value.blob_limits {
+        put_u64(out, v);
+    }
     for v in [
         value.max_wasm_stack_bytes,
         value.reserved_memory_bytes,
@@ -639,6 +644,14 @@ fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
 }
 fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
     Ok(ExecuteMetadata {
+        blob_limits: [
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+        ],
         max_wasm_stack_bytes: take_u64(input)?,
         reserved_memory_bytes: take_u64(input)?,
         maximum_active_roots: take_u64(input)?,
@@ -688,6 +701,7 @@ mod tests {
     }
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            blob_limits: [12, 13, 14, 15, 16, 17],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 2,
             maximum_active_roots: 3,
@@ -776,7 +790,7 @@ mod tests {
         frame[0] = 0;
         assert_eq!(decode(&frame), Err(ProtocolError::BadMagic));
         let mut frame = encode(&Message::Hello { request_id: 1 }).unwrap();
-        frame[4] = 2;
+        frame[4] = 1;
         assert_eq!(decode(&frame), Err(ProtocolError::UnsupportedVersion));
         let mut frame = encode(&Message::Hello { request_id: 1 }).unwrap();
         frame[6] = 99;

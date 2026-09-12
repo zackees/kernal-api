@@ -10,18 +10,33 @@ use kernal_api::wasm::{
 #[test]
 #[ignore = "requires a native display and actual screenshot artifact"]
 fn actual_screenshot_guest_runs_inside_containment() {
-    run_contained_screenshot(false);
+    run_contained_screenshot(ContainedScenario::Capture);
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
 #[test]
 #[ignore = "requires a native display and actual trap-after-capture artifact"]
 fn actual_screenshot_guest_trap_inside_containment_preserves_output() {
-    run_contained_screenshot(true);
+    run_contained_screenshot(ContainedScenario::Trap);
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
-fn run_contained_screenshot(trap: bool) {
+#[test]
+#[ignore = "requires a native display and actual block-after-capture artifact"]
+fn actual_screenshot_guest_block_inside_containment_forces_reap() {
+    run_contained_screenshot(ContainedScenario::Block);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContainedScenario {
+    Capture,
+    Trap,
+    Block,
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+fn run_contained_screenshot(scenario: ContainedScenario) {
     use kernal_api::wasm::{SketchEpochLimits, SketchWorkerConfig, SketchWorkerTerminal};
     use std::io::{Read, Write};
     use std::sync::{
@@ -29,10 +44,10 @@ fn run_contained_screenshot(trap: bool) {
         Arc,
     };
     use std::time::Duration;
-    let artifact = std::env::var_os(if trap {
-        "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM"
-    } else {
-        "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
+    let artifact = std::env::var_os(match scenario {
+        ContainedScenario::Trap => "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM",
+        ContainedScenario::Block => "KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM",
+        ContainedScenario::Capture => "KERNAL_API_SCREENSHOT_ARTIFACT_WASM",
     })
     .expect("built screenshot artifact");
     let directory = tempfile::tempdir().unwrap();
@@ -93,7 +108,11 @@ fn run_contained_screenshot(trap: bool) {
         SketchCompilerConfig::default()
             .with_epoch_limits(
                 SketchEpochLimits::new(
-                    Duration::from_secs(60),
+                    Duration::from_secs(if scenario == ContainedScenario::Block {
+                        20
+                    } else {
+                        60
+                    }),
                     epochs.tick_interval(),
                     epochs.maximum_active_registrations(),
                 )
@@ -112,7 +131,15 @@ fn run_contained_screenshot(trap: bool) {
     );
     let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
     let terminal = runtime.run(sketch.execute_threaded_root_contained(runtime.handle(), &config));
-    if trap {
+    if scenario == ContainedScenario::Block {
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::ForcedContainment {
+                trigger: kernal_api::wasm::SketchWorkerStopReason::DeadlineExceeded,
+            }
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    } else if scenario == ContainedScenario::Trap {
         assert_eq!(
             terminal,
             SketchWorkerTerminal::Execution(SketchExecutionError::Trapped)
@@ -130,6 +157,10 @@ fn run_contained_screenshot(trap: bool) {
     let counts = sketch.worker_execution_snapshot();
     assert_eq!(counts.spawned, 1);
     assert_eq!(counts.reaped, 1);
+    assert_eq!(
+        counts.forced,
+        u64::from(scenario == ContainedScenario::Block)
+    );
     assert_eq!(
         (
             counts.live_workers,

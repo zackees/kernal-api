@@ -15,7 +15,17 @@ guest in a separate contained worker on Linux. The focused
 pixel capture and trap-after-capture output preservation when built with
 `wasm-sketch-worker,tauri-webview-test-support`. They use the same normal/trap
 artifact environment variables documented below. Windows/macOS native worker
-execution, forced native teardown, and migration of the CLI remain pending.
+execution, exhaustive renderer-destruction evidence, and migration of the CLI
+remain pending. Linux also passes the forced-deadline proof described below.
+
+For the containment-only blocking variant, build with
+`build-guest.sh --block-after-capture` (PowerShell: `-BlockAfterCapture`) and
+set `KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM` to the admitted artifact under
+`kernal-api-wasm-tauri-guest-block`. This guest waits on an unnotified condition
+variable after receiving the native snapshot. Never run that variant in the
+in-process CLI: the `block_inside_containment` test exercises the worker's
+20-second deadline and forced-reap path. Post-capture fault variants are
+source-only acceptance fixtures and are disabled in the normal build.
 
 Commit `52d4a3b` preserves the initial real Rust build failure: the generated
 `WebviewUrl`, `run`, and `OperationFuture::wait` interfaces were absent. The
@@ -30,7 +40,7 @@ output grants, so the guest now proceeds directly to closing the view.
 This is still an in-progress #20/#21 implementation, not completion of the
 full acceptance matrix. Broader failure-path trace coverage,
 queued/cancelled native-creation destruction evidence, the complete
-failure matrix, CLI worker migration and forced native teardown, and native
+failure matrix, CLI worker migration and renderer-destruction evidence, and native
 Windows/macOS execution remain outstanding. Do not treat this in-process
 diagnostic CLI as containment for arbitrary untrusted Wasm.
 

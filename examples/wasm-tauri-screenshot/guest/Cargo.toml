@@ -10,6 +10,7 @@ publish = false
 
 [features]
 proof-trap-after-capture = []
+proof-block-after-capture = []
 
 [dependencies]
 kernal-api-v1-bindings = { path = "../../../src/wasm/generated/v1/guest" }

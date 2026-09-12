@@ -1,5 +1,5 @@
 # PowerShell 7 counterpart of build-guest.sh. The caller owns build storage.
-param([switch]$TrapAfterCapture)
+param([switch]$TrapAfterCapture, [switch]$BlockAfterCapture)
 $ErrorActionPreference = 'Stop'
 $repoDirectory = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $guestDirectory = Join-Path $PSScriptRoot 'guest'
@@ -10,9 +10,14 @@ if (-not $env:CARGO_TARGET_DIR -or -not [System.IO.Path]::IsPathFullyQualified($
 }
 $guestTargetDirectory = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest'
 $guestFeatures = @()
+if ($TrapAfterCapture -and $BlockAfterCapture) { throw 'choose only one post-capture fault' }
 if ($TrapAfterCapture) {
     $guestTargetDirectory += '-trap'
     $guestFeatures = @('--features', 'proof-trap-after-capture')
+}
+if ($BlockAfterCapture) {
+    $guestTargetDirectory += '-block'
+    $guestFeatures = @('--features', 'proof-block-after-capture')
 }
 $hadSoldrLinker = Test-Path Env:SOLDR_LINKER
 $previousSoldrLinker = $env:SOLDR_LINKER

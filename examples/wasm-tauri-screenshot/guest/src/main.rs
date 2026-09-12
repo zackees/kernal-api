@@ -26,6 +26,17 @@ async fn screenshot(step: &mut Step) -> Result<(), OperationError> {
     if cfg!(feature = "proof-trap-after-capture") {
         std::arch::wasm32::unreachable();
     }
+    if cfg!(feature = "proof-block-after-capture") {
+        // The threaded Rust standard library parks on shared-memory atomics.
+        // No producer can notify this condition: only process containment can
+        // reclaim the live view and completed snapshot after this point.
+        let mutex = std::sync::Mutex::new(());
+        let condition = std::sync::Condvar::new();
+        let mut guard = mutex.lock().unwrap();
+        loop {
+            guard = condition.wait(guard).unwrap();
+        }
+    }
     *step = Step::Write;
     output.write_blob(&snapshot)?.wait().await?;
     // Successful exact-output commit consumes the snapshot and output grants.

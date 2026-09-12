@@ -9,7 +9,8 @@ guest_features=()
 case "${1-}" in
   "") ;;
   --trap-after-capture) guest_name="${guest_name}-trap"; guest_features=(--features proof-trap-after-capture) ;;
-  *) echo "usage: build-guest.sh [--trap-after-capture]" >&2; exit 2 ;;
+  --block-after-capture) guest_name="${guest_name}-block"; guest_features=(--features proof-block-after-capture) ;;
+  *) echo "usage: build-guest.sh [--trap-after-capture|--block-after-capture]" >&2; exit 2 ;;
 esac
 if [ "$#" -gt 1 ]; then echo "too many arguments" >&2; exit 2; fi
 case "$CARGO_TARGET_DIR" in

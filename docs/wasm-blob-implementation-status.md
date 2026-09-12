@@ -158,9 +158,23 @@ real trap is reported as `Execution(Trapped)`, leaves the original output and
 neighbor unchanged, removes staging, and drains those same parent counters.
 All 18 focused parent lifecycle/configuration unit tests also pass.
 The focused Linux CI lane now includes this ignored native proof. This is not
-Windows/macOS runtime evidence or a forced-native-teardown proof; the screenshot
+Windows/macOS runtime evidence; the separate forced case follows below. The screenshot
 CLI still needs migration from its in-process path, and worker trace retention
 remains unfinished.
+
+The source-built `proof-block-after-capture` guest then passed the Linux forced
+containment proof in 23.70 seconds. It receives the native snapshot before
+waiting indefinitely on an unnotified Rust condition variable. The parent
+reports `ForcedContainment { DeadlineExceeded }` after its 20-second deadline
+and two-second grace, records one forced reap, preserves the original exact
+output and neighbor, removes staging, and has zero live worker/task/lease
+counters. Bash and PowerShell build this separate acceptance artifact; normal
+guest builds do not enable the fault. CI includes the variant. This establishes
+the worker outcome and parent cleanup, not an inventory proving destruction of
+every native renderer or a zero-counter report from a forcibly killed guest.
+The combined success/trap/block suite passes all three cases in 42.33 seconds;
+the focused test passes strict Clippy, and both build scripts produced the
+blocking artifact locally (PowerShell was run on Linux, not Windows).
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning

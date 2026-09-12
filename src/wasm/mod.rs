@@ -1670,6 +1670,22 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         let Some(runtime) = self.runtime.clone() else {
             return Ok(0);
         };
+        if kind == crate::operations::OP_BLOB_READ_COLLECT {
+            let offset = arg1 as u32 as i32;
+            let capacity = (arg1 >> 32) as usize;
+            let Some(cells) = shared_range(&self.controller.memory, offset, capacity) else {
+                return Ok(0x80);
+            };
+            return Ok(self
+                .operations
+                .collect_blob_read_wire(self.store_owner, arg0, capacity, |bytes| {
+                    for (cell, byte) in cells.iter().zip(bytes) {
+                        // SAFETY: pinned shared bytes, accessed atomically.
+                        unsafe { AtomicU8::from_ptr(cell.get()) }.store(*byte, Ordering::Relaxed);
+                    }
+                })
+                .unwrap_or(0x80));
+        }
         if kind == crate::operations::OP_BLOB_WRITE {
             let offset = arg1 as u32 as i32;
             let length = (arg1 >> 32) as usize;
@@ -3418,7 +3434,7 @@ mod threaded_root_observation_tests {
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
         assert_eq!(operations.suspends, 6);
-        assert_eq!(operations.resumes, 7);
+        assert_eq!(operations.resumes, 8);
         assert_eq!(operations.peak_buffered_blob_bytes, 4);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(

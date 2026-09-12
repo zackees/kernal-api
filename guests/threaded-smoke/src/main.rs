@@ -145,6 +145,14 @@ pub extern "C" fn kernal_api_run() -> u32 {
         write.yield_now().expect("yield pending blob write");
         assert!(write.poll().expect("poll completed blob write").is_some());
     }
+    let read = blob.read_chunk(4).expect("submit bounded blob read");
+    let mut received = [0_u8; 4];
+    let count = loop {
+        if let Some(count) = read.poll_into(&mut received).expect("collect blob read") { break count; }
+        read.yield_now().expect("yield pending blob read");
+    };
+    assert_eq!(count, 4);
+    assert_eq!(&received, b"blob");
     complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));

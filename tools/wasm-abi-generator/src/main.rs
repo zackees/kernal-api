@@ -115,9 +115,32 @@ pub fn synthetic_yield() -> Result<OperationFuture, OperationError> { OperationF
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
+pub struct BlobReadFuture { operation: u64 }
+impl BlobReadFuture {
+    /// Poll and collect into a caller-owned bounded destination. No pointer
+    /// is retained after this call, including when the result is pending.
+    pub fn poll_into(&self, destination: &mut [u8]) -> Result<Option<usize>, OperationError> {
+        let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
+        let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let packed = imports::operation_submit(8, self.operation, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        match packed as u8 {
+            0 => Ok(None),
+            1 => Ok(Some((packed >> 8) as usize)),
+            2 => Err(OperationError::Cancelled),
+            6 => Err(OperationError::Closed),
+            _ => Err(OperationError::Failed),
+        }
+    }
+    pub fn yield_now(&self) -> Result<(), OperationError> { OperationFuture { operation: self.operation }.yield_now() }
+    pub fn cancel(&self) { OperationFuture { operation: self.operation }.cancel(); }
+}
 impl BlobHandle {
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { token } }
+    pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {
+        let operation = OperationFuture::submit(7, self.token, u64::from(maximum_bytes))?;
+        Ok(BlobReadFuture { operation: operation.operation })
+    }
     pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
     /// The host copies this bounded slice before returning the future.
     /// No guest pointer or borrow is retained while waiting for capacity.

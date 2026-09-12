@@ -25,6 +25,8 @@ pub(crate) const OP_SYNTHETIC_RESOURCE_USE: u32 = 3;
 pub(crate) const OP_SYNTHETIC_RESOURCE_CLOSE: u32 = 4;
 pub(crate) const OP_BLOB_CREATE: u32 = 5;
 pub(crate) const OP_BLOB_WRITE: u32 = 6;
+pub(crate) const OP_BLOB_READ: u32 = 7;
+pub(crate) const OP_BLOB_READ_COLLECT: u32 = 8;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -194,6 +196,7 @@ struct OperationSlot {
     created_resource: Option<OpaqueToken>,
     pending_blob_write: Option<Vec<u8>>,
     pending_blob_read: Option<usize>,
+    is_blob_read: bool,
     blob_read_result: Option<Vec<u8>>,
 }
 
@@ -514,6 +517,15 @@ impl OperationHub {
         arg0: u64,
         arg1: u64,
     ) -> Result<u64, HubError> {
+        if kind == OP_BLOB_READ {
+            return self
+                .submit_blob_read(
+                    store,
+                    OpaqueToken(arg0),
+                    usize::try_from(arg1).map_err(|_| HubError::Quota)?,
+                )
+                .map(|token| token.0);
+        }
         let request = match kind {
             OP_BLOB_CREATE if arg0 == 0 && arg1 == 0 => Request::BlobCreate,
             OP_SYNTHETIC_YIELD => Request::SyntheticYield,
@@ -540,6 +552,16 @@ impl OperationHub {
     }
 
     pub(crate) fn poll_wire(&self, store: u64, operation: u64) -> u64 {
+        // Read completion must be collected with its bytes, never consumed
+        // through the payload-free lifecycle poll.
+        if self.state.lock().is_ok_and(|state| {
+            state
+                .operations
+                .get(&OpaqueToken(operation))
+                .is_some_and(|op| op.is_blob_read)
+        }) {
+            return pack(STATUS_ERROR, None);
+        }
         match self.take_terminal(OpaqueToken(operation), store) {
             Ok(None) => pack(STATUS_PENDING, None),
             Ok(Some(result)) => pack(status(result.terminal), result.resource),
@@ -864,6 +886,7 @@ impl OperationHub {
             if operation.terminal.is_none() {
                 operation.pending_blob_read = Some(maximum);
             }
+            operation.is_blob_read = true;
         }
         self.drive_blob_reads()?;
         self.drive_blob_writes()?;
@@ -928,6 +951,47 @@ impl OperationHub {
         Ok(())
     }
 
+    /// Copy a terminal bounded result during the collecting import. Invalid
+    /// destinations and wrong owners leave the operation available to retry.
+    pub(crate) fn collect_blob_read_wire(
+        &self,
+        store: u64,
+        token: u64,
+        capacity: usize,
+        copy: impl FnOnce(&[u8]),
+    ) -> Result<u64, HubError> {
+        let token = OpaqueToken(token);
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed {
+            return Err(HubError::Closed);
+        }
+        let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
+        if operation.owner.store != store {
+            return Err(HubError::Stale);
+        }
+        if !operation.is_blob_read {
+            return Err(HubError::WrongKind);
+        }
+        let Some(result) = operation.terminal else {
+            return Ok(0);
+        };
+        let bytes = operation.blob_read_result.as_deref().unwrap_or_default();
+        if capacity < bytes.len() {
+            return Err(HubError::Quota);
+        }
+        let length = bytes.len();
+        if result.terminal == Terminal::Completed {
+            copy(bytes);
+        }
+        let packed = (length as u64) << 8 | u64::from(status(result.terminal));
+        state.operations.remove(&token);
+        state.resumes = state.resumes.saturating_add(1);
+        drop(state);
+        self.drive_blob_writes()?;
+        self.drive_blob_reads()?;
+        Ok(packed)
+    }
+
     pub(crate) fn take_blob_read(
         &self,
         store: u64,
@@ -940,6 +1004,9 @@ impl OperationHub {
         let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
         if operation.owner.store != store {
             return Err(HubError::Stale);
+        }
+        if !operation.is_blob_read {
+            return Err(HubError::WrongKind);
         }
         let Some(result) = operation.terminal else {
             return Ok(None);
@@ -1367,6 +1434,7 @@ impl OperationHub {
                 created_resource: None,
                 pending_blob_write: None,
                 pending_blob_read: None,
+                is_blob_read: false,
                 blob_read_result: None,
             },
         );
@@ -1851,6 +1919,43 @@ mod tests {
             Ok(Some((Terminal::Completed, b"full".to_vec())))
         );
         assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn wire_read_collection_is_bounded_typed_and_consumed_once() {
+        let hub = OperationHub::with_blob_limits(4, 1, BlobLimits::new(4, 4, 4).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let read = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 4, |_| panic!("pending copy")),
+            Ok(0)
+        );
+        hub.blob_write(1, blob, b"data").unwrap();
+        assert_eq!(hub.poll_wire(1, read.0) as u8, STATUS_ERROR);
+        assert_eq!(
+            hub.collect_blob_read_wire(2, read.0, 4, |_| panic!("wrong owner")),
+            Err(HubError::Stale)
+        );
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 3, |_| panic!("short destination")),
+            Err(HubError::Quota)
+        );
+        let mut copied = Vec::new();
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 4, |bytes| copied.extend_from_slice(bytes)),
+            Ok((4 << 8) | u64::from(STATUS_COMPLETED))
+        );
+        assert_eq!(copied, b"data");
+        assert_eq!(hub.snapshot().completed_read_bytes, 0);
+        assert!(hub
+            .collect_blob_read_wire(1, read.0, 4, |_| panic!("double collection"))
+            .is_err());
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        assert_eq!(
+            hub.collect_blob_read_wire(1, write.0, 4, |_| panic!("wrong kind")),
+            Err(HubError::WrongKind)
+        );
+        assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_COMPLETED);
     }
 
     #[test]

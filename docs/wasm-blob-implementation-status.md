@@ -2,12 +2,16 @@
 
 The blob implementation on this development branch is incomplete and is not
 release evidence for issue #17. The generated ABI exposes blob creation,
-bounded writes, and closure through the existing operation family, exercised
+bounded writes, pull reads, and closure through the existing operation family, exercised
 by the threaded smoke guest. The write import validates the guest-memory range
 and checks authority/chunk/pending-byte quotas before copying into host-owned
 bytes using atomic byte loads. It retains no guest pointer across suspension.
+Read collection validates a caller-supplied destination on each call and
+copies only a completed bounded result. Pending calls retain no pointer;
+wrong-owner, wrong-kind, short-buffer, and double collection are rejected.
+The real guest currently verifies a four-byte round trip, not a large stream.
 Large-transfer tests still call the private operation hub directly;
-pull reads and exact output are not yet exposed to the guest.
+exact output is not yet exposed to the guest.
 
 ## Verified host behavior
 

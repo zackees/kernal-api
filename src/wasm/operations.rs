@@ -27,6 +27,7 @@ pub(crate) const OP_BLOB_CREATE: u32 = 5;
 pub(crate) const OP_BLOB_WRITE: u32 = 6;
 pub(crate) const OP_BLOB_READ: u32 = 7;
 pub(crate) const OP_BLOB_READ_COLLECT: u32 = 8;
+pub(crate) const OP_BLOB_SEAL: u32 = 9;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -517,6 +518,27 @@ impl OperationHub {
         arg0: u64,
         arg1: u64,
     ) -> Result<u64, HubError> {
+        if kind == OP_BLOB_SEAL {
+            if arg1 != 0 {
+                return Err(HubError::Invalid);
+            }
+            let blob = OpaqueToken(arg0);
+            let (operation, _) =
+                self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+            let terminal = if self.seal_blob(store, blob).is_ok() {
+                Terminal::Completed
+            } else {
+                Terminal::Rejected
+            };
+            self.terminal(
+                operation,
+                TerminalResult {
+                    terminal,
+                    resource: None,
+                },
+            )?;
+            return Ok(operation.0);
+        }
         if kind == OP_BLOB_READ {
             return self
                 .submit_blob_read(
@@ -1932,6 +1954,34 @@ mod tests {
             Ok(Some((Terminal::Completed, b"full".to_vec())))
         );
         assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"next");
+    }
+
+    #[test]
+    fn generated_seal_completes_pending_eof_and_rejects_later_writes() {
+        let hub = OperationHub::new(4, 1).unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let read = hub.submit_blob_read(1, blob, 1).unwrap();
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 1, |_| panic!("not EOF yet")),
+            Ok(0)
+        );
+        assert!(hub
+            .submit_wire(runtime.handle(), 2, OP_BLOB_SEAL, blob.0, 0)
+            .is_err());
+        let seal = hub
+            .submit_wire(runtime.handle(), 1, OP_BLOB_SEAL, blob.0, 0)
+            .unwrap();
+        assert_eq!(hub.poll_wire(1, seal) as u8, STATUS_COMPLETED);
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 1, |bytes| assert!(bytes.is_empty())),
+            Ok(u64::from(STATUS_COMPLETED))
+        );
+        let write = hub.submit_blob_write(1, blob, b"x").unwrap();
+        assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
     }
 
     #[test]

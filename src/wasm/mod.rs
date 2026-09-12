@@ -1706,7 +1706,10 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
                 })
                 .unwrap_or(0));
         }
-        if kind == crate::operations::OP_BLOB_READ {
+        if matches!(
+            kind,
+            crate::operations::OP_BLOB_READ | crate::operations::OP_BLOB_SEAL
+        ) {
             // Expected admission failures are guest-visible rejection, not
             // Wasmtime traps. Match the bounded-write submission contract.
             return Ok(self
@@ -3453,7 +3456,7 @@ mod threaded_root_observation_tests {
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
         assert_eq!(operations.suspends, 6);
-        assert_eq!(operations.resumes, 6 + 2 * 1024);
+        assert_eq!(operations.resumes, 8 + 2 * 1024);
         assert_eq!(operations.peak_buffered_blob_bytes, 64 * 1024);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(

@@ -2,7 +2,7 @@
 
 The blob implementation on this development branch is incomplete and is not
 release evidence for issue #17. The generated ABI exposes blob creation,
-bounded writes, pull reads, and closure through the existing operation family, exercised
+bounded writes, pull reads, explicit EOF, and closure through the existing operation family, exercised
 by the threaded smoke guest. The write import validates the guest-memory range
 and checks authority/chunk/pending-byte quotas before copying into host-owned
 bytes using atomic byte loads. It retains no guest pointer across suspension.
@@ -12,6 +12,11 @@ wrong-owner, wrong-kind, short-buffer, and double collection are rejected.
 The real guest verifies 64 MiB through 1,024 sequential write/read pairs,
 reusing two 64 KiB arrays and checking every returned byte. Exact output is
 not yet exposed to the guest.
+
+Guest `seal` publishes EOF without revoking the readable handle. Pending empty
+reads then complete with zero bytes; an empty unsealed blob stays pending.
+Producers must await preceding writes before sealing, because sealing rejects
+pending and subsequent writes.
 
 ## Verified host behavior
 

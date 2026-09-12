@@ -150,6 +150,9 @@ impl BlobHandle {
         let operation = OperationFuture::submit(7, self.token, u64::from(maximum_bytes))?;
         Ok(BlobReadFuture { operation: operation.operation })
     }
+    /// Publish EOF. Call only after preceding writes have completed; pending
+    /// writes are rejected when the producer seals its stream.
+    pub fn seal(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(9, self.token, 0) }
     pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
     /// The host copies this bounded slice before returning the future.
     /// No guest pointer or borrow is retained while waiting for capacity.

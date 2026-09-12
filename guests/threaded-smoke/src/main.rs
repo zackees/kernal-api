@@ -175,6 +175,17 @@ pub extern "C" fn kernal_api_run() -> u32 {
         assert_eq!(count, CHUNK_BYTES);
         assert_eq!(received, sent);
     }
+    let eof = blob.read_chunk(1).expect("submit EOF observation");
+    assert!(eof
+        .poll_into(&mut received[..1])
+        .expect("empty live blob")
+        .is_none());
+    let seal = blob.seal().expect("submit EOF");
+    assert!(seal.poll().expect("completed seal").is_some());
+    assert_eq!(
+        eof.poll_into(&mut received[..1]).expect("sealed EOF"),
+        Some(0)
+    );
     complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));

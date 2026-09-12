@@ -88,12 +88,20 @@ fn actual_screenshot_guest_write_failure_reclaims_capture_and_preserves_files() 
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
+#[test]
+#[ignore = "requires a native display and the real guest built with proof-trap-after-capture"]
+fn actual_screenshot_guest_trap_reclaims_completed_native_capture() {
+    run_native_screenshot_proof(NativeScenario::TrapAfterCapture);
+}
+
+#[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NativeScenario {
     Capture,
     Redirect,
     Timeout,
     MissingOutputParent,
+    TrapAfterCapture,
 }
 
 #[cfg(feature = "tauri-webview-test-support")]
@@ -123,8 +131,12 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             let _ = self.0.wait();
         }
     }
-    let artifact = std::env::var_os("KERNAL_API_SCREENSHOT_ARTIFACT_WASM")
-        .expect("actual guest artifact required");
+    let artifact_variable = if scenario == NativeScenario::TrapAfterCapture {
+        "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM"
+    } else {
+        "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
+    };
+    let artifact = std::env::var_os(artifact_variable).expect("actual guest artifact required");
     // Diagnostic logs remain outside the exact-output directory.
     let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
         std::fs::create_dir_all(&root).unwrap();
@@ -249,6 +261,29 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             );
         }
         let trace = std::fs::read_to_string(proof.join("runner.stderr.log")).unwrap();
+        if scenario == NativeScenario::TrapAfterCapture {
+            assert!(
+                trace.contains("error: \"trapped\""),
+                "expected actual Wasm trap: {trace}"
+            );
+            assert!(
+                trace.contains("phase=capture-requested"),
+                "trap bypassed native capture"
+            );
+            assert!(
+                !trace.lines().any(
+                    |line| line.starts_with("kernal-webview-trace phase=submit ")
+                        && line.ends_with("opcode=10")
+                ),
+                "trap guest submitted output commit"
+            );
+            validate_teardown_trace(&trace)
+                .expect("trap must reclaim captured blob and native view");
+            assert_eq!(std::fs::read(&output).unwrap(), b"original");
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged");
+            assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
+            return;
+        }
         if scenario == NativeScenario::MissingOutputParent {
             assert!(
                 trace.contains("screenshot-write-rejected"),

@@ -4,8 +4,16 @@ set -euo pipefail
 example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$example_dir/../.." && pwd)"
 : "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR to caller-managed writable storage}"
+guest_name="kernal-api-wasm-tauri-guest"
+guest_features=()
+case "${1-}" in
+  "") ;;
+  --trap-after-capture) guest_name="${guest_name}-trap"; guest_features=(--features proof-trap-after-capture) ;;
+  *) echo "usage: build-guest.sh [--trap-after-capture]" >&2; exit 2 ;;
+esac
+if [ "$#" -gt 1 ]; then echo "too many arguments" >&2; exit 2; fi
 case "$CARGO_TARGET_DIR" in
-  /*) guest_target_dir="${CARGO_TARGET_DIR%/}/kernal-api-wasm-tauri-guest" ;;
+  /*) guest_target_dir="${CARGO_TARGET_DIR%/}/$guest_name" ;;
   *) echo "CARGO_TARGET_DIR must be absolute" >&2; exit 2 ;;
 esac
 target="wasm32-wasip1-threads"
@@ -16,7 +24,7 @@ target="wasm32-wasip1-threads"
   cd "$example_dir/guest"
   SOLDR_LINKER=default soldr --no-cache cargo build --locked \
     --manifest-path Cargo.toml --target "$target" --release \
-    --target-dir "$guest_target_dir"
+    --target-dir "$guest_target_dir" "${guest_features[@]}"
 )
 built="$guest_target_dir/$target/release/kernal-api-wasm-tauri-guest.wasm"
 admitted="$guest_target_dir/$target/release/kernal-api-wasm-tauri-guest.admitted.wasm"

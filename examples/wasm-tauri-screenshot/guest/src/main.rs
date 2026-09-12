@@ -21,6 +21,11 @@ async fn screenshot(step: &mut Step) -> Result<(), OperationError> {
     kernel::clock_sleep(5_000)?.wait().await?;
     *step = Step::Capture;
     let snapshot = view.capture_visible_png().await?;
+    // Acceptance-only fault in the real guest, after the native result has
+    // crossed the generated ABI. No native replacement orchestration runs.
+    if cfg!(feature = "proof-trap-after-capture") {
+        std::arch::wasm32::unreachable();
+    }
     *step = Step::Write;
     output.write_blob(&snapshot)?.wait().await?;
     // Successful exact-output commit consumes the snapshot and output grants.

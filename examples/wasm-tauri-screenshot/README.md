@@ -31,6 +31,7 @@ Build the actual guest on a Unix host with the pinned target installed:
 ```sh
 soldr --no-cache rustup target add wasm32-wasip1-threads
 CARGO_TARGET_DIR="$PWD/target/screenshot-proof" bash examples/wasm-tauri-screenshot/build-guest.sh
+CARGO_TARGET_DIR="$PWD/target/screenshot-proof" bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture
 ```
 
 The build produces one module with generated ABI metadata; metadata embedding
@@ -76,6 +77,7 @@ enable both capabilities on a host with a working native display:
 
 ```sh
 KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
+KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
   soldr cargo test --locked --features wasm-sketch-host,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
 ```
 
@@ -107,6 +109,14 @@ the now-missing parent. The proof requires `screenshot-write-rejected`, no
 recreated parent or sibling temporary file, unchanged preserved files, and
 zero captured blobs/output jobs/native/Wasm resources. This is a missing-parent
 I/O failure, not yet a portable permissions or disk-exhaustion proof.
+The trap proof compiles the same actual guest with the explicit
+`proof-trap-after-capture` feature. It traps only after the native capture
+result returns through the generated ABI, before output commit. The test
+requires a genuine Wasm `trapped` result, no output-commit submission, unchanged
+files, and zero resources after teardown. The scripts select separate `-trap`
+storage with `--trap-after-capture` (Bash) or `-TrapAfterCapture` (PowerShell),
+so this variant never overwrites the normal guest artifact. It is a source-level
+fault injection, not a fake native capture or replacement guest workflow.
 These observations do not establish the remaining failure matrix.
 Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.

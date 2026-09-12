@@ -1,4 +1,5 @@
 # PowerShell 7 counterpart of build-guest.sh. The caller owns build storage.
+param([switch]$TrapAfterCapture)
 $ErrorActionPreference = 'Stop'
 $repoDirectory = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $guestDirectory = Join-Path $PSScriptRoot 'guest'
@@ -8,12 +9,17 @@ if (-not $env:CARGO_TARGET_DIR -or -not [System.IO.Path]::IsPathFullyQualified($
     throw 'CARGO_TARGET_DIR must name absolute caller-managed writable storage'
 }
 $guestTargetDirectory = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest'
+$guestFeatures = @()
+if ($TrapAfterCapture) {
+    $guestTargetDirectory += '-trap'
+    $guestFeatures = @('--features', 'proof-trap-after-capture')
+}
 $hadSoldrLinker = Test-Path Env:SOLDR_LINKER
 $previousSoldrLinker = $env:SOLDR_LINKER
 Push-Location -LiteralPath $guestDirectory
 try {
     $env:SOLDR_LINKER = 'default'
-    & soldr --no-cache cargo build --locked --manifest-path Cargo.toml --target $target --release --target-dir $guestTargetDirectory
+    & soldr --no-cache cargo build --locked --manifest-path Cargo.toml --target $target --release --target-dir $guestTargetDirectory @guestFeatures
     if ($LASTEXITCODE -ne 0) { throw "guest build failed with exit code $LASTEXITCODE" }
 }
 finally {

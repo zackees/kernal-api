@@ -8,5 +8,8 @@ publish = false
 # Source-only application guest, not another public facade or host dependency.
 [workspace]
 
+[features]
+proof-trap-after-capture = []
+
 [dependencies]
 kernal-api-v1-bindings = { path = "../../../src/wasm/generated/v1/guest" }

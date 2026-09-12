@@ -167,6 +167,13 @@ pub extern "C" fn kernal_api_run() -> u32 {
         "producer must wait for consumption"
     );
     let first = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+    let cancelled_write = blob.write_chunk(&sent).unwrap();
+    assert!(cancelled_write.poll().unwrap().is_none());
+    cancelled_write.cancel();
+    assert_eq!(
+        cancelled_write.poll(),
+        Err(kernal_api_v1_bindings::OperationError::Cancelled)
+    );
     assert_eq!(first.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
     assert!(
         blocked.poll().unwrap().is_some(),
@@ -177,6 +184,16 @@ pub extern "C" fn kernal_api_run() -> u32 {
         assert_eq!(read.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
         assert_eq!(received, sent);
     }
+    let cancelled_read = blob.read_chunk(1).unwrap();
+    assert!(cancelled_read
+        .poll_into(&mut received[..1])
+        .unwrap()
+        .is_none());
+    cancelled_read.cancel();
+    assert_eq!(
+        cancelled_read.poll_into(&mut received[..1]),
+        Err(kernal_api_v1_bindings::OperationError::Cancelled)
+    );
     for chunk in 0..CHUNKS {
         for (index, byte) in sent.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_add(chunk as u8);

@@ -59,7 +59,11 @@ consumption. One bounded pull then completes the waiting write. It drains all
 17 chunks before the 64 MiB round trip. The combined proof therefore asserts
 a 1 MiB peak blob buffer; the earlier 64 KiB peak was for the sequential-only
 proof. This is a controlled consumer pause in one Store, not a concurrent
-multi-producer/consumer stress test. Pending write inputs and
+multi-producer/consumer stress test. The guest additionally
+cancels a capacity-blocked write and an empty pending read, observes typed
+`Cancelled` results, and verifies that the cancelled write adds no chunk to
+the subsequently drained stream. The generated cancellation import is accepted
+only with the complete lifecycle import set. Pending write inputs and
 retained read results have separate snapshot counters. This does not establish
 a bound on total allocated memory, collection capacity, or simultaneous guest
 transfers.

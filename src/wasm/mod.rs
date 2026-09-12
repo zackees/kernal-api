@@ -3515,7 +3515,7 @@ mod threaded_root_observation_tests {
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
         assert!((8..=9).contains(&operations.suspends));
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 35);
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),
@@ -5206,9 +5206,11 @@ fn preflight_threaded_rust(
         (ABI_MODULE, "operation_yield"),
     ];
     let lifecycle_present = lifecycle.iter().filter(|pair| seen.contains(*pair)).count();
+    let cancellation_present = usize::from(seen.contains(&(ABI_MODULE, "operation_cancel")));
     if !required.iter().all(|pair| seen.contains(pair))
         || !matches!(lifecycle_present, 0 | 3)
-        || seen.len() != required.len() + lifecycle_present
+        || (cancellation_present != 0 && lifecycle_present != 3)
+        || seen.len() != required.len() + lifecycle_present + cancellation_present
     {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",

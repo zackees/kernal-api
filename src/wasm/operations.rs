@@ -1452,10 +1452,7 @@ impl OperationHub {
         let temporary = self.temporary_output_path(&destination)?;
         // Only clean up a file this operation successfully created. A
         // competing creator must never have its file removed on open failure.
-        let mut file = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)?;
+        let mut temporary = TemporaryOutput::create(temporary)?;
         let result = (|| {
             loop {
                 let chunk = self
@@ -1464,17 +1461,22 @@ impl OperationHub {
                 if chunk.is_empty() {
                     break;
                 }
-                file.write_all(&chunk)?;
+                temporary
+                    .file
+                    .as_mut()
+                    .expect("open temporary")
+                    .write_all(&chunk)?;
             }
-            file.sync_all()?;
-            drop(file);
-            self.replace_output_operation(store, blob, output, &temporary, operation)
+            temporary
+                .file
+                .as_ref()
+                .expect("open temporary")
+                .sync_all()?;
+            drop(temporary.file.take());
+            self.replace_output_operation(store, blob, output, &temporary.path, operation)
         })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-            return result;
-        }
-        Ok(())
+        temporary.committed = result.is_ok();
+        result
     }
 
     #[cfg(feature = "wasm-sketch-host")]
@@ -2077,6 +2079,36 @@ impl OperationHub {
 }
 
 #[cfg(feature = "wasm-sketch-host")]
+struct TemporaryOutput {
+    file: Option<File>,
+    path: PathBuf,
+    committed: bool,
+}
+
+#[cfg(feature = "wasm-sketch-host")]
+impl TemporaryOutput {
+    fn create(path: PathBuf) -> std::io::Result<Self> {
+        let file = File::options().write(true).create_new(true).open(&path)?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            committed: false,
+        })
+    }
+}
+
+#[cfg(feature = "wasm-sketch-host")]
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        // Windows also requires the handle to be closed before removal.
+        drop(self.file.take());
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-sketch-host")]
 struct BlobCommitLease<'a> {
     hub: &'a OperationHub,
     blob: OpaqueToken,
@@ -2186,6 +2218,37 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
         assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[cfg(feature = "wasm-sketch-host")]
+    #[test]
+    fn temporary_output_unwind_closes_and_removes_only_its_owned_file() {
+        for close_before_panic in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let final_path = directory.path().join("final");
+            let temporary_path = directory.path().join("temporary");
+            fs::write(&final_path, b"original").unwrap();
+            let panic = std::panic::catch_unwind(|| {
+                let mut temporary = TemporaryOutput::create(temporary_path.clone()).unwrap();
+                temporary
+                    .file
+                    .as_mut()
+                    .unwrap()
+                    .write_all(b"partial")
+                    .unwrap();
+                if close_before_panic {
+                    temporary.file.as_ref().unwrap().sync_all().unwrap();
+                    drop(temporary.file.take());
+                }
+                panic!("injected before atomic replacement");
+            });
+            assert!(panic.is_err());
+            assert!(!temporary_path.exists());
+            assert_eq!(fs::read(&final_path).unwrap(), b"original");
+            fs::write(&temporary_path, b"another creator").unwrap();
+            assert!(TemporaryOutput::create(temporary_path.clone()).is_err());
+            assert_eq!(fs::read(&temporary_path).unwrap(), b"another creator");
+        }
     }
 
     #[cfg(feature = "wasm-sketch-host")]

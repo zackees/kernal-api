@@ -39,6 +39,13 @@ pending and subsequent writes.
   temporary file, syncs and closes it, and uses the existing atomic replacement.
 - Replacement failure removes the owned temporary file. Failed exclusive
   creation does not remove a file belonging to another creator.
+- An ownership guard now closes and removes the temporary file on unwind as
+  well as ordinary errors. Focused injected-panic tests cover partial writes
+  and the post-sync/close, pre-replacement boundary while preserving the
+  original final file. This does not establish cleanup after process kill;
+  worker-owned staging and parent cleanup remain required for that case.
+  All 47 hub tests pass; the existing in-process 64 MiB Cargo guest and its
+  exact-output commit also passed (8.23 seconds on Linux x86-64).
 
 Focused command:
 

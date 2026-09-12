@@ -29,6 +29,7 @@ pub(crate) const OP_BLOB_READ: u32 = 7;
 pub(crate) const OP_BLOB_READ_COLLECT: u32 = 8;
 pub(crate) const OP_BLOB_SEAL: u32 = 9;
 pub(crate) const OP_OUTPUT_COMMIT: u32 = 10;
+pub(crate) const OP_OUTPUT_GRANT: u32 = 11;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
@@ -1081,6 +1082,16 @@ impl OperationHub {
     /// Canonicalize one host-authorized final destination and represent it
     /// only as an opaque resource. The generated guest ABI receives the
     /// returned token, never this path or a directory capability.
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) fn grant_exact_output_wire(
+        &self,
+        store: u64,
+        destination: &Path,
+    ) -> Result<u64, HubError> {
+        self.grant_exact_output(store, destination)
+            .map(|token| token.0)
+    }
+
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) fn grant_exact_output(
         &self,

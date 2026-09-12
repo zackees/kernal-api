@@ -127,6 +127,11 @@ pub struct BlobHandle { token: u64 }
 /// One exact destination authorized by the embedding host; never a guest path.
 pub struct OutputFile { token: u64 }
 impl OutputFile {
+    /// Discover the optional initial grant for the root Store.
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(11, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
     /// Wrap the scoped token supplied by the host. Forging this value grants
     /// no authority: every commit checks the host's resource registry.
     pub fn from_granted_token(token: u64) -> Self { Self { token } }

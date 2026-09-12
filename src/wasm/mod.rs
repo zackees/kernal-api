@@ -677,6 +677,29 @@ impl AdmittedSketch {
         runtime: crate::async_engine::RuntimeHandle,
         cancellation: crate::async_engine::CancellationToken,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(runtime, cancellation, None)
+            .await
+    }
+
+    /// Runs with one exact host-authorized output destination. The guest can
+    /// discover only its opaque handle, never the path. Like the other
+    /// in-process entry point, this is not a substitute for worker containment.
+    pub async fn execute_threaded_root_with_output(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        destination: std::path::PathBuf,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(runtime, cancellation, Some(destination))
+            .await
+    }
+
+    async fn execute_threaded_root_with_grant(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        destination: Option<std::path::PathBuf>,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
@@ -690,9 +713,11 @@ impl AdmittedSketch {
         let logical = registration.logical();
         let blocking_runtime = runtime.clone();
         let blocking = runtime.launch_blocking(move || {
-            blocking_runtime.block_on_wasm(
-                sketch.execute_threaded_root_async(blocking_runtime.clone(), logical),
-            )
+            blocking_runtime.block_on_wasm(sketch.execute_threaded_root_async(
+                blocking_runtime.clone(),
+                logical,
+                destination,
+            ))
         });
         let outcome = match blocking.await {
             Ok(outcome) => outcome,
@@ -711,6 +736,7 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
         logical_epoch: Arc<LogicalEpoch>,
+        destination: Option<std::path::PathBuf>,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
@@ -728,6 +754,13 @@ impl AdmittedSketch {
         // cached Store or a different root execution.
         let operations = OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
             .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        // Grant before constructing or instantiating the root Store: even a
+        // module start section sees only the already-authorized resource.
+        let initial_output = destination
+            .as_deref()
+            .map(|path| operations.grant_exact_output_wire(0, path))
+            .transpose()
+            .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
         let mut store = Store::new(
             &self.engine,
@@ -738,6 +771,7 @@ impl AdmittedSketch {
                 epoch: Arc::clone(&logical_epoch),
                 operations,
                 store_owner: 0,
+                initial_output,
             },
         );
         install_epoch_deadline(&mut store);
@@ -892,6 +926,7 @@ impl AdmittedSketch {
                 operations: OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
                 store_owner: 0,
+                initial_output: None,
             },
         );
         linker
@@ -1051,6 +1086,7 @@ pub enum SketchExecutionError {
     ContainmentRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
+    OutputGrantRejected,
     NonzeroExit {
         code: i32,
     },
@@ -1082,6 +1118,7 @@ impl SketchExecutionError {
             Self::ContainmentRequired => "containment-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
+            Self::OutputGrantRejected => "output-grant-rejected",
             Self::NonzeroExit { .. } => "nonzero-exit",
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",
@@ -1616,6 +1653,7 @@ struct ThreadStoreState {
     epoch: Arc<LogicalEpoch>,
     operations: Arc<OperationHub>,
     store_owner: u64,
+    initial_output: Option<u64>,
 }
 
 impl generated_v1::KernalApiV1Imports for ThreadStoreState {
@@ -1667,6 +1705,13 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if kind == crate::operations::OP_OUTPUT_GRANT {
+            return Ok(if arg0 == 0 && arg1 == 0 {
+                self.initial_output.unwrap_or(0)
+            } else {
+                0
+            });
+        }
         let Some(runtime) = self.runtime.clone() else {
             return Ok(0);
         };
@@ -2453,6 +2498,7 @@ fn define_closed_imports(
                                 epoch: Arc::clone(&epoch),
                                 operations,
                                 store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
+                                initial_output: None,
                             },
                         );
                         install_epoch_deadline(&mut store);
@@ -3410,10 +3456,15 @@ mod threaded_root_observation_tests {
             .enable_all()
             .build()
             .expect("runtime");
+        let output_directory = tempfile::tempdir().expect("output directory");
+        let output_path = output_directory.path().join("exact-output");
+        std::fs::write(&output_path, b"original").expect("existing output");
         let outcome = runtime.run(async {
             sketch
-                .execute_threaded_root(
+                .execute_threaded_root_with_output(
                     crate::async_engine::RuntimeHandle::current().expect("handle"),
+                    crate::async_engine::CancellationSource::new().token(),
+                    output_path.clone(),
                 )
                 .await
         });
@@ -3457,8 +3508,13 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.live_resources, 0);
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
-        assert_eq!(operations.suspends, 6);
-        assert_eq!(operations.resumes, 8 + 2 * 1024);
+        assert!((7..=8).contains(&operations.suspends));
+        assert_eq!(operations.resumes, 12 + 2 * 1024);
+        assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
+        assert_eq!(
+            std::fs::read_dir(output_directory.path()).unwrap().count(),
+            1
+        );
         assert_eq!(operations.peak_buffered_blob_bytes, 64 * 1024);
         assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(

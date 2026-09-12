@@ -14,8 +14,13 @@ reusing two 64 KiB arrays and checking every returned byte. Generated
 `OutputFile::write_blob` dispatches an opaque blob/output token pair through
 the same operation protocol to the supplied runtime's blocking lane. Its
 wire-level host test verifies exact replacement and rejection of forged or
-wrong-owner output grants. Pre-instantiation grant delivery to the real guest
-is not yet implemented, so this is not end-to-end guest output evidence.
+wrong-owner output grants. The in-process `execute_threaded_root_with_output`
+entry point authorizes the destination before root Store creation. The root
+guest discovers it through `OutputFile::granted`; child Stores do not receive
+an initial grant. The real guest replaces an existing output with the exact
+bytes `guest exact output`, with no sibling temporary remaining afterward.
+This is Linux in-process output evidence only: output-grant delivery through
+the killable worker protocol and its failure cleanup are not implemented.
 
 Guest `seal` publishes EOF without revoking the readable handle. Pending empty
 reads then complete with zero bytes; an empty unsealed blob stays pending.
@@ -65,7 +70,8 @@ transfers, and the sequential proof does not exercise a slow consumer.
   blocking lane, reserves exclusive blob consumption, and checks the operation
   terminal winner at final replacement under the hub lock. A stalled filesystem
   replacement holds the hub lock; worker containment must bound this case.
-- Grant output before guest execution and pass only its semantic handle.
+- Deliver the exact output grant through the worker boundary before guest
+  execution, retaining only the semantic handle in guest-visible state.
 - Extend the 64 MiB generated guest proof with slow-consumer backpressure,
   cancellation, forged/stale/cross-sketch handles, and teardown.
 - Inject write, flush, and rename failures and cancellation at the commit

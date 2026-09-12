@@ -187,6 +187,20 @@ pub extern "C" fn kernal_api_run() -> u32 {
         Some(0)
     );
     complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
+    if let Some(output) =
+        kernal_api_v1_bindings::OutputFile::granted().expect("initial output grant")
+    {
+        let image = kernal_api_v1_bindings::BlobHandle::from_create_payload(
+            complete_operation(kernal_api_v1_bindings::BlobHandle::create().unwrap()).unwrap(),
+        );
+        let write = image.write_chunk(b"guest exact output").unwrap();
+        assert!(write.poll().unwrap().is_some());
+        assert!(image.seal().unwrap().poll().unwrap().is_some());
+        let commit = output.write_blob(&image).expect("submit exact output");
+        while commit.poll().expect("commit result").is_none() {
+            commit.yield_now().expect("wait for output commit");
+        }
+    }
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));
     // Use an explicit deterministic hasher: the closed threaded P1 surface

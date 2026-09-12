@@ -812,6 +812,16 @@ impl OperationHub {
         blob: OpaqueToken,
         bytes: &[u8],
     ) -> Result<usize, HubError> {
+        self.blob_write_inner(store, blob, bytes, false)
+    }
+
+    fn blob_write_inner(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        bytes: &[u8],
+        unpublished: bool,
+    ) -> Result<usize, HubError> {
         if bytes.len() > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
@@ -822,7 +832,14 @@ impl OperationHub {
             return Err(HubError::Quota);
         }
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
-        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        if unpublished {
+            if !resource.reserved {
+                return Err(HubError::WrongRights);
+            }
+            Self::validate_resource_owner(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        } else {
+            Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        }
         let ResourceValue::Blob { buffer, sealed } = &mut resource.value else {
             return Err(HubError::WrongKind);
         };
@@ -1680,6 +1697,15 @@ impl OperationHub {
         if resource.reserved {
             return Err(HubError::Closed);
         }
+        Self::validate_resource_owner(resource, store, kind, rights)
+    }
+
+    fn validate_resource_owner(
+        resource: &ResourceSlot,
+        store: u64,
+        kind: u8,
+        rights: u8,
+    ) -> Result<(), HubError> {
         if resource.identity.kind != kind {
             return Err(HubError::WrongKind);
         }
@@ -2143,6 +2169,124 @@ impl OperationHub {
     }
 }
 
+/// Bounded native encoder sink. Its reserved blob cannot be read by a guest
+/// until encoding succeeds; failure or abandonment revokes all stored bytes.
+pub(crate) struct NativeBlobEncoder {
+    hub: Arc<OperationHub>,
+    store: u64,
+    blob: Option<OpaqueToken>,
+    maximum_bytes: usize,
+    written: usize,
+    failure: Option<HubError>,
+}
+
+impl NativeBlobEncoder {
+    pub(crate) fn new(
+        hub: Arc<OperationHub>,
+        store: u64,
+        maximum_bytes: usize,
+    ) -> Result<Self, HubError> {
+        if maximum_bytes == 0 || maximum_bytes > hub.blob_limits.maximum_blob_bytes {
+            return Err(HubError::Quota);
+        }
+        let blob = hub.create_resource_value(
+            store,
+            BLOB_RESOURCE_KIND,
+            BLOB_RIGHT_READ | BLOB_RIGHT_WRITE,
+            false,
+            ResourceValue::Blob {
+                buffer: VecDeque::new(),
+                sealed: false,
+            },
+        )?;
+        Ok(Self {
+            hub,
+            store,
+            blob: Some(blob),
+            maximum_bytes,
+            written: 0,
+            failure: None,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), HubError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let result = (|| {
+            let total = self
+                .written
+                .checked_add(bytes.len())
+                .ok_or(HubError::Quota)?;
+            if total > self.maximum_bytes {
+                return Err(HubError::Quota);
+            }
+            for chunk in bytes.chunks(self.hub.blob_limits.maximum_chunk_bytes) {
+                self.hub.blob_write_inner(
+                    self.store,
+                    self.blob.ok_or(HubError::Closed)?,
+                    chunk,
+                    true,
+                )?;
+            }
+            self.written = total;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.failure = Some(error);
+        }
+        result
+    }
+
+    pub(crate) fn finish(mut self) -> Result<OpaqueToken, HubError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        let token = self.blob.ok_or(HubError::Closed)?;
+        let mut state = self.hub.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed {
+            return Err(HubError::Closed);
+        }
+        let resource = state.resources.get_mut(&token).ok_or(HubError::Closed)?;
+        OperationHub::validate_resource_owner(
+            resource,
+            self.store,
+            BLOB_RESOURCE_KIND,
+            BLOB_RIGHT_WRITE,
+        )?;
+        if !resource.reserved {
+            return Err(HubError::WrongRights);
+        }
+        let ResourceValue::Blob { sealed, .. } = &mut resource.value else {
+            return Err(HubError::WrongKind);
+        };
+        *sealed = true;
+        resource.identity.rights = BLOB_RIGHT_READ;
+        resource.reserved = false;
+        self.blob = None;
+        Ok(token)
+    }
+}
+
+impl std::io::Write for NativeBlobEncoder {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.append(bytes)
+            .map_err(|error| std::io::Error::other(format!("native blob encoding: {error:?}")))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for NativeBlobEncoder {
+    fn drop(&mut self) {
+        if let Some(blob) = self.blob.take() {
+            let _ = self.hub.close_resource(blob);
+        }
+    }
+}
+
 #[cfg(all(test, feature = "wasm-sketch-host"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OutputFault {
@@ -2267,6 +2411,46 @@ fn hub_io_error(error: HubError) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_encoder_publishes_only_sealed_read_only_quota_accounted_blob() {
+        use std::io::Write as _;
+        let hub = OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+        let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 8).unwrap();
+        let unpublished = encoder.blob.unwrap();
+        encoder.write_all(b"12345678").unwrap();
+        assert_eq!(hub.blob_read(7, unpublished, 4), Err(HubError::Closed));
+        assert_eq!(hub.snapshot().buffered_blob_bytes, 8);
+        let blob = encoder.finish().unwrap();
+        assert_eq!(hub.blob_read(8, blob, 4), Err(HubError::WrongRights));
+        assert_eq!(hub.blob_read(7, blob, 4).unwrap(), b"1234");
+        assert_eq!(hub.blob_write(7, blob, b"x"), Err(HubError::WrongRights));
+        assert_eq!(hub.blob_read(7, blob, 4).unwrap(), b"5678");
+        hub.close_resource(blob).unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        assert_eq!(hub.snapshot().live_blobs, 0);
+    }
+
+    #[test]
+    fn native_encoder_failure_or_teardown_cannot_publish_partial_bytes() {
+        use std::io::Write as _;
+        for teardown in [false, true] {
+            let hub =
+                OperationHub::with_blob_limits(4, 2, BlobLimits::new(4, 8, 8).unwrap()).unwrap();
+            let mut encoder = NativeBlobEncoder::new(Arc::clone(&hub), 7, 6).unwrap();
+            encoder.write_all(b"1234").unwrap();
+            if teardown {
+                hub.close_all(Terminal::Cancelled);
+            } else {
+                assert!(encoder.write_all(b"567").is_err());
+                assert_eq!(hub.snapshot().buffered_blob_bytes, 4);
+                assert!(encoder.write_all(b"5").is_err(), "failure must be sticky");
+            }
+            assert!(encoder.finish().is_err());
+            assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+            assert_eq!(hub.snapshot().live_blobs, 0);
+        }
+    }
 
     #[cfg(feature = "wasm-sketch-host")]
     #[test]

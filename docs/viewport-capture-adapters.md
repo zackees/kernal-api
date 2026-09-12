@@ -4,6 +4,17 @@ Status: implementation prerequisite review; the three adapters and snapshot
 operation are not implemented. This note does not establish native capture
 acceptance or close #19.
 
+The shared hub now has a private `NativeBlobEncoder` implementing `io::Write`.
+It copies encoder writes in configured chunks directly into quota-accounted
+blob storage, without an intermediate full encoded-image vector. Its resource
+stays reserved and unreadable until successful finish, which publishes a
+sealed read-only blob. Encoded-byte overflow is rejected before that write is
+copied, failures remain terminal, and drop/teardown reclaim the reservation.
+Tests cover hidden partial output, read-only publication, cross-store rejection,
+size overflow, and teardown; all 50 hub tests pass on Linux. This sink is not
+yet connected to a native capture callback and does not bound native images
+or encoder-internal scratch allocations.
+
 ## Exact dependency boundary
 
 The current manifest pins Tauri 2.11.5, tauri-runtime 2.11.3,

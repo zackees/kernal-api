@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
@@ -195,8 +195,8 @@ pub(super) enum ProtocolError {
 /// Facade semantic primitives needed to reconstruct compiler/limit settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ExecuteMetadata {
-    /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes.
-    pub(super) blob_limits: [u64; 6],
+    /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes, transfer bytes.
+    pub(super) blob_limits: [u64; 7],
     pub(super) max_wasm_stack_bytes: u64,
     pub(super) reserved_memory_bytes: u64,
     pub(super) maximum_active_roots: u64,
@@ -651,6 +651,7 @@ fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
             take_u64(input)?,
             take_u64(input)?,
             take_u64(input)?,
+            take_u64(input)?,
         ],
         max_wasm_stack_bytes: take_u64(input)?,
         reserved_memory_bytes: take_u64(input)?,
@@ -701,7 +702,7 @@ mod tests {
     }
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
-            blob_limits: [12, 13, 14, 15, 16, 17],
+            blob_limits: [12, 13, 14, 15, 16, 17, 18],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 2,
             maximum_active_roots: 3,

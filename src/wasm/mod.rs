@@ -276,7 +276,8 @@ impl Default for SketchExecutionLimits {
 
 /// Host-selected bounds for opaque blob storage and pending I/O.
 /// Pending input and read-result byte budgets are each bounded by
-/// `maximum_sketch_bytes`; this is not a combined process-memory limit.
+/// `maximum_sketch_bytes`, with a separate combined hub-capacity limit.
+/// Neither limit is a process-memory bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SketchBlobLimits {
     limits: operations::BlobLimits,
@@ -323,6 +324,28 @@ impl SketchBlobLimits {
     }
     pub fn maximum_pending_writes(self) -> usize {
         self.limits.maximum_pending_writes
+    }
+    /// Bounds combined hub-owned blob, pending-input and read-result capacity.
+    /// One chunk is reserved for pull progress. Buffers handed to native
+    /// callers and allocator-internal scratch are not covered by this limit.
+    pub fn with_maximum_transfer_bytes(
+        mut self,
+        maximum: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let minimum = self
+            .limits
+            .maximum_chunk_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(self.limits.maximum_sketch_bytes))
+            .ok_or(SketchCompilerError::InvalidExecutionLimits)?;
+        if maximum < minimum {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.limits.maximum_transfer_bytes = maximum;
+        Ok(self)
+    }
+    pub fn maximum_transfer_bytes(self) -> usize {
+        self.limits.maximum_transfer_bytes
     }
 }
 impl Default for SketchBlobLimits {
@@ -1375,6 +1398,14 @@ mod execution_ledger_tests {
         }
         // Zero count limits intentionally disable the corresponding admission.
         let blobs = SketchBlobLimits::new(4, 8, 16, 0, 2, 3).unwrap();
+        assert!(blobs.with_maximum_transfer_bytes(23).is_err());
+        assert_eq!(
+            blobs
+                .with_maximum_transfer_bytes(24)
+                .unwrap()
+                .maximum_transfer_bytes(),
+            24
+        );
         let compiler = SketchCompiler::new(
             SketchCompilerConfig::default()
                 .with_execution_limits(SketchExecutionLimits::default().with_blob_limits(blobs))
@@ -3518,7 +3549,10 @@ mod threaded_root_observation_tests {
             )
             .expect("transfer limits")
             .with_blob_limits(
-                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 1, 1, 1).unwrap(),
+                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 1, 1, 1)
+                    .unwrap()
+                    .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
+                    .unwrap(),
             );
         let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
         assert_eq!(

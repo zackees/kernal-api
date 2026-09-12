@@ -88,13 +88,31 @@ Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
 the host.
 
-The worker supervisor sends all six limits, and the worker validates them
+The worker supervisor sends all seven limits, and the worker validates them
 through the same public constructor before compiler construction. Private
-worker protocol version 2 rejects version-1 peers rather than silently using
+worker protocol version 3 rejects older peers rather than silently using
 default limits; rebuild the worker executable together with the host. This
 changes no guest ABI import signature or guest artifact. Pending inputs and
-completed reads still have separate byte budgets; this configuration does not
-claim an aggregate allocation ceiling.
+completed reads still have separate byte budgets. Hosts can additionally set
+`SketchBlobLimits::with_maximum_transfer_bytes` for combined hub-owned blob,
+pending-input, and completed-read backing capacities. Its default is three
+times the sketch-storage budget plus one chunk; the minimum configurable
+value is the sketch-storage budget plus two chunks. Writes preserve one chunk
+of pull headroom, and reads can use that reserve. Result collection releases
+capacity and revisits waiting writers. The bound includes write/read copy
+overlap. Exact-sized read allocations avoid an eight-byte minimum growth for
+smaller chunks. All 43 hub tests pass, including a tight 16-byte combined
+budget that rejects input before copying, remains drainable, and resumes the
+writer after result collection.
+
+This combined limit does not yet account for native chunks retained after
+return from a hub pull (including output-writer chunks), or allocator-internal
+reallocation scratch. Those remain necessary for the complete in-flight
+allocation contract; the hub limit is not a total process-memory limit.
+Both 64 MiB Cargo guest paths also pass with an explicit 2,228,224-byte
+combined hub limit; the in-process proof retains its exact 1,179,648-byte peak
+assertion. The version-3 protocol tests, reconstruction test, and host-policy
+validation test pass with the additional transfer-budget field.
 The non-default policy (64 KiB chunks, 1 MiB per blob, 2 MiB sketch storage,
 one live blob/read/write) passed the existing 64 MiB Cargo guest in-process
 (6.98 seconds) and in the rebuilt worker (11.07 seconds including test-side

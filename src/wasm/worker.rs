@@ -1153,6 +1153,7 @@ fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMet
             blobs.maximum_live_blobs() as u64,
             blobs.maximum_pending_reads() as u64,
             blobs.maximum_pending_writes() as u64,
+            blobs.maximum_transfer_bytes() as u64,
         ],
         max_wasm_stack_bytes: config.max_wasm_stack_bytes() as u64,
         reserved_memory_bytes: limits.maximum_reserved_shared_memory_bytes(),

@@ -81,6 +81,8 @@ fn compiler(deadline: Duration, fuel: SketchFuelLimits) -> SketchCompiler {
                 1,
                 1,
             )
+            .unwrap()
+            .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
             .unwrap(),
         );
     SketchCompiler::new(

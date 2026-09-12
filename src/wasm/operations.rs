@@ -111,6 +111,7 @@ pub(crate) struct BlobLimits {
     pub(crate) maximum_live_blobs: usize,
     pub(crate) maximum_pending_reads: usize,
     pub(crate) maximum_pending_writes: usize,
+    pub(crate) maximum_transfer_bytes: usize,
 }
 
 impl BlobLimits {
@@ -132,6 +133,13 @@ impl BlobLimits {
             maximum_live_blobs: 128,
             maximum_pending_reads: 128,
             maximum_pending_writes: 128,
+            maximum_transfer_bytes: match maximum_sketch_bytes.checked_mul(3) {
+                Some(bytes) => match bytes.checked_add(maximum_chunk_bytes) {
+                    Some(bytes) => bytes,
+                    None => return Err(HubError::Quota),
+                },
+                None => return Err(HubError::Quota),
+            },
         })
     }
 }
@@ -143,6 +151,7 @@ const DEFAULT_BLOB_LIMITS: BlobLimits = BlobLimits {
     maximum_live_blobs: 128,
     maximum_pending_reads: 128,
     maximum_pending_writes: 128,
+    maximum_transfer_bytes: 12 * 1024 * 1024 + 64 * 1024,
 };
 
 /// Private typed requests shared by the generated ABI and heavyweight native
@@ -749,6 +758,7 @@ impl OperationHub {
             blob,
             bytes.len(),
             self.blob_limits.maximum_sketch_bytes,
+            self.blob_limits.maximum_transfer_bytes - self.blob_limits.maximum_chunk_bytes,
         )?;
         if let ResourceValue::Blob { buffer, .. } = &mut state
             .resources
@@ -800,7 +810,11 @@ impl OperationHub {
             return Err(HubError::WrongKind);
         };
         let count = maximum_bytes.min(buffer.len());
-        let result: Vec<_> = buffer.drain(..count).collect();
+        if retained_before_read.saturating_add(count) > self.blob_limits.maximum_transfer_bytes {
+            return Err(HubError::Quota);
+        }
+        let mut result = Vec::with_capacity(count);
+        result.extend(buffer.drain(..count));
         if buffer.is_empty() {
             // An empty live resource must not retain a formerly full buffer
             // while its length-based byte ledger reports zero.
@@ -866,7 +880,10 @@ impl OperationHub {
                 .filter_map(|op| op.pending_blob_write.as_ref())
                 .map(Vec::len)
                 .sum();
-            if pending.saturating_add(length) > self.blob_limits.maximum_sketch_bytes {
+            if pending.saturating_add(length) > self.blob_limits.maximum_sketch_bytes
+                || Self::transfer_capacity(&state).saturating_add(length)
+                    > self.blob_limits.maximum_transfer_bytes - self.blob_limits.maximum_chunk_bytes
+            {
                 state.operations.remove(&operation);
                 return Err(HubError::Quota);
             }
@@ -890,7 +907,9 @@ impl OperationHub {
         blob: OpaqueToken,
         additional: usize,
         maximum: usize,
+        transfer_maximum: usize,
     ) -> Result<(), HubError> {
+        let transfer_retained = Self::transfer_capacity(state);
         let retained = state.resources.values().fold(0_usize, |total, resource| {
             total.saturating_add(match &resource.value {
                 ResourceValue::Blob { buffer, .. } => buffer.capacity(),
@@ -910,7 +929,9 @@ impl OperationHub {
             .checked_add(additional)
             .ok_or(HubError::Quota)?;
         let growth = required.saturating_sub(buffer.capacity());
-        if retained.saturating_add(growth) > maximum {
+        if retained.saturating_add(growth) > maximum
+            || transfer_retained.saturating_add(growth) > transfer_maximum
+        {
             return Err(HubError::Quota);
         }
         // Avoid VecDeque's geometric growth retaining uncharged spare bytes.
@@ -966,6 +987,7 @@ impl OperationHub {
                     resource,
                     count,
                     self.blob_limits.maximum_sketch_bytes,
+                    self.blob_limits.maximum_transfer_bytes - self.blob_limits.maximum_chunk_bytes,
                 ) {
                     Ok(()) => {}
                     Err(HubError::Quota) => continue,
@@ -1077,10 +1099,14 @@ impl OperationHub {
                 continue;
             }
             let count = maximum.min(buffer.len());
-            if retained.saturating_add(count) > self.blob_limits.maximum_sketch_bytes {
+            if retained.saturating_add(count) > self.blob_limits.maximum_sketch_bytes
+                || retained_before_read.saturating_add(count)
+                    > self.blob_limits.maximum_transfer_bytes
+            {
                 continue;
             }
-            let bytes: Vec<_> = buffer.drain(..count).collect();
+            let mut bytes = Vec::with_capacity(count);
+            bytes.extend(buffer.drain(..count));
             if buffer.is_empty() {
                 *buffer = VecDeque::new();
             }
@@ -2214,6 +2240,38 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    fn combined_transfer_quota_preserves_pull_headroom_and_resumes_after_collection() {
+        let mut limits = BlobLimits::new(4, 8, 8).unwrap();
+        limits.maximum_transfer_bytes = 16;
+        let hub = OperationHub::with_blob_limits(8, 1, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        assert_eq!(
+            hub.submit_blob_write_from(1, blob, 4, || panic!(
+                "read headroom must not be copied away"
+            )),
+            Err(HubError::Quota)
+        );
+        let read = hub.submit_blob_read(1, blob, 4).unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 16);
+        assert_eq!(hub.take_terminal(write, 1).unwrap(), None);
+        assert_eq!(
+            hub.collect_blob_read_wire(1, read.0, 4, |bytes| assert_eq!(bytes, b"full"))
+                .unwrap(),
+            4 << 8 | u64::from(STATUS_COMPLETED)
+        );
+        assert_eq!(
+            hub.take_terminal(write, 1).unwrap().unwrap().terminal,
+            Terminal::Completed
+        );
+        assert_eq!(hub.snapshot().peak_retained_transfer_capacity, 16);
+        hub.close_all(Terminal::Closed);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
     }
 
     #[test]

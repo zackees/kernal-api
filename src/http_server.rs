@@ -23,6 +23,9 @@ pub use target::QueryPairs;
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Maximum concurrently owned connections. The accept loop waits at capacity.
+    /// Also bounds outstanding native file-read workers in a separate shared
+    /// budget. A cancelled connection's native read retains its read slot until
+    /// the OS call finishes; new file reads fail when this budget is exhausted.
     pub max_connections: usize,
     /// Maximum collected request body bytes.
     pub max_request_body_bytes: usize,
@@ -267,6 +270,7 @@ pub struct Server {
     limits: Limits,
     diagnostics: Diagnostics,
     response_headers: Arc<hyper::HeaderMap>,
+    read_budget: body::ReadBudget,
 }
 
 impl Server {
@@ -281,6 +285,7 @@ impl Server {
             limits,
             diagnostics: Diagnostics::default(),
             response_headers: Arc::new(hyper::HeaderMap::new()),
+            read_budget: body::ReadBudget::new(limits.max_connections),
         })
     }
 
@@ -346,9 +351,10 @@ impl Server {
                     let limits = self.limits;
                     let diagnostics = self.diagnostics.clone();
                     let response_headers = self.response_headers.clone();
+                    let read_budget = self.read_budget.clone();
                     tasks.spawn(async move {
                         let request_diagnostics = diagnostics.clone();
-                        let service = service_fn(move |request| dispatch(request, handler.clone(), limits, request_diagnostics.clone(), response_headers.clone()));
+                        let service = service_fn(move |request| dispatch(request, handler.clone(), limits, request_diagnostics.clone(), response_headers.clone(), read_budget.clone()));
                         let mut builder = hyper::server::conn::http1::Builder::new();
                         builder.timer(TokioTimer::new())
                             .header_read_timeout(limits.header_timeout)
@@ -380,12 +386,14 @@ async fn dispatch<H, F>(
     limits: Limits,
     diagnostics: Diagnostics,
     response_headers: Arc<hyper::HeaderMap>,
+    read_budget: body::ReadBudget,
 ) -> Result<hyper::Response<ServerBody>, Infallible>
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
     let mut result = dispatch_inner(request, handler, limits, diagnostics.clone()).await?;
+    result.body_mut().set_read_budget(read_budget);
     for (name, value) in response_headers.iter() {
         result.headers_mut().insert(name.clone(), value.clone());
     }

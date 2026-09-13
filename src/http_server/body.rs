@@ -4,12 +4,39 @@ use futures_core::Stream;
 use hyper::body::{Body, Frame, SizeHint};
 use std::{
     future::Future,
-    io::{self, Seek},
+    io::{self, Read, Seek},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
-use tokio::io::{AsyncRead, ReadBuf};
+
+#[derive(Clone, Debug)]
+pub(super) struct ReadBudget(Arc<tokio::sync::Semaphore>);
+
+impl ReadBudget {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(capacity)))
+    }
+
+    fn spawn<F>(&self, operation: F) -> io::Result<tokio::task::JoinHandle<io::Result<Bytes>>>
+    where
+        F: FnOnce() -> io::Result<Bytes> + Send + 'static,
+    {
+        let permit = self.0.clone().try_acquire_owned().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "HTTP file read capacity exhausted",
+            )
+        })?;
+        Ok(tokio::task::spawn_blocking(move || {
+            // Connection cancellation can detach this worker, but cannot admit
+            // a replacement native read until its OS call actually finishes.
+            let _permit = permit;
+            operation()
+        }))
+    }
+}
 
 enum Source {
     Bytes(Bytes),
@@ -18,10 +45,11 @@ enum Source {
 }
 
 struct FileSource {
-    file: tokio::fs::File,
+    file: Arc<std::fs::File>,
     remaining: u64,
     prefix: Bytes,
-    buffer: Vec<u8>,
+    pending: Option<tokio::task::JoinHandle<io::Result<Bytes>>>,
+    budget: ReadBudget,
 }
 
 struct EventSource {
@@ -64,14 +92,13 @@ impl ServerBody {
             ));
         }
         let remaining = metadata.len().saturating_sub(file.stream_position()?);
-        let mut file = tokio::fs::File::from_std(file);
-        file.set_max_buf_size(65536);
         Ok(Self {
             source: Source::File(FileSource {
-                file,
+                file: Arc::new(file),
                 remaining,
                 prefix: prefix.into(),
-                buffer: Vec::new(),
+                pending: None,
+                budget: ReadBudget::new(1),
             }),
             chunk: 65536,
             done: false,
@@ -107,7 +134,6 @@ impl ServerBody {
         let accepted = match &mut self.source {
             Source::Bytes(bytes) => bytes.len() <= limits.max_response_body_bytes,
             Source::File(file) => {
-                file.file.set_max_buf_size(self.chunk);
                 file.prefix.len() <= limits.max_response_body_bytes
                     && file
                         .remaining
@@ -129,6 +155,12 @@ impl ServerBody {
         }
     }
 
+    pub(super) fn set_read_budget(&mut self, budget: ReadBudget) {
+        if let Source::File(file) = &mut self.source {
+            file.budget = budget;
+        }
+    }
+
     fn poll_data(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
         match &mut self.source {
             Source::Bytes(bytes) => {
@@ -147,18 +179,40 @@ impl ServerBody {
                 if file.remaining == 0 {
                     return Poll::Ready(None);
                 }
-                let size = file.remaining.min(self.chunk as u64) as usize;
-                file.buffer.resize(size, 0);
-                let mut buffer = ReadBuf::new(&mut file.buffer);
-                match std::task::ready!(Pin::new(&mut file.file).poll_read(cx, &mut buffer)) {
+                if file.pending.is_none() {
+                    let size = file.remaining.min(self.chunk as u64) as usize;
+                    let handle = file.file.clone();
+                    match file.budget.spawn(move || {
+                        let mut buffer = vec![0; size];
+                        let count = loop {
+                            match (&*handle).read(&mut buffer) {
+                                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                                    continue
+                                }
+                                result => break result?,
+                            }
+                        };
+                        buffer.truncate(count);
+                        Ok(Bytes::from(buffer))
+                    }) {
+                        Ok(read) => file.pending = Some(read),
+                        Err(error) => return Poll::Ready(Some(Err(error))),
+                    }
+                }
+                let result = match &mut file.pending {
+                    Some(read) => std::task::ready!(Pin::new(read).poll(cx)),
+                    None => return Poll::Ready(Some(Err(io::Error::other("missing file read")))),
+                };
+                file.pending = None;
+                match result.map_err(io::Error::other).and_then(|result| result) {
                     Err(error) => Poll::Ready(Some(Err(error))),
-                    Ok(()) if buffer.filled().is_empty() => Poll::Ready(Some(Err(io::Error::new(
+                    Ok(bytes) if bytes.is_empty() => Poll::Ready(Some(Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "response file was truncated",
                     )))),
-                    Ok(()) => {
-                        file.remaining -= buffer.filled().len() as u64;
-                        Poll::Ready(Some(Ok(Bytes::copy_from_slice(buffer.filled()))))
+                    Ok(bytes) => {
+                        file.remaining -= bytes.len() as u64;
+                        Poll::Ready(Some(Ok(bytes)))
                     }
                 }
             }
@@ -253,6 +307,53 @@ impl Body for ServerBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_read_keeps_shared_admission_until_native_work_finishes() {
+        let budget = ReadBudget::new(1);
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let (started, began) = tokio::sync::oneshot::channel();
+        let read = budget
+            .spawn(move || {
+                let _ = started.send(());
+                let _ = waiting.recv();
+                Ok(Bytes::new())
+            })
+            .unwrap();
+        began.await.unwrap();
+        drop(read);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(1).unwrap();
+        let mut body =
+            ServerBody::file(std::fs::File::open(file.path()).unwrap(), Vec::new()).unwrap();
+        body.set_read_budget(budget.clone());
+        assert_eq!(
+            body.frame().await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(body.frame().await.is_none());
+        for _ in 0..10 {
+            assert_eq!(
+                budget.spawn(|| Ok(Bytes::new())).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match budget.spawn(|| Ok(Bytes::new())) {
+                    Ok(read) => {
+                        read.await.unwrap().unwrap();
+                        break;
+                    }
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
     use http_body_util::BodyExt;
     use std::io::Write;
 

@@ -27,6 +27,12 @@ initial transport tests alone.
   from the file's current position to its original length. Growth is ignored;
   premature EOF is an error. Prefix transmission does not read ahead into the
   file. There is no whole-file collection or producer queue.
+- Native file reads use a separate shared admission budget of `max_connections`.
+  Each blocking read owns its permit through completion, even if its response
+  or connection is cancelled. A saturated read budget fails the next file frame
+  with `WouldBlock` (closing a response already started), rather than adding
+  another worker. This prevents stalled filesystem work accumulating behind
+  repeatedly expired connections.
 - Pull-driven SSE bodies encode multiline data safely, emit keepalive comments,
   bound individual payloads and frames, and do not prefetch the next event while
   encoded bytes remain pending.
@@ -95,9 +101,10 @@ non-reading client releasing its connection slot, duplicate/header-byte limits,
 bodyless-status/connection-header rejection, and diagnostic counters for
 rejections, handler panics, protocol failures and deadlines, and path/query
 decoding, server header overrides/error coverage, merged header budgets, and
-HEAD/OPTIONS behavior. Seven focused unit tests cover
+HEAD/OPTIONS behavior. Eight focused unit tests cover
 bounded file reads, growth/truncation, SSE backpressure/encoding/keepalives, and
-write-timeout activation, malformed queries and once-only path decoding.
+write-timeout activation, malformed queries, once-only path decoding, and
+cancelled native read admission (including rejection of another file body).
 The full kernel suite with `http-server,event-stream`,
 strict all-target Clippy, formatting, and dependency-isolation RED -> GREEN
 checks pass locally. The suite uses the Linux build-ID flag required by process

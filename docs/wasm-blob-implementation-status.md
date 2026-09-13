@@ -22,8 +22,11 @@ bytes `guest exact output`, with no sibling temporary remaining afterward.
 The killable worker protocol now delivers the exact-output grant too: parent
 staging is published only after successful execution and reap, with Linux
 success, trap, cancellation, and publication-failure proofs described below.
-These implementations are not full release acceptance: all six native targets,
-renamed-parent cleanup, and kernel-blocked filesystem behavior remain gaps.
+These implementations are not full release acceptance: fresh all-six-target
+exact-output evidence and kernel-blocked filesystem behavior remain gaps.
+The renamed-parent cleanup regression has native Linux, Windows ARM64, and
+macOS ARM evidence recorded below, but that partial coverage does not replace
+the full platform acceptance matrix.
 
 Guest `seal` publishes EOF without revoking the readable handle. Pending empty
 reads then complete with zero bytes; an empty unsealed blob stays pending.

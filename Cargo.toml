@@ -88,12 +88,8 @@ http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "de
 # but the feature name is host-independent so a client enables one capability
 # rather than one host.
 #
-# This does not yet remove `png`/`x11rb` from the default *graph*:
-# `running-process-platform-internal` 4.10.10 declares both as non-optional
-# `cfg(target_os = "linux")` dependencies and `running-process` is mandatory
-# here, so they resolve regardless. What this gates is the code and public
-# surface this crate owns; the graph reduction follows when the substrate
-# gates its own copy.
+# The migration substrate also gates its PNG/X11 dependencies, keeping
+# these GUI facilities out of the default process/host graph.
 window-icon = ["dep:png", "dep:x11rb"]
 # Untrusted external web content is an explicit, heavyweight native capability.
 # The private implementation uses tauri-runtime-wry directly because Tauri's
@@ -283,7 +279,10 @@ blake3 = { version = "=1.8.7", features = ["rayon"] }
 memmap2 = "=0.9.11"
 # Exact first-party pre-1.0 pin. The substrate remains private behind facade
 # owned semantic types, with only the lightweight async process HAL enabled.
-running-process = { version = "=4.10.10", default-features = false, features = ["kernel-substrate"] }
+# Migration-only: PR running-process#1204 supplies acknowledged output cleanup.
+# The unchanged release guard rejects this Git source; replace it with an exact
+# published registry release containing the change before release packaging.
+running-process = { version = "=4.10.11", git = "https://github.com/zackees/running-process", rev = "1943831d13bf0f4c82eb694bc1f9cf5940d4718a", default-features = false, features = ["kernel-substrate"] }
 sysinfo = "=0.30.13"
 tokio = { version = "=1.53.1", default-features = false, features = [
   "fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread",

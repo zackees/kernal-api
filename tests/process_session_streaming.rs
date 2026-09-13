@@ -10,6 +10,7 @@ use kernal_api::{
 };
 
 const HELPER_ENV: &str = "KERNAL_API_STREAMING_PROCESS_HELPER";
+const SILENT_HELPER_ENV: &str = "KERNAL_API_SILENT_PROCESS_HELPER";
 const STREAM_BYTES: usize = 32 * 1024 * 1024;
 const CHUNK_BYTES: usize = 4096;
 
@@ -28,6 +29,93 @@ fn streaming_process_helper() {
     }
     stdout.flush().unwrap();
     stderr.flush().unwrap();
+}
+
+#[test]
+fn silent_process_helper() {
+    if std::env::var_os(SILENT_HELPER_ENV).is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[test]
+fn output_shutdown_wakes_a_parked_receiver_and_all_callers() {
+    assert_output_shutdown(false);
+}
+
+#[test]
+fn cancelled_output_shutdown_observer_can_be_retried() {
+    assert_output_shutdown(true);
+}
+
+fn assert_output_shutdown(cancel_first: bool) {
+    runtime().run(async {
+        let session = SpawnSpec::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("silent_process_helper")
+            .arg("--nocapture")
+            .env(SILENT_HELPER_ENV, "1")
+            .stdin(StreamMode::Null)
+            .stdout(StreamMode::Null)
+            .stderr(StreamMode::Piped)
+            .spawn_session(ProcessSessionOptions {
+                kill_on_drop: true,
+                ..ProcessSessionOptions::default()
+            })
+            .await
+            .unwrap();
+
+        // Poll the receive once so it holds the private output mutex while
+        // waiting on the silent pipe. Shutdown must signal before taking it.
+        let mut receive = std::pin::pin!(session.next_output());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(receive.as_mut(), &mut context).is_pending());
+        if cancel_first {
+            let mut abandoned = std::pin::pin!(session.shutdown_output());
+            assert!(std::future::Future::poll(abandoned.as_mut(), &mut context).is_pending());
+            // The receive still owns the mutex. Dropping this observer must
+            // leave its shutdown request active for subsequent callers.
+        }
+        let mut first = std::pin::pin!(session.shutdown_output());
+        let mut second = std::pin::pin!(session.shutdown_output());
+        let result = kernal_api::async_engine::timeout(Duration::from_secs(5), async {
+            let mut done = [false; 3];
+            std::future::poll_fn(|cx| {
+                if !done[0] {
+                    if let std::task::Poll::Ready(event) =
+                        std::future::Future::poll(receive.as_mut(), cx)
+                    {
+                        assert!(event.is_none());
+                        done[0] = true;
+                    }
+                }
+                for (index, shutdown) in [first.as_mut(), second.as_mut()].into_iter().enumerate() {
+                    if !done[index + 1] {
+                        if let std::task::Poll::Ready(result) =
+                            std::future::Future::poll(shutdown, cx)
+                        {
+                            result.unwrap();
+                            done[index + 1] = true;
+                        }
+                    }
+                }
+                if done.into_iter().all(|value| value) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            assert!(session.next_output().await.is_none());
+            session.shutdown_output().await.unwrap();
+            assert!(session.poll().await.unwrap().is_none());
+        })
+        .await;
+        // Reap before asserting the deadline, including the failure path.
+        session.kill().await.unwrap();
+        session.wait().await.unwrap();
+        result.expect("output shutdown must wake a parked receiver and every caller");
+    });
 }
 
 async fn session() -> ProcessSession {

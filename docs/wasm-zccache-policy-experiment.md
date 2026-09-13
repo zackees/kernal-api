@@ -311,3 +311,28 @@ this internal output step; they remain required before guest exposure.
 This experiment does not replace the Component Model comparison, ten-edit
 latency measurements, sealed extension2 archive proof, or six native target
 acceptance required by #13.
+
+## Native output-shutdown facade prerequisite
+
+The experimental branch now pins the private substrate to
+`1943831d13bf0f4c82eb694bc1f9cf5940d4718a` from
+[running-process PR #1204](https://github.com/zackees/running-process/pull/1204).
+Its existing package version is 4.10.11; no package was published or relabelled.
+This Git source is migration-only. The unchanged TOML-aware release guard
+rejects it, and an exact published registry release containing the implementation
+must replace it before release packaging. This is not release-ready evidence.
+
+`ProcessSession::shutdown_output(&self)` requests shutdown before acquiring the
+private output-lane mutex, then awaits the substrate's reader/pump cleanup and
+discards queued events. Returned events remain caller-owned. It neither kills
+the child nor proves descendant cleanup. Concurrent callers and cancelled
+observers can retry the same shutdown; an error is not permission to recycle
+native capacity.
+
+The facade regression deliberately parks a receive holding that mutex. Moving
+the shutdown request behind mutex acquisition produces a five-second deadline
+failure (Soldr log `20260913T124130Z`); requesting first passes. A separate case
+drops a pending shutdown observer and retries with two callers. These are native
+facade tests, not proof of guest exposure, native-buffer admission accounting,
+or the complete compiler/cache workflow. The compiler supervisor and its ledger
+still need integration before the audited native allowance can be recycled.

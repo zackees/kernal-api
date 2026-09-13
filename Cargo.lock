@@ -4250,9 +4250,8 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d49ccdbfa59730688bbbeca9c9f3f4ee4c8976e38e9e5929fee8128bbd046db"
+version = "4.10.11"
+source = "git+https://github.com/zackees/running-process?rev=1943831d13bf0f4c82eb694bc1f9cf5940d4718a#1943831d13bf0f4c82eb694bc1f9cf5940d4718a"
 dependencies = [
  "blake3",
  "getrandom 0.4.3",
@@ -4272,29 +4271,25 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2c944cf400635eebd05ece53fb38786005602e4f99f8ecbab45f2df0ea17194"
+version = "4.10.11"
+source = "git+https://github.com/zackees/running-process?rev=1943831d13bf0f4c82eb694bc1f9cf5940d4718a#1943831d13bf0f4c82eb694bc1f9cf5940d4718a"
 dependencies = [
  "blake3",
  "dirs 6.0.0",
  "interprocess",
  "libc",
- "png 0.17.16",
  "sysinfo",
  "thiserror 2.0.20",
  "tokio",
  "widestring",
  "winapi",
  "windows-sys 0.61.2",
- "x11rb",
 ]
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "effd1ab4c1415bac2e5e854fbb24b13a58e9f17ccba49da4a2ed87ba9d9c58f6"
+version = "4.10.11"
+source = "git+https://github.com/zackees/running-process?rev=1943831d13bf0f4c82eb694bc1f9cf5940d4718a#1943831d13bf0f4c82eb694bc1f9cf5940d4718a"
 dependencies = [
  "prost",
  "prost-build",

@@ -948,6 +948,21 @@ impl ProcessSession {
         self.inner.next_output().await
     }
 
+    /// Stop output delivery and await cleanup of native output readers.
+    ///
+    /// Discards queued output and waits for the output pumps and outstanding
+    /// native reads to finish cleanup. Already-returned events remain owned by
+    /// their callers. Success does not mean the child or its descendants have
+    /// exited; use lifecycle controls separately.
+    ///
+    /// This wakes a pending [`Self::next_output`] receive. Multiple shutdown
+    /// callers may wait concurrently. Once polled, cancelling this future does
+    /// not undo the shutdown request; retrying observes the same cleanup result.
+    /// An error is not acknowledgement that native output storage was reclaimed.
+    pub async fn shutdown_output(&self) -> io::Result<()> {
+        self.inner.shutdown_output().await
+    }
+
     /// Wait only for the direct child to exit and be reaped.
     ///
     /// This is independent from output completion, so it remains observable

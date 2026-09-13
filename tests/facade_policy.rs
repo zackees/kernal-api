@@ -91,9 +91,9 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { version = \"=4.10.10\", default-features = false, features = [\"kernel-substrate\"] }"
+            "running-process = { version = \"=4.10.11\", git = \"https://github.com/zackees/running-process\", rev = \"1943831d13bf0f4c82eb694bc1f9cf5940d4718a\", default-features = false, features = [\"kernel-substrate\"] }"
         ),
-        "the facade must retain the exact published running-process pin and minimal feature set"
+        "the migration must retain the exact reviewed substrate commit and minimal feature set; release packaging remains blocked"
     );
     assert!(
         manifest.contains("# Exact first-party pre-1.0 pin."),
@@ -700,14 +700,9 @@ fn json_is_confined_to_the_external_firefox_export() {
 /// async process/host HAL, so it must be feature-gated like every peer
 /// capability (`fs`, `fs-watch`, `ipc`, `pty`).
 ///
-/// This is a manifest-and-source test rather than a `cargo tree` case in
-/// `ci/check_compilation_boundary_dependencies.py` on purpose. That harness
-/// proves a package is absent from the default graph, and `png`/`x11rb`
-/// cannot be: `running-process-platform-internal` 4.10.10 declares both as
-/// non-optional `cfg(target_os = "linux")` dependencies, and `running-process`
-/// is a mandatory private dependency here. Gating this crate's own copy is
-/// what is in this crate's power; the graph reduction arrives when the
-/// substrate gates its own.
+/// This manifest-and-source test proves this crate's own gates. The migration
+/// substrate also gates its PNG/X11 dependencies; graph isolation is a separate
+/// dependency-tree check, not something this source scan proves.
 #[test]
 fn window_icon_stays_an_opt_in_gui_capability() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

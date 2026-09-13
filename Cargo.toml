@@ -102,7 +102,7 @@ tauri-webview = [
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
 tauri-webview-test-support = ["tauri-webview"]
 hash-sha256 = ["dep:sha2"]
-archive = ["dep:zip"]
+archive = ["dep:zip", "dep:tar", "dep:zstd", "dep:flate2"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",

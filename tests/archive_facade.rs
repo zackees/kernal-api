@@ -1,7 +1,259 @@
 #![cfg(feature = "archive")]
 
-use kernal_api::archive::{extract, ArchiveFormat, ExtractionLimits};
-use std::io::Write;
+use kernal_api::archive::{extract, ArchiveFormat, DanglingLinks, ExtractionLimits};
+use std::io::{Read, Write};
+
+#[test]
+#[ignore = "requires KERNAL_ARCHIVE_ZSTD_FIXTURE pointing to a real toolchain archive"]
+fn real_zstd_toolchain_extracts_into_fresh_staging() {
+    let source = std::env::var_os("KERNAL_ARCHIVE_ZSTD_FIXTURE").expect("fixture path");
+    let temp = tempfile::tempdir().unwrap();
+    extract(
+        std::path::Path::new(&source),
+        temp.path(),
+        ArchiveFormat::TarZstd,
+        ExtractionLimits {
+            dangling_links: DanglingLinks::PreserveMissingLeaf,
+            ..ExtractionLimits::default()
+        },
+    )
+    .unwrap();
+    assert!(std::fs::read_dir(temp.path()).unwrap().next().is_some());
+    let decoder = zstd::stream::read::Decoder::new(std::fs::File::open(&source).unwrap()).unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = 0;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        let output = temp.path().join(entry.path().unwrap());
+        let kind = entry.header().entry_type();
+        if kind.is_file() {
+            let expected = kernal_api::hash::blake3_reader(&mut entry, Default::default()).unwrap();
+            let actual = kernal_api::hash::blake3_file(&output, Default::default()).unwrap();
+            assert_eq!(actual, expected, "{}", output.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                    entry.header().mode().unwrap() & 0o777
+                );
+            }
+            files += 1;
+        } else if kind.is_symlink() {
+            assert_eq!(
+                std::fs::read_link(&output).unwrap(),
+                entry.link_name().unwrap().unwrap()
+            );
+        } else if kind.is_dir() {
+            assert!(output.is_dir());
+        }
+    }
+    assert!(files > 0);
+}
+
+#[test]
+fn tar_zstd_preserves_long_names_pax_and_links() {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_pax_extensions([("comment", b"bounded metadata".as_slice())])
+        .unwrap();
+    let long_name = format!("root/{}/tool", "nested".repeat(24));
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, &long_name, &b"tool"[..])
+        .unwrap();
+    #[cfg(unix)]
+    {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "alias", &long_name)
+            .unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Link);
+        header.set_size(0);
+        header.set_mode(0o755);
+        builder
+            .append_link(&mut header, "hard", &long_name)
+            .unwrap();
+    }
+    let bytes = zstd::stream::encode_all(builder.into_inner().unwrap().as_slice(), 1).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("input.tar.zst");
+    std::fs::write(&archive, bytes).unwrap();
+    let out = dir.path().join("out");
+    extract(
+        &archive,
+        &out,
+        ArchiveFormat::TarZstd,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(out.join(&long_name)).unwrap(), b"tool");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::read(out.join("alias")).unwrap(), b"tool");
+        assert_eq!(
+            std::fs::metadata(out.join("hard")).unwrap().ino(),
+            std::fs::metadata(out.join(&long_name)).unwrap().ino()
+        );
+    }
+}
+
+#[test]
+fn tar_rejects_oversized_extension_before_reading_its_body_and_corrupt_gzip_footer() {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::GNULongName);
+    header.set_size(65537);
+    header.set_cksum();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(header.as_bytes()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("input.tgz");
+    std::fs::write(&archive, gzip.finish().unwrap()).unwrap();
+    let error = extract(
+        &archive,
+        &dir.path().join("out"),
+        ArchiveFormat::TarGzip,
+        ExtractionLimits::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("64 KiB"), "{error}");
+    let mut bytes = tgz_fixture();
+    let crc = bytes.len() - 8;
+    bytes[crc] ^= 1;
+    std::fs::write(&archive, bytes).unwrap();
+    assert!(kernal_api::archive::extract_member(
+        &archive,
+        "package/bin/tool",
+        &dir.path().join("selected"),
+        ArchiveFormat::TarGzip,
+        ExtractionLimits::default()
+    )
+    .is_err());
+}
+
+#[test]
+fn tar_global_pax_resets_local_size_before_next_header() {
+    let mut builder = tar::Builder::new(Vec::new());
+    builder
+        .append_pax_extensions([("size", b"100000".as_slice())])
+        .unwrap();
+    let mut global = tar::Header::new_ustar();
+    global.set_entry_type(tar::EntryType::XGlobalHeader);
+    global.set_size(0);
+    global.set_mode(0o644);
+    global.set_cksum();
+    builder
+        .append_data(&mut global, "global", std::io::empty())
+        .unwrap();
+    let mut regular = tar::Header::new_gnu();
+    regular.set_size(0);
+    regular.set_mode(0o644);
+    regular.set_cksum();
+    builder
+        .append_data(&mut regular, "file", std::io::empty())
+        .unwrap();
+    let mut bytes = builder.into_inner().unwrap();
+    bytes.truncate(bytes.len() - 1024);
+    let mut long = tar::Header::new_gnu();
+    long.set_entry_type(tar::EntryType::GNULongName);
+    long.set_size(65537);
+    long.set_cksum();
+    bytes.extend_from_slice(long.as_bytes());
+    let compressed = zstd::stream::encode_all(bytes.as_slice(), 1).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("input.tar.zst");
+    std::fs::write(&archive, compressed).unwrap();
+    let error = extract(
+        &archive,
+        &dir.path().join("out"),
+        ArchiveFormat::TarZstd,
+        ExtractionLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("64 KiB"),
+        "must reject oversized header before trying to read body: {error}"
+    );
+}
+
+#[test]
+#[ignore = "requires KERNAL_ARCHIVE_TGZ_FIXTURE pointing to a real archive"]
+fn real_tgz_member_matches_original_stream() {
+    let source = std::env::var_os("KERNAL_ARCHIVE_TGZ_FIXTURE").expect("fixture path");
+    let member = std::env::var("KERNAL_ARCHIVE_TGZ_MEMBER").expect("member name");
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("tool");
+    kernal_api::archive::extract_member(
+        std::path::Path::new(&source),
+        &member,
+        &output,
+        ArchiveFormat::TarGzip,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    let decoder = flate2::read::GzDecoder::new(std::fs::File::open(&source).unwrap());
+    let mut archive = tar::Archive::new(decoder);
+    let mut expected = Vec::new();
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        if entry.path().unwrap() == std::path::Path::new(&member) {
+            entry.read_to_end(&mut expected).unwrap();
+            break;
+        }
+    }
+    assert!(!expected.is_empty());
+    assert_eq!(std::fs::read(output).unwrap(), expected);
+}
+
+fn tgz_fixture() -> Vec<u8> {
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gzip);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(4);
+    header.set_mode(0o755);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/bin/tool", &b"tool"[..])
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap()
+}
+
+#[test]
+fn tgz_extracts_files_and_selected_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("input.tgz");
+    std::fs::write(&archive, tgz_fixture()).unwrap();
+    let out = dir.path().join("out");
+    extract(
+        &archive,
+        &out,
+        ArchiveFormat::TarGzip,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read(out.join("package/bin/tool")).unwrap(),
+        b"tool"
+    );
+    let member = dir.path().join("single/tool");
+    kernal_api::archive::extract_member(
+        &archive,
+        "package/bin/tool",
+        &member,
+        ArchiveFormat::TarGzip,
+        ExtractionLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(&member).unwrap(), b"tool");
+}
 
 /// Read-only source fixture; extracted data is isolated and never executed.
 #[test]
@@ -19,7 +271,6 @@ fn real_zip_fixture_extracts_into_fresh_staging() {
     assert!(std::fs::read_dir(temp.path()).unwrap().next().is_some());
 }
 
-#[cfg(unix)]
 fn zip_links(links: &[(&str, &str)]) -> Vec<u8> {
     let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
     let options = zip::write::SimpleFileOptions::default();
@@ -29,6 +280,91 @@ fn zip_links(links: &[(&str, &str)]) -> Vec<u8> {
         writer.add_symlink(*path, *target, options).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn zip_rejects_link_targets_with_non_directory_prefixes() {
+    for target in [
+        "lib/tool/../tool",
+        "missing/../lib/tool",
+        "lib/tool/child",
+        "lib/tool/",
+        "lib/tool/.",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("input.zip");
+        std::fs::write(&archive, zip_links(&[("bad", target)])).unwrap();
+        let out = dir.path().join("out");
+        assert!(
+            extract(
+                &archive,
+                &out,
+                ArchiveFormat::Zip,
+                ExtractionLimits::default()
+            )
+            .is_err(),
+            "accepted {target}"
+        );
+        assert!(std::fs::symlink_metadata(out.join("bad")).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn zip_preserves_missing_leaf_only_when_explicitly_enabled() {
+    for target in [r"..\acorn\bin\acorn", "lib/missing"] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("input.zip");
+        std::fs::write(&archive, zip_links(&[("alias", target)])).unwrap();
+        assert!(extract(
+            &archive,
+            &dir.path().join("strict"),
+            ArchiveFormat::Zip,
+            ExtractionLimits::default()
+        )
+        .is_err());
+        let out = dir.path().join("out");
+        extract(
+            &archive,
+            &out,
+            ArchiveFormat::Zip,
+            ExtractionLimits {
+                dangling_links: DanglingLinks::PreserveMissingLeaf,
+                ..ExtractionLimits::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(out.join("alias")).unwrap(),
+            std::path::Path::new(target)
+        );
+        assert!(!out.join("alias").exists());
+    }
+    for target in [
+        "../outside",
+        "missing/../lib/tool",
+        "lib/tool/../tool",
+        "missing/child",
+        "lib/missing/",
+        "lib/tool/.",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("input.zip");
+        std::fs::write(&archive, zip_links(&[("bad", target)])).unwrap();
+        assert!(
+            extract(
+                &archive,
+                &dir.path().join("out"),
+                ArchiveFormat::Zip,
+                ExtractionLimits {
+                    dangling_links: DanglingLinks::PreserveMissingLeaf,
+                    ..ExtractionLimits::default()
+                }
+            )
+            .is_err(),
+            "accepted {target}"
+        );
+    }
 }
 
 #[cfg(unix)]

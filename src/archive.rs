@@ -10,6 +10,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
+mod tar_format;
+
 struct MetadataBudget {
     file: File,
     remaining: Rc<Cell<u64>>,
@@ -63,9 +65,25 @@ fn copy_bounded(
 pub enum ArchiveFormat {
     /// Standard ZIP, including ZIP64. Self-extracting prefixes are unsupported.
     Zip,
+    /// Gzip-compressed tar.
+    TarGzip,
+    /// Zstandard-compressed tar.
+    TarZstd,
 }
 
-/// Resource ceilings, checked before allocation or output where possible.
+/// Treatment of symbolic links whose final target does not exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DanglingLinks {
+    /// Require every link to resolve to an extracted entry.
+    #[default]
+    Reject,
+    /// Preserve missing final components inside existing extracted directories.
+    /// Missing intermediate directories and hardlink targets still fail.
+    /// Windows creates missing-target links as file symlinks.
+    PreserveMissingLeaf,
+}
+
+/// Resource ceilings and link policy, checked before allocation or output where possible.
 #[derive(Clone, Copy, Debug)]
 pub struct ExtractionLimits {
     /// Maximum source archive size.
@@ -80,6 +98,8 @@ pub struct ExtractionLimits {
     pub max_path_bytes: usize,
     /// Maximum component visits while resolving the complete link graph.
     pub max_link_steps: u64,
+    /// Whether confined dangling symbolic links may be preserved.
+    pub dangling_links: DanglingLinks,
 }
 
 impl Default for ExtractionLimits {
@@ -91,6 +111,7 @@ impl Default for ExtractionLimits {
             max_metadata_bytes: 64 * 1024 * 1024,
             max_path_bytes: 4096,
             max_link_steps: 1_000_000,
+            dangling_links: DanglingLinks::Reject,
         }
     }
 }
@@ -137,9 +158,15 @@ fn prepare_destination(dest: &Path) -> io::Result<PathBuf> {
 
 // Resolve the virtual link graph before placing any link on disk. In
 // particular, `alias/..` must expand alias before interpreting the parent.
+struct ArchiveLink {
+    target: PathBuf,
+    hard: bool,
+}
+
 fn resolve_link_path(
+    root: &Path,
     path: &Path,
-    links: &BTreeMap<PathBuf, PathBuf>,
+    links: &BTreeMap<PathBuf, ArchiveLink>,
     depth: usize,
     steps: &mut u64,
 ) -> io::Result<PathBuf> {
@@ -151,6 +178,14 @@ fn resolve_link_path(
         *steps = steps
             .checked_sub(1)
             .ok_or_else(|| invalid("archive link work limit exceeded"))?;
+        // Every prefix traversed by the OS must exist and be a directory,
+        // including the prefix discarded by `..`. Links have not been
+        // installed yet; graph expansion below resolves them virtually.
+        if matches!(component, Component::Normal(_) | Component::ParentDir)
+            && !fs::metadata(root.join(&resolved))?.is_dir()
+        {
+            return Err(invalid("archive link traverses a non-directory"));
+        }
         match component {
             Component::CurDir => (),
             Component::ParentDir => {
@@ -160,18 +195,44 @@ fn resolve_link_path(
             }
             Component::Normal(name) => {
                 resolved.push(name);
-                if let Some(target) = links.get(&resolved) {
-                    let parent = resolved.parent().unwrap_or(Path::new(""));
-                    resolved = resolve_link_path(&parent.join(target), links, depth + 1, steps)?;
+                if let Some(link) = links.get(&resolved) {
+                    let parent = if link.hard {
+                        Path::new("")
+                    } else {
+                        resolved.parent().unwrap_or(Path::new(""))
+                    };
+                    resolved = resolve_link_path(
+                        root,
+                        &parent.join(&link.target),
+                        links,
+                        depth + 1,
+                        steps,
+                    )?;
                 }
             }
             _ => return Err(invalid("absolute archive link target")),
         }
     }
+    // Components removes terminal separators and `/.`, but the operating
+    // system requires those literal targets to name directories.
+    let raw = path
+        .to_str()
+        .ok_or_else(|| invalid("non-UTF-8 link path"))?;
+    let requires_directory = raw.ends_with('/')
+        || raw.ends_with("/.")
+        || (cfg!(windows) && (raw.ends_with('\\') || raw.ends_with("\\.")));
+    if requires_directory && !fs::metadata(root.join(&resolved))?.is_dir() {
+        return Err(invalid("archive link requires a directory target"));
+    }
     Ok(resolved)
 }
 
-fn install_links(root: &Path, links: BTreeMap<PathBuf, PathBuf>, mut steps: u64) -> io::Result<()> {
+fn install_links(
+    root: &Path,
+    links: BTreeMap<PathBuf, ArchiveLink>,
+    mut steps: u64,
+    dangling_links: DanglingLinks,
+) -> io::Result<()> {
     // Parent creation happens before link creation, so none can redirect it.
     for path in links.keys() {
         if let Some(parent) = root.join(path).parent() {
@@ -179,21 +240,40 @@ fn install_links(root: &Path, links: BTreeMap<PathBuf, PathBuf>, mut steps: u64)
         }
     }
     let mut validated = Vec::with_capacity(links.len());
-    for (path, target) in &links {
+    for (path, link) in &links {
         let output = root.join(path);
         match fs::symlink_metadata(&output) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => (),
             Err(error) => return Err(error),
             Ok(_) => return Err(invalid("archive link collides with another entry")),
         }
-        let resolved = resolve_link_path(path, &links, 0, &mut steps)?;
-        let canonical = fs::canonicalize(root.join(resolved))?;
+        let resolved = resolve_link_path(root, path, &links, 0, &mut steps)?;
+        let canonical = match fs::canonicalize(root.join(&resolved)) {
+            Ok(path) => path,
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && !link.hard
+                    && dangling_links == DanglingLinks::PreserveMissingLeaf =>
+            {
+                root.join(resolved)
+            }
+            Err(error) => return Err(error),
+        };
         if !canonical.starts_with(root) {
             return Err(invalid("archive link escapes destination"));
         }
-        validated.push((output, target, canonical.is_dir()));
+        if link.hard && !canonical.is_file() {
+            return Err(invalid("hardlink target is not a regular file"));
+        }
+        let is_dir = canonical.is_dir();
+        validated.push((output, link, canonical, is_dir));
     }
-    for (output, target, is_dir) in validated {
+    for (output, link, canonical, is_dir) in validated {
+        if link.hard {
+            fs::hard_link(canonical, output)?;
+            continue;
+        }
+        let target = &link.target;
         #[cfg(unix)]
         {
             let _ = is_dir;
@@ -222,7 +302,30 @@ pub fn extract(
     }
     match format {
         ArchiveFormat::Zip => extract_zip(file, dest, limits),
+        ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => {
+            tar_format::extract_tar(file, dest, format, limits, None)
+        }
     }
+}
+
+/// Extract one regular tar member without writing other members. The output
+/// must not exist. The entire input is validated, including compression EOF.
+pub fn extract_member(
+    archive: &Path,
+    member: &str,
+    dest: &Path,
+    format: ArchiveFormat,
+    limits: ExtractionLimits,
+) -> io::Result<()> {
+    let member = relative_path(member, limits.max_path_bytes)?;
+    let file = File::open(archive)?;
+    if file.metadata()?.len() > limits.max_input_bytes {
+        return Err(invalid("archive input exceeds byte limit"));
+    }
+    if matches!(format, ArchiveFormat::Zip) {
+        return Err(invalid("selected ZIP member is unsupported"));
+    }
+    tar_format::extract_tar(file, dest, format, limits, Some(member))
 }
 
 // Check advertised ZIP/ZIP64 metadata before the backend sizes its entry vec.
@@ -336,10 +439,19 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
             remaining -= before - allowed;
             let target =
                 String::from_utf8(bytes).map_err(|_| invalid("non-UTF-8 archive link target"))?;
-            if target.is_empty() || target.contains(['\\', ':', '\0']) {
+            if target.is_empty() || target.contains([':', '\0']) {
                 return Err(invalid("unsafe archive link target"));
             }
-            if links.insert(relative, PathBuf::from(target)).is_some() {
+            if links
+                .insert(
+                    relative,
+                    ArchiveLink {
+                        target: PathBuf::from(target),
+                        hard: false,
+                    },
+                )
+                .is_some()
+            {
                 return Err(invalid("duplicate archive link"));
             }
             continue;
@@ -366,5 +478,5 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
             fs::set_permissions(&output, fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
-    install_links(&root, links, limits.max_link_steps)
+    install_links(&root, links, limits.max_link_steps, limits.dangling_links)
 }

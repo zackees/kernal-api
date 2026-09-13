@@ -389,20 +389,39 @@ pub(crate) mod tests {
         bytes: u64,
         value: u8,
     ) -> (EncryptedInput, u64) {
+        encrypted_zip_entries(
+            header,
+            key,
+            nonce,
+            corrupt_tag,
+            [(name.to_owned(), bytes, value)],
+        )
+    }
+
+    pub(crate) fn encrypted_zip_entries(
+        header: &[u8],
+        key: [u8; 16],
+        nonce: [u8; 12],
+        corrupt_tag: bool,
+        entries: impl IntoIterator<Item = (String, u64, u8)>,
+    ) -> (EncryptedInput, u64) {
         use openssl::symm::{Cipher, Crypter, Mode};
         let mut zip = zip::ZipWriter::new(tempfile::tempfile().unwrap());
-        zip.start_file(
-            name,
-            zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored),
-        )
-        .unwrap();
-        let mut chunk = [value; 64 * 1024];
-        let mut remaining = bytes;
-        while remaining != 0 {
-            let count = remaining.min(chunk.len() as u64) as usize;
-            zip.write_all(&chunk[..count]).unwrap();
-            remaining -= count as u64;
+        let mut chunk = [0; 64 * 1024];
+        for (name, bytes, value) in entries {
+            zip.start_file(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            chunk.fill(value);
+            let mut remaining = bytes;
+            while remaining != 0 {
+                let count = remaining.min(chunk.len() as u64) as usize;
+                zip.write_all(&chunk[..count]).unwrap();
+                remaining -= count as u64;
+            }
         }
         let mut zip = zip.finish().unwrap();
         let length = zip.metadata().unwrap().len();

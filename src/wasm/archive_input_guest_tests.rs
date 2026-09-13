@@ -39,7 +39,7 @@ fn authenticated_guest_control(artifact_variable: &str) {
         .build()
         .unwrap();
     let stream_proof = artifact_variable == "KERNAL_EXTENSION2_STREAM_WASM";
-    for case in 0..if stream_proof { 7 } else { 3 } {
+    for case in 0..if stream_proof { 8 } else { 3 } {
         let sketch = compiler.admit(&bytes, policy).unwrap();
         let header = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#;
         let (name, payload_bytes, value) = match case {
@@ -49,14 +49,18 @@ fn authenticated_guest_control(artifact_variable: &str) {
             6 => ("payload", 17 * 1024 * 1024, 0),
             _ => ("payload", 17 * 1024 * 1024, 0x5a),
         };
-        let (input, length) = crate::operations::archive_input::tests::encrypted_zip_entry(
+        // A valid first payload plus empty, unique entries exceeds the native
+        // 16,384-entry limit. Reject during inventory admission, before opening
+        // even the otherwise valid payload as a guest-readable Blob.
+        let extra_entries = if case == 7 { 16_384 } else { 0 };
+        let entries = std::iter::once((name.to_owned(), payload_bytes, value))
+            .chain((0..extra_entries).map(|index| (format!("extra-{index}"), 0, 0)));
+        let (input, length) = crate::operations::archive_input::tests::encrypted_zip_entries(
             header,
             [7; 16],
             if case == 2 { [8; 12] } else { [0; 12] },
             case == 1,
-            name,
-            payload_bytes,
-            value,
+            entries,
         );
         assert!(length > 16 * 1024 * 1024);
         let result = runtime.run(sketch.execute_threaded_root_with_grant(
@@ -91,7 +95,10 @@ fn authenticated_guest_control(artifact_variable: &str) {
         if stream_proof && matches!(case, 0 | 6) {
             assert!(snapshot.peak_buffered_blob_bytes > 0);
         } else if stream_proof {
-            assert_eq!(snapshot.peak_buffered_blob_bytes, 0);
+            assert_eq!(
+                snapshot.peak_buffered_blob_bytes, 0,
+                "authenticated guest case {case} exposed Blob payload"
+            );
         }
         sketch.close_threaded_root().unwrap();
     }

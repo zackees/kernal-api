@@ -170,6 +170,20 @@ Blob payload; the incorrect-content case reaches guest byte validation, then
 reclaims its producer and storage on nonzero guest exit. Native path/size
 rejection and guest product-name/content rejection are distinct evidence.
 
+An eighth case supplies a valid 17 MiB first payload followed by 16,384
+uniquely named empty entries. The resulting 16,385-entry archive must fail
+native inventory admission before any Blob payload is exposed. Requiring a
+zero Blob peak distinguishes count rejection from the guest merely rejecting
+the second entry's product name after streaming the first entry. This is a
+native count-limit proof, not execution of the guest's own count-policy limit.
+The ZIP writer retains fixture metadata, while payload generation and
+encryption continue using fixed 64 KiB buffers.
+The eight-case Linux x86-64 run passes in 37.11 s. A temporary mutation raising
+the native ceiling to 16,385 fails the zero-peak assertion with 131,072 bytes
+exposed (39.58 s); the source ceiling was restored to 16,384 afterward. This
+demonstrates that the new case detects a relaxed native count limit rather
+than passing solely because the guest eventually rejects an extra name.
+
 The reader is sequential: drain or drop the open Blob before advancing
 inventory or opening another entry. Entry handles independently retain storage,
 but do not promise concurrent stream progress. Closing the parent archive does

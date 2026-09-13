@@ -253,7 +253,7 @@ fn implementation_crates_are_not_publicly_reexported() {
 }
 
 #[test]
-fn process_substrate_is_feature_minimal_and_tracks_the_temporary_canonical_spawn_subgit() {
+fn process_substrate_selects_independent_spawn_without_widening_kernel_substrate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(

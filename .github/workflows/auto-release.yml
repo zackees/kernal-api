@@ -1,0 +1,97 @@
+name: Autonomous Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - pyproject.toml
+      - python/kernal_api/__init__.py
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report the release decision without creating a release.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: kernal-api-auto-release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Detect version bump
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Validate synchronized version and detect a missing release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          cargo = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
+          pyproject = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          init = Path('python/kernal_api/__init__.py').read_text()
+          if cargo == '0.0.0':
+              raise SystemExit('0.0.0 is a migration-only version and cannot be released')
+          if cargo != pyproject or f'__version__ = "{cargo}"' not in init:
+              raise SystemExit('Cargo, pyproject, and Python companion versions must agree')
+          print(cargo)
+          PY
+          )"
+          tag="v${version}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            release_state="$(gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" --json isDraft,isPrerelease --jq 'if .isDraft then "draft" elif .isPrerelease then "prerelease" else "published" end')"
+            if [ "${release_state}" != "published" ]; then
+              echo "${tag} already has a ${release_state} release; resolve it before automatic release" >&2
+              exit 1
+            fi
+            should_release=false
+            echo "${tag} is already published from this commit"
+          else
+            should_release=true
+            echo "${tag} is not published"
+          fi
+          if [ "${should_release}" = true ] && git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            tag_commit="$(git rev-parse "refs/tags/${tag}^{}")"
+            if [ "${tag_commit}" != "${GITHUB_SHA}" ]; then
+              echo "${tag} points at ${tag_commit}, not this release candidate ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "should_release=${should_release}" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Create immutable GitHub release from this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: >-
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY"
+          --target "$GITHUB_SHA" --generate-notes --title "kernal-api $TAG"
+      - name: Dispatch release verification and asset packaging
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG" -f tag="$TAG"

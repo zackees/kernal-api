@@ -135,15 +135,15 @@ fn owner_system_private_file_dacl(actual: &[u8]) -> bool {
     // when `OICI` is propagated through a directory. It is restrictive, but
     // introduces no principal beyond the owner/SYSTEM policy from
     // PRIVATE_DIR_SDDL.
-    [0, 0x10, 0x11, 0x12, 0x13, 0x18]
+    [(0, 0), (0x10, 0x10), (0x18, 0x10)]
         .into_iter()
-        .any(|inheritance| {
+        .any(|(owner_inheritance, system_inheritance)| {
             let mut expected = Vec::with_capacity(48);
             expected.extend(HEADER);
-            expected.extend([0, inheritance, 20, 0]);
+            expected.extend([0, owner_inheritance, 20, 0]);
             expected.extend(FULL_CONTROL);
             expected.extend(OWNER_RIGHTS);
-            expected.extend([0, inheritance, 20, 0]);
+            expected.extend([0, system_inheritance, 20, 0]);
             expected.extend(FULL_CONTROL);
             expected.extend(LOCAL_SYSTEM);
             actual == expected
@@ -220,23 +220,6 @@ fn open_directory_for_dacl_update(path: &Path) -> io::Result<File> {
 /// split the owner and DACL updates across different directories.
 #[cfg(feature = "ipc")]
 fn open_directory_for_owner_and_dacl_update(path: &Path) -> io::Result<File> {
-    match open_directory_for_owner_and_dacl_update_once(path) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            // An elevated token may create a directory owned by its default
-            // Administrators group.  The normal user SID then is not the
-            // object owner and cannot request WRITE_OWNER through the current
-            // DACL.  Use an isolated thread token for the one access check;
-            // changing the process token would expose unrelated callers to
-            // the privilege and make restoration racy.
-            open_directory_with_thread_take_ownership(path)
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(feature = "ipc")]
-fn open_directory_for_owner_and_dacl_update_once(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
     use winapi::um::winnt::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
@@ -245,144 +228,6 @@ fn open_directory_for_owner_and_dacl_update_once(path: &Path) -> io::Result<File
         .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
-}
-
-/// Open with SeTakeOwnershipPrivilege on a new thread's impersonation token.
-///
-/// The thread has no ambient work and exits immediately after the access
-/// check. Its impersonation token and enabled privilege therefore cannot leak
-/// to the process or interfere with concurrent callers. The returned file
-/// handle has already passed the access check and remains valid after the
-/// helper thread exits.
-#[cfg(feature = "ipc")]
-fn open_directory_with_thread_take_ownership(path: &Path) -> io::Result<File> {
-    if caller_has_impersonation_token()? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "ownership repair is unavailable while the caller impersonates another token",
-        ));
-    }
-    let path = path.to_owned();
-    std::thread::Builder::new()
-        .name("kernal-ipc-take-ownership".into())
-        .spawn(move || {
-            use windows_sys::Win32::Foundation::{
-                CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED,
-            };
-            use windows_sys::Win32::Security::{
-                AdjustTokenPrivileges, ImpersonateSelf, LookupPrivilegeValueW, RevertToSelf,
-                LUID_AND_ATTRIBUTES, SecurityImpersonation, SE_PRIVILEGE_ENABLED,
-                SE_TAKE_OWNERSHIP_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
-            };
-            use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
-
-            // SAFETY: this changes only the new helper thread. Its token is
-            // reverted before return and is destroyed when the thread exits.
-            if unsafe { ImpersonateSelf(SecurityImpersonation) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            struct Revert;
-            impl Drop for Revert {
-                fn drop(&mut self) {
-                    // SAFETY: this helper owns the thread impersonation
-                    // established above. Its thread exits immediately after.
-                    unsafe {
-                        let _ = RevertToSelf();
-                    }
-                }
-            }
-            let _revert = Revert;
-            let mut token = std::ptr::null_mut();
-            // SAFETY: current-thread pseudo handle and writable output token.
-            if unsafe {
-                OpenThreadToken(
-                    GetCurrentThread(),
-                    TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
-                    1,
-                    &mut token,
-                )
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            struct Token(windows_sys::Win32::Foundation::HANDLE);
-            impl Drop for Token {
-                fn drop(&mut self) {
-                    // SAFETY: this is the one successful OpenThreadToken
-                    // handle for the helper thread.
-                    unsafe { CloseHandle(self.0) };
-                }
-            }
-            let _token = Token(token);
-            let mut luid = unsafe { std::mem::zeroed() };
-            // SAFETY: the privilege name is static and NUL-terminated; `luid`
-            // is a writable local.
-            if unsafe {
-                LookupPrivilegeValueW(std::ptr::null(), SE_TAKE_OWNERSHIP_NAME, &mut luid)
-            } == 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            let requested = TOKEN_PRIVILEGES {
-                PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES {
-                    Luid: luid,
-                    Attributes: SE_PRIVILEGE_ENABLED,
-                }],
-            };
-            // SAFETY: `token` is the helper's thread token and `requested`
-            // names exactly one privilege. No prior state is needed because
-            // the helper thread reverts and exits before returning.
-            let adjusted = unsafe {
-                AdjustTokenPrivileges(
-                    token,
-                    0,
-                    &requested,
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                )
-            };
-            let last_error = unsafe { GetLastError() };
-            if adjusted == 0 || last_error == ERROR_NOT_ALL_ASSIGNED {
-                return Err(if last_error == ERROR_NOT_ALL_ASSIGNED {
-                    io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "SeTakeOwnershipPrivilege is not assigned to this token",
-                    )
-                } else {
-                    io::Error::last_os_error()
-                });
-            }
-            open_directory_for_owner_and_dacl_update_once(&path)
-        })
-        .map_err(|error| io::Error::other(format!("could not start ownership helper: {error}")))?
-        .join()
-        .map_err(|_| io::Error::other("ownership helper panicked"))?
-}
-
-/// Never retry an impersonated caller's denied access under the process token.
-/// A service must retain the client authority that performed the original
-/// check; rejection is safer than a privileged process-identity fallback.
-#[cfg(feature = "ipc")]
-fn caller_has_impersonation_token() -> io::Result<bool> {
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NO_TOKEN};
-    use windows_sys::Win32::Security::TOKEN_QUERY;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
-
-    let mut token = std::ptr::null_mut();
-    // SAFETY: current-thread pseudo handle and writable output token. The
-    // token, when returned, is closed before this function returns.
-    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 0, &mut token) } != 0 {
-        unsafe { CloseHandle(token) };
-        return Ok(true);
-    }
-    let error = unsafe { GetLastError() };
-    if error == ERROR_NO_TOKEN {
-        Ok(false)
-    } else {
-        Err(io::Error::from_raw_os_error(error as i32))
-    }
 }
 
 /// Compare the owner of this live handle to the caller's TokenUser SID.
@@ -784,8 +629,12 @@ mod tests {
         let parent = temporary.path().join("parent");
         let directory = parent.join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(&parent, "D:P(A;;FA;;;OW)(A;;FA;;;SY)").unwrap();
+        // Establish the child's owner/DACL while its ordinary creator still
+        // has WRITE_OWNER. The controlled parent is then protected without
+        // inheritable ACEs, so clearing the child DACL's protection bit cannot
+        // introduce runner-specific inherited entries.
         apply_protected_dacl_sddl(&directory, PRIVATE_DIR_SDDL).unwrap();
+        apply_protected_dacl_sddl(&parent, "D:P(A;;FA;;;OW)(A;;FA;;;SY)").unwrap();
         let protected = file_security_descriptor(&directory).unwrap();
         let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
 

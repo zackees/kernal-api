@@ -2476,6 +2476,7 @@ dependencies = [
  "dirs 6.0.0",
  "flate2",
  "framehop",
+ "futures-core",
  "getrandom 0.4.3",
  "globset",
  "gtk",
@@ -5268,6 +5269,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -28,6 +28,14 @@ use std::time::Duration;
 
 use tokio::sync::Notify as BackendNotify;
 
+mod broadcast;
+pub use broadcast::{
+    broadcast_channel, BroadcastReceiver, BroadcastRecvError, BroadcastSender,
+    BroadcastTryRecvError,
+};
+#[cfg(feature = "event-stream")]
+pub use broadcast::{BroadcastLagged, BroadcastStream};
+
 /// Current engine implementation, retained for diagnostics and bug reports.
 pub const BACKEND_NAME: &str = "tokio";
 /// Exact backend version selected by this `kernal-api` release.

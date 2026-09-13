@@ -50,8 +50,12 @@ jobs:
           --bin kernal-tauri-smoke
       - name: Verify native Windows external-page isolation
         if: runner.os == 'Windows'
-        timeout-minutes: 3
-        run: .\target\debug\kernal-tauri-smoke.exe close
+        # Let Cargo resolve Soldr's actual binary path. Keep the feature graph
+        # identical to the preceding build, allowing time for cache recovery.
+        timeout-minutes: 15
+        run: >-
+          soldr cargo run --locked --all-features
+          --bin kernal-tauri-smoke -- close
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.

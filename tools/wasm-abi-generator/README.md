@@ -17,6 +17,19 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
+The metadata also binds `operation_protocol_revision=1`, independently of the
+scalar import signatures. Revision 1 includes opcodes 1–19 and specifically
+requires scoped transfer/blob abandonment. Bump this revision when operation
+semantics change even if the scalar function signatures remain identical.
+Unversioned and unknown operation revisions are rejected before compilation;
+there is no legacy-host fallback. This closes the gap where an older host could
+accept a newer drop-capable guest because its import signatures still matched.
+
+Rebuild artifacts from matching guest sources with the normal build scripts.
+An already embedded legacy artifact is rejected by the embedder rather than
+silently relabeled. Metadata is a compatibility declaration, not attestation
+of guest source behavior; it never grants resource authority by itself.
+
 Run `soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml`
 for malformed-manifest/metadata, idempotency, and historical transport checks.
 

@@ -4,6 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
+// Revision 1 requires the scoped transfer/blob abandonment semantics (18/19).
+// Bump when operation meaning changes, even if scalar signatures do not.
+const OPERATION_PROTOCOL_REVISION: u32 = 1;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -380,7 +383,7 @@ impl Contract {
             namespace,
             import_name: import_name.to_owned(),
             // Exact bytes bind every signature/version, without a lossy fingerprint.
-            metadata: format!("capabilities={CAPABILITIES}\n{manifest}"),
+            metadata: format!("capabilities={CAPABILITIES}\noperation_protocol_revision={OPERATION_PROTOCOL_REVISION}\n{manifest}"),
         })
     }
     fn render(&self) -> String {
@@ -573,7 +576,10 @@ mod tests {
     #[test]
     fn metadata_binds_the_entire_generated_contract() {
         let contract = Contract::parse(MANIFEST).unwrap();
-        assert_eq!(contract.metadata, format!("capabilities=0\n{MANIFEST}"));
+        assert_eq!(
+            contract.metadata,
+            format!("capabilities=0\noperation_protocol_revision=1\n{MANIFEST}")
+        );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(
             contract.metadata,

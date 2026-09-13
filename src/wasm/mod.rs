@@ -121,7 +121,8 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\n{GENERATED_V1_MANIFEST}").as_bytes()
+        format!("capabilities=0\noperation_protocol_revision=1\n{GENERATED_V1_MANIFEST}")
+            .as_bytes()
     );
 }
 
@@ -3731,7 +3732,16 @@ mod threaded_root_observation_tests {
         replace_metadata_byte(&mut schema_skew, b"schema_revision = 1\n", b'2');
         let mut capability_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(&mut capability_skew, b"capabilities=0\n", b'1');
+        let mut operation_skew = ABI_METADATA_VALUE.to_vec();
+        replace_metadata_byte(
+            &mut operation_skew,
+            b"operation_protocol_revision=1\n",
+            b'2',
+        );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
+        let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=1\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -3739,6 +3749,16 @@ mod threaded_root_observation_tests {
         };
 
         let cases = [
+            (
+                "future operation protocol",
+                threaded_fixture_with_abi_metadata(Some(&operation_skew)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "legacy unversioned operation protocol",
+                threaded_fixture_with_abi_metadata(Some(legacy_operations.as_bytes())),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
             (
                 "absent",
                 absent,

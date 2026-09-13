@@ -81,6 +81,53 @@ pub use crate::{
     FsFileIdentity as FileIdentity,
 };
 
+/// Largest byte limit accepted by [`read_private_regular_file_bounded`].
+///
+/// This is deliberately a hard ceiling as well as a caller-selected limit:
+/// this convenience operation returns one allocation rather than a stream.
+#[cfg(feature = "fs")]
+pub const MAX_PRIVATE_REGULAR_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Read a current-user-private regular file, rejecting links and oversized
+/// input.
+///
+/// The final path component is opened without following a link, and all file
+/// security checks are made from that same open handle before its contents are
+/// read. The immediate parent must also be a current-user-private directory.
+/// The path is re-identified after reading where the host can do so, so a
+/// replacement of that final component during the operation is rejected rather
+/// than silently read. This is not a filesystem sandbox: callers must supply a
+/// trusted parent and ancestor path, and must prevent races that could replace
+/// or redirect those path components while this operation runs.
+///
+/// `max_bytes` is both the returned-data limit and the allocation/read bound:
+/// at most `max_bytes + 1` bytes are read in order to distinguish an exact
+/// limit from an oversized file. Limits above
+/// [`MAX_PRIVATE_REGULAR_FILE_BYTES`] are rejected.
+///
+/// On Unix, private means owned by the effective uid with no group or other
+/// permission bits. On Windows, the trusted parent must have the protected
+/// owner-and-SYSTEM DACL, and the opened file must be owned by the current user
+/// with exactly the private owner-rights-and-SYSTEM full-control DACL, either
+/// direct or inherited. The final component's reparse point is rejected; no
+/// claim is made about reparse points in ancestors.
+/// Callers that create staging files must still create them under an
+/// owner-private directory (for example the runtime-directory helper's
+/// result); this operation does not repair insecure paths.
+#[cfg(feature = "fs")]
+pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    if max_bytes > MAX_PRIVATE_REGULAR_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "private regular-file limit {max_bytes} exceeds the {} byte facade cap",
+                MAX_PRIVATE_REGULAR_FILE_BYTES
+            ),
+        ));
+    }
+    crate::fs_read_private_regular_file_bounded(path, max_bytes)
+}
+
 #[cfg(feature = "fs")]
 use std::fs::File;
 #[cfg(feature = "fs")]

@@ -1,0 +1,52 @@
+name: Auto-Release
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Verify and upload build artifacts without publishing anything
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: kernal-api-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    # Existing-tag dispatch is the immutable registry recovery path after main advances.
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      should_release: ${{ steps.detect.outputs.should_release }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Detect version bump
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BEFORE: ${{ github.event.before }}
+        run: uv run --no-project --python 3.13 ci/auto_release.py
+
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      source_sha: ${{ github.sha }}
+      tag: ${{ needs.prepare.outputs.tag }}
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    secrets: inherit

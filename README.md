@@ -48,7 +48,21 @@ adapter privately uses `running-process` 4.10.10 without exposing backend
 types; that dependency is mandatory, not feature-gated. Optional features keep
 consumers from linking tooling they do not use:
 
+- `sqlite` for synchronous, bounded SQLite connection/transaction/query and
+  backup mechanics; applications retain schema and SQL. See [SQLite facade](docs/sqlite.md).
+
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
+- `fs` includes `platform::fs::read_private_regular_file_bounded` for small
+  imported markers and credentials. Unix requires an effective-user-owned,
+  mode-private regular file below an equally private parent. Windows requires
+  a trusted protected owner-and-SYSTEM-DACL parent and, on the opened file,
+  current-user ownership plus exactly the private owner-rights-and-SYSTEM
+  full-control DACL (direct or inherited). It rejects only a reparse point in
+  the final path component and detects replacement of that component where
+  supported; it is not a filesystem sandbox. Callers must keep the parent and
+  ancestor path trusted and free of replacement races. It reads at most the
+  supplied limit plus one byte. The facade hard-caps this whole-value operation
+  at 64 MiB; larger artifacts must use a streaming operation.
 - `fs` also enables `hash::blake3_tree`: content-authoritative fingerprints of
   glob-selected directory trees, with bounded parallel streaming reads and a
   versioned path/content encoding. Include/exclude rules remain caller policy.

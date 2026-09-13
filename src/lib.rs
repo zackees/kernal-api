@@ -24,6 +24,14 @@ mod process_adapter;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Synchronous, bounded SQLite storage mechanics.
+///
+/// This facade owns connection safety policy and semantic result values; the
+/// application owns its schema, SQL, migrations, and choice of blocking
+/// worker. Do not call it on an async executor thread.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
 pub mod random;
@@ -236,6 +244,9 @@ pub use platform_imp::{
     fs_try_lock_shared, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
     fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
 };
+
+#[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_read_private_regular_file_bounded;
 
 #[cfg(feature = "fs-watch")]
 pub use platform_imp::FsWatchWatcher;

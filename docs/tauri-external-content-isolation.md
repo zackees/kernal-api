@@ -6,10 +6,12 @@ guest target cannot resolve a platform webview runtime.
 
 The private backend creates a plain `tauri_runtime::PendingWindow` on the
 canonical `tauri_runtime_wry::Wry` event loop, then attaches a direct
-`wry::WebViewBuilder` without calling `with_ipc_handler`, adding scripts, or
-adding custom schemes. It does not use Tauri's `WebviewWindowBuilder`, which
-installs an IPC bridge. The exact pinned Wry fork makes bridge installation
-conditional on that omitted handler. A loopback page-level proof asserts that
+`wry::WebViewBuilder` without calling `with_ipc_handler` or adding custom
+schemes. Default opens add no caller scripts. It does not use Tauri's
+`WebviewWindowBuilder`, which installs an IPC bridge. The exact published Wry
+0.57.0 pin makes bridge installation conditional on that omitted handler on
+Windows and macOS. On Linux the adapter removes backend initialization scripts
+and unregisters the IPC endpoint before navigation. A loopback proof asserts that
 `window.ipc`, Tauri internals, and the platform IPC handler are all absent.
 The view is incognito, disables clipboard, autofill, and devtools, refuses
 downloads, and denies every popup/new-window request.
@@ -63,3 +65,26 @@ Replace `close` with `popup`, `redirect`, `timeout`, `cancel`, or
 `window-close` to exercise isolation and cleanup paths. The test-support
 feature is accepted only for this executable proof and exposes aggregate
 semantic counts, never backend types.
+
+## Explicit page bootstrap
+
+Native callers may opt into `open_webview_with_bootstrap` using a validated
+`WebviewPageBootstrap`. Its trusted source is limited to 64 KiB of UTF-8 and
+cannot contain NUL. The limit bounds stored source, not execution time or page
+allocations. JavaScript runs at document start in the ordinary page world;
+syntax errors use normal page error reporting rather than becoming open errors.
+It is not a native IPC capability and must not contain secrets or untrusted
+remote input interpolated as code.
+
+Bootstrap views restrict navigation to the initial HTTP(S) origin. Both the
+native policy and a main-frame/origin JavaScript guard apply; the latter is
+necessary because WebView2 can inject initialization scripts into subframes.
+The script runs again on same-origin reloads. Default script-free opens retain
+their existing navigation policy.
+
+Run the `bootstrap` smoke scenario to verify execution before the first page
+script, re-execution on reload, absence in a same-origin child frame, absence
+of the tested IPC bridges, and rejection of cross-origin navigation. The HTTP
+fixture permits automatic favicon requests without counting them as an expected
+page request; it still rejects other unexpected paths. The fixture regression
+tests that distinction independently of native browser scheduling.

@@ -1,7 +1,7 @@
 //! Linux per-user directory placement for product runtime artifacts.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Directory for `product`'s ephemeral runtime artifacts (sockets, pid files).
@@ -288,4 +288,68 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+/// Secure, bounded private-file read for the facade.
+pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file path has no parent")
+    })?;
+    let parent_metadata = parent.metadata()?;
+    if !parent_metadata.is_dir()
+        // SAFETY: `geteuid` has no preconditions and only reads this process's credentials.
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file parent is not current-user private",
+        ));
+    }
+
+    // O_NONBLOCK makes opening a FIFO harmless long enough to reject it from
+    // the handle metadata; O_NOFOLLOW keeps the final component honest.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private input is not a regular file",
+        ));
+    }
+    // SAFETY: `geteuid` has no preconditions and only reads this process's credentials.
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private input is not current-user private",
+        ));
+    }
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file limit overflows")
+    })?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file)
+        .take(bound_plus_one as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    let opened = file_identity(&file)?;
+    if path_identity(path)? != opened {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private input path changed while it was read",
+        ));
+    }
+    Ok(bytes)
 }

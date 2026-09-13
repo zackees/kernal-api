@@ -288,7 +288,10 @@ tauri = { version = "=2.11.5", default-features = false, optional = true }
 tauri-runtime = { version = "=2.11.3", optional = true }
 tauri-runtime-wry = { version = "=2.11.4", default-features = false, optional = true }
 tauri-utils = { version = "=2.9.3", optional = true }
-wry = { version = "=0.57.0", default-features = false, optional = true }
+# 0.57 makes the no-handler Windows/macOS IPC bridge conditional. Published
+# Tauri runtime still uses private Wry 0.55 for its event-loop integration;
+# only this direct Wry creates the facade's isolated external webviews.
+wry = { version = "=0.57.0", default-features = false, features = ["os-webview"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
@@ -403,13 +406,3 @@ codegen-units = 1
 
 [profile.test]
 codegen-units = 1
-
-# Temporary exact upstream fix for the native external-content backend.  The
-# forked runtime-Wry revision makes its Wry IPC bridge optional, so the direct
-# Wry builder can remain bridge-free while sharing the canonical Tauri loop.
-[patch.crates-io]
-tauri = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
-tauri-runtime = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
-tauri-runtime-wry = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
-tauri-utils = { git = "https://github.com/zackees/tauri.git", rev = "4039372c9f75fc3e1c9f0fc98858c7c100880f8f" }
-wry = { git = "https://github.com/zackees/wry.git", rev = "29a2228b594d45c0ae9710866e46a6f898120151" }

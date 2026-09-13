@@ -2,10 +2,11 @@
 //!
 //! This module deliberately does not use `tauri::WebviewWindowBuilder`.
 //! Its external-URL route installs the Tauri IPC scripts and handler even
-//! when no application command has been configured.  A `PendingWebview`
-//! constructed below instead starts with an empty initialization-script list,
-//! no IPC handler, and no registered URI schemes.  The only native authority
-//! it receives is rendering an approved external HTTP(S) document.
+//! when no application command has been configured. A plain native window
+//! instead hosts a raw Wry view. Before its first external navigation, the
+//! Linux adapter removes Wry's injected scripts and IPC endpoint. No application
+//! IPC handler or custom URI scheme is installed. The only native authority it
+//! receives is rendering an approved external HTTP(S) document.
 //!
 //! The public semantic façade at the end of this module submits every native
 //! transition through the shared generation-safe operation hub. Raw Wry
@@ -510,7 +511,8 @@ fn build_isolated_webview(
     let builder = WebViewBuilder::new()
         // Deliberately do not call `with_ipc_handler`: Wry documents that it
         // exposes `window.ipc.postMessage` to page JavaScript.
-        .with_url(target.as_str())
+        // Do not navigate during construction. The Linux adapter must remove
+        // backend-injected scripts and endpoints before any external page runs.
         .with_incognito(true)
         .with_clipboard(false)
         .with_devtools(false)
@@ -563,7 +565,9 @@ fn build_isolated_webview(
         let webview = builder
             .build_gtk(&dispatcher.default_vbox().map_err(host_failure)?)
             .map_err(host_failure)?;
+        linux_webkitgtk::remove_host_bridge(&webview.webview())?;
         linux_webkitgtk::configure_permissions(&webview.webview(), permissions);
+        webview.load_url(target.as_str()).map_err(host_failure)?;
         Ok(webview)
     }
     #[cfg(not(any(
@@ -574,9 +578,11 @@ fn build_isolated_webview(
         target_os = "openbsd"
     )))]
     {
-        builder
+        let webview = builder
             .build(&NativeWindowHandle(dispatcher.clone()))
-            .map_err(host_failure)
+            .map_err(host_failure)?;
+        webview.load_url(target.as_str()).map_err(host_failure)?;
+        Ok(webview)
     }
 }
 

@@ -34,6 +34,7 @@ enum ContainedScenario {
     Trap,
     Block,
     CancelLoad,
+    CaptureQuota,
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
@@ -41,6 +42,13 @@ enum ContainedScenario {
 #[ignore = "requires a native display and actual screenshot artifact"]
 fn actual_screenshot_guest_cancellation_inside_containment_drains_load() {
     run_contained_screenshot(ContainedScenario::CancelLoad);
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn actual_screenshot_guest_native_capture_quota_failure_drains_containment() {
+    run_contained_screenshot(ContainedScenario::CaptureQuota);
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
@@ -55,9 +63,9 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
     let artifact = std::env::var_os(match scenario {
         ContainedScenario::Trap => "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM",
         ContainedScenario::Block => "KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM",
-        ContainedScenario::Capture | ContainedScenario::CancelLoad => {
-            "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
-        }
+        ContainedScenario::Capture
+        | ContainedScenario::CancelLoad
+        | ContainedScenario::CaptureQuota => "KERNAL_API_SCREENSHOT_ARTIFACT_WASM",
     })
     .expect("built screenshot artifact");
     let directory = tempfile::tempdir().unwrap();
@@ -98,9 +106,13 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
                             }
                             continue;
                         }
-                        let page = include_str!(
-                            "../examples/wasm-tauri-screenshot/fixtures/viewport.html"
-                        );
+                        let page = if scenario == ContainedScenario::CaptureQuota {
+                            include_str!(
+                                "../examples/wasm-tauri-screenshot/fixtures/over-budget.html"
+                            )
+                        } else {
+                            include_str!("../examples/wasm-tauri-screenshot/fixtures/viewport.html")
+                        };
                         let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}", page.len());
                     }
                 }
@@ -199,6 +211,26 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
             "load wait was not submitted: {trace}"
         );
         assert!(!trace.contains("phase=capture-requested"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    } else if scenario == ContainedScenario::CaptureQuota {
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Execution(SketchExecutionError::NonzeroExit { code: 97 })
+        );
+        let trace = trace.take().expect("failed capture cleanup trace");
+        validate_teardown_trace(&trace).unwrap();
+        assert!(trace.contains("phase=capture-requested"), "{trace}");
+        assert!(
+            trace.contains("phase=capture-encoded-byte-limit"),
+            "{trace}"
+        );
+        assert!(
+            !trace.lines().any(
+                |line| line.starts_with("kernal-webview-trace phase=submit ")
+                    && line.ends_with("opcode=10")
+            ),
+            "failed capture attempted output commit: {trace}"
+        );
         assert_eq!(std::fs::read(&output).unwrap(), b"original");
     } else if scenario == ContainedScenario::Block {
         assert_eq!(

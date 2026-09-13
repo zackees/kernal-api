@@ -111,6 +111,13 @@ pub(super) struct CaptureRequest {
     guest_owned: bool,
 }
 impl CaptureRequest {
+    #[cfg(all(feature = "wasm-sketch-host", feature = "tauri-webview-test-support"))]
+    pub(super) fn exceeded_encoded_byte_limit(&self) -> bool {
+        self.error
+            .lock()
+            .is_ok_and(|error| matches!(*error, Some(CaptureError::BlobLimit)))
+    }
+
     #[cfg(feature = "wasm-sketch-host")]
     pub(super) fn for_guest(mut self) -> Self {
         self.guest_owned = true;

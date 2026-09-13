@@ -21,6 +21,13 @@ remain pending. Linux also passes the forced-deadline proof described below.
 The cancellation proof requires `Stopped(Cancelled)`, not forced termination,
 and checks transported worker cleanup plus parent counters and unchanged output.
 
+`native_capture_quota_failure` runs the same guest against the fixed-seed noise
+fixture in `fixtures/over-budget.html`. The real native PNG encoder exceeds its
+unchanged 1 MiB bound. The test requires capture-rejected (exit 97), the bounded
+`capture-encoded-byte-limit` trace marker, no output-write submission, preserved
+files, and zero worker/native-resource counters without force. This Linux proof
+does not substitute for the remaining native Windows/macOS failure matrix.
+
 For the containment-only blocking variant, build with
 `build-guest.sh --block-after-capture` (PowerShell: `-BlockAfterCapture`) and
 set `KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM` to the admitted artifact under

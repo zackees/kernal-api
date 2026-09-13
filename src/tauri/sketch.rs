@@ -299,6 +299,10 @@ impl SketchWebviews {
                         .hub
                         .finish_external_operation(operation, Terminal::TimedOut);
                 }
+                #[cfg(feature = "tauri-webview-test-support")]
+                if request.exceeded_encoded_byte_limit() {
+                    self.trace_abi("capture-encoded-byte-limit", None);
+                }
                 drop(request);
             }
             OP_WEBVIEW_CLOSE => {

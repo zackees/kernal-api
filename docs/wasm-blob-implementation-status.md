@@ -252,6 +252,19 @@ The four real default-CLI regressions pass after the change in 30.87 seconds:
 missing worker, publication failure, standalone build/capture, and trap output
 preservation. Formatting and diff checks also pass.
 
+A real contained native-capture failure proof passes on Linux x86-64 in
+9.60 seconds. The fixture renders fixed-seed RGB noise across the ordinary
+800×600 viewport; the native PNG encoder exceeds its unchanged 1 MiB limit.
+The unchanged guest reports capture-rejected (exit 97), never submits output
+commit, and preserves the original output and neighbor with no staging left.
+The bounded acceptance trace explicitly records `capture-encoded-byte-limit`
+from the native request error, then verifies zero hub/compiler counters; parent
+worker/task/lease counters also drain without force. The first test run failed
+because the trace could not distinguish this cause from unrelated capture
+errors. The marker is test-feature-only and does not change the guest ABI or
+production capture behavior. This proves native encoder quota failure, not
+arbitrary OS capture-device failure or native execution on the other targets.
+
 A real contained cancellation-during-load proof exposed a cooperative shutdown
 bug: epoch interruption did not wake a guest suspended in the generated async
 `operation_yield` host import, so the parent had to force containment. The epoch

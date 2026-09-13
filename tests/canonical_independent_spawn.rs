@@ -41,6 +41,14 @@ fn module_namespace_preserves_canonical_signatures() {
         &running_process::SpawnOptions,
         &std::sync::atomic::AtomicBool,
     ) -> std::io::Result<running_process::independent_spawn::IndependentChild> =
+        kernal_api::spawn_independent;
+
+    let _: fn(
+        &running_process::independent_spawn::LaunchSpec,
+        &std::path::Path,
+        std::time::Duration,
+        &std::sync::atomic::AtomicBool,
+    ) -> std::io::Result<running_process::independent_spawn::IndependentChild> =
         kernal_api::independent_spawn::spawn;
 
     let _: Option<LaunchSpec> = None;

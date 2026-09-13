@@ -67,7 +67,9 @@ pub use running_process::independent_spawn;
 /// remain subject to their existing cgroup or Job limits.
 pub use running_process::foreground;
 
-pub use independent_spawn::{spawn as spawn_independent, IndependentChild};
+pub use independent_spawn::IndependentChild;
+/// Canonical options-based independent spawn entry point.
+pub use running_process::spawn_with_options as spawn_independent;
 
 /// Canonical semantic asynchronous child/session primitives. The opt-in
 /// `async-process-client` migration bridge additionally exposes Tokio-compatible

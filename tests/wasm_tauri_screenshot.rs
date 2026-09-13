@@ -28,6 +28,47 @@ fn screenshot_binary(worker: bool) -> std::path::PathBuf {
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+fn join_fixture_thread(thread: std::thread::JoinHandle<()>) {
+    if let Err(failure) = thread.join() {
+        // Preserve an assertion already unwinding through fixture cleanup.
+        // Otherwise the fixture failure must still fail the test itself.
+        if !std::thread::panicking() {
+            std::panic::resume_unwind(failure);
+        }
+    }
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+fn fixture_thread_panic_is_reported_without_an_existing_failure() {
+    assert!(std::panic::catch_unwind(|| {
+        let thread = std::thread::spawn(|| panic!("fixture failure"));
+        join_fixture_thread(thread);
+    })
+    .is_err());
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+fn fixture_thread_panic_preserves_an_existing_test_failure() {
+    struct JoinOnDrop(Option<std::thread::JoinHandle<()>>);
+    impl Drop for JoinOnDrop {
+        fn drop(&mut self) {
+            join_fixture_thread(self.0.take().unwrap());
+        }
+    }
+    let failure = std::panic::catch_unwind(|| {
+        let _fixture = JoinOnDrop(Some(std::thread::spawn(|| panic!("fixture failure"))));
+        panic!("original assertion failure");
+    })
+    .unwrap_err();
+    assert_eq!(
+        failure.downcast_ref::<&str>(),
+        Some(&"original assertion failure")
+    );
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
 #[test]
 #[ignore = "requires a native display and actual screenshot artifact"]
 fn actual_screenshot_guest_runs_inside_containment() {
@@ -123,7 +164,7 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
     impl Drop for Server {
         fn drop(&mut self) {
             self.0.store(true, Ordering::Release);
-            self.1.take().unwrap().join().unwrap();
+            join_fixture_thread(self.1.take().unwrap());
         }
     }
     let stopping = Arc::clone(&stop);
@@ -534,7 +575,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
             if let Some(thread) = self.thread.take() {
-                let _ = thread.join();
+                join_fixture_thread(thread);
             }
         }
     }

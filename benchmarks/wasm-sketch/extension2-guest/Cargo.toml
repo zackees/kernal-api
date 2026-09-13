@@ -13,6 +13,7 @@ publish = false
 guest-proof = []
 header-proof = ["guest-proof"]
 auth-proof = ["guest-proof"]
+inventory-proof = ["guest-proof"]
 
 [[bin]]
 name = "kernal-extension2-guest-proof"

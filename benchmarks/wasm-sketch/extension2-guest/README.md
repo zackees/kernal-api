@@ -2,7 +2,7 @@
 
 This source-only experiment makes the missing #13 guest capability concrete.
 The `guest-proof` binary currently **does not compile**: the public facade has
-no `AuthenticatedArchive::next_entry`. The optional binary is an explicit unfinished acceptance
+no `ArchiveEntry::open`. The optional binary is an explicit unfinished acceptance
 contract, not a shipped example or a passing Wasm proof. Do not replace its
 kernel calls with host-side orchestration or cite library tests as guest GREEN.
 
@@ -38,7 +38,7 @@ soldr cargo clippy --locked \
 Recorded on Linux x86-64: both policy tests pass (0.03 s), strict library
 Clippy passes, and a `cargo check --lib` using the same Wasm target and lock
 passes (5.31 s). The original guest binary failed on the missing facade import
-with E0432; the full contract now stops at the missing inventory method.
+with E0432; inventory is now implemented, but entry streaming remains absent.
 These library checks are not artifact execution evidence.
 
 ## Header-only actual guest control
@@ -67,8 +67,8 @@ KERNAL_EXTENSION2_HEADER_WASM="$PWD/target/extension2-header-proof/wasm32-wasip1
   -j1 -- --ignored
 ```
 
-Operation protocol revision 3 adds authentication/future-drop/archive-drop to
-revision 2's grant/header/abandon submissions. Rebuild guest code before
+Operation protocol revision 4 adds inventory/metadata/entry-drop to revision
+3's authentication submissions and revision 2's grant/header/abandon submissions. Rebuild guest code before
 embedding its metadata; never relabel an older binary.
 The header control also awaits a host timer to exercise the complete admitted
 async lifecycle; the bounded header copy itself finishes synchronously.
@@ -103,8 +103,28 @@ Linux x86-64 execution passes valid authentication, corrupted tag, and wrong
 nonce cases in 11.27 s. Each ends with zero staging bytes, authentication jobs,
 resources, and operations. Native tests separately cover pending-future
 abandonment and abandonment after successful authentication before collection.
-This guest does **not** enumerate or read entries yet. The full build remains
-RED at `next_entry` (Soldr log `20260913T073302Z-home-niteris-dev-kernal-api.xml`).
+This authentication-only control does **not** enumerate or read entries.
+
+## Inventory guest control
+
+`inventory-proof` additionally enumerates the authenticated ZIP through the
+public facade, applies bounded name/size/duplicate policy, and requires exactly
+one `payload` record of 17 MiB. It does not read the entry body. Protocol 4
+returns independently owned entry handles: closing enumeration retains staging
+while an entry remains live; dropping the last entry releases that storage.
+ZIP metadata I/O runs on the existing tracked blocking lane, never an import.
+
+Build using the authentication commands above, substituting `inventory-proof`
+for `auth-proof` in feature and target directory, and set
+`KERNAL_EXTENSION2_INVENTORY_WASM` when running the ignored test
+`authenticated_input_actual_guest_enumerates_large_zip_and_rejects_bad_tag_or_nonce`.
+The freshly built revision-4 guest passes valid ZIP, bad-tag, and wrong-nonce
+cases on Linux x86-64 in 13.60 s, with all four teardown counters zero.
+Native tests cover foreign/stale entry rejection, short metadata buffers,
+entry lifetime after parent close, resource-quota cursor rollback, and dropping
+an inventory future after completion but before collecting its entry.
+The full contract remains RED solely at `ArchiveEntry::open` (E0599, Soldr
+log `20260913T075448Z-home-niteris-dev-kernal-api.xml`).
 
 The executable contract requires a host-granted encrypted input, a bounded
 header read, asynchronous authentication, bounded inventory, and entry-to-Blob
@@ -112,7 +132,7 @@ streaming through `kernal_api::guest`. The guest accepts exactly one `payload`
 entry and verifies every byte of its 17 MiB body with a 64 KiB buffer. The host
 must keep the original header as AAD and expose no archive or entry resource
 before the final tag succeeds. The method names are a proposed semantic
-contract; inventory and entry dispatch are still absent.
+contract; entry streaming dispatch is still absent.
 
 To turn this RED into runtime evidence, add the generated operations and
 host-granted input, construct and encrypt the large synthetic ZIP, build and

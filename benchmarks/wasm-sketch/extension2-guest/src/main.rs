@@ -1,5 +1,4 @@
-//! Header/authentication guest controls plus the unfinished archive contract.
-//! Neither control enumerates or streams entries inside the guest yet.
+//! Header/authentication/inventory controls plus the unfinished streaming contract.
 use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
 use kernal_extension2_guest_proof::policy;
 
@@ -26,13 +25,42 @@ async fn proof() -> Result<(), OperationError> {
     Ok(())
 }
 
-#[cfg(all(feature = "auth-proof", not(feature = "header-proof")))]
+#[cfg(all(
+    feature = "auth-proof",
+    not(any(feature = "header-proof", feature = "inventory-proof"))
+))]
 async fn proof() -> Result<(), OperationError> {
     let (encrypted, nonce) = header().await?;
     encrypted.authenticate(nonce).await?.close().await
 }
 
-#[cfg(not(any(feature = "header-proof", feature = "auth-proof")))]
+#[cfg(all(feature = "inventory-proof", not(feature = "header-proof")))]
+async fn proof() -> Result<(), OperationError> {
+    let (encrypted, nonce) = header().await?;
+    let mut archive = encrypted.authenticate(nonce).await?;
+    let mut inventory = policy::Inventory::default();
+    let mut entries = 0;
+    while let Some(entry) = archive.next_entry().await? {
+        if !inventory.accept(entry.name(), entry.uncompressed_bytes())
+            || entry.name() != "payload"
+            || entry.uncompressed_bytes() != policy::PAYLOAD_BYTES
+        {
+            return Err(OperationError::Rejected);
+        }
+        entries += 1;
+    }
+    archive.close().await?;
+    if entries != 1 {
+        return Err(OperationError::Rejected);
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    feature = "header-proof",
+    feature = "auth-proof",
+    feature = "inventory-proof"
+)))]
 async fn proof() -> Result<(), OperationError> {
     let (encrypted, nonce) = header().await?;
     // The host retains its key and exact original AAD. No plaintext archive

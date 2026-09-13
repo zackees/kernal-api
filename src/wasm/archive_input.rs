@@ -197,7 +197,7 @@ impl OperationHub {
             .operations
             .get_mut(&operation)
             .ok_or(HubError::Closed)?
-            .is_archive_authentication = true;
+            .is_archive_operation = true;
         jobs.tasks.retain(|task| !task.is_finished());
         jobs.active.fetch_add(1, Ordering::AcqRel);
         let lease = ArchiveJobLease {
@@ -247,6 +247,53 @@ impl OperationHub {
         } else {
             Ok(())
         }
+    }
+
+    pub(super) fn submit_archive_work(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        authority: (OpaqueToken, u8, u8),
+        work: impl FnOnce(&Arc<Self>, OpaqueToken) -> Result<(), HubError> + Send + 'static,
+    ) -> Result<OpaqueToken, HubError> {
+        let (operation, _) = self.submit(store, Some(authority.0), authority.1, authority.2)?;
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let mut jobs = self.archive_jobs.lock().map_err(|_| HubError::Closed)?;
+        if state.closed || jobs.active.load(Ordering::Acquire) >= self.maximum_operations as u64 {
+            state.operations.remove(&operation);
+            return Err(if state.closed {
+                HubError::Closed
+            } else {
+                HubError::Quota
+            });
+        }
+        state
+            .operations
+            .get_mut(&operation)
+            .ok_or(HubError::Closed)?
+            .is_archive_operation = true;
+        jobs.tasks.retain(|task| !task.is_finished());
+        jobs.active.fetch_add(1, Ordering::AcqRel);
+        let lease = ArchiveJobLease {
+            hub: Arc::clone(self),
+            operation,
+            active: Arc::clone(&jobs.active),
+            failed: Arc::clone(&jobs.failed),
+        };
+        let hub = Arc::clone(self);
+        jobs.tasks.push(runtime.launch_blocking(move || {
+            let _lease = lease;
+            if work(&hub, operation).is_err() {
+                let _ = hub.terminal(
+                    operation,
+                    TerminalResult {
+                        terminal: Terminal::Rejected,
+                        resource: None,
+                    },
+                );
+            }
+        }));
+        Ok(operation)
     }
 
     pub(crate) fn grant_encrypted_input(

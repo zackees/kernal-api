@@ -19,7 +19,7 @@ impl OperationHub {
             if slot.owner.store != store {
                 return Err(HubError::WrongRights);
             }
-            if !slot.is_archive_authentication {
+            if !slot.is_archive_operation {
                 return Err(HubError::WrongKind);
             }
             let resource = slot.created_resource;
@@ -313,6 +313,9 @@ impl OperationHub {
             .get_mut(&token)
             .ok_or_else(|| invalid(HubError::Invalid))?;
         Self::validate_resource(slot, store, ARCHIVE_KIND, EXTRACT_RIGHT).map_err(invalid)?;
+        if !matches!(slot.value, ResourceValue::AuthenticatedArchive(_)) {
+            return Err(invalid(HubError::WrongKind));
+        }
         let ResourceValue::AuthenticatedArchive(archive) =
             std::mem::replace(&mut slot.value, ResourceValue::Synthetic)
         else {

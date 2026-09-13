@@ -5,10 +5,19 @@ use std::io::Write;
 #[test]
 #[ignore = "requires Cargo-built auth-proof artifact in KERNAL_EXTENSION2_AUTH_WASM"]
 fn authenticated_input_actual_guest_authenticates_large_zip_and_rejects_bad_tag_or_nonce() {
-    let bytes = std::fs::read(
-        std::env::var_os("KERNAL_EXTENSION2_AUTH_WASM").expect("auth-proof artifact"),
-    )
-    .unwrap();
+    authenticated_guest_control("KERNAL_EXTENSION2_AUTH_WASM");
+}
+
+#[test]
+#[ignore = "requires Cargo-built inventory-proof artifact in KERNAL_EXTENSION2_INVENTORY_WASM"]
+fn authenticated_input_actual_guest_enumerates_large_zip_and_rejects_bad_tag_or_nonce() {
+    authenticated_guest_control("KERNAL_EXTENSION2_INVENTORY_WASM");
+}
+
+fn authenticated_guest_control(artifact_variable: &str) {
+    let bytes =
+        std::fs::read(std::env::var_os(artifact_variable).expect("authenticated guest artifact"))
+            .unwrap();
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
     let policy =
         SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).unwrap();

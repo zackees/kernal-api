@@ -96,6 +96,33 @@ pub struct AuthenticatedArchive {
 }
 
 impl AuthenticatedArchive {
+    /// Read the next bounded inventory record. Returned entries retain their
+    /// authenticated storage independently of this enumeration handle.
+    pub async fn next_entry(&mut self) -> Result<Option<ArchiveEntry>, OperationError> {
+        let Some(inner) = self.inner.next_entry()?.wait().await? else {
+            return Ok(None);
+        };
+        let mut record = [0; 4108];
+        let count = inner.metadata(&mut record)?;
+        let bytes = u64::from_le_bytes(record[..8].try_into().map_err(|_| OperationError::Failed)?);
+        let length = u32::from_le_bytes(
+            record[8..12]
+                .try_into()
+                .map_err(|_| OperationError::Failed)?,
+        ) as usize;
+        if length != count - 12 {
+            return Err(OperationError::Failed);
+        }
+        let name = std::str::from_utf8(&record[12..count])
+            .map_err(|_| OperationError::Failed)?
+            .to_owned();
+        Ok(Some(ArchiveEntry {
+            _inner: inner,
+            name,
+            bytes,
+        }))
+    }
+
     pub async fn close(self) -> Result<(), OperationError> {
         self.inner.close().map_err(OperationError::from)
     }
@@ -104,6 +131,24 @@ impl AuthenticatedArchive {
 impl Drop for AuthenticatedArchive {
     fn drop(&mut self) {
         self.inner.abandon();
+    }
+}
+
+/// One bounded inventory record and its independent scoped entry authority.
+pub struct ArchiveEntry {
+    // Retains scoped authority until Drop, even though inventory only reads
+    // the copied metadata. Entry streaming is a separate unfinished step.
+    _inner: bindings::ArchiveEntry,
+    name: String,
+    bytes: u64,
+}
+
+impl ArchiveEntry {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn uncompressed_bytes(&self) -> u64 {
+        self.bytes
     }
 }
 

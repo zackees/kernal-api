@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
-// Revision 3 adds authentication and scoped future/archive abandonment (23-25).
+// Revision 4 adds bounded archive inventory and entry metadata/drop (26-28).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 3;
+const OPERATION_PROTOCOL_REVISION: u32 = 4;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -234,12 +234,45 @@ impl Drop for ArchiveAuthentication {
 }
 pub struct AuthenticatedArchive { token: u64 }
 impl AuthenticatedArchive {
+    pub fn next_entry(&self) -> Result<ArchiveNextEntry, OperationError> {
+        Ok(ArchiveNextEntry { inner: OperationFuture::submit(26, self.token, 0)? })
+    }
     pub fn close(&self) -> Result<(), OperationError> {
         if imports::operation_submit(25, self.token, 0).map_err(|_| OperationError::Failed)? == 1 {
             Ok(())
         } else { Err(OperationError::Rejected) }
     }
     pub fn abandon(&self) { let _ = self.close(); }
+}
+pub struct ArchiveNextEntry { inner: OperationFuture }
+impl ArchiveNextEntry {
+    pub async fn wait(self) -> Result<Option<ArchiveEntry>, OperationError> {
+        loop {
+            if let Some(token) = self.inner.poll()? {
+                return Ok(if token == 0 { None } else { Some(ArchiveEntry { token }) });
+            }
+            self.inner.yield_now()?;
+        }
+    }
+}
+impl Drop for ArchiveNextEntry {
+    fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
+}
+pub struct ArchiveEntry { token: u64 }
+impl ArchiveEntry {
+    pub fn metadata(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
+        let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let result = imports::operation_submit(27, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let count = (result >> 8) as usize;
+        if result as u8 != 1 || count > destination.len() || !(12..=4108).contains(&count) {
+            return Err(OperationError::Rejected);
+        }
+        Ok(count)
+    }
+}
+impl Drop for ArchiveEntry {
+    fn drop(&mut self) { let _ = imports::operation_submit(28, self.token, 0); }
 }
 /// One exact destination authorized by the embedding host; never a guest path.
 pub struct OutputFile { token: u64 }
@@ -633,7 +666,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=3\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=4\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

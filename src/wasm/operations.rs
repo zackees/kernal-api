@@ -23,6 +23,13 @@ static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
 ))]
 #[path = "archive_input.rs"]
 pub(crate) mod archive_input;
+#[cfg(all(
+    test,
+    feature = "archive-auth-test-support",
+    feature = "wasm-sketch-host"
+))]
+#[path = "archive_inventory.rs"]
+mod archive_inventory;
 #[cfg(all(test, feature = "archive-auth-test-support"))]
 #[path = "authenticated_archive.rs"]
 mod authenticated_archive;
@@ -62,6 +69,9 @@ pub(crate) const OP_ENCRYPTED_INPUT_ABANDON: u32 = 22;
 pub(crate) const OP_ENCRYPTED_INPUT_AUTHENTICATE: u32 = 23;
 pub(crate) const OP_ARCHIVE_AUTHENTICATION_ABANDON: u32 = 24;
 pub(crate) const OP_AUTHENTICATED_ARCHIVE_ABANDON: u32 = 25;
+pub(crate) const OP_ARCHIVE_NEXT_ENTRY: u32 = 26;
+pub(crate) const OP_ARCHIVE_ENTRY_METADATA: u32 = 27;
+pub(crate) const OP_ARCHIVE_ENTRY_ABANDON: u32 = 28;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
@@ -264,6 +274,18 @@ enum ResourceValue {
         feature = "archive-auth-test-support",
         feature = "wasm-sketch-host"
     ))]
+    ArchiveReader(archive_inventory::SharedArchive),
+    #[cfg(all(
+        test,
+        feature = "archive-auth-test-support",
+        feature = "wasm-sketch-host"
+    ))]
+    ArchiveEntry(archive_inventory::ArchiveEntry),
+    #[cfg(all(
+        test,
+        feature = "archive-auth-test-support",
+        feature = "wasm-sketch-host"
+    ))]
     EncryptedInput(archive_input::EncryptedInput),
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     AuthenticatedArchive(crate::archive::authenticated_staging::Authenticated),
@@ -280,7 +302,7 @@ enum ResourceValue {
 
 struct OperationSlot {
     #[cfg(all(test, feature = "archive-auth-test-support"))]
-    is_archive_authentication: bool,
+    is_archive_operation: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     pending_authentication: Option<crate::archive::authenticated_staging::Authentication>,
     owner: Owner,
@@ -2286,7 +2308,7 @@ impl OperationHub {
             token,
             OperationSlot {
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
-                is_archive_authentication: false,
+                is_archive_operation: false,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 pending_authentication: None,
                 owner: Owner { store },

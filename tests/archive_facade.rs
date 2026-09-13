@@ -65,7 +65,6 @@ fn tar_zstd_preserves_long_names_pax_and_links() {
     builder
         .append_data(&mut header, &long_name, &b"tool"[..])
         .unwrap();
-    #[cfg(unix)]
     {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Symlink);
@@ -95,10 +94,11 @@ fn tar_zstd_preserves_long_names_pax_and_links() {
     )
     .unwrap();
     assert_eq!(std::fs::read(out.join(&long_name)).unwrap(), b"tool");
+    assert_eq!(std::fs::read(out.join("alias")).unwrap(), b"tool");
+    assert_eq!(std::fs::read(out.join("hard")).unwrap(), b"tool");
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(std::fs::read(out.join("alias")).unwrap(), b"tool");
         assert_eq!(
             std::fs::metadata(out.join("hard")).unwrap().ino(),
             std::fs::metadata(out.join(&long_name)).unwrap().ino()
@@ -367,7 +367,6 @@ fn zip_preserves_missing_leaf_only_when_explicitly_enabled() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn zip_preserves_internal_link_chains_and_relative_parent_targets() {
     let dir = tempfile::tempdir().unwrap();

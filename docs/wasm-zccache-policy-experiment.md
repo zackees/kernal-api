@@ -4,7 +4,8 @@
 
 Inspected zccache revision `a7c84de53105ce41b2060bd9dd7730ef226e78a1`
 (workspace version 1.13.22) in the sister checkout
-`../kernal-api-extern/zccache`. No upstream source changes were made.
+`../kernal-api-extern/zccache`. No upstream source changes were made during
+this initial reproduction; coordinated prerequisites are recorded below.
 On the Linux x86-64 reference host, using its pinned Rust 1.95.0 toolchain:
 
 ```sh
@@ -83,9 +84,34 @@ soldr --no-cache cargo test --locked -p zccache-compiler -j1
 soldr --no-cache cargo clippy --locked -p zccache-compiler --all-targets -j1 -- --deny warnings
 ```
 
-This prerequisite is pushed but not merged. It does not remove the native
+This prerequisite is tracked in [zccache #1580](https://github.com/zackees/zccache/pull/1580)
+and is not yet merged. It does not remove the native
 dependency graph or change `NormalizedPath`/lexical path semantics. These
 results are native parser evidence, not an actual Wasm parser/key/miss proof.
+
+## Shared request-key encoder prerequisite
+
+[zccache #1581](https://github.com/zackees/zccache/pull/1581), commit
+`c54cf8aecd9a508cd090fa32ef9e1f5569eeaa05`, extracts the actual daemon
+`zccache-request-v2` byte encoding into the existing hash crate. The native
+daemon now consumes that same fallible emitter with lazy argument normalization.
+It preserves ordered argv, detached remap handling, raw depfile salts, and
+selected sorted environment entries without collecting a whole-key buffer.
+This request-cache fingerprint is not the complete artifact key described above.
+
+Literal-byte compatibility fixtures passed against the original daemon encoder.
+The new emitter tests first failed with E0432, then passed after implementation.
+Linux validation: 23 hash tests, 29 daemon fingerprint/path-policy tests, and
+the full daemon suite (837 passed, 28 existing ignored integration tests,
+139.73 seconds). Strict all-target Clippy for the changed crates passed with
+`--no-deps`; broader dependency linting stopped on three existing
+`double_must_use` diagnostics in untouched protocol code. Focused formatting
+and independent Astra code/documentation review passed.
+
+The PR remains open: merge API attempts failed and a subsequent read confirmed
+no merge. The sink boundary is ready for a kernel hash adapter, but neither
+that adapter nor portable path normalization or the Wasm dependency graph is
+implemented by this prerequisite. Neither PR changes a release version.
 
 ## Remaining proof
 

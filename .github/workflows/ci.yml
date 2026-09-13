@@ -39,16 +39,16 @@ jobs:
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - run: soldr cargo test --locked --all-features
-      - name: Verify HTTP wire semantics under backend feature unification
-        # This deliberately resolves a backend feature outside our manifest's
-        # production feature graph; the normal all-features lane stays locked.
-        run: >-
-          soldr cargo test --features http-client,reqwest/gzip
-          --test http_client encoded_responses_preserve_wire_bytes_and_headers
       - run: >-
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - run: soldr cargo fmt --all -- --check
+      - name: Verify HTTP wire semantics under backend feature unification
+        # Run after locked checks: this deliberately resolves a backend feature
+        # outside our manifest's production graph and may update the lockfile.
+        run: >-
+          soldr cargo test --features http-client,reqwest/gzip
+          --test http_client encoded_responses_preserve_wire_bytes_and_headers
 
   # Compile the aarch64-apple-darwin test binaries on Linux. Nothing here
   # needs a Mac: Soldr carries its own LLVM and macOS SDK, and clippy is a

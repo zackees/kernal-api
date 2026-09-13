@@ -2,6 +2,10 @@ name: CI
 
 on:
   pull_request:
+  # Retain a deterministic recovery path when GitHub drops or delays a
+  # pull-request synchronize event for a draft branch. Manual dispatch runs
+  # the exact same matrix at the explicitly selected ref.
+  workflow_dispatch:
   push:
     branches: [main]
 

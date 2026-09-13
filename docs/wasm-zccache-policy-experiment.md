@@ -166,9 +166,10 @@ artifact is 87242 bytes with exactly two kernel import instances. These are
 correctness observations, not matched performance measurements. The source pin
 is migration-only and does not satisfy published-front-door acceptance.
 
-The freshly rebuilt revision-6 archive guest also passes all eight cases on
-Linux (42.45 s). The screenshot guest was rebuilt for revision 8 in normal,
-trap, and blocked forms; all 16 Linux x86-64 native regressions pass in
+The revision-8 archive guest was freshly rebuilt and passes its 29 authenticated
+staging tests in 1.46 seconds plus all eight streaming cases in 42.94 seconds
+on Linux x86-64. The screenshot guest was also rebuilt for revision 8 in
+normal, trap, and blocked forms; all 16 Linux x86-64 native regressions pass in
 173.78 seconds. These are local compatibility results, not six-target evidence
 for this revision.
 
@@ -496,8 +497,7 @@ revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
 decision now exist. Artifact persistence/transfer, the six-host parent proof,
 matched candidate measurements, and final runtime selection remain unfinished.
-Existing revision-6 archive evidence is historical and must be rebuilt for the
-revision-8 host. The revision-8 screenshot artifact has Linux x86-64 evidence
+The revision-8 archive and screenshot artifacts have Linux x86-64 evidence
 only; the remaining five native targets still need fresh execution.
 
 ## Component compiler candidate

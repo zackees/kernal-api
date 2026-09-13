@@ -19,6 +19,16 @@ use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 /// the directory. Reapplying this policy repairs that legacy state.
 const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
 
+/// Protected, non-inheriting owner-and-SYSTEM DACL for a private regular file.
+///
+/// A file created below `PRIVATE_DIR_SDDL` normally inherits effective owner
+/// and SYSTEM ACEs. Some Windows token/filesystem combinations preserve
+/// `INHERIT_ONLY` on the Owner Rights ACE, which leaves the new file's owner
+/// unable to reopen it. The private-file creator applies this exact policy to
+/// its still-open handle after assigning TokenUser as owner.
+#[cfg(feature = "fs")]
+const PRIVATE_FILE_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
+
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
     fs::create_dir_all(path)?;
@@ -66,8 +76,9 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
 /// a rename or reparse-point swap cannot change the object whose owner and
 /// DACL are checked. We accept only the two exact owner/SYSTEM full-control
 /// ACL forms Windows creates directly or by inheriting `PRIVATE_DIR_SDDL`.
-/// Every other ACE kind, principal, mask, order, or callback payload differs
-/// byte-for-byte and fails closed.
+/// An `INHERIT_ONLY` Owner Rights ACE does not grant the file owner access, so
+/// it is not private-file policy. Every other ACE kind, principal, mask,
+/// order, or callback payload differs byte-for-byte and fails closed.
 #[cfg(feature = "fs")]
 pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -122,20 +133,18 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
 fn owner_system_private_file_dacl(actual: &[u8]) -> bool {
     // ACL revision 2, exactly two ACCESS_ALLOWED ACEs. The first principal is
     // Owner Rights (S-1-3-4); the second is LocalSystem (S-1-5-18). These are
-    // the only direct or inherited forms produced from PRIVATE_DIR_SDDL for a
-    // regular file. The inherited INHERIT_ONLY form is restrictive rather than
-    // an effective full-control grant. Every other mask, SID, order, ACE type,
-    // or payload remains byte-for-byte constrained.
+    // the only effective direct or inherited forms for a regular file. Every
+    // other mask, SID, order, ACE type, or payload remains byte-for-byte
+    // constrained.
     const HEADER: [u8; 8] = [2, 0, 48, 0, 2, 0, 0, 0];
     const OWNER_RIGHTS: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
     const LOCAL_SYSTEM: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
     const FULL_CONTROL: [u8; 4] = [0xff, 0x01, 0x1f, 0x00];
 
-    // Windows can preserve INHERIT_ONLY together with INHERITED_ACE (0x18)
-    // when `OICI` is propagated through a directory. It is restrictive, but
-    // introduces no principal beyond the owner/SYSTEM policy from
-    // PRIVATE_DIR_SDDL.
-    [(0, 0), (0x10, 0x10), (0x18, 0x10)]
+    // `INHERITED_ACE` (0x10) preserves the normal file inheritance form. Do
+    // not accept Owner Rights `INHERIT_ONLY` (0x18): that ACE grants no access
+    // to this file and produced unreadable private files on hosted Windows.
+    [(0, 0), (0x10, 0x10)]
         .into_iter()
         .any(|(owner_inheritance, system_inheritance)| {
             let mut expected = Vec::with_capacity(48);
@@ -306,6 +315,42 @@ pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
             current_sid.as_ptr().cast_mut().cast(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+/// Bind the effective private-file DACL to an already-created file handle.
+///
+/// The caller must first assign TokenUser as owner on this same handle. This
+/// avoids a path reopen and ensures the Owner Rights ACE resolves to exactly
+/// that user rather than an elevated token's default-owner group.
+#[cfg(feature = "fs")]
+pub(super) fn apply_current_user_private_file_dacl(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let descriptor = LocalSecurityDescriptor::from_sddl(PRIVATE_FILE_SDDL)?;
+    let dacl = descriptor.dacl()?;
+    // SAFETY: `file` is the still-open newly-created object, opened with
+    // WRITE_DAC by the caller. `dacl` borrows `descriptor`, which stays live
+    // through this synchronous call; no pathname is resolved.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl.as_ptr(),
             std::ptr::null_mut(),
         )
     };
@@ -705,14 +750,14 @@ mod tests {
 
     #[cfg(feature = "fs")]
     #[test]
-    fn inherited_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
+    fn created_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
         ensure_owner_private_directory(&directory).unwrap();
         let child = directory.join("marker");
         // An elevated token can default file ownership to Administrators.
-        // Exercise the production creator to ensure its handle-bound TokenUser
-        // assignment preserves the inherited Owner Rights ACL as private.
+        // Exercise the production creator: it pins TokenUser ownership and
+        // applies the effective owner/SYSTEM policy on that same handle.
         let mut child_file = crate::platform::fs::create_private_file(&child).unwrap();
         use std::io::Write as _;
         child_file.write_all(b"marker").unwrap();
@@ -721,11 +766,11 @@ mod tests {
         let child_dacl = file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap();
         assert!(
             owner_system_private_file_dacl(&child_dacl),
-            "private child DACL was not one accepted inherited owner/SYSTEM form: {child_dacl:02x?}"
+            "private child DACL was not one accepted owner/SYSTEM form: {child_dacl:02x?}"
         );
         assert_eq!(
             crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap_or_else(
-                |error| panic!("private inherited child DACL {child_dacl:02x?}: {error}"),
+                |error| panic!("private created child DACL {child_dacl:02x?}: {error}"),
             ),
             b"marker"
         );

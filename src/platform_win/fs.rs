@@ -440,7 +440,7 @@ pub fn sync_directory(directory: &Path) -> io::Result<()> {
 /// does not remove access inherited from a permissive parent.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
-    use winapi::um::winnt::{DELETE, GENERIC_WRITE, WRITE_OWNER};
+    use winapi::um::winnt::{DELETE, GENERIC_WRITE, WRITE_DAC, WRITE_OWNER};
 
     let file = std::fs::OpenOptions::new()
         .write(true)
@@ -449,9 +449,13 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
         // handle-bound too, so a rename cannot redirect it to another file.
         // `access_mode` replaces, rather than augments, `.write(true)` on
         // this host, so retain generic data-write access explicitly.
-        .access_mode(GENERIC_WRITE | WRITE_OWNER | DELETE)
+        .access_mode(GENERIC_WRITE | WRITE_OWNER | WRITE_DAC | DELETE)
         .open(path)?;
     if let Err(error) = super::ipc_private_dir::apply_current_user_owner(&file) {
+        let _ = delete_file_on_close(&file);
+        return Err(error);
+    }
+    if let Err(error) = super::ipc_private_dir::apply_current_user_private_file_dacl(&file) {
         let _ = delete_file_on_close(&file);
         return Err(error);
     }

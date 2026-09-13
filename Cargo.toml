@@ -103,6 +103,7 @@ tauri-webview = [
 tauri-webview-test-support = ["tauri-webview"]
 hash-sha256 = ["dep:sha2"]
 archive = ["dep:zip", "dep:tar", "dep:zstd", "dep:flate2"]
+http-client = ["dep:reqwest"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
@@ -184,6 +185,7 @@ full = [
 ]
 
 [dependencies]
+reqwest = { version = "=0.12.28", default-features = false, features = ["default-tls"], optional = true }
 # `rayon` backs the parallel memory-mapped hashing path; its global pool is
 # constructed lazily, so a consumer that never hashes a large file never builds
 # one.

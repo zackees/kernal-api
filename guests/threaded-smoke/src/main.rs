@@ -237,6 +237,11 @@ pub extern "C" fn kernal_api_run() -> u32 {
         let image = guest::run(Blob::create()).unwrap();
         let mut write = image.write_chunk(b"guest exact output").unwrap();
         assert!(write.poll().unwrap().is_some());
+        assert_eq!(
+            guest::run(output.write_blob(&image)),
+            Err(OperationError::Rejected),
+            "unsealed output preflight must preserve both guest handles"
+        );
         guest::run(image.seal()).unwrap();
         guest::run(output.write_blob(&image)).expect("public exact output");
     }

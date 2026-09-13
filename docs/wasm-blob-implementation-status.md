@@ -737,3 +737,23 @@ is included. All 13 facade-policy tests pass. The existing single reviewer
 rechecked both ownership findings and found them resolved with no new actionable
 findings. This is local candidate evidence, not six-target native acceptance or
 authorization to publish a matching release.
+
+The macOS ARM retry of run `34732458921` completed successfully for prior head
+`2722c6c` (job `103660674379`). Its 16 native screenshot cases passed in
+139.13s, including renamed-parent cleanup, quota rejection, cancellation, and
+trap paths. Abandoned browser connections still produced EINVAL during fixture
+setup, but the server discarded those connections and continued serving later
+requests. Together with that run's other five successful native jobs, this
+completes the six-target screenshot matrix for that prior head only. The
+public-guest head `8eeb166` has separate validation in run `34733726389`.
+
+The public guest regression now attempts output commit before sealing, observes
+typed rejection, then seals and successfully commits using the same handles.
+The in-process Wasmtime proof passes (6.24s). Its exact lifecycle expectation
+includes one additional consumed result and at most one additional suspension
+for the rejected blocking output job; zero final resource/operation counters
+and the existing byte budgets remain unchanged.
+The two worker proofs pass in 19.67s, and forced-output cleanup passes in
+10.81s. Strict host-library Clippy and formatting checks pass. The same
+reviewer independently reran the actual-artifact proof (6.13s) and returned
+clean for the regression, counter changes, snapshot, and evidence documents.

@@ -1,9 +1,9 @@
 threaded-artifact-manifest-v1
-export name=__main_void kind=function index=50 type=Some(13)
+export name=__main_void kind=function index=53 type=Some(13)
 export name=_start kind=function index=16 type=Some(1)
-export name=kernal-api-run kind=function index=45 type=Some(13)
+export name=kernal-api-run kind=function index=48 type=Some(13)
 export name=memory kind=memory index=0 type=None
-export name=wasi_thread_start kind=function index=369 type=Some(3)
+export name=wasi_thread_start kind=function index=374 type=Some(3)
 import module=env name=memory kind=memory initial=17 maximum=Some(16384) shared=true memory64=false page-size-log2=None
 import module=kernal-api:v1 name=kernel_yield kind=function type=1
 import module=kernal-api:v1 name=operation_cancel kind=function type=10

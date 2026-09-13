@@ -3889,10 +3889,12 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.active_clocks, 0);
         // One create, two child uses, and one close must each prove a real
         // Pending -> async yield wake -> one terminal poll transition.
-        // Output completion and the clock may win before waiter registration;
-        // each adds at most one suspension, but exactly one consumed result.
-        assert!((8..=10).contains(&operations.suspends), "{operations:?}");
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1);
+        // Output rejection, successful output completion, and the clock may
+        // win before waiter registration; each adds at most one suspension,
+        // but exactly one consumed result. The rejected unsealed commit must
+        // leave both authorities usable by the subsequent successful retry.
+        assert!((8..=11).contains(&operations.suspends), "{operations:?}");
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),

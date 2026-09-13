@@ -3,6 +3,97 @@
 use kernal_api::json::{encode, parse, Error, Layout, Value};
 
 #[test]
+fn member_parsing_retains_nested_duplicates_and_order() {
+    use kernal_api::json::parse_members;
+    let source = br#"{"a":null,"a":1,"nested":[{"x":false,"x":true}]}"#;
+    let value = parse_members(source).unwrap();
+    assert_eq!(
+        value,
+        Value::ObjectMembers(vec![
+            ("a".into(), Value::Null),
+            ("a".into(), Value::Signed(1)),
+            (
+                "nested".into(),
+                Value::Array(vec![Value::ObjectMembers(vec![
+                    ("x".into(), Value::Bool(false)),
+                    ("x".into(), Value::Bool(true)),
+                ])])
+            ),
+        ])
+    );
+    assert_eq!(encode(&value, Layout::Compact).unwrap(), source);
+    assert_ne!(parse(source).unwrap(), value);
+}
+
+#[test]
+fn member_parser_bounds_count_repeated_values_and_depth() {
+    use kernal_api::json::{parse_members, MAX_DEPTH, MAX_INPUT_BYTES, MAX_NODES};
+    let source = format!("{{{}\"x\":null}}", "\"x\":null,".repeat(MAX_NODES - 2));
+    let Value::ObjectMembers(members) = parse_members(source.as_bytes()).unwrap() else {
+        panic!("member object")
+    };
+    assert_eq!(members.len(), MAX_NODES - 1);
+    let source = format!("{{{}\"x\":null}}", "\"x\":null,".repeat(MAX_NODES - 1));
+    assert_eq!(parse_members(source.as_bytes()), Err(Error::TooManyNodes));
+    for depth in [MAX_DEPTH, MAX_DEPTH + 1] {
+        let source = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        let result = parse_members(source.as_bytes());
+        if depth == MAX_DEPTH {
+            assert!(result.is_ok());
+        } else {
+            assert_eq!(result, Err(Error::TooDeep));
+        }
+    }
+    let mut source = vec![b' '; MAX_INPUT_BYTES];
+    source[0] = b'0';
+    assert_eq!(parse_members(&source), Ok(Value::Signed(0)));
+    source.push(b' ');
+    assert_eq!(parse_members(&source), Err(Error::InputTooLarge));
+    for source in [b"[".as_slice(), b"{} {}", b"\xff", b"{\"a\":1,}"] {
+        assert_eq!(parse_members(source), Err(Error::InvalidSyntax));
+    }
+}
+
+#[test]
+fn member_parser_keeps_scalar_contract_and_decoded_key_spelling() {
+    use kernal_api::json::parse_members;
+    for source in [
+        "null",
+        "true",
+        "-9223372036854775808",
+        "18446744073709551615",
+        "1.5",
+        "-0.0",
+        "\"日本\\ntext\"",
+    ] {
+        assert_eq!(
+            parse_members(source.as_bytes()).unwrap(),
+            parse(source.as_bytes()).unwrap()
+        );
+    }
+    assert_eq!(
+        parse_members(br#"{"a":null,"\u0061":true}"#).unwrap(),
+        Value::ObjectMembers(vec![
+            ("a".into(), Value::Null),
+            ("a".into(), Value::Bool(true))
+        ])
+    );
+}
+
+#[test]
+fn member_parser_does_not_confuse_user_keys_with_private_number_markers() {
+    let key = "$serde_json::private::Number";
+    let source = format!("{{\"{key}\":\"1.5\",\"{key}\":2.5}}");
+    assert_eq!(
+        kernal_api::json::parse_members(source.as_bytes()).unwrap(),
+        Value::ObjectMembers(vec![
+            (key.into(), Value::String("1.5".into())),
+            (key.into(), Value::Float(2.5)),
+        ])
+    );
+}
+
+#[test]
 fn json_values_preserve_integer_extrema_and_unicode() {
     let value =
         parse(br#"[-9223372036854775808,18446744073709551615,"\u65e5\u672c",null,true,1.5]"#)

@@ -18,7 +18,7 @@ use super::WebviewPermissions;
 const FALLBACK_FONT_DPI: i32 = 96;
 
 /// Published Wry installs an IPC script and endpoint even with no application
-/// handler. This capability permits neither, nor any initialization scripts.
+/// handler. Remove both before installing any explicitly opted-in caller script.
 /// Called on the UI thread before the facade initiates the first navigation.
 pub(super) fn remove_host_bridge(
     webview: &webkit2gtk::WebView,
@@ -97,6 +97,25 @@ fn effective_font_dpi(desktop_gtk_xft_dpi: i32, integer_scale: i32) -> i32 {
         return FALLBACK_FONT_DPI * 1024;
     }
     (desktop_gtk_xft_dpi / integer_scale.max(1)).max(1)
+}
+
+/// Called after backend bridge removal and before the first navigation.
+pub(super) fn install_page_bootstrap(
+    webview: &webkit2gtk::WebView,
+    source: &str,
+) -> Result<(), super::NativeWebviewError> {
+    let manager = webview.user_content_manager().ok_or_else(|| {
+        super::NativeWebviewError::HostFailure("webview has no user content manager".into())
+    })?;
+    let script = webkit2gtk::UserScript::new(
+        source,
+        webkit2gtk::UserContentInjectedFrames::TopFrame,
+        webkit2gtk::UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    );
+    manager.add_script(&script);
+    Ok(())
 }
 
 /// Correct GTK's effective page DPI after GTK initialization but before the

@@ -18,6 +18,11 @@
 //! a maintained backend privately, because there is no std equivalent and a
 //! hand-rolled reflink ioctl is not something to get wrong silently.
 
+#[cfg(feature = "fs")]
+mod temporary;
+#[cfg(feature = "fs")]
+pub use temporary::{TemporaryDirectory, MAX_TEMP_PREFIX_BYTES};
+
 /// A descriptor the caller already owns and has asked us to write to.
 ///
 /// Deliberately opaque. Callers hold host-specific things -- a `RawFd` on

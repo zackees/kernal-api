@@ -61,6 +61,32 @@ requirements for native/Wasm fixture equivalence:
   sorted arguments and a v1 tag; that prose must not define the experiment's
   expected keys. Kernel hashing must preserve the actual byte-update sequence.
 
+## Explicit Rustc host-policy prerequisite
+
+The coordinated sister branch `feat/rustc-explicit-host-policy` contains
+[zccache commit 4d37833](https://github.com/zackees/zccache/commit/4d378335db604ea340e204fa50d513197415009d).
+It adds `RustcHost` and `parse_rustc_invocation_with_host` to the existing
+compiler crate, without copying its parser into this benchmark. The native
+entry point still resolves the existing host/configuration facts and delegates
+to that implementation. Host-side proc-macro/Dylint names are independent of
+the requested target; an explicit target still controls executable naming.
+
+RED: the three new tests fail with unresolved imports before the seam exists
+(Soldr record `20260913T085516Z-home-niteris-dev-kernal-api-extern-zccache.xml`).
+GREEN on Linux x86-64: all three explicit-host tests pass, exercising all three
+host families, Dylint/test-cache admission, and original argv preservation.
+The complete compiler suite passes 383 tests with no failures or ignored tests;
+strict package Clippy and an independent focused Astra review also pass:
+
+```sh
+soldr --no-cache cargo test --locked -p zccache-compiler -j1
+soldr --no-cache cargo clippy --locked -p zccache-compiler --all-targets -j1 -- --deny warnings
+```
+
+This prerequisite is pushed but not merged. It does not remove the native
+dependency graph or change `NormalizedPath`/lexical path semantics. These
+results are native parser evidence, not an actual Wasm parser/key/miss proof.
+
 ## Remaining proof
 
 No extracted policy package or GREEN result is claimed yet. The next

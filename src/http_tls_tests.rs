@@ -38,6 +38,9 @@ fn fixture(response: Vec<u8>) -> (u16, JoinHandle<bool>) {
                 Err(error) => panic!("TLS fixture accept: {error}"),
             }
         };
+        // Winsock inherits the listener's nonblocking mode on accept. This
+        // worker drives blocking native TLS with bounded socket timeouts.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

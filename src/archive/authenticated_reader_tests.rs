@@ -2,7 +2,7 @@ use super::*;
 use crate::archive::ExtractionLimits;
 use std::io::Read;
 
-fn fixture(name: &str, length: u64) -> (Authenticated, StagingBudget) {
+pub(crate) fn fixture(name: &str, length: u64) -> (Authenticated, StagingBudget) {
     let mut writer = zip::ZipWriter::new(tempfile::tempfile().unwrap());
     writer
         .start_file(

@@ -12,7 +12,7 @@ const CHUNK: usize = 64 * 1024;
 
 #[cfg(test)]
 #[path = "authenticated_reader_tests.rs"]
-mod reader_tests;
+pub(crate) mod reader_tests;
 
 #[derive(Clone, Debug)]
 pub(crate) struct StagingBudget(Arc<StagingBudgetState>);

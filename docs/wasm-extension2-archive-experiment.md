@@ -240,9 +240,51 @@ regression fail because a retry succeeded (Soldr log
 
 This is the native entry-streaming seam required by the guest contract, not
 its completed implementation. The generated `EncryptedArchive` operations,
-host dispatch, capacity-awaited Blob sink and real guest artifact execution
-remain missing. The synchronous `Write` sink in these tests does not prove
-asynchronous backpressure or cancellation of blocked filesystem operations.
+host dispatch and real guest artifact execution remain missing. The original
+synchronous `Write` sink tests do not prove asynchronous backpressure; the
+native Blob bridge below adds that separate proof. Neither proves cancellation
+of blocked filesystem operations.
+
+## Native entry-to-Blob bridge
+
+`src/wasm/authenticated_blob.rs` now connects the owned reader to the existing
+capacity-awaited Blob writes under the test-only host experiment. A private,
+non-cloneable producer creates a read-only consumer Blob. Ordinary write/seal
+operations still require WRITE authority and reject that consumer handle.
+There is no producer constructor accepting an arbitrary consumer token.
+
+The blocking copy worker uses the caller's existing async-engine handle to
+observe, suspend, and await each bounded write. It holds at most one pending
+chunk and never waits with the operation-table mutex held. No second executor
+or queue was added. A pending-write guard synchronously abandons uncollected
+operations and their buffers on error/unwind. Only a successful complete
+archive copy seals EOF; flush does not seal, and failure permanently invalidates
+the producer. Unfinished producer drop closes the Blob instead of reporting EOF.
+
+The bridge tests initially failed to compile because `NativeArchiveSink` was
+absent (Soldr log `20260913T062645Z-home-niteris-dev-kernal-api.xml`). They now
+stream and verify all 17 MiB through the same read-result collection machinery
+used by guest Blob reads, stop at a 128 KiB Blob plus one pending 64 KiB write
+while the consumer pauses, and resume after consumption. The hub's retained
+transfer-capacity peak stays within its configured ceiling. This accounting
+does not include the reader's fixed 64 KiB stack buffer or ZIP metadata budget,
+and is not process RSS evidence.
+
+Consumer drop, trap and timeout teardown wake the blocked producer, join the
+copy worker, and leave zero storage, resources, operations and retained transfer
+buffers. A separate test consumes a readable prefix before a write-submission
+failure or producer panic, then requires closure rather than successful EOF.
+Disabling the failed-producer guard made this regression fail because `finish`
+accepted EOF after the failed write (Soldr log
+`20260913T063059Z-home-niteris-dev-kernal-api.xml`); the guard was restored.
+
+These are native integration tests, not execution of the guest archive
+contract. The driver still needs generated operations, host grant/dispatch,
+bounded queued/running archive-job accounting and draining, progress deadlines,
+worker containment and actual guest/six-target validation. Operation-slot limits
+alone do not bound native jobs that outlive a cancelled operation. The fixture's
+owned reader is supplied directly by trusted native test code, not discovered
+through guest archive authority.
 
 ## Native portability gate
 

@@ -19,6 +19,9 @@ static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
 #[cfg(all(test, feature = "archive-auth-test-support"))]
 #[path = "authenticated_archive.rs"]
 mod authenticated_archive;
+#[cfg(all(test, feature = "archive-auth-test-support", feature = "wasm-sketch-host"))]
+#[path = "authenticated_blob.rs"]
+mod authenticated_blob;
 static NEXT_LOGICAL_SCOPE: AtomicU64 = AtomicU64::new(1);
 const MAX_CLOSED_TOMBSTONES: usize = 128;
 const MAX_WIRE_TOKEN: u64 = (1_u64 << 56) - 1;
@@ -1339,11 +1342,22 @@ impl OperationHub {
         length: usize,
         copy: impl FnOnce() -> Vec<u8>,
     ) -> Result<OpaqueToken, HubError> {
+        self.submit_blob_write_checked(store, blob, length, BLOB_RIGHT_WRITE, copy)
+    }
+
+    fn submit_blob_write_checked(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        length: usize,
+        required_rights: u8,
+        copy: impl FnOnce() -> Vec<u8>,
+    ) -> Result<OpaqueToken, HubError> {
         if length > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
         let (operation, _) =
-            self.submit(store, Some(blob), BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+            self.submit(store, Some(blob), BLOB_RESOURCE_KIND, required_rights)?;
         {
             let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
             if state
@@ -1695,9 +1709,18 @@ impl OperationHub {
 
     /// Publish EOF explicitly. An empty, unsealed blob can still receive data.
     pub(crate) fn seal_blob(&self, store: u64, blob: OpaqueToken) -> Result<(), HubError> {
+        self.seal_blob_checked(store, blob, BLOB_RIGHT_WRITE)
+    }
+
+    fn seal_blob_checked(
+        &self,
+        store: u64,
+        blob: OpaqueToken,
+        required_rights: u8,
+    ) -> Result<(), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let resource = state.resources.get_mut(&blob).ok_or(HubError::Invalid)?;
-        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, BLOB_RIGHT_WRITE)?;
+        Self::validate_resource(resource, store, BLOB_RESOURCE_KIND, required_rights)?;
         let ResourceValue::Blob { sealed, .. } = &mut resource.value else {
             return Err(HubError::WrongKind);
         };

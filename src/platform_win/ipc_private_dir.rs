@@ -9,13 +9,19 @@ use std::{fs::File, os::windows::io::AsRawHandle as _};
 #[cfg(feature = "ipc")]
 use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 
-/// Protected, inheritable owner-and-SYSTEM DACL for private IPC directories.
+/// Protected, inheritable current-user-and-SYSTEM DACL for private IPC directories.
 ///
 /// OICI is required because applying a protected DACL re-propagates inherited
 /// ACEs through existing descendants. The earlier non-inheritable policy could
 /// leave descendants with an empty DACL, including files with hardlinks outside
 /// the directory. Reapplying this policy repairs that legacy state.
-const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
+#[cfg(feature = "ipc")]
+fn private_dir_sddl() -> io::Result<String> {
+    Ok(format!(
+        "D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",
+        current_user_sid_sddl()?
+    ))
+}
 
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
@@ -25,7 +31,7 @@ pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDir
     if owner_private_directory(path).unwrap_or(false) {
         return Ok(OwnerPrivateDirectoryOutcome::AlreadyPrivate);
     }
-    apply_protected_dacl_sddl(path, PRIVATE_DIR_SDDL)?;
+    apply_protected_dacl_sddl(path, &private_dir_sddl()?)?;
     if owner_private_directory(path)? {
         Ok(OwnerPrivateDirectoryOutcome::Hardened)
     } else {
@@ -46,7 +52,7 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     }
     // Binary equality covers ACL revision, ACE flags/masks/SIDs/order and
     // callback or object payloads that SDDL substring checks can misclassify.
-    let expected = LocalSecurityDescriptor::from_sddl(PRIVATE_DIR_SDDL)?;
+    let expected = LocalSecurityDescriptor::from_sddl(&private_dir_sddl()?)?;
     Ok(actual.dacl()?.bytes()? == expected.dacl()?.bytes()?)
 }
 
@@ -54,8 +60,8 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
 ///
 /// This uses `GetSecurityInfo` on the handle rather than reopening the path:
 /// a rename or reparse-point swap cannot change the object whose owner and
-/// DACL are checked. We accept only the two exact owner/SYSTEM full-control
-/// ACL forms Windows creates directly or by inheriting `PRIVATE_DIR_SDDL`.
+/// DACL are checked. We accept only the exact current-user/SYSTEM full-control
+/// ACL forms Windows creates directly or by inheriting `private_dir_sddl()`.
 /// Every other ACE kind, principal, mask, order, or callback payload differs
 /// byte-for-byte and fails closed.
 #[cfg(feature = "fs")]
@@ -99,17 +105,19 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     if unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } == 0 {
         return Ok(false);
     }
-    // `OW` is the Owner Rights SID rather than a literal account SID: it is
-    // exactly what the protected parent policy inherits into a child. The
-    // owner equality above independently proves this object belongs to the
-    // current user.
-    let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
-    let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
+    let current_sid_sddl = current_user_sid_sddl()?;
+    let direct = LocalSecurityDescriptor::from_sddl(&format!(
+        "D:P(A;;FA;;;{current_sid_sddl})(A;;FA;;;SY)"
+    ))?;
+    let inherited = LocalSecurityDescriptor::from_sddl(&format!(
+        "D:(A;ID;FA;;;{current_sid_sddl})(A;ID;FA;;;SY)"
+    ))?;
     // Windows preserves the parent OI|CI inheritance flags on some inherited
     // file ACEs (notably on the hosted Windows runners), in addition to ID.
     // It is the same two-principal full-control policy, not a broader ACL.
-    let inherited_with_propagation =
-        LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
+    let inherited_with_propagation = LocalSecurityDescriptor::from_sddl(&format!(
+        "D:(A;OICIID;FA;;;{current_sid_sddl})(A;OICIID;FA;;;SY)"
+    ))?;
     let actual = actual.dacl()?.bytes()?;
     Ok(
         actual == direct.dacl()?.bytes()?
@@ -118,7 +126,7 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     )
 }
 
-#[cfg(feature = "fs")]
+#[cfg(any(feature = "fs", feature = "ipc"))]
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
@@ -155,6 +163,37 @@ fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     if length == 0 || length > 1024 { return Err(io::Error::new(io::ErrorKind::InvalidData, "implausible current-user SID length")); }
     // SAFETY: IsValidSid and GetLengthSid above validated this live token SID.
     Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length).to_vec() })
+}
+
+#[cfg(any(feature = "fs", feature = "ipc"))]
+fn current_user_sid_sddl() -> io::Result<String> {
+    let bytes = current_user_sid_bytes()?;
+    let revision = *bytes
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty current-user SID"))?;
+    let sub_authority_count = *bytes
+        .get(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated current-user SID"))?
+        as usize;
+    let expected_len = 8 + sub_authority_count * 4;
+    if bytes.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid current-user SID length",
+        ));
+    }
+    let mut authority = 0_u64;
+    for byte in &bytes[2..8] {
+        authority = (authority << 8) | u64::from(*byte);
+    }
+    let mut sddl = format!("S-{revision}-{authority}");
+    for index in 0..sub_authority_count {
+        let offset = 8 + index * 4;
+        let sub_authority = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        sddl.push('-');
+        sddl.push_str(&sub_authority.to_string());
+    }
+    Ok(sddl)
 }
 
 #[cfg(feature = "ipc")]
@@ -401,8 +440,14 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(&directory, "D:P(A;OICI;FA;;;SY)(OA;OICI;FA;;;OW)")
-            .unwrap();
+        apply_protected_dacl_sddl(
+            &directory,
+            &format!(
+                "D:P(A;OICI;FA;;;SY)(OA;OICI;FA;;;{})",
+                current_user_sid_sddl().unwrap()
+            ),
+        )
+        .unwrap();
 
         assert!(!owner_private_directory(&directory).unwrap());
         assert_eq!(
@@ -420,14 +465,22 @@ mod tests {
         let parent = temporary.path().join("parent");
         let directory = parent.join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(&parent, "D:P(A;;FA;;;OW)(A;;FA;;;SY)").unwrap();
-        apply_protected_dacl_sddl(&directory, PRIVATE_DIR_SDDL).unwrap();
+        apply_protected_dacl_sddl(
+            &parent,
+            &format!(
+                "D:P(A;;FA;;;{})(A;;FA;;;SY)",
+                current_user_sid_sddl().unwrap()
+            ),
+        )
+        .unwrap();
+        let private_sddl = private_dir_sddl().unwrap();
+        apply_protected_dacl_sddl(&directory, &private_sddl).unwrap();
         let protected = file_security_descriptor(&directory).unwrap();
         let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
 
         apply_dacl_sddl(
             &directory,
-            PRIVATE_DIR_SDDL,
+            &private_sddl,
             UNPROTECTED_DACL_SECURITY_INFORMATION,
         )
         .unwrap();
@@ -480,7 +533,11 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, b"payload").unwrap();
 
-        apply_protected_dacl_sddl(&directory, "D:P(A;;FA;;;OW)").unwrap();
+        apply_protected_dacl_sddl(
+            &directory,
+            &format!("D:P(A;;FA;;;{})", current_user_sid_sddl().unwrap()),
+        )
+        .unwrap();
         assert!(!owner_private_directory(&directory).unwrap());
         assert!(File::open(&file).is_err());
         assert_eq!(

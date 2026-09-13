@@ -3,8 +3,10 @@ use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
-#[cfg(feature = "fs")]
-use std::{fs::File, os::windows::io::AsRawHandle as _};
+#[cfg(any(feature = "fs", feature = "ipc"))]
+use std::fs::File;
+#[cfg(any(feature = "fs", feature = "ipc"))]
+use std::os::windows::io::AsRawHandle as _;
 
 #[cfg(feature = "ipc")]
 use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
@@ -188,13 +190,30 @@ fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
 }
 
+/// Open a directory once for the owner and DACL updates that harden it.
+///
+/// The handle pins the target across the two required `SetSecurityInfo` calls:
+/// a rename or reparse-point replacement cannot make the owner update affect
+/// one directory and the DACL update another.
+#[cfg(feature = "ipc")]
+fn open_directory_for_security_update(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+    use winapi::um::winnt::{WRITE_DAC, WRITE_OWNER};
+
+    std::fs::OpenOptions::new()
+        .access_mode(WRITE_OWNER | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
 /// Assign the current token user as an open file's owner without accepting
 /// its default owner SID (which can be an elevated local group).
 ///
 /// This operates on the caller's handle, rather than reopening its pathname:
 /// the object whose owner changes is necessarily the one the caller created
 /// and still holds. The handle must have `WRITE_OWNER` access.
-#[cfg(feature = "fs")]
+#[cfg(any(feature = "fs", feature = "ipc"))]
 pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
@@ -229,29 +248,24 @@ fn apply_dacl_sddl(
     inheritance_control: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
 ) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
+    let file = open_directory_for_security_update(path)?;
+    apply_current_user_owner(&file)?;
     let descriptor = LocalSecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
-    let current_sid = current_user_sid_bytes()?;
-
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: `wide` is NUL-terminated; `dacl` borrows the live descriptor
-    // for this call; all unused owner/group/SACL pointers are null as the
-    // requested flags update the DACL and make the current token user the
-    // owner. `OW` in the DACL then remains a single-user principal even for
-    // elevated tokens whose default owner is a local group.
+    // SAFETY: `file` pins the object updated above and has WRITE_DAC access;
+    // `dacl` borrows the live descriptor for this call. All unused
+    // owner/group/SACL pointers are null. The owner was assigned to TokenUser
+    // on this same handle first, so `OW` is a single-user principal even for
+    // an elevated token whose default owner is a local group.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | inheritance_control,
-            current_sid.as_ptr().cast_mut().cast(),
+            DACL_SECURITY_INFORMATION | inheritance_control,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             dacl.as_ptr(),
             std::ptr::null_mut(),
@@ -598,7 +612,10 @@ mod tests {
         drop(child_file);
 
         let child_dacl = file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap();
-        assert!(owner_system_private_file_dacl(&child_dacl));
+        assert!(
+            owner_system_private_file_dacl(&child_dacl),
+            "private child DACL was not one accepted inherited owner/SYSTEM form: {child_dacl:02x?}"
+        );
         assert_eq!(
             crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap_or_else(
                 |error| panic!("private inherited child DACL {child_dacl:02x?}: {error}"),

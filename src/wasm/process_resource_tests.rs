@@ -555,7 +555,7 @@ fn native_output_credit_waits_for_ack_and_is_poisoned_on_failure() {
                 .unwrap();
             let (process, session) = published(&hub, operation).await;
             hub.take_terminal(operation, 7).unwrap().unwrap();
-            hub.close_resource(process).unwrap();
+            let completion = hub.close_compiler(7, process).unwrap();
             crate::async_engine::timeout(Duration::from_secs(5), ready)
                 .await
                 .unwrap()
@@ -589,12 +589,14 @@ fn native_output_credit_waits_for_ack_and_is_poisoned_on_failure() {
             .await
             .unwrap();
             if fails {
+                assert_eq!(completion.wait().await, Err(HubError::Closed));
                 assert_eq!(hub.snapshot().reserved_native_process_output_bytes, budget);
                 assert_eq!(
                     hub.submit_compiler_spawn(runtime.handle(), 7, next),
                     Err(HubError::Closed)
                 );
             } else {
+                assert_eq!(completion.wait().await, Ok(()));
                 assert_eq!(hub.snapshot().reserved_native_process_output_bytes, 0);
                 hub.submit_compiler_spawn(runtime.handle(), 7, next)
                     .unwrap();
@@ -606,4 +608,103 @@ fn native_output_credit_waits_for_ack_and_is_poisoned_on_failure() {
             assert_eq!(hub.join_process_jobs().await, expected);
         });
     }
+}
+
+#[test]
+fn closing_one_compiler_has_retryable_completion_without_closing_the_hub() {
+    let runtime = runtime();
+    runtime.run(async {
+        let hub = OperationHub::new(4, 4).unwrap();
+        let (started, ready) = crate::async_engine::oneshot_channel();
+        let (resume, resumed) = crate::async_engine::oneshot_channel();
+        *hub.process_cleanup_checkpoint.lock().unwrap() = Some(CleanupCheckpoint {
+            started,
+            resume: resumed,
+        });
+        let grant = hub
+            .grant_compiler(7, spec("silent"), Duration::from_secs(10))
+            .unwrap();
+        let spawn = hub
+            .submit_compiler_spawn(runtime.handle(), 7, grant)
+            .unwrap();
+        let (process, _) = published(&hub, spawn).await;
+        assert!(matches!(
+            hub.close_compiler(8, process),
+            Err(HubError::WrongRights)
+        ));
+        let completion = hub.close_compiler(7, process).unwrap();
+        crate::async_engine::timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        {
+            let mut cancelled = std::pin::pin!(completion.wait());
+            assert!(cancelled
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending());
+        }
+        assert!(!hub.state.lock().unwrap().closed);
+        assert_eq!(
+            hub.snapshot().reserved_native_process_output_bytes,
+            NATIVE_PROCESS_OUTPUT_ALLOWANCE
+        );
+        let mut first = std::pin::pin!(completion.wait());
+        let mut second = std::pin::pin!(completion.wait());
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(first.as_mut().poll(&mut context).is_pending());
+        assert!(second.as_mut().poll(&mut context).is_pending());
+        resume.send(CleanupFault::None).ok().unwrap();
+        let results = crate::async_engine::timeout(
+            Duration::from_secs(5),
+            crate::async_engine::join(first, second),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results, (Ok(()), Ok(())));
+        assert_eq!(completion.wait().await, Ok(()));
+        assert_eq!(hub.snapshot().reserved_native_process_output_bytes, 0);
+        assert!(!hub.state.lock().unwrap().closed);
+        hub.grant_compiler(7, spec("exit"), Duration::from_secs(10))
+            .unwrap();
+        hub.close_all(Terminal::Closed);
+        hub.join_process_jobs().await.unwrap();
+    });
+}
+
+#[test]
+fn unpolled_cleanup_producer_drop_reports_failure_instead_of_hanging() {
+    let runtime = runtime();
+    let hub = OperationHub::new(2, 2).unwrap();
+    let grant = hub
+        .grant_compiler(7, spec("silent"), Duration::from_secs(10))
+        .unwrap();
+    let spawn = hub
+        .submit_compiler_spawn(runtime.handle(), 7, grant)
+        .unwrap();
+    let completion = {
+        let state = hub.state.lock().unwrap();
+        let process = state.operations[&spawn].created_resource.unwrap();
+        let ResourceValue::CompilerProcess(value) = &state.resources[&process].value else {
+            panic!("compiler process");
+        };
+        Arc::clone(&value.cleanup)
+    };
+    // No task was polled on this current-thread runtime. Its destruction must
+    // still drop the producer and wake a completion observer with failure.
+    drop(runtime);
+    let mut wait = std::pin::pin!(completion.wait());
+    assert_eq!(
+        wait.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+        Poll::Ready(Err(HubError::Closed)),
+    );
+    assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        hub.snapshot().reserved_native_process_output_bytes,
+        NATIVE_PROCESS_OUTPUT_ALLOWANCE
+    );
+    hub.close_all(Terminal::Closed);
+    let mut state = hub.state.lock().unwrap();
+    OperationHub::poll_process_jobs(&mut state, &mut Context::from_waker(Waker::noop()));
+    assert!(state.process_job_failed);
 }

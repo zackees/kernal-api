@@ -373,3 +373,30 @@ Local validation: 104 operation tests pass, strict Clippy passes with
 actual ABI-revision-6 Core-Wasm parser/hash guest still passes its 64-MiB public
 facade proof against the updated host. That reused guest artifact tests ABI
 compatibility; no compiler guest operation was added or exercised by it.
+
+## Per-process close completion
+
+The internal compiler authority now returns an observation-only completion
+when closing a process. Authority is revoked synchronously; the completion
+resolves only after the tracked supervisor finishes native cleanup and its
+payload refund. Closing one process does not close the logical hub. Concurrent,
+cancelled/retried, and late observers see the same retained result through the
+existing facade sticky notification primitive, without sharing a single task
+join waker or allocating a tombstone map.
+
+The supervisor owns a completion guard before its first poll. Panic or runtime
+teardown reports failure rather than leaving observers pending or treating task
+destruction as resource reclamation. Moving guard construction inside the future
+is RED (`20260913T130548Z`): destroying an unpolled runtime leaves the observer
+pending. Restoring external ownership is GREEN. Tests also hold cleanup after
+reaping, cancel an observer, wake concurrent and late observers, reject a foreign
+owner, and preserve the failed result and native charge after cleanup error/panic.
+These are private host prerequisites; the guest compiler operations and their
+Core/Component adapters have not yet been added.
+
+Upstream shutdown validation now passes all six native OS/architecture pairs in
+[run 34758566275](https://github.com/zackees/running-process/actions/runs/34758566275),
+including the queued-before-system-call race on Windows x86-64 and ARM64.
+The CI commit `8e8c942` changes no Rust implementation relative to the parent pin
+`1943831`. This proves the dependency shutdown primitive on those hosts, not the
+parent ledger, complete guest workflows, or full #13 six-host acceptance.

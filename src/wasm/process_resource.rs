@@ -6,6 +6,7 @@ use crate::async_engine::{CancellationSource, CancellationToken, RuntimeHandle};
 use crate::{ProcessSession, ProcessSessionOptions, SpawnSpec, StreamMode};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU8;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -49,10 +50,59 @@ pub(super) struct CompilerGrant {
 
 pub(super) struct CompilerProcess {
     session: Option<Arc<ProcessSession>>,
+    cleanup: Arc<CompilerCleanup>,
     cancel: CancellationSource,
     output_busy: bool,
     output_bytes: usize,
     output_limit: usize,
+}
+
+/// Observation-only completion retained independently of revocable authority.
+pub(crate) struct CompilerCleanup {
+    // 0 pending, 1 acknowledged success, 2 failure/producer disappearance.
+    result: AtomicU8,
+    finished: CancellationSource,
+}
+
+impl CompilerCleanup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: AtomicU8::new(0),
+            finished: CancellationSource::new(),
+        })
+    }
+
+    fn finish(&self, result: Result<(), HubError>) {
+        let terminal = if result.is_ok() { 1 } else { 2 };
+        if self
+            .result
+            .compare_exchange(0, terminal, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Reuse the facade's sticky broadcast rather than a one-waker Task
+            // or a Notify permit that could strand concurrent/late observers.
+            self.finished.cancel();
+        }
+    }
+
+    pub(crate) async fn wait(&self) -> Result<(), HubError> {
+        self.finished.token().cancelled().await;
+        if self.result.load(Ordering::Acquire) == 1 {
+            Ok(())
+        } else {
+            Err(HubError::Closed)
+        }
+    }
+}
+
+struct CompilerCleanupProducer(Arc<CompilerCleanup>);
+
+impl Drop for CompilerCleanupProducer {
+    fn drop(&mut self) {
+        // Dropping a supervisor, including before its first poll or on panic,
+        // is never evidence that its native resources were reclaimed.
+        self.0.finish(Err(HubError::Closed));
+    }
 }
 
 impl Drop for CompilerProcess {
@@ -141,6 +191,7 @@ impl OperationHub {
             self.submit_locked(&mut state, store, Some(grant), GRANT_KIND, PROCESS_RIGHT)?;
         let cancel = CancellationSource::new();
         let cancellation = cancel.token();
+        let cleanup = CompilerCleanup::new();
         let process = match self.create_resource_value_locked(
             &mut state,
             store,
@@ -149,6 +200,7 @@ impl OperationHub {
             false,
             ResourceValue::CompilerProcess(CompilerProcess {
                 session: None,
+                cleanup: Arc::clone(&cleanup),
                 cancel,
                 output_busy: false,
                 output_bytes: 0,
@@ -187,19 +239,42 @@ impl OperationHub {
         let deadline = grant.deadline;
         let admitted = Instant::now();
         let hub = Arc::clone(self);
+        // Construct outside the future so a task dropped before first poll
+        // still resolves every observation capability to failure.
+        let producer = CompilerCleanupProducer(cleanup);
         let job = runtime.launch(async move {
             let result = Arc::clone(&hub)
                 .supervise_compiler(spec, operation, process, cancellation, admitted, deadline)
                 .await;
             // No Drop-based refund: panic, dropped tasks, and uncertain native
             // cleanup must not make their allowance reusable by another job.
-            if result.is_ok() {
-                hub.release_native_process_output()?;
-            }
+            let result = result.and_then(|()| hub.release_native_process_output());
+            producer.0.finish(result);
             result
         });
         state.process_jobs.push(job);
         Ok(operation)
+    }
+
+    pub(crate) fn close_compiler(
+        &self,
+        store: u64,
+        process: OpaqueToken,
+    ) -> Result<Arc<CompilerCleanup>, HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let slot = state.resources.get(&process).ok_or(HubError::Closed)?;
+        Self::validate_resource(slot, store, PROCESS_KIND, PROCESS_RIGHT)?;
+        let ResourceValue::CompilerProcess(value) = &slot.value else {
+            return Err(HubError::WrongKind);
+        };
+        let completion = Arc::clone(&value.cleanup);
+        let notifications =
+            Self::close_resource_with_terminal_locked(&mut state, process, Terminal::Closed)?;
+        drop(state);
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(completion)
     }
 
     async fn supervise_compiler(

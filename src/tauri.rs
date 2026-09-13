@@ -285,6 +285,12 @@ impl NativeWebviewBackend {
             }
         });
 
+        // The native getter synchronously routes to the event loop. Query on
+        // this creation worker, never inside the UI closure below. Script-free
+        // routes do not need a scale query or bootstrap context.
+        let bootstrap_source = request.bootstrap.as_ref().map(|script| {
+            script.for_origin(&request.url, dispatcher.scale_factor().unwrap_or(1.0))
+        });
         let window_for_ui = dispatcher.clone();
         let completion_for_ui = Arc::clone(&completion);
         let terminal_for_ui = Arc::clone(&terminal);
@@ -294,7 +300,7 @@ impl NativeWebviewBackend {
                 &window_for_ui,
                 request.url,
                 request.permissions,
-                request.bootstrap,
+                bootstrap_source,
                 completion_for_ui,
                 terminal_for_ui,
             );
@@ -509,7 +515,7 @@ fn build_isolated_webview(
     dispatcher: &WryWindowDispatcher<()>,
     target: Url,
     permissions: WebviewPermissions,
-    bootstrap: Option<WebviewPageBootstrap>,
+    bootstrap_source: Option<String>,
     completion: Arc<LoadCompletion>,
     terminal: Arc<TerminalCompletion>,
 ) -> Result<WebView, NativeWebviewError> {
@@ -520,8 +526,7 @@ fn build_isolated_webview(
     let completion_for_popup = Arc::clone(&completion);
     let terminal_for_popup = Arc::clone(&terminal);
     let completion_for_load = Arc::clone(&completion);
-    let bootstrap_origin = bootstrap.as_ref().map(|_| target.origin());
-    let bootstrap_source = bootstrap.as_ref().map(|script| script.for_origin(&target));
+    let bootstrap_origin = bootstrap_source.as_ref().map(|_| target.origin());
     let builder = WebViewBuilder::new()
         // Deliberately do not call `with_ipc_handler`: Wry documents that it
         // exposes `window.ipc.postMessage` to page JavaScript.
@@ -697,6 +702,13 @@ pub enum PageBootstrapError {
 /// a block in the main frame's ordinary page world, not an isolated privileged
 /// world. No native IPC or guest ABI capability is installed. Runtime syntax
 /// errors follow normal page error reporting; they are not host-open errors.
+///
+/// The block reserves the lexical binding `kernalWindow`: a frozen object with
+/// `initialScaleFactor`, the native window's creation-time scale (physical
+/// pixels per logical pixel). This finite positive snapshot is independent of
+/// browser zoom, defaults to 1 on unavailable/invalid native data, and does not
+/// update after moving between displays. It exposes no native methods or IPC.
+/// Source must not redeclare `kernalWindow` in the same block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebviewPageBootstrap {
     source: String,
@@ -721,13 +733,18 @@ impl WebviewPageBootstrap {
         &self.source
     }
 
-    fn for_origin(&self, target: &Url) -> String {
+    fn for_origin(&self, target: &Url, native_scale: f64) -> String {
         // WebView2 injects into subframes regardless of Wry's main-only flag.
         // Guard in page code too, including against initial about:blank.
         // The origin is URL-canonicalized and JS-string escaped; source is
         // deliberately trusted caller code, never a remote page's input.
+        let scale = if native_scale.is_finite() && native_scale > 0.0 {
+            native_scale
+        } else {
+            1.0
+        };
         format!(
-            "if (window === window.top && location.origin === \"{}\") {{\n{}\n}}\n",
+            "if (window === window.top && location.origin === \"{}\") {{\nconst kernalWindow = Object.freeze({{ initialScaleFactor: {scale} }});\n{}\n}}\n",
             target.origin().ascii_serialization().escape_default(),
             self.source
         )
@@ -1366,6 +1383,21 @@ fn map_hub(error: HubError) -> WebviewError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_exposes_native_scale_snapshot_before_caller_source() {
+        let target = Url::parse("http://127.0.0.1:8080/").unwrap();
+        let bootstrap =
+            WebviewPageBootstrap::new("window.scale = kernalWindow.initialScaleFactor;").unwrap();
+        for scale in [1.0, 1.25, 2.0] {
+            let wrapped = bootstrap.for_origin(&target, scale);
+            assert!(wrapped.contains(&format!("const kernalWindow = Object.freeze({{ initialScaleFactor: {scale} }});\nwindow.scale")));
+        }
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let wrapped = bootstrap.for_origin(&target, invalid);
+            assert!(wrapped.contains("initialScaleFactor: 1 }"));
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1394,7 +1426,7 @@ mod tests {
             None
         ));
         let bootstrap = WebviewPageBootstrap::new("window.marker = 1; // comment").unwrap();
-        let wrapped = bootstrap.for_origin(&target);
+        let wrapped = bootstrap.for_origin(&target, 1.0);
         assert!(wrapped.starts_with(
             "if (window === window.top && location.origin === \"http://127.0.0.1:8080\") {\n"
         ));

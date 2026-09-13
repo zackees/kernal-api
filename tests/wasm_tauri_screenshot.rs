@@ -28,7 +28,7 @@ fn actual_screenshot_guest_block_inside_containment_forces_reap() {
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContainedScenario {
     Capture,
     Trap,
@@ -68,9 +68,21 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         | ContainedScenario::CaptureQuota => "KERNAL_API_SCREENSHOT_ARTIFACT_WASM",
     })
     .expect("built screenshot artifact");
-    let directory = tempfile::tempdir().unwrap();
-    let output = directory.path().join("viewport.png");
-    let sentinel = directory.path().join("untouched");
+    let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
+        std::fs::create_dir_all(&root).unwrap();
+        tempfile::Builder::new()
+            .prefix(&format!("contained-{scenario:?}-"))
+            .tempdir_in(root)
+            .unwrap()
+            .keep()
+    });
+    let temporary = tempfile::tempdir().unwrap();
+    let proof = retained.as_deref().unwrap_or(temporary.path());
+    let directory = proof.join("output");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(proof.join("process.json"), "{\"outcome\":\"started\"}\n").unwrap();
+    let output = directory.join("viewport.png");
+    let sentinel = directory.join("untouched");
     std::fs::write(&output, b"original").unwrap();
     std::fs::write(&sentinel, b"unchanged").unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -188,6 +200,27 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         &config,
         cancellation.token(),
     ));
+    // Persist raw evidence before assertions, including failure outcomes. A
+    // killed worker may never send its terminal trace; do not invent one.
+    let worker_trace = trace.take();
+    if let Some(trace) = &worker_trace {
+        std::fs::write(proof.join("worker.trace"), trace).unwrap();
+    }
+    let counts = sketch.worker_execution_snapshot();
+    let guest_exit_code = match &terminal {
+        SketchWorkerTerminal::Execution(SketchExecutionError::NonzeroExit { code }) => {
+            code.to_string()
+        }
+        _ => "null".to_owned(),
+    };
+    std::fs::write(
+        proof.join("process.json"),
+        format!(
+            "{{\"scenario\":\"{scenario:?}\",\"os\":\"{}\",\"arch\":\"{}\",\"terminal\":\"{}\",\"guest_exit_code\":{guest_exit_code},\"worker_trace_available\":{},\"spawned\":{},\"reaped\":{},\"forced\":{},\"live_workers\":{},\"live_protocol_tasks\":{},\"pending_root_leases\":{}}}\n",
+            std::env::consts::OS, std::env::consts::ARCH, terminal.code(), worker_trace.is_some(), counts.spawned, counts.reaped,
+            counts.forced, counts.live_workers, counts.live_protocol_tasks, counts.pending_root_leases,
+        ),
+    ).unwrap();
     if let Some(task) = cancel_task {
         assert!(
             runtime.run(task).unwrap(),
@@ -199,10 +232,10 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
             terminal,
             SketchWorkerTerminal::Stopped(kernal_api::wasm::SketchWorkerStopReason::Cancelled)
         );
-        let trace = trace
-            .take()
+        let trace = worker_trace
+            .as_deref()
             .expect("cooperative cancellation must report worker cleanup");
-        validate_teardown_trace(&trace).unwrap();
+        validate_teardown_trace(trace).unwrap();
         assert!(
             trace.lines().any(
                 |line| line.starts_with("kernal-webview-trace phase=submit ")
@@ -217,8 +250,10 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
             terminal,
             SketchWorkerTerminal::Execution(SketchExecutionError::NonzeroExit { code: 97 })
         );
-        let trace = trace.take().expect("failed capture cleanup trace");
-        validate_teardown_trace(&trace).unwrap();
+        let trace = worker_trace
+            .as_deref()
+            .expect("failed capture cleanup trace");
+        validate_teardown_trace(trace).unwrap();
         assert!(trace.contains("phase=capture-requested"), "{trace}");
         assert!(
             trace.contains("phase=capture-encoded-byte-limit"),
@@ -254,7 +289,7 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         validate_fixture_png(&std::fs::read(&output).unwrap()).unwrap();
     }
     assert_eq!(std::fs::read(sentinel).unwrap(), b"unchanged");
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 2);
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 2);
     let counts = sketch.worker_execution_snapshot();
     assert_eq!(counts.spawned, 1);
     assert_eq!(counts.reaped, 1);
@@ -275,6 +310,11 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
     assert_eq!(counts.active_root_executions(), 0);
     assert_eq!(counts.live_stores(), 0);
     assert_eq!(counts.reserved_shared_memory_bytes(), 0);
+    std::fs::write(
+        proof.join("validation.txt"),
+        "all contained proof assertions passed\n",
+    )
+    .unwrap();
 }
 
 #[cfg(feature = "tauri-webview-test-support")]

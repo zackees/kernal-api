@@ -176,6 +176,13 @@ process. With the test feature enabled, the default contained CLI receives one
 64-KiB-capped trace batch through private protocol version 6; its success and
 trap tests check the same detailed timing/resource assertions as diagnostic mode.
 Rebuild the worker and CLI together when the private protocol changes.
+Direct containment proofs also retain unique `contained-<scenario>-*` folders
+under the same proof directory. Their `process.json` records OS/architecture,
+terminal category, guest exit status, parent counters, and worker-trace
+availability before assertions run. `worker.trace` exists only when the worker
+delivered it; `output/` retains the final file and neighbor. A `validation.txt`
+marker is written only after all assertions pass. In particular, forced
+termination records a missing trace rather than fabricated zero worker counters.
 Hard termination can prevent the bounded trace from being emitted,
 so failure-path/containment diagnostics remain incomplete. This Linux x86-64 lane does not
 establish native execution on the other five supported host targets.

@@ -265,6 +265,20 @@ errors. The marker is test-feature-only and does not change the guest ABI or
 production capture behavior. This proves native encoder quota failure, not
 arbitrary OS capture-device failure or native execution on the other targets.
 
+The five direct contained-worker proofs now honor the same CI proof-directory
+setting as the CLI harness. They retain scenario-specific output directories,
+raw available worker traces, and parent process JSON before assertions. The
+JSON includes OS/architecture, terminal category, guest exit code, counters,
+and an explicit worker-trace availability flag. Only fully passing assertions
+write `validation.txt`. A forced-kill proof therefore retains truthful parent
+evidence without manufacturing a worker trace or claiming worker-local zeros.
+These files fall under the existing always-upload CI artifact path.
+All five final-format proofs pass in 70.01 seconds on Linux x86-64. A separate
+on-disk check verifies exactly five validation markers, zero parent live
+counters, quota-failure exit 97, and trace presence matching the JSON flag
+(four traces, none for forced termination). Strict focused Clippy, formatting,
+and diff checks pass.
+
 A real contained cancellation-during-load proof exposed a cooperative shutdown
 bug: epoch interruption did not wake a guest suspended in the generated async
 `operation_yield` host import, so the parent had to force containment. The epoch

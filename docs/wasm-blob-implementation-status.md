@@ -529,6 +529,18 @@ native execution results, not cross-checks; they do not establish Windows or
 macOS acceptance on this commit. The rollout notes below retain their original
 pre-execution context.
 
+The same run's Windows ARM64 native screenshot job `103655809650` also
+passes: five ordinary tests in 1.51 seconds and sixteen native/artifact tests
+in 146.19 seconds, including the production renamed-parent cleanup regression.
+Artifact `10309795953` was downloaded and inspected. Its
+`contained-RenamedParent-CUZUQA/process.json` records Windows/aarch64,
+typed nonzero guest exit 113, one spawned and reaped worker, no forced kill,
+and zero live workers, protocol tasks, and pending root leases;
+`validation.txt` confirms all contained assertions passed. This supplies
+native evidence for the production file-ID anchor on Windows ARM64, rather
+than only the earlier test-only x86-64 probe. Windows x86-64 screenshot and
+macOS current-commit acceptance remain separate gates.
+
 The dedicated screenshot job is now `wasm-tauri-screenshot-native`, with six
 explicit runner/target pairs documented in the example README. Each checks
 the Rust host triple and builds the test executable with native Cargo defaults;

@@ -164,6 +164,22 @@ fn optional_and_repeated_values_and_option_relations_are_enforced() {
 }
 
 #[test]
+fn defaulted_options_do_not_count_as_explicit_relation_inputs() {
+    let schema = Command::new("fastled")
+        .option(OptionSpec::flag("test"))
+        .option(
+            OptionSpec::value("timeout", ValueKind::f64())
+                .default("120")
+                .requires_any(["test"]),
+        );
+    assert!(schema.parse(["fastled"]).is_ok());
+    assert_eq!(
+        schema.parse(["fastled", "--timeout", "10"]),
+        Err(CommandError::InvalidArguments)
+    );
+}
+
+#[test]
 fn optional_positionals_do_not_hide_subcommands() {
     let schema = Command::new("fastled")
         .optional_positional("directory", ValueKind::string())

@@ -14,6 +14,7 @@ import sys
 CASES = (
     ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
+    ("command-arguments", "shell-words"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),

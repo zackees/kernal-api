@@ -176,6 +176,7 @@ jobs:
           - hash-sha256
           - secure-random
           - text-similarity
+          - command-arguments
           - terminal-style
           - terminal-input
           - event-stream

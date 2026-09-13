@@ -52,6 +52,9 @@ pub use running_process::{
     SpawnOptions,
 };
 
+#[cfg(feature = "command-arguments")]
+pub mod arguments;
+
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;

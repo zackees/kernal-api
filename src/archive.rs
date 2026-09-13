@@ -62,6 +62,45 @@ fn copy_bounded(
     }
 }
 
+fn copy_entry_bounded(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    remaining: &mut u64,
+    max_entry_bytes: u64,
+) -> io::Result<()> {
+    let before = (*remaining).min(max_entry_bytes);
+    let mut entry_remaining = before;
+    let result = copy_bounded(reader, writer, &mut entry_remaining);
+    *remaining -= before - entry_remaining;
+    result
+}
+
+#[cfg(test)]
+mod entry_budget_tests {
+    use super::*;
+
+    #[test]
+    fn entry_copy_limits_actual_bytes_even_without_size_metadata() {
+        for (bytes, limit, succeeds) in [
+            (&b""[..], 0, true),
+            (&b"x"[..], 0, false),
+            (&b"1234"[..], 4, true),
+            (&b"12345"[..], 4, false),
+        ] {
+            let mut output = Vec::new();
+            let mut total = 10;
+            let result = copy_entry_bounded(&mut &bytes[..], &mut output, &mut total, limit);
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(output.len() as u64 <= limit);
+            assert_eq!(10 - total, output.len() as u64);
+        }
+        let mut total = 3;
+        let mut output = Vec::new();
+        assert!(copy_entry_bounded(&mut &b"1234"[..], &mut output, &mut total, 10).is_err());
+        assert!(output.len() <= 3);
+    }
+}
+
 /// Supported archive encoding.
 #[derive(Clone, Copy, Debug)]
 pub enum ArchiveFormat {
@@ -92,6 +131,10 @@ pub struct ExtractionLimits {
     pub max_input_bytes: u64,
     /// Maximum sum of extracted file bytes.
     pub max_output_bytes: u64,
+    /// Maximum uncompressed payload bytes in any one non-metadata entry.
+    /// Independent of the aggregate output budget; zero permits empty entries.
+    /// Tar extension records remain subject to the metadata budget instead.
+    pub max_entry_bytes: u64,
     /// Maximum archive entries.
     pub max_entries: u64,
     /// Maximum central-directory metadata bytes.
@@ -109,6 +152,7 @@ impl Default for ExtractionLimits {
         Self {
             max_input_bytes: 16 * 1024 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024 * 1024,
+            max_entry_bytes: 64 * 1024 * 1024 * 1024,
             max_entries: 1_000_000,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_path_bytes: 4096,
@@ -454,13 +498,17 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
     let mut links = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(io::Error::other)?;
+        if entry.size() > limits.max_entry_bytes {
+            return Err(invalid("ZIP entry exceeds byte limit"));
+        }
         let relative = relative_path(entry.name(), limits.max_path_bytes)?;
         let output = root.join(&relative);
         if entry.is_symlink() {
             let mut bytes = Vec::new();
             let mut allowed = (limits.max_path_bytes as u64)
                 .min(link_bytes)
-                .min(remaining);
+                .min(remaining)
+                .min(limits.max_entry_bytes);
             let before = allowed;
             copy_bounded(&mut entry, &mut bytes, &mut allowed)?;
             link_bytes -= before - allowed;
@@ -498,7 +546,7 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
             .write(true)
             .create_new(true)
             .open(&output)?;
-        copy_bounded(&mut entry, &mut target, &mut remaining)?;
+        copy_entry_bounded(&mut entry, &mut target, &mut remaining, limits.max_entry_bytes)?;
         target.flush()?;
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {

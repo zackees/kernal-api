@@ -15,6 +15,7 @@ CASES = (
     ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
     ("command-arguments", "shell-words"),
+    ("json", "serde_json"),
     ("source-cpp", "tree-sitter"),
     ("source-cpp", "tree-sitter-cpp"),
     ("wasm-sketch-host", "wasmtime"),

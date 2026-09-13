@@ -178,6 +178,7 @@ jobs:
           - text-similarity
           - command-arguments
           - config-toml
+          - json
           - source-cpp
           - terminal-style
           - terminal-input

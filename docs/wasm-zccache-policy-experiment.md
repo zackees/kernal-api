@@ -143,13 +143,28 @@ the freshly built module and embed metadata using the ABI generator, then set
 `KERNAL_HASH_GUEST_WASM` to that admitted copy when running the ignored
 `hash_actual_guest_streams_64_mib_through_public_facade` host test.
 
-This control does not yet connect the shared zccache request encoder to the
-guest or remove its native dependency graph. A private Component adapter now
+The initial control did not connect the shared zccache request encoder to the
+guest. A private Component adapter now
 executes the exact shared hash policy through the same public facade on Linux
 (3.52 s), including failed-export cleanup and direct canonical oversized-input
 rejection. This establishes hash correctness only: canonical list lifting is
 not yet bounded before allocation, Blob semantics remain a separate private
 probe, and no matched runtime-performance selection has been made.
+
+The shared guest policy now also executes the real zccache request encoder,
+pinned to source commit `2543136ea8b648b295d2f7115a19656ff0854531` with default
+features disabled. This encoder-only graph has no normal dependencies: hashing
+continues through the public kernel capability, not guest BLAKE3. Its resumable
+cursor feeds a fixed 64-KiB buffer with chunk limits of 1, 7, and 65536 bytes.
+The fixture includes order-sensitive arguments, an empty argument, raw depfile
+stdout salt, and sorted environment entries. Its expected digest was checked
+independently with `b3sum` over the literal existing v2 byte protocol.
+
+Fresh actual guest executions passed on Linux x86-64: Core 4.59 s and Component
+3.88 s, including the existing 64-MiB hash and cleanup checks. The Component
+artifact is 87242 bytes with exactly two kernel import instances. These are
+correctness observations, not matched performance measurements. The source pin
+is migration-only and does not satisfy published-front-door acceptance.
 
 The freshly rebuilt revision-6 archive guest also passes all eight cases on
 Linux (42.45 s). All 16 screenshot regressions also pass on Linux against
@@ -158,7 +173,7 @@ compatibility results, not six-target evidence for this revision.
 
 ## Remaining proof
 
-No extracted policy package or GREEN result is claimed yet. The next
+No complete compiler-policy or cache-workflow GREEN result is claimed yet. The next
 implementation must reuse representative parser/key fixtures, supply host
 facts explicitly, and route hashing and the controlled compiler miss through
 public kernel capabilities with bounded stdout/stderr. Native and Wasm runs

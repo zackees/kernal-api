@@ -20,6 +20,8 @@ path = "src/main.rs"
 required-features = ["guest-proof"]
 
 [dependencies]
+# Exact source-only migration fixture; not published-pin acceptance.
+zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
 # Migration-only source proof, not release-pin acceptance.
 kernal-api = { version = "=0.1.0", path = "../../..", default-features = false }
 base64 = "=0.22.1"

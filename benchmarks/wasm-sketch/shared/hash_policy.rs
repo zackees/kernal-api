@@ -1,4 +1,4 @@
-//! Actual public hash capability control; not zccache policy acceptance.
+//! Public hash control and actual zccache key encoding; not full policy acceptance.
 use kernal_api::guest::{Blake3Hasher, OperationError};
 
 const EXPECTED: [u8; 32] = [
@@ -7,6 +7,7 @@ const EXPECTED: [u8; 32] = [
 ];
 
 pub async fn proof() -> Result<(), OperationError> {
+    request_key_proof().await?;
     let empty = Blake3Hasher::new().await?.finalize().await?;
     if empty
         != [
@@ -32,5 +33,44 @@ pub async fn proof() -> Result<(), OperationError> {
     }
     // Drop must reclaim a created resource without requiring another operation slot.
     drop(Blake3Hasher::new().await?);
+    Ok(())
+}
+
+async fn request_key_proof() -> Result<(), OperationError> {
+    use zccache_hash::request_fingerprint::RequestFingerprint;
+
+    let raw = ["-MD", "-MF-", "source.c"].map(String::from);
+    let env = [("A", ""), ("Z", "last")];
+    // Independent b3sum of the literal v2 protocol fixture, not a second encoder.
+    let expected = [
+        0xdb, 0xed, 0xcb, 0xc5, 0x83, 0xf5, 0x1d, 0x14, 0x3b, 0xae, 0xb1, 0x9d, 0xbe, 0xac, 0xfd,
+        0x3f, 0xa0, 0xcb, 0x40, 0x8c, 0xe8, 0x39, 0x9b, 0x56, 0xce, 0xc7, 0x22, 0x24, 0xd8, 0x54,
+        0xe9, 0x93,
+    ];
+    for width in [1, 7, 65536] {
+        let mut cursor =
+            RequestFingerprint::new("cc", ["-O2", "-O0", ""].into_iter(), &raw, "work", &env);
+        let mut hash = Blake3Hasher::new().await?;
+        let mut buffer = [0u8; 65536];
+        let mut used = 0;
+        while let Some(mut fragment) = cursor.next_fragment() {
+            while !fragment.is_empty() {
+                let count = fragment.len().min(width - used);
+                buffer[used..used + count].copy_from_slice(&fragment[..count]);
+                used += count;
+                fragment = &fragment[count..];
+                if used == width {
+                    hash.update(&buffer[..used]).await?;
+                    used = 0;
+                }
+            }
+        }
+        if used != 0 {
+            hash.update(&buffer[..used]).await?;
+        }
+        if hash.finalize().await? != expected {
+            return Err(OperationError::Failed);
+        }
+    }
     Ok(())
 }

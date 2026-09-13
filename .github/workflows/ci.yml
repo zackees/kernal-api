@@ -33,6 +33,10 @@ jobs:
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          # The native tests use Cargo's dev profile. Prebuilding release
+          # dependencies cannot satisfy their cache keys.
+          prebuild-deps-flags: ""
       - name: Restore native pkg-config search path
         if: runner.os == 'Linux'
         run: |

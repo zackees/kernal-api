@@ -26,6 +26,9 @@ use tauri_runtime_wry::{WindowBuilderWrapper, Wry, WryHandle, WryWindowDispatche
 use url::Url;
 use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 
+#[cfg(target_os = "linux")]
+#[path = "tauri/linux_webkitgtk.rs"]
+mod linux_webkitgtk;
 #[cfg(feature = "wasm-sketch-host")]
 pub(crate) mod sketch;
 
@@ -46,6 +49,9 @@ use wry::raw_window_handle::{HandleError, HasWindowHandle, WindowHandle};
     target_os = "openbsd"
 ))]
 use wry::WebViewBuilderExtUnix as _;
+
+#[cfg(target_os = "linux")]
+use wry::WebViewExtUnix as _;
 
 use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
 use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
@@ -115,10 +121,14 @@ pub(crate) enum NativeWebviewError {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeWebviewRequest {
     url: Url,
+    permissions: WebviewPermissions,
 }
 
 impl NativeWebviewRequest {
-    pub(crate) fn parse(url: &str) -> Result<Self, NativeWebviewError> {
+    pub(crate) fn parse(
+        url: &str,
+        permissions: WebviewPermissions,
+    ) -> Result<Self, NativeWebviewError> {
         // `url::Url` intentionally repairs `https:///name` into
         // `https://name/`. That is useful for browsers but violates this
         // capability's before-effects policy: the caller did not provide a
@@ -131,7 +141,7 @@ impl NativeWebviewRequest {
         }
         let url = Url::parse(url).map_err(|_| NativeWebviewError::InvalidUrl)?;
         if is_allowed_url(&url) {
-            Ok(Self { url })
+            Ok(Self { url, permissions })
         } else {
             Err(NativeWebviewError::InvalidUrl)
         }
@@ -284,6 +294,7 @@ impl NativeWebviewBackend {
             let result = build_isolated_webview(
                 &window_for_ui,
                 request.url,
+                request.permissions,
                 completion_for_ui,
                 terminal_for_ui,
             );
@@ -504,9 +515,12 @@ impl LoadCompletion {
 fn build_isolated_webview(
     dispatcher: &WryWindowDispatcher<()>,
     target: Url,
+    permissions: WebviewPermissions,
     completion: Arc<LoadCompletion>,
     terminal: Arc<TerminalCompletion>,
 ) -> Result<WebView, NativeWebviewError> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = permissions;
     let completion_for_navigation = Arc::clone(&completion);
     let terminal_for_navigation = Arc::clone(&terminal);
     let completion_for_popup = Arc::clone(&completion);
@@ -564,9 +578,12 @@ fn build_isolated_webview(
         target_os = "openbsd"
     ))]
     {
-        builder
+        linux_webkitgtk::ensure_font_dpi();
+        let webview = builder
             .build_gtk(&dispatcher.default_vbox().map_err(host_failure)?)
-            .map_err(host_failure)
+            .map_err(host_failure)?;
+        linux_webkitgtk::configure_permissions(&webview.webview(), permissions);
+        Ok(webview)
     }
     #[cfg(not(any(
         target_os = "linux",
@@ -621,6 +638,34 @@ pub enum WebviewError {
     HostFailure(String),
 }
 
+/// Semantic permissions for one external webview.
+///
+/// All permissions are denied by default. Enabling user media permits only
+/// microphone/camera requests on Linux WebKitGTK; unrelated WebKit permission
+/// requests retain their engine-default denial. This type intentionally does
+/// not expose a WebKit, Wry, or Tauri policy object.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WebviewPermissions {
+    pub(crate) allow_user_media: bool,
+}
+
+impl WebviewPermissions {
+    /// Start from the deny-by-default webview permission policy.
+    pub const fn deny_all() -> Self {
+        Self {
+            allow_user_media: false,
+        }
+    }
+
+    /// Permit microphone/camera requests for this webview where the host
+    /// supports user media. This does not grant geolocation, notifications,
+    /// downloads, clipboard access, or host IPC.
+    pub const fn allow_user_media(mut self) -> Self {
+        self.allow_user_media = true;
+        self
+    }
+}
+
 /// Process-main-thread owner of the opt-in native event loop.
 ///
 /// Construct this on the UI/main thread, hand [`ExternalWebviewClient`] to
@@ -657,7 +702,8 @@ impl WebviewUrlGrant {
         if url.len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
             return Err(WebviewError::InvalidUrl);
         }
-        let request = NativeWebviewRequest::parse(url).map_err(map_native)?;
+        let request =
+            NativeWebviewRequest::parse(url, WebviewPermissions::deny_all()).map_err(map_native)?;
         if request.url.as_str().len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
             return Err(WebviewError::InvalidUrl);
         }
@@ -818,11 +864,31 @@ impl ExternalWebviewClient {
         self.open_granted_webview(&grant).await
     }
 
+    /// Create an isolated native webview with explicitly supplied permissions.
+    pub async fn open_webview_with_permissions(
+        &self,
+        url: &str,
+        permissions: WebviewPermissions,
+    ) -> Result<WebviewHandle, WebviewError> {
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_permissions(&grant, permissions)
+            .await
+    }
+
     /// Open a prevalidated host URL. The temporary registry grant is scoped
     /// to this instance and revoked on completion, error, or future drop.
     pub async fn open_granted_webview(
         &self,
         grant: &WebviewUrlGrant,
+    ) -> Result<WebviewHandle, WebviewError> {
+        self.open_granted_with_permissions(grant, WebviewPermissions::deny_all())
+            .await
+    }
+
+    async fn open_granted_with_permissions(
+        &self,
+        grant: &WebviewUrlGrant,
+        permissions: WebviewPermissions,
     ) -> Result<WebviewHandle, WebviewError> {
         let grant = PendingUrlGrant {
             hub: Arc::clone(&self.service.hub),
@@ -840,7 +906,7 @@ impl ExternalWebviewClient {
             operation,
             transferred: false,
         };
-        let request = NativeWebviewRequest::parse(&url).map_err(map_native)?;
+        let request = NativeWebviewRequest::parse(&url, permissions).map_err(map_native)?;
         let lease = self.service.hub.acquire_native_open().map_err(map_hub)?;
         let mut native = match self.service.backend.open(request, lease).await {
             Ok(native) => native,
@@ -1230,8 +1296,16 @@ mod tests {
 
     #[test]
     fn external_url_policy_admits_loopback_and_refuses_ambient_schemes() {
-        assert!(NativeWebviewRequest::parse("http://127.0.0.1:8080/page").is_ok());
-        assert!(NativeWebviewRequest::parse("https://example.test/").is_ok());
+        assert!(NativeWebviewRequest::parse(
+            "http://127.0.0.1:8080/page",
+            WebviewPermissions::default(),
+        )
+        .is_ok());
+        assert!(NativeWebviewRequest::parse(
+            "https://example.test/",
+            WebviewPermissions::default(),
+        )
+        .is_ok());
         for forbidden in [
             "file:///etc/passwd",
             "data:text/html,hello",
@@ -1241,10 +1315,22 @@ mod tests {
             "https://user@example.test/",
         ] {
             assert_eq!(
-                NativeWebviewRequest::parse(forbidden).unwrap_err(),
+                NativeWebviewRequest::parse(forbidden, WebviewPermissions::default()).unwrap_err(),
                 NativeWebviewError::InvalidUrl,
                 "must reject {forbidden}",
             );
         }
+    }
+
+    #[test]
+    fn user_media_permission_is_explicitly_opt_in() {
+        assert_eq!(
+            WebviewPermissions::default(),
+            WebviewPermissions::deny_all()
+        );
+        assert_ne!(
+            WebviewPermissions::deny_all(),
+            WebviewPermissions::deny_all().allow_user_media()
+        );
     }
 }

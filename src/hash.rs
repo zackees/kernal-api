@@ -1,4 +1,4 @@
-//! Kernel-owned BLAKE3 content hashing.
+//! Kernel-owned content hashing: BLAKE3 and optional `hash-sha256` compatibility.
 //!
 //! The concrete operations here deliberately expose only `kernal-api`
 //! semantic values. The BLAKE3 implementation remains a private dependency,
@@ -10,6 +10,16 @@
 use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
+
+#[cfg(feature = "hash-sha256")]
+mod sha256;
+#[cfg(feature = "hash-sha256")]
+pub use sha256::{sha256_bytes, sha256_file, sha256_reader, Sha256Digest, Sha256Hasher};
+
+#[cfg(feature = "fs")]
+mod tree;
+#[cfg(feature = "fs")]
+pub use tree::{blake3_tree, TreeHashOptions};
 
 /// The number of bytes in a BLAKE3 content digest.
 pub const BLAKE3_DIGEST_LENGTH: usize = 32;

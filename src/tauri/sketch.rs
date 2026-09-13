@@ -205,9 +205,11 @@ impl SketchWebviews {
         }
         match kind {
             OP_WEBVIEW_OPEN => {
-                let request =
-                    NativeWebviewRequest::parse(url.as_deref().ok_or(WebviewError::InvalidUrl)?)
-                        .map_err(map_native)?;
+                let request = NativeWebviewRequest::parse(
+                    url.as_deref().ok_or(WebviewError::InvalidUrl)?,
+                    WebviewPermissions::deny_all(),
+                )
+                .map_err(map_native)?;
                 let mut native = async_engine::cancellable(
                     &cancellation,
                     self.service.backend.open(

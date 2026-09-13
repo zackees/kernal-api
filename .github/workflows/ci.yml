@@ -140,6 +140,7 @@ jobs:
           - daemon-registration-v2
           - fs
           - fs-watch
+          - hash-sha256
           - ipc
           - ipc-async
           - profile

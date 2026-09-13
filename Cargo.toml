@@ -122,10 +122,11 @@ tauri-webview = [
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
 tauri-webview-test-support = ["tauri-webview", "dep:png"]
+hash-sha256 = ["dep:sha2"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
-  "dep:sha2",
+  "hash-sha256",
   "dep:tar",
   "dep:ureq",
   "dep:zstd",
@@ -172,7 +173,7 @@ symbolize-worker = [
   "dep:object",
   "dep:pdb",
   "dep:pdb-addr2line",
-  "dep:sha2",
+  "hash-sha256",
   "dep:tempfile",
   "dep:url",
   "dep:ureq",
@@ -288,13 +289,16 @@ tauri-utils = { version = "=2.9.3", optional = true }
 wry = { version = "=0.57.0", default-features = false, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = { version = "=2.0.2", optional = true }
-gtk = { version = "=0.18.2", optional = true }
 gio = { version = "=0.18.4", optional = true }
 cairo-rs = { version = "=0.18.5", features = ["png"], optional = true }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
 x11rb = { version = "=0.13.2", optional = true }
+# These are the exact GTK/WebKitGTK bindings linked privately by the pinned
+# Wry/Tauri runtime. The facade uses them only for WebKitGTK host setup and
+# permission signals; neither crate crosses the public webview boundary.
+gtk = { version = "=0.18.2", optional = true }
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "=0.6.2", optional = true }

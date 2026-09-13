@@ -93,6 +93,18 @@ impl Drop for OwnedScratchDirectory {
     }
 }
 
+/// Resolve the current user's home directory using native account conventions.
+///
+/// On Unix, a nonempty `HOME` overrides the account database; missing or empty
+/// `HOME` falls back to the account's home. On Windows, uses the user-profile
+/// known folder. Returns `None` when the host cannot resolve a home; does not
+/// create directories or invent a temporary fallback. Unlike
+/// [`super::host::home_dir`], this is not an environment-only host fact.
+#[cfg(feature = "fs")]
+pub fn user_home_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir()
+}
+
 #[cfg(feature = "fs")]
 pub use crate::{
     fs_create_private_file as create_private_file, fs_decode_path_bytes as decode_path_bytes,

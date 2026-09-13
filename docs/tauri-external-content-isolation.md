@@ -48,6 +48,30 @@ See `examples/wasm-tauri-screenshot` for the actual CLI/guest proof and its
 remaining tracing, containment, and platform acceptance work. Native-only
 smoke tests remain distinct from that end-to-end Wasm proof.
 
+On Linux, renderer environment must be configured by the application launcher,
+before starting the process. The safe library constructor does not mutate
+process environment: an existing runtime or application thread may already
+be reading it. Where needed, launch with `env JSC_useSharedArrayBuffer=1 app`;
+on NVIDIA, also supply `__NV_DISABLE_EXPLICIT_SYNC=1`, and for an X11 backend
+`WEBKIT_DISABLE_DMABUF_RENDERER=1`. These are launch-time choices, not defaults
+that override explicitly supplied user values.
+
+GTK's unknown/fractional font DPI is corrected before each view. Correction
+remembers the original desktop setting per GTK settings object on the UI
+thread, so repeated views do not divide an already corrected value. Observed
+desktop-setting and monitor-scale changes are recomputed from the original;
+an external reset exactly equal to the last applied value is indistinguishable.
+The repeated-view, scale-change, desktop-change, and unknown-DPI regression
+tests failed with the original cumulative division and pass with this state.
+
+`WebviewPermissions` is deny-by-default. Call
+`open_webview_with_permissions(url, WebviewPermissions::deny_all().allow_user_media())`
+only for pages that should receive microphone/camera access. On Linux this
+enables WebKitGTK media streams and accepts only user-media permission
+requests; all other WebKit permission kinds remain denied. GStreamer core,
+base, good, and PipeWire plugins must be available to WebKitGTK for devices to
+enumerate (notably, an unwrapped Nix shell may need to expose them).
+
 For a repeatable Linux proof outside CI, use the Nix development shell below.
 The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built
 binary from the ephemeral shell rather than from a Nix-wrapped derivation:

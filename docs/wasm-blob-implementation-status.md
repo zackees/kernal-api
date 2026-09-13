@@ -91,6 +91,32 @@ transfers.
 
 ## Remaining acceptance work
 
+### Public Rust guest API remains unimplemented (#13)
+
+The threaded smoke and screenshot guests currently depend directly on
+`kernal-api-v1-bindings` through source-tree paths in
+`guests/threaded-smoke/Cargo.toml` and
+`examples/wasm-tauri-screenshot/guest/Cargo.toml`. They call generated operations,
+not facade-owned public `kernal_api` guest operations. These unpublished fixtures
+prove ABI/runtime behavior only; they do not satisfy #13's public guest API or
+exact pre-1.0 consumer-pin acceptance criteria.
+
+The native package currently selects only Linux/macOS/Windows implementations
+in `src/lib.rs` and has an unconditional mandatory `running-process` dependency.
+Simply renaming the generated dependency to `kernal-api` would conceal rather
+than resolve this gap. Implement the explicit host/guest boundary while keeping
+one public API and generated support types private. Preserve the mandatory
+native substrate dependency, native default-feature behavior, and the single
+native platform selector. Do not introduce a second public facade or release
+path patch as a workaround.
+
+Acceptance needs a real guest consuming the exact published facade version,
+with semantic public handles/errors and no direct generated-binding imports;
+then rerun module admission, bounded transfer/backpressure/cancellation, and
+native containment proofs through that surface. The representative zccache and
+extension2 experiments and comparative timing gates remain separate required
+work, not consequences of the fixture passing.
+
 Worker exact-output success is now wired through
 `SketchWorkerConfig::with_output_destination`. The private
 `worker::output` component owns a sibling staging directory and
@@ -489,6 +515,19 @@ The wider goal also retains #13, #19–#22, #28, and fp-bindgen#1. Completion of
 these native hub tests does not close those deliverables.
 
 ## Native CI matrix rollout (not execution evidence)
+
+Current-commit evidence: run
+[34731795169](https://github.com/zackees/kernal-api/actions/runs/34731795169)
+at `95949ce` passes both native Linux screenshot jobs. The x86-64 job
+`103655809596` passes five ordinary tests (0.25 seconds) and all sixteen
+native/artifact tests (141.01 seconds); the ARM64 job `103655809612` passes
+the same groups in 0.20 and 142.81 seconds. Both explicitly execute and pass
+the renamed-parent staging regression and the default-contained CLI success,
+trap, missing-worker, and publication-failure cases. Uploaded screenshot
+artifacts are `10309592039` (x86-64) and `10309636767` (ARM64). These are
+native execution results, not cross-checks; they do not establish Windows or
+macOS acceptance on this commit. The rollout notes below retain their original
+pre-execution context.
 
 The dedicated screenshot job is now `wasm-tauri-screenshot-native`, with six
 explicit runner/target pairs documented in the example README. Each checks

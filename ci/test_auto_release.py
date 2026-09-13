@@ -46,6 +46,30 @@ class AutoReleaseTests(unittest.TestCase):
             "cp target/package/kernal-api-*.crate dist/* registry-packages/", workflow
         )
 
+    def test_release_stages_the_generated_conpty_manifest(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertNotIn(
+            "cmp conpty-sidecar.sha256.toml target/conpty-assets/conpty-sidecar.sha256.toml",
+            workflow,
+        )
+        self.assertIn(
+            "cp target/conpty-assets/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml",
+            workflow,
+        )
+        self.assertIn(
+            "target/conpty-assets/conpty-sidecar.sha256.toml",
+            workflow,
+        )
+        self.assertIn(
+            "cp conpty-sidecars/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml",
+            workflow,
+        )
+        self.assertIn(
+            "bash ci/verify_conpty_assets.sh target/conpty-assets", workflow
+        )
+        self.assertIn("soldr cargo package --locked --all-features --allow-dirty", workflow)
+        self.assertIn("soldr cargo publish --locked --no-verify --allow-dirty", workflow)
+
     def verify_source(self, tag="v0.1.0", sha="a" * 40, tagged_sha=None):
         env = {"RELEASE_TAG": tag, "RELEASE_SHA": sha, "GITHUB_SHA": "a" * 40}
         results = ["a" * 40, "" if tagged_sha is None else tag, tagged_sha]

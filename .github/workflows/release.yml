@@ -66,17 +66,20 @@ jobs:
           test "${manifest_version}" != "0.0.0"
           grep -q "version = \"${manifest_version}\"" pyproject.toml
           grep -q "__version__ = \"${manifest_version}\"" python/kernal_api/__init__.py
-      - name: Regenerate and verify ConPTY sidecars
+      - name: Build and stage ConPTY sidecars
         shell: bash
         run: |
           bash ci/build_conpty_assets.sh target/conpty-assets
-          cmp conpty-sidecar.sha256.toml target/conpty-assets/conpty-sidecar.sha256.toml
+          bash ci/verify_conpty_assets.sh target/conpty-assets
+          cp target/conpty-assets/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml
       - name: Test every facility together
         run: soldr cargo test --locked --all-features
       - name: Package exact Rust source
         # Registry consumers do not inherit this checkout's Git patches. Check
         # the extracted package with every advertised feature before publishing.
-        run: soldr cargo package --locked --all-features
+        # The generated sidecar manifest is the verified release input.
+        # Allow exactly that staged release input into the package.
+        run: soldr cargo package --locked --all-features --allow-dirty
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*
@@ -94,7 +97,9 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: conpty-sidecars
-          path: target/conpty-assets/conpty-sidecar-*.tar.zst
+          path: |
+            target/conpty-assets/conpty-sidecar-*.tar.zst
+            target/conpty-assets/conpty-sidecar.sha256.toml
           if-no-files-found: error
 
   symbolizer-workers:
@@ -172,6 +177,13 @@ jobs:
         with:
           name: registry-packages
           path: release-packages
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: conpty-sidecars
+          path: conpty-sidecars
+      - name: Stage validated ConPTY manifest for publishing
+        shell: bash
+        run: cp conpty-sidecars/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml
       - name: Publish or verify identical crates.io artifact
         shell: bash
         env:
@@ -185,7 +197,7 @@ jobs:
             -H 'User-Agent: kernal-api-release (https://github.com/zackees/kernal-api)' \
             "https://crates.io/api/v1/crates/kernal-api/${version}")"
           if [[ "${status}" == "404" ]]; then
-            soldr cargo publish --locked --no-verify
+            soldr cargo publish --locked --no-verify --allow-dirty
           elif [[ "${status}" == "200" ]]; then
             remote_sha="$(jq -r '.version.checksum' crates.json)"
             test "${local_sha}" = "${remote_sha}"

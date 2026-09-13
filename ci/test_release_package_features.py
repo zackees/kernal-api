@@ -10,7 +10,10 @@ class ReleasePackageFeatures(unittest.TestCase):
             Path(__file__).resolve().parents[1] / ".github/workflows/release.yml"
         ).read_text()
         commands = [line.strip() for line in workflow.splitlines()]
-        self.assertIn("run: soldr cargo package --locked --all-features", commands)
+        self.assertIn(
+            "run: soldr cargo package --locked --all-features --allow-dirty",
+            commands,
+        )
 
 
 if __name__ == "__main__":

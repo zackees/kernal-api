@@ -209,6 +209,41 @@ tests pass together in 0.56 seconds on Linux x86-64. This remains a synthetic
 native fixture: real extension2 envelope parsing/identity policy, guest ABI
 execution, asynchronous cancellation, and worker teardown are still required.
 
+## Owned authenticated entry reader
+
+The test-gated `Authenticated::into_reader` now consumes authenticated staging
+into a private, owned ZIP reader. It shares the native extractor's ZIP opener,
+including input, central-directory and entry-count preflight, and the existing
+64 KiB bounded copy helper. One bounded semantic inventory record is returned
+at a time, after name/path and per-entry validation. The initial streaming
+seam accepts regular files only; directories, links and special entries are
+rejected rather than exposed as ordinary file streams. Product inventory
+decisions still belong in the guest.
+
+The metadata-read control now uses an `Arc<AtomicU64>` instead of `Rc<Cell>` so
+the parsed reader can move to a blocking worker. This is serialized access to
+one non-cloneable reader, not a concurrent quota. The existing staged-storage
+reservation remains inside the authenticated wrapper until its ZIP/file is
+closed. A copy error permanently invalidates the reader: a partial failing
+sink write must not allow a retry with reusable aggregate accounting.
+
+The focused regressions first failed because `into_reader` was absent (Soldr
+log `20260913T061359Z-home-niteris-dev-kernal-api.xml`). The large encrypted ZIP
+test now hands the reader to a worker, validates its inventory, verifies every
+byte of the 17 MiB entry through a bounded sink, and observes retained storage
+during every write and zero storage after drop. Separate tests cover rejected
+metadata/input/name/entry limits, unsafe paths, unsupported entry kinds, empty
+files, aggregate-budget reuse, and a sink that fails after a partial write.
+A temporary mutation disabling reader invalidation made the partial-sink
+regression fail because a retry succeeded (Soldr log
+`20260913T061836Z-home-niteris-dev-kernal-api.xml`); the guard was restored.
+
+This is the native entry-streaming seam required by the guest contract, not
+its completed implementation. The generated `EncryptedArchive` operations,
+host dispatch, capacity-awaited Blob sink and real guest artifact execution
+remain missing. The synchronous `Write` sink in these tests does not prove
+asynchronous backpressure or cancellation of blocked filesystem operations.
+
 ## Native portability gate
 
 The existing six-host `wasm-tauri-screenshot-native` CI matrix now runs
@@ -226,7 +261,29 @@ must succeed on each host; a cross-compilation or screenshot-only result
 does not substitute for this step. These native tests still do not exercise
 the generated guest archive API or complete the extension2 acceptance gate.
 
-### Verified native staging baseline
+### Verified native registry baseline
+
+[Run 34740972933](https://github.com/zackees/kernal-api/actions/runs/34740972933)
+completed successfully at `e0216d4b622049f1751dc72dc0aac2b713a7192b`.
+Each native job's log reports all eight authenticated tests passing, including
+`authenticated_archive_registry_extracts_large_zip_with_bounded_transfers`.
+This extends the earlier staging-only baseline to immutable storage quotas,
+scoped registry ownership and the 17 MiB registry extraction fixture.
+
+| Target | Native job | Eight-test time |
+| --- | --- | --- |
+| Linux x86-64 | [103680505435](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505435) | 0.27 s |
+| Linux ARM64 | [103680505322](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505322) | 0.37 s |
+| macOS x86-64 | [103680505367](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505367) | 2.02 s |
+| macOS ARM64 | [103680505258](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505258) | 0.29 s |
+| Windows x86-64 | [103680505245](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505245) | 0.54 s |
+| Windows ARM64 | [103680505383](https://github.com/zackees/kernal-api/actions/runs/34740972933/job/103680505383) | 2.00 s |
+
+The later pending-authentication operation, atomic finalization, owned reader,
+and guest contract changes are not covered by this revision. In particular,
+these eight tests are not a six-target execution of the guest archive API.
+
+### Earlier verified native staging baseline
 
 CI run [34740154679](https://github.com/zackees/kernal-api/actions/runs/34740154679)
 at `978afc4e1e1b1c711ee9183add74631db24218b1` executed all four original

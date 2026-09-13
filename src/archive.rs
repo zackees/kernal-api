@@ -5,14 +5,19 @@
 //! Symbolic targets retain their relative spelling on Unix; Windows converts
 //! archive `/` separators to native `\` separators for usable relative links.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 mod tar_format;
+
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+mod zip_reader;
 
 #[cfg(all(test, feature = "archive-auth-test-support"))]
 pub(crate) mod authenticated_staging;
@@ -52,7 +57,10 @@ mod owned_source_tests {
 
 struct MetadataBudget {
     file: File,
-    remaining: Rc<Cell<u64>>,
+    // One non-Clone reader, always accessed through an exclusive borrow.
+    // The shared control only disables the ceiling after metadata parsing;
+    // it is not a concurrently consumed staging/storage quota.
+    remaining: Arc<AtomicU64>,
 }
 
 impl Read for MetadataBudget {
@@ -60,12 +68,14 @@ impl Read for MetadataBudget {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let allowed = self.remaining.get().min(buffer.len() as u64) as usize;
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let allowed = remaining.min(buffer.len() as u64) as usize;
         if allowed == 0 {
             return Err(invalid("ZIP metadata read budget exhausted"));
         }
         let count = self.file.read(&mut buffer[..allowed])?;
-        self.remaining.set(self.remaining.get() - count as u64);
+        self.remaining
+            .store(remaining - count as u64, Ordering::Relaxed);
         Ok(count)
     }
 }
@@ -524,23 +534,31 @@ fn preflight_zip(file: &mut File, limits: ExtractionLimits) -> io::Result<()> {
     file.rewind()
 }
 
-fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Result<()> {
+fn open_zip(mut file: File, limits: ExtractionLimits) -> io::Result<zip::ZipArchive<MetadataBudget>> {
+    if file.metadata()?.len() > limits.max_input_bytes {
+        return Err(invalid("archive input exceeds byte limit"));
+    }
     preflight_zip(&mut file, limits)?;
-    let budget = Rc::new(Cell::new(limits.max_metadata_bytes.saturating_add(65557)));
+    let budget = Arc::new(AtomicU64::new(limits.max_metadata_bytes.saturating_add(65557)));
     let reader = MetadataBudget {
         file,
-        remaining: Rc::clone(&budget),
+        remaining: Arc::clone(&budget),
     };
     let config = zip::read::Config {
         archive_offset: zip::read::ArchiveOffset::Known(0),
     };
-    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(io::Error::other)?;
+    let archive = zip::ZipArchive::with_config(config, reader).map_err(io::Error::other)?;
     // Metadata parsing is complete. File data is bounded by compressed file
     // size and the independent decompressed-output counter below.
-    budget.set(u64::MAX);
+    budget.store(u64::MAX, Ordering::Relaxed);
     if archive.len() as u64 > limits.max_entries {
         return Err(invalid("too many archive entries"));
     }
+    Ok(archive)
+}
+
+fn extract_zip(file: File, dest: &Path, limits: ExtractionLimits) -> io::Result<()> {
+    let mut archive = open_zip(file, limits)?;
     let root = prepare_destination(dest)?;
     let mut remaining = limits.max_output_bytes;
     let mut link_bytes = limits.max_metadata_bytes;

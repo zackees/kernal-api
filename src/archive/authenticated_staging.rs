@@ -10,6 +10,10 @@ use openssl::symm::{Cipher, Crypter, Mode};
 
 const CHUNK: usize = 64 * 1024;
 
+#[cfg(test)]
+#[path = "authenticated_reader_tests.rs"]
+mod reader_tests;
+
 #[derive(Clone, Debug)]
 pub(crate) struct StagingBudget(Arc<StagingBudgetState>);
 
@@ -199,6 +203,20 @@ pub(crate) struct Authenticated {
 }
 
 impl Authenticated {
+    pub(crate) fn into_reader(
+        self,
+        limits: super::ExtractionLimits,
+    ) -> io::Result<AuthenticatedReader> {
+        let Self {
+            file,
+            _reservation: reservation,
+        } = self;
+        Ok(AuthenticatedReader {
+            reader: super::zip_reader::Reader::new(file, limits)?,
+            _reservation: reservation,
+        })
+    }
+
     #[cfg(any(feature = "wasm-sketch-host", feature = "tauri-webview"))]
     pub(crate) fn belongs_to(&self, budget: &StagingBudget) -> bool {
         Arc::ptr_eq(&self._reservation.budget.0, &budget.0)
@@ -218,6 +236,22 @@ impl Authenticated {
         // source, including every error path. No source pathname is reopened.
         drop(reservation);
         result
+    }
+}
+
+pub(crate) struct AuthenticatedReader {
+    // Declaration order closes the ZIP/file before releasing its charge.
+    reader: super::zip_reader::Reader,
+    _reservation: Reservation,
+}
+
+impl AuthenticatedReader {
+    pub(crate) fn entry(&mut self, index: usize) -> io::Result<Option<super::zip_reader::Entry>> {
+        self.reader.entry(index)
+    }
+
+    pub(crate) fn copy_entry(&mut self, index: usize, sink: &mut impl Write) -> io::Result<u64> {
+        self.reader.copy_entry(index, sink)
     }
 }
 

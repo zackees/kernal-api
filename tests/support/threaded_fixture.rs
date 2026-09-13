@@ -1,3 +1,6 @@
+#[path = "abi_metadata.rs"]
+pub(super) mod abi_metadata;
+
 pub(crate) fn leb(mut value: u32, output: &mut Vec<u8>) {
     loop {
         let mut byte = (value & 0x7f) as u8;
@@ -144,11 +147,7 @@ pub(crate) fn threaded_root_wasm(
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
-    let metadata = format!(
-        "capabilities=0\n{}",
-        include_str!("../../src/wasm/generated/v1/kernal-api-v1.abi.toml")
-    );
-    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
+    custom("kernal-api.abi", abi_metadata::METADATA, &mut wasm);
     wasm
 }
 #[allow(dead_code)] // used by the sibling wasm_epoch_cancellation integration crate.

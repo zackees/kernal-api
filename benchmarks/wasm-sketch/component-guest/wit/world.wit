@@ -1,0 +1,19 @@
+package kernal:probe@0.1.0;
+
+interface blobs {
+    resource blob {
+        read: async func() -> stream<u8>;
+    }
+    granted: async func() -> option<blob>;
+    // Test-only synchronization: wait until the host observed a pending read.
+    await-pending-read: async func();
+    // Test-only synchronization: pause after consuming one 64 KiB chunk.
+    pause-consumer: async func();
+}
+
+world sketch {
+    import blobs;
+    export run: async func() -> result<u64>;
+    export cancel-read: async func() -> result<u64>;
+    export slow-consumer: async func() -> result<u64>;
+}

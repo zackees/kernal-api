@@ -12,6 +12,12 @@
 //! `kernal_api` types and never name the underlying async runtime, allocator,
 //! profiler, symbol parser, or native platform APIs directly.
 
+// Guest ABI selection is separate from native operating-system selection.
+std::cfg_select! {
+    target_family = "wasm" => {
+        pub mod guest;
+    }
+    _ => {
 use std::cfg_select;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -89,6 +95,12 @@ pub(crate) mod operations;
 ))]
 mod tauri;
 
+#[cfg(feature = "tauri-webview")]
+pub(crate) use platform_imp::viewport_capture as native_viewport_capture;
+
+#[cfg(feature = "wasm-sketch-worker")]
+pub(crate) use platform_imp::scratch_directory::Anchor as ScratchDirectoryAnchor;
+
 /// Semantic, opt-in external-webview operations.
 ///
 /// This module exposes no Tauri, Wry, Tokio, or platform-window types.  It
@@ -99,9 +111,14 @@ mod tauri;
 ))]
 pub mod webview {
     #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::capture::WebviewTestUiPause;
+    #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestObservation;
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::WebviewTestTraceEvent;
     pub use crate::tauri::{
-        ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewHandle, WebviewPermissions,
+        ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,
+        WebviewHandle, WebviewPermissions, WebviewSnapshot, WebviewSnapshotChunk, WebviewUrlGrant,
     };
 }
 
@@ -1726,5 +1743,7 @@ mod tests {
                 "blocking command occupied the current-thread runtime for {tick:?}"
             );
         });
+    }
+}
     }
 }

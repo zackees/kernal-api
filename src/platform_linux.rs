@@ -1,5 +1,13 @@
 //! Linux implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_linux/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_linux/autostart.rs"]
 pub(crate) mod autostart;
 
@@ -885,6 +893,15 @@ pub(crate) fn spawn_contained_worker(
     )
     .map_err(|error| WorkerError::new(WorkerStage::Create, error))?;
     worker_from_spawned_child(child)
+}
+
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    // Host-selected display/session and native loader settings, never guest input.
+    // Do not inherit HOME, credentials, or the full ambient environment.
+    for key in ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "LD_LIBRARY_PATH", "GDK_BACKEND", "LIBGL_ALWAYS_SOFTWARE", "NO_AT_BRIDGE", "WEBKIT_DISABLE_COMPOSITING_MODE"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
 }
 
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.

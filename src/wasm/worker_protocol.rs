@@ -1,18 +1,19 @@
 //! Private, bounded v1 framing for the one-request Wasm worker.
 //!
-//! This intentionally transports only one module and terminal observation. It
-//! is not a capability, resource, or generic streaming protocol.
+//! This transports one module, an optional bounded acceptance trace, and a
+//! terminal observation. It is not a generic resource streaming protocol.
 
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 1;
+const VERSION: u16 = 6;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
 /// admission policy: only the process transport is bounded by this contract.
 pub(super) const WORKER_PROTOCOL_MAX_MODULE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 1024;
+pub(super) const MAX_TRACE_BYTES: usize = 64 * 1024;
 const NO_STATUS_CODE: i32 = i32::MIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,6 +27,7 @@ pub(super) enum Kind {
     Cancel = 6,
     Terminal = 7,
     ExecuteAck = 8,
+    Trace = 9,
 }
 
 impl TryFrom<u8> for Kind {
@@ -40,6 +42,7 @@ impl TryFrom<u8> for Kind {
             6 => Ok(Self::Cancel),
             7 => Ok(Self::Terminal),
             8 => Ok(Self::ExecuteAck),
+            9 => Ok(Self::Trace),
             _ => Err(ProtocolError::UnknownKind),
         }
     }
@@ -193,8 +196,15 @@ pub(super) enum ProtocolError {
 }
 
 /// Facade semantic primitives needed to reconstruct compiler/limit settings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ExecuteMetadata {
+    /// Host-owned URL authority, never guest bytes. Native workers must
+    /// revalidate it before creating their per-root grant.
+    pub(super) webview_url: Option<String>,
+    /// Parent-owned staging destination, never the final output path or guest data.
+    pub(super) staged_output: Option<std::path::PathBuf>,
+    /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes, transfer bytes.
+    pub(super) blob_limits: [u64; 7],
     pub(super) max_wasm_stack_bytes: u64,
     pub(super) reserved_memory_bytes: u64,
     pub(super) maximum_active_roots: u64,
@@ -220,6 +230,10 @@ pub(super) struct FinalCounters {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Message {
+    Trace {
+        request_id: u64,
+        text: String,
+    },
     Hello {
         request_id: u64,
     },
@@ -263,6 +277,7 @@ impl Message {
             | Self::ExecuteEnd { request_id }
             | Self::Cancel { request_id } => *request_id,
             Self::ExecuteStart { request_id, .. }
+            | Self::Trace { request_id, .. }
             | Self::ModuleChunk { request_id, .. }
             | Self::Terminal { request_id, .. } => *request_id,
         }
@@ -277,6 +292,7 @@ impl Message {
             Self::ExecuteEnd { .. } => Kind::ExecuteEnd,
             Self::Cancel { .. } => Kind::Cancel,
             Self::Terminal { .. } => Kind::Terminal,
+            Self::Trace { .. } => Kind::Trace,
         }
     }
 }
@@ -288,6 +304,10 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
     let mut payload = Vec::new();
     put_u64(&mut payload, message.request_id());
     match message {
+        Message::Trace { text, .. } => {
+            validate_trace(text.as_bytes())?;
+            payload.extend_from_slice(text.as_bytes());
+        }
         Message::Hello { .. }
         | Message::HelloAck { .. }
         | Message::ExecuteAck { .. }
@@ -299,7 +319,7 @@ pub(super) fn encode(message: &Message) -> Result<Vec<u8>, ProtocolError> {
             ..
         } => {
             put_u64(&mut payload, *module_len);
-            put_metadata(&mut payload, metadata);
+            put_metadata(&mut payload, metadata)?;
         }
         Message::ModuleChunk {
             sequence, bytes, ..
@@ -376,6 +396,14 @@ pub(super) fn decode(frame: &[u8]) -> Result<Message, ProtocolError> {
         return Err(ProtocolError::InvalidRequestId);
     }
     let message = match kind {
+        Kind::Trace => {
+            validate_trace(input)?;
+            Message::Trace {
+                request_id,
+                text: String::from_utf8(std::mem::take(&mut input).to_vec())
+                    .map_err(|_| ProtocolError::InvalidPayload)?,
+            }
+        }
         Kind::Hello => Message::Hello { request_id },
         Kind::HelloAck => Message::HelloAck { request_id },
         Kind::ExecuteAck => Message::ExecuteAck { request_id },
@@ -451,10 +479,13 @@ pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolE
     if get_u16(&header[4..6])? != VERSION {
         return Err(ProtocolError::UnsupportedVersion);
     }
-    let _ = Kind::try_from(header[6])?;
+    let kind = Kind::try_from(header[6])?;
     let length =
         usize::try_from(get_u32(&header[7..11])?).map_err(|_| ProtocolError::LengthOverflow)?;
     if length > MAX_FRAME_PAYLOAD {
+        return Err(ProtocolError::FrameTooLarge);
+    }
+    if kind == Kind::Trace && length > MAX_TRACE_BYTES + 8 {
         return Err(ProtocolError::FrameTooLarge);
     }
     let total = HEADER_LEN
@@ -467,6 +498,16 @@ pub(super) fn read_message<R: Read>(reader: &mut R) -> Result<Message, ProtocolE
         .read_exact(&mut frame[HEADER_LEN..])
         .map_err(|_| ProtocolError::Truncated)?;
     decode(&frame)
+}
+
+fn validate_trace(bytes: &[u8]) -> Result<(), ProtocolError> {
+    if bytes.is_empty()
+        || bytes.len() > MAX_TRACE_BYTES
+        || bytes.iter().any(|byte| !matches!(byte, b'\n' | 32..=126))
+    {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    Ok(())
 }
 
 pub(super) fn write_message<W: Write>(
@@ -619,7 +660,123 @@ fn take_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
             .map_err(|_| ProtocolError::Truncated)?,
     ))
 }
-fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
+const MAX_OUTPUT_PATH_BYTES: usize = 65_536;
+
+fn put_output_path(out: &mut Vec<u8>, path: Option<&std::path::Path>) -> Result<(), ProtocolError> {
+    let Some(path) = path else {
+        put_u32(out, 0);
+        return Ok(());
+    };
+    if !path.is_absolute() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.contains(&0) || bytes.len() > MAX_OUTPUT_PATH_BYTES {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        bytes.to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt;
+        let mut bytes = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            if unit == 0 || bytes.len() >= MAX_OUTPUT_PATH_BYTES {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    };
+    put_u32(out, bytes.len() as u32);
+    out.push(if cfg!(windows) { 2 } else { 1 });
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+fn take_output_path(input: &mut &[u8]) -> Result<Option<std::path::PathBuf>, ProtocolError> {
+    let length = take_u32(input)? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAX_OUTPUT_PATH_BYTES {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    if take_u8(input)? != if cfg!(windows) { 2 } else { 1 } {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    let bytes = take(input, length)?;
+    #[cfg(unix)]
+    let path = {
+        use std::os::unix::ffi::OsStringExt;
+        if bytes.contains(&0) {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    };
+    #[cfg(windows)]
+    let path = {
+        use std::os::windows::ffi::OsStringExt;
+        if bytes.len() % 2 != 0 {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        let units: Vec<_> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        if units.contains(&0) {
+            return Err(ProtocolError::InvalidPayload);
+        }
+        std::path::PathBuf::from(std::ffi::OsString::from_wide(&units))
+    };
+    if !path.is_absolute() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    Ok(Some(path))
+}
+
+const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
+
+fn put_webview_url(out: &mut Vec<u8>, url: Option<&str>) -> Result<(), ProtocolError> {
+    match url {
+        None => put_u32(out, 0),
+        Some(url) => {
+            if url.is_empty() || url.len() > MAX_WEBVIEW_URL_BYTES || url.as_bytes().contains(&0) {
+                return Err(ProtocolError::InvalidPayload);
+            }
+            put_u32(out, url.len() as u32);
+            out.extend_from_slice(url.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn take_webview_url(input: &mut &[u8]) -> Result<Option<String>, ProtocolError> {
+    let length = take_u32(input)? as usize;
+    if length == 0 {
+        return Ok(None);
+    }
+    if length > MAX_WEBVIEW_URL_BYTES || length > input.len() {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    let (bytes, rest) = input.split_at(length);
+    let url = std::str::from_utf8(bytes).map_err(|_| ProtocolError::InvalidPayload)?;
+    if bytes.contains(&0) {
+        return Err(ProtocolError::InvalidPayload);
+    }
+    *input = rest;
+    Ok(Some(url.to_owned()))
+}
+
+fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) -> Result<(), ProtocolError> {
+    put_webview_url(out, value.webview_url.as_deref())?;
+    put_output_path(out, value.staged_output.as_deref())?;
+    for v in value.blob_limits {
+        put_u64(out, v);
+    }
     for v in [
         value.max_wasm_stack_bytes,
         value.reserved_memory_bytes,
@@ -636,9 +793,21 @@ fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) {
     }
     put_u32(out, value.max_shared_memory_pages);
     put_u64(out, value.max_guest_threads);
+    Ok(())
 }
 fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
     Ok(ExecuteMetadata {
+        webview_url: take_webview_url(input)?,
+        staged_output: take_output_path(input)?,
+        blob_limits: [
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+            take_u64(input)?,
+        ],
         max_wasm_stack_bytes: take_u64(input)?,
         reserved_memory_bytes: take_u64(input)?,
         maximum_active_roots: take_u64(input)?,
@@ -686,8 +855,46 @@ mod tests {
         trailing.push(0);
         assert_eq!(decode(&trailing), Err(ProtocolError::TrailingBytes));
     }
+    #[test]
+    fn webview_url_transport_is_bounded_and_preserves_absence() {
+        for url in [
+            None,
+            Some("https://example.test/exact?q=1"),
+            Some("https://例え.test/"),
+        ] {
+            let mut bytes = Vec::new();
+            put_webview_url(&mut bytes, url).unwrap();
+            let mut input = bytes.as_slice();
+            assert_eq!(take_webview_url(&mut input).unwrap().as_deref(), url);
+            assert!(input.is_empty());
+        }
+        for invalid in [
+            String::new(),
+            "x".repeat(MAX_WEBVIEW_URL_BYTES + 1),
+            "https://example.test/\0".into(),
+        ] {
+            assert!(put_webview_url(&mut Vec::new(), Some(&invalid)).is_err());
+        }
+        for invalid in [
+            vec![1, 0, 0, 0, 0xff],
+            vec![2, 0, 0, 0, b'x'],
+            vec![1, 0, 0, 0, 0],
+            u32::MAX.to_le_bytes().to_vec(),
+        ] {
+            assert!(take_webview_url(&mut invalid.as_slice()).is_err());
+        }
+        let mut original = metadata();
+        original.webview_url = Some("https://example.test/exact".into());
+        let mut bytes = Vec::new();
+        put_metadata(&mut bytes, &original).unwrap();
+        assert_eq!(take_metadata(&mut bytes.as_slice()).unwrap(), original);
+    }
+
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            webview_url: None,
+            staged_output: None,
+            blob_limits: [12, 13, 14, 15, 16, 17, 18],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 2,
             maximum_active_roots: 3,
@@ -727,6 +934,68 @@ mod tests {
             },
         };
         assert_eq!(decode(&encode(&terminal).unwrap()).unwrap(), terminal);
+    }
+
+    #[test]
+    fn staged_output_round_trips_only_bounded_absolute_native_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("completed-output");
+        let mut configuration = metadata();
+        configuration.staged_output = Some(path.clone());
+        let start = Message::ExecuteStart {
+            request_id: 1,
+            module_len: 1,
+            metadata: configuration,
+        };
+        assert_eq!(decode(&encode(&start).unwrap()).unwrap(), start);
+        let mut bytes = Vec::new();
+        put_output_path(&mut bytes, Some(&path)).unwrap();
+        for length in 0..bytes.len() {
+            assert!(take_output_path(&mut &bytes[..length]).is_err());
+        }
+        let mut foreign = bytes.clone();
+        foreign[4] = if cfg!(windows) { 1 } else { 2 };
+        assert_eq!(
+            take_output_path(&mut &foreign[..]),
+            Err(ProtocolError::InvalidPayload)
+        );
+        assert!(put_output_path(&mut Vec::new(), Some(std::path::Path::new("relative"))).is_err());
+        let oversized = ((MAX_OUTPUT_PATH_BYTES + 1) as u32).to_le_bytes();
+        assert_eq!(
+            take_output_path(&mut &oversized[..]),
+            Err(ProtocolError::InvalidPayload)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_output_preserves_non_utf8_unix_paths_and_rejects_nul() {
+        use std::os::unix::ffi::OsStringExt;
+        for bytes in [b"/output/\xff".to_vec(), b"/output/\0".to_vec()] {
+            let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(bytes.clone()));
+            let mut encoded = Vec::new();
+            if bytes.contains(&0) {
+                assert!(put_output_path(&mut encoded, Some(&path)).is_err());
+            } else {
+                put_output_path(&mut encoded, Some(&path)).unwrap();
+                assert_eq!(take_output_path(&mut &encoded[..]).unwrap(), Some(path));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn staged_output_preserves_unpaired_utf16_windows_paths() {
+        use std::os::windows::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&[
+            b'C' as u16,
+            b':' as u16,
+            b'\\' as u16,
+            0xd800,
+        ]));
+        let mut encoded = Vec::new();
+        put_output_path(&mut encoded, Some(&path)).unwrap();
+        assert_eq!(take_output_path(&mut &encoded[..]).unwrap(), Some(path));
     }
     #[test]
     fn round_trip_module_chunk_consumes_its_payload() {
@@ -776,7 +1045,7 @@ mod tests {
         frame[0] = 0;
         assert_eq!(decode(&frame), Err(ProtocolError::BadMagic));
         let mut frame = encode(&Message::Hello { request_id: 1 }).unwrap();
-        frame[4] = 2;
+        frame[4] = 1;
         assert_eq!(decode(&frame), Err(ProtocolError::UnsupportedVersion));
         let mut frame = encode(&Message::Hello { request_id: 1 }).unwrap();
         frame[6] = 99;
@@ -969,6 +1238,45 @@ mod tests {
         assert_eq!(
             encode(&cancelled_with_status),
             Err(ProtocolError::InvalidTerminal)
+        );
+    }
+    #[test]
+    fn trace_batch_is_bounded_printable_and_round_trips() {
+        for text in [
+            "kernal-webview-trace phase=poll\n".to_owned(),
+            "x".repeat(MAX_TRACE_BYTES),
+        ] {
+            let message = Message::Trace {
+                request_id: 3,
+                text,
+            };
+            assert_eq!(decode(&encode(&message).unwrap()).unwrap(), message);
+        }
+        for text in [
+            String::new(),
+            "x".repeat(MAX_TRACE_BYTES + 1),
+            "escape\x1b[31m".into(),
+            "nul\0".into(),
+            "é".into(),
+        ] {
+            assert!(encode(&Message::Trace {
+                request_id: 3,
+                text
+            })
+            .is_err());
+        }
+        let mut frame = encode(&Message::Trace {
+            request_id: 3,
+            text: "ok".into(),
+        })
+        .unwrap();
+        *frame.last_mut().unwrap() = 0xff;
+        assert!(decode(&frame).is_err());
+        let mut header = frame[..HEADER_LEN].to_vec();
+        header[7..11].copy_from_slice(&((MAX_TRACE_BYTES + 9) as u32).to_le_bytes());
+        assert_eq!(
+            read_message(&mut header.as_slice()),
+            Err(ProtocolError::FrameTooLarge)
         );
     }
 }

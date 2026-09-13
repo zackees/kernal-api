@@ -67,6 +67,9 @@ pub fn install_shutdown_request_handler() -> io::Result<ShutdownRequest> {
 mod tests {
     use super::*;
 
+    // Every test resets and observes the same process-global latch.
+    static SIGNAL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Installing succeeds and reports "not asked yet".
     ///
     /// Delivery is exercised by calling the handler directly rather than
@@ -74,6 +77,7 @@ mod tests {
     /// group -- including the test runner and its siblings.
     #[test]
     fn installing_reports_nothing_asked_yet() {
+        let _guard = SIGNAL_TEST.lock().unwrap();
         let request = install_shutdown_request_handler().expect("install");
         assert!(!request.requested());
     }
@@ -84,6 +88,7 @@ mod tests {
     /// default terminate and the caller never gets to drain.
     #[test]
     fn every_shutdown_event_is_claimed_and_requests_shutdown() {
+        let _guard = SIGNAL_TEST.lock().unwrap();
         use winapi::um::wincon::{
             CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT,
             CTRL_SHUTDOWN_EVENT,
@@ -119,6 +124,7 @@ mod tests {
     /// this process has no opinion about.
     #[test]
     fn an_unrecognized_console_event_is_declined() {
+        let _guard = SIGNAL_TEST.lock().unwrap();
         let request = install_shutdown_request_handler().expect("install");
         REQUESTED.store(false, Ordering::Relaxed);
         // SAFETY: as above.

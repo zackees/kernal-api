@@ -1,5 +1,13 @@
 //! macOS implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_macos/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_macos/autostart.rs"]
 pub(crate) mod autostart;
 
@@ -948,6 +956,13 @@ pub(crate) fn spawn_contained_worker(
         pid,
         Box::new(MacosWorkerControl { inner }),
     ))
+}
+
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    for key in ["TMPDIR", "__CF_USER_TEXT_ENCODING"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
 }
 
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.

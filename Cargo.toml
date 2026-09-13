@@ -17,6 +17,10 @@ exclude = ["/.github", "/ci", "/dylints", "/python", "/vendor", "/pyproject.toml
 name = "kernal_api"
 path = "src/lib.rs"
 
+[[example]]
+name = "wasm-admission"
+required-features = ["wasm-sketch-host"]
+
 [[bin]]
 name = "kernal-symbolize"
 path = "src/bin/kernal-symbolize.rs"
@@ -31,6 +35,11 @@ required-features = ["wasm-sketch-worker"]
 name = "kernal-tauri-smoke"
 path = "src/bin/kernal-tauri-smoke.rs"
 required-features = ["tauri-webview-test-support"]
+
+[[bin]]
+name = "kernal-api-wasm-tauri"
+path = "examples/wasm-tauri-screenshot/runner.rs"
+required-features = ["wasm-sketch-worker", "tauri-webview"]
 
 [features]
 default = []
@@ -93,20 +102,34 @@ window-icon = ["dep:png", "dep:x11rb"]
 # runtime supplies the canonical event loop, while Wry's builder is attached
 # directly to its plain native window without an IPC handler.
 tauri-webview = [
-  "dep:gtk",
   "dep:tauri",
   "dep:tauri-runtime",
   "dep:tauri-runtime-wry",
   "dep:tauri-utils",
   "dep:url",
-  "dep:webkit2gtk",
   "dep:wry",
+  "dep:webkit2gtk",
+  "dep:gtk",
+  "dep:gio",
+  "dep:cairo-rs",
+  "dep:webview2-com",
+  "dep:windows",
+  "dep:windows-core",
+  "dep:block2",
+  "dep:objc2-app-kit",
+  "dep:objc2-foundation",
+  "dep:objc2-core-foundation",
+  "dep:objc2-core-graphics",
+  "dep:objc2-image-io",
+  "dep:objc2-web-kit",
 ]
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
-tauri-webview-test-support = ["tauri-webview"]
+tauri-webview-test-support = ["tauri-webview", "dep:png"]
 hash-sha256 = ["dep:sha2"]
 archive = ["dep:zip", "dep:tar", "dep:zstd", "dep:flate2"]
+# Test-only native authentication and guest-header experiment.
+archive-auth-test-support = ["archive", "dep:openssl", "dep:tempfile"]
 http-client = ["dep:reqwest", "dep:bytes", "dep:hyper"]
 conpty-sidecar = [
   "pty",
@@ -166,10 +189,10 @@ symbolize-worker = [
 # The sketch host is intentionally isolated from ordinary async/process users.
 # It uses core Wasm plus Cranelift; WASI, the Component Model, pooling, Winch,
 # and a second executor remain out of this first admission-only slice.
-wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser"]
+wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser", "fs"]
 # Private one-request worker protocol; the executable/supervisor follows in
 # phase B. Keeping this separate preserves default-feature isolation.
-wasm-sketch-worker = ["wasm-sketch-host"]
+wasm-sketch-worker = ["wasm-sketch-host", "dep:tempfile", "dep:cap-std"]
 # Deliberately test-only: permits the private worker supervisor to publish an
 # exact native identity to an externally controlled containment harness.
 wasm-sketch-worker-test-support = ["wasm-sketch-worker"]
@@ -189,6 +212,8 @@ full = [
 ]
 
 [dependencies]
+# Portable decoding is opt-in for native screenshot proofs and window icons.
+png = { version = "=0.17.16", optional = true }
 reqwest = { version = "=0.12.28", default-features = false, features = ["default-tls"], optional = true }
 # Constrain reqwest's private parser for published consumers, not just this
 # repository's lockfile. Its metadata bounds are audited in docs/http-client.md.
@@ -196,19 +221,6 @@ hyper = { version = "=1.11.0", default-features = false, optional = true }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"], optional = true }
 http-body-util = { version = "=0.1.5", optional = true }
 bytes = { version = "=1.12.1", optional = true }
-# `rayon` backs the parallel memory-mapped hashing path; its global pool is
-# constructed lazily, so a consumer that never hashes a large file never builds
-# one.
-#
-# `pure` is deliberately NOT set, and the reasoning that says it should be is a
-# trap worth naming. blake3's build script compiles `c/blake3_neon.c` through
-# `cc` on aarch64 little-endian unless `pure` or `no_neon` is set, which looks
-# like it must break a Linux-hosted `aarch64-pc-windows-msvc` cross. Tested: it
-# does not. Soldr supplies its own clang and target SDKs, and
-# `check --target aarch64-pc-windows-msvc` completes with the NEON C compiled.
-# Setting `pure` would force x86_64 onto Rust intrinsics and disable AVX-512
-# for every consumer, to prevent a break that does not occur.
-blake3 = { version = "=1.8.7", features = ["rayon"] }
 console-api = { version = "=0.9.0", optional = true }
 console-subscriber = { version = "=0.5.0", optional = true }
 crash-handler = { version = "=0.7.0", optional = true }
@@ -220,12 +232,8 @@ getrandom = { version = "=0.4.3", optional = true }
 globset = { version = "=0.4.18", optional = true }
 interprocess = { version = "=2.4.3", optional = true }
 jwalk = { version = "=0.8.1", optional = true }
-memmap2 = "=0.9.11"
 mimalloc-pprof = { version = "=0.9.4", optional = true }
 portable-pty = { version = "=0.9.0", optional = true }
-# Exact first-party pre-1.0 pin. The substrate remains private behind facade
-# owned semantic types, with only the lightweight async process HAL enabled.
-running-process = { version = "=4.10.10", default-features = false, features = ["kernel-substrate"] }
 prost = { version = "=0.14.4", optional = true }
 prost-types = { version = "=0.14.4", optional = true }
 # Exact-pinned per the issue tracking this facade: reflink semantics are
@@ -235,23 +243,12 @@ reflink-copy = { version = "=0.1.30", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
 serde_json = { version = "=1.0.151", optional = true }
 sha2 = { version = "=0.10.9", optional = true }
-sysinfo = "=0.30.13"
 tar = { version = "=0.4.46", default-features = false, optional = true }
 zip = { version = "=2.4.2", optional = true }
+openssl = { version = "=0.10.81", features = ["vendored"], optional = true }
 tempfile = { version = "=3.27.0", optional = true }
+cap-std = { version = "=4.0.3", optional = true }
 thiserror = "=2.0.20"
-tokio = { version = "=1.53.1", default-features = false, features = [
-  "fs",
-  "io-util",
-  "macros",
-  "net",
-  "process",
-  "rt",
-  "rt-multi-thread",
-  "signal",
-  "sync",
-  "time",
-] }
 tokio-stream = { version = "=0.1.19", optional = true }
 tonic = { version = "=0.14.6", default-features = false, features = [
   "codegen",
@@ -272,6 +269,23 @@ zstd = { version = "=0.13.3", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
+
+# The guest uses the generated kernel ABI, not a native runtime or OS substrate.
+# These remain mandatory (not feature-optional) for every native consumer.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+# `rayon` backs native parallel memory-mapped hashing; its global pool is lazy.
+# Keep native SIMD enabled: Soldr supplies the clang/SDK needed by BLAKE3's
+# ARM64 NEON C backend, including Linux-hosted Windows ARM64 cross-checks.
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+memmap2 = "=0.9.11"
+# Exact first-party pre-1.0 pin. The substrate remains private behind facade
+# owned semantic types, with only the lightweight async process HAL enabled.
+running-process = { version = "=4.10.10", default-features = false, features = ["kernel-substrate"] }
+sysinfo = "=0.30.13"
+tokio = { version = "=1.53.1", default-features = false, features = [
+  "fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread",
+  "signal", "sync", "time",
+] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 object = { version = "=0.36.7", default-features = false, features = ["read", "std"], optional = true }
@@ -296,9 +310,10 @@ tauri-utils = { version = "=2.9.3", optional = true }
 wry = { version = "=0.57.0", default-features = false, features = ["os-webview"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gio = { version = "=0.18.4", optional = true }
+cairo-rs = { version = "=0.18.5", features = ["png"], optional = true }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
-png = { version = "=0.17.16", optional = true }
 x11rb = { version = "=0.13.2", optional = true }
 # These are the exact GTK/WebKitGTK bindings linked privately by the pinned
 # Wry/Tauri runtime. The facade uses them only for WebKitGTK host setup and
@@ -307,11 +322,21 @@ gtk = { version = "=0.18.2", optional = true }
 webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "=0.6.2", optional = true }
+objc2-app-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSImage", "NSImageRep", "NSGraphicsContext", "NSView", "NSWindow", "objc2-core-graphics"] }
+objc2-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSError"] }
+objc2-core-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CFString"] }
+objc2-core-graphics = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGDataConsumer", "CGImage"] }
+objc2-image-io = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGImageDestination", "objc2-core-graphics"] }
+objc2-web-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "WKWebView", "WKSnapshotConfiguration", "block2"] }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }
 lzma-rs = { version = "=0.3.0", optional = true }
 mach2 = "=0.4.3"
 
 [target.'cfg(windows)'.dependencies]
+webview2-com = { version = "=0.39.1", optional = true }
+windows = { version = "=0.62.2", optional = true, features = ["Win32_System_Com", "Win32_Foundation"] }
+windows-core = { version = "=0.62.2", optional = true }
 libc = "=0.2.189"
 object = { version = "=0.36.7", default-features = false, features = ["read", "std"], optional = true }
 pdb = { version = "=0.8.0", optional = true }

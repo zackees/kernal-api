@@ -147,6 +147,7 @@ jobs:
         feature:
           - allocator
           - archive
+          - archive-auth-test-support
           - conpty-sidecar
           - crash
           # The four daemon lanes are the frozen running-process substrates.
@@ -197,7 +198,8 @@ jobs:
   # therefore use a real Xvfb display, a loopback page, and one supplied
   # kernal-api async runtime. They exercise matching Finished correlation,
   # actual window destruction, popup/redirect denial, timeout, cancellation,
-  # and window-close revocation with zero semantic/native resources.
+  # window-close revocation, bounded viewport capture, and cancelled native
+  # queue admission with zero semantic/native resources.
   tauri-webview-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -210,7 +212,7 @@ jobs:
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Restore native pkg-config search path
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - name: Run real semantic webview lifecycle proofs
+      - name: Run real semantic webview lifecycle and capture proofs
         env:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: "1"
@@ -218,6 +220,8 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          # Expand fixture variables inside the child Bash, not this step shell.
+          # shellcheck disable=SC2016
           dbus-run-session -- xvfb-run -a bash -c '
             soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
@@ -226,6 +230,207 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
+
+  # Archive and screenshot builds need independent cold-build deadlines.
+  # Both matrices execute real guests; neither is a cross-build substitute.
+  wasm-archive-native:
+    name: Native archive (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Configure archive build storage
+        shell: pwsh
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'kernal-api-archive-build')" >> $env:GITHUB_ENV
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          toolchain: 1.95.0
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify native host and install guest target
+        shell: pwsh
+        run: |
+          $version = & soldr rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'Rust host probe failed' }
+          if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
+          ./tests/screenshot-target-repair.ps1
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
+      - name: Run native authenticated archive staging proofs
+        shell: pwsh
+        run: |
+          & soldr cargo test --locked --no-default-features --features wasm-sketch-host,archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
+      - name: Run actual streaming archive guest on the native host
+        shell: pwsh
+        run: |
+          & uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs
+          if ($LASTEXITCODE -ne 0) { throw 'Archive proof runner checks failed' }
+          & uv run --no-project ci/run_extension2_guest.py --native-target $env:NATIVE_TARGET --target-dir $env:CARGO_TARGET_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Actual streaming archive guest proof failed' }
+
+  # Each #22 platform/architecture requires its own successful native run.
+  # Matrix configuration alone is not acceptance evidence.
+  wasm-tauri-screenshot-native:
+    name: Native screenshot (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+      GDK_BACKEND: x11
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      NO_AT_BRIDGE: "1"
+      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install native WebKitGTK 4.1 and virtual display
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+      - name: Configure screenshot build and proof storage
+        shell: pwsh
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'kernal-api-screenshot-build')" >> $env:GITHUB_ENV
+          "KERNAL_API_SCREENSHOT_PROOF_DIR=$(Join-Path $env:RUNNER_TEMP 'kernal-api-screenshot-proof')" >> $env:GITHUB_ENV
+      - name: Ensure Cargo JSON parser on macOS
+        if: runner.os == 'macOS'
+        shell: bash
+        run: command -v jq || brew install jq
+      - name: Ensure Windows WebView2 Runtime
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Microsoft's documented Evergreen Runtime keys, not the Edge browser.
+          function Get-WebViewRuntimeVersion {
+            foreach ($key in @('HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}', 'HKCU:\Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}')) {
+              $value = (Get-ItemProperty -LiteralPath $key -Name pv -ErrorAction SilentlyContinue).pv
+              $parsed = $null
+              if ([version]::TryParse($value, [ref]$parsed) -and $parsed -gt [version]'0.0.0.0') { return $value }
+            }
+            return $null
+          }
+          if (-not (Get-WebViewRuntimeVersion)) {
+            $installer = Join-Path $env:RUNNER_TEMP 'MicrosoftEdgeWebview2Setup.exe'
+            Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $installer
+            if ((Get-AuthenticodeSignature -LiteralPath $installer).Status -ne 'Valid') { throw 'Invalid WebView2 installer signature' }
+            $installation = Start-Process -FilePath $installer -ArgumentList '/silent','/install' -Wait -PassThru
+            if ($installation.ExitCode -ne 0) { throw "WebView2 installation failed: $($installation.ExitCode)" }
+          }
+          if (-not (Get-WebViewRuntimeVersion)) { throw 'WebView2 Runtime is unavailable after setup' }
+          Write-Output "WebView2 Runtime: $(Get-WebViewRuntimeVersion)"
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          toolchain: 1.95.0
+      - name: Restore native pkg-config search path
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          echo "PKG_CONFIG_LIBDIR_${NATIVE_TARGET//-/_}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - name: Verify this is the native Rust host
+        shell: pwsh
+        run: |
+          $version = & soldr rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'Rust host probe failed' }
+          if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
+      - name: Build actual Rust screenshot guest
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash tests/screenshot-build-arguments.sh
+          bash tests/screenshot-target-repair.sh
+          soldr --no-cache rustup target add wasm32-wasip1-threads
+          bash examples/wasm-tauri-screenshot/build-guest.sh
+          bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture
+          bash examples/wasm-tauri-screenshot/build-guest.sh --block-after-capture
+      - name: Build actual Rust screenshot guest on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tests/screenshot-target-repair.ps1
+          & soldr --no-cache rustup target add wasm32-wasip1-threads
+          if ($LASTEXITCODE -ne 0) { throw 'Wasm target installation failed' }
+          ./examples/wasm-tauri-screenshot/build-guest.ps1
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -TrapAfterCapture
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -BlockAfterCapture
+      - name: Run offline native Wasm screenshot and admission proofs
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          KERNAL_API_SCREENSHOT_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
+          KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
+          KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest-block/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
+        run: |
+          soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot
+          # The build-and-run CLI starts Soldr itself. Finish the outer Soldr
+          # invocation before running the harness; never disable its reentry guard.
+          test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
+            jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            dbus-run-session -- xvfb-run -a "$test_executable" --ignored --nocapture --test-threads=1
+          else
+            "$test_executable" --ignored --nocapture --test-threads=1
+          fi
+      - name: Run offline native Wasm screenshot and admission proofs on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:KERNAL_API_SCREENSHOT_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+          $env:KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+          $env:KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest-block/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+          & soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot
+          if ($LASTEXITCODE -ne 0) { throw 'Screenshot admission tests failed' }
+          $messages = & soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'Screenshot harness build failed' }
+          $artifacts = @($messages | ConvertFrom-Json | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'wasm_tauri_screenshot' -and $_.profile.test -and $_.executable })
+          if ($artifacts.Count -ne 1) { throw 'Expected exactly one screenshot test executable' }
+          & $artifacts[0].executable --ignored --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'Native screenshot proof failed' }
+      - name: Preserve screenshot and process diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wasm-tauri-screenshot-${{ matrix.target }}
+          path: ${{ runner.temp }}/kernal-api-screenshot-proof
+          if-no-files-found: warn
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it
@@ -283,6 +488,16 @@ jobs:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
         shell: pwsh
         run: ./scripts/build-threaded-smoke.ps1
+      - name: Build and admit the actual screenshot guest (Windows, no GUI)
+        if: runner.os == 'Windows'
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-screenshot-build
+        shell: pwsh
+        run: |
+          ./examples/wasm-tauri-screenshot/build-guest.ps1
+          $env:KERNAL_API_SCREENSHOT_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'
+          soldr cargo test --locked --features wasm-sketch-host --test wasm_tauri_screenshot -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   wasm-abi-generation:
     runs-on: ubuntu-latest

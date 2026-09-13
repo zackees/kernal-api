@@ -5,18 +5,62 @@
 //! Symbolic targets retain their relative spelling on Unix; Windows converts
 //! archive `/` separators to native `\` separators for usable relative links.
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::rc::Rc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
 mod tar_format;
 
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+mod zip_reader;
+
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+pub(crate) mod authenticated_staging;
+
+#[cfg(test)]
+mod owned_source_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_seekable_source_extracts_large_entry_without_a_source_path() {
+        const LENGTH: u64 = 17 * 1024 * 1024;
+        let mut writer = zip::ZipWriter::new(tempfile::tempfile().unwrap());
+        writer.start_file("payload", zip::write::SimpleFileOptions::default()).unwrap();
+        let chunk = [0x5a; 64 * 1024];
+        for _ in 0..LENGTH / chunk.len() as u64 {
+            writer.write_all(&chunk).unwrap();
+        }
+        let source = writer.finish().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        extract_file(source, output.path(), ArchiveFormat::Zip, ExtractionLimits {
+            max_entry_bytes: LENGTH,
+            max_output_bytes: LENGTH,
+            ..ExtractionLimits::default()
+        }).unwrap();
+        let mut payload = File::open(output.path().join("payload")).unwrap();
+        let mut read = [0; 64 * 1024];
+        let mut total = 0;
+        loop {
+            let count = payload.read(&mut read).unwrap();
+            if count == 0 { break; }
+            assert!(read[..count].iter().all(|byte| *byte == 0x5a));
+            total += count as u64;
+        }
+        assert_eq!(total, LENGTH);
+    }
+}
+
 struct MetadataBudget {
     file: File,
-    remaining: Rc<Cell<u64>>,
+    // One non-Clone reader, always accessed through an exclusive borrow.
+    // The shared control only disables the ceiling after metadata parsing;
+    // it is not a concurrently consumed staging/storage quota.
+    remaining: Arc<AtomicU64>,
 }
 
 impl Read for MetadataBudget {
@@ -24,12 +68,14 @@ impl Read for MetadataBudget {
         if buffer.is_empty() {
             return Ok(0);
         }
-        let allowed = self.remaining.get().min(buffer.len() as u64) as usize;
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        let allowed = remaining.min(buffer.len() as u64) as usize;
         if allowed == 0 {
             return Err(invalid("ZIP metadata read budget exhausted"));
         }
         let count = self.file.read(&mut buffer[..allowed])?;
-        self.remaining.set(self.remaining.get() - count as u64);
+        self.remaining
+            .store(remaining - count as u64, Ordering::Relaxed);
         Ok(count)
     }
 }
@@ -59,6 +105,45 @@ fn copy_bounded(
         }
         writer.write_all(&buffer[..count])?;
         *remaining -= count as u64;
+    }
+}
+
+fn copy_entry_bounded(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    remaining: &mut u64,
+    max_entry_bytes: u64,
+) -> io::Result<()> {
+    let before = (*remaining).min(max_entry_bytes);
+    let mut entry_remaining = before;
+    let result = copy_bounded(reader, writer, &mut entry_remaining);
+    *remaining -= before - entry_remaining;
+    result
+}
+
+#[cfg(test)]
+mod entry_budget_tests {
+    use super::*;
+
+    #[test]
+    fn entry_copy_limits_actual_bytes_even_without_size_metadata() {
+        for (bytes, limit, succeeds) in [
+            (&b""[..], 0, true),
+            (&b"x"[..], 0, false),
+            (&b"1234"[..], 4, true),
+            (&b"12345"[..], 4, false),
+        ] {
+            let mut output = Vec::new();
+            let mut total = 10;
+            let result = copy_entry_bounded(&mut &bytes[..], &mut output, &mut total, limit);
+            assert_eq!(result.is_ok(), succeeds);
+            assert!(output.len() as u64 <= limit);
+            assert_eq!(10 - total, output.len() as u64);
+        }
+        let mut total = 3;
+        let mut output = Vec::new();
+        assert!(copy_entry_bounded(&mut &b"1234"[..], &mut output, &mut total, 10).is_err());
+        assert!(output.len() <= 3);
     }
 }
 
@@ -92,6 +177,10 @@ pub struct ExtractionLimits {
     pub max_input_bytes: u64,
     /// Maximum sum of extracted file bytes.
     pub max_output_bytes: u64,
+    /// Maximum uncompressed payload bytes in any one non-metadata entry.
+    /// Independent of the aggregate output budget; zero permits empty entries.
+    /// Tar extension records remain subject to the metadata budget instead.
+    pub max_entry_bytes: u64,
     /// Maximum archive entries.
     pub max_entries: u64,
     /// Maximum central-directory metadata bytes.
@@ -109,6 +198,7 @@ impl Default for ExtractionLimits {
         Self {
             max_input_bytes: 16 * 1024 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024 * 1024,
+            max_entry_bytes: 64 * 1024 * 1024 * 1024,
             max_entries: 1_000_000,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_path_bytes: 4096,
@@ -325,9 +415,22 @@ pub fn extract(
     limits: ExtractionLimits,
 ) -> io::Result<()> {
     let file = File::open(archive)?;
+    extract_file(file, dest, format, limits)
+}
+
+// Consume the already-authorized source without reopening a pathname. Future
+// authenticated staging must reach this boundary only after verification.
+// File ownership itself is not an authentication verdict.
+pub(crate) fn extract_file(
+    mut file: File,
+    dest: &Path,
+    format: ArchiveFormat,
+    limits: ExtractionLimits,
+) -> io::Result<()> {
     if file.metadata()?.len() > limits.max_input_bytes {
         return Err(invalid("archive input exceeds byte limit"));
     }
+    file.rewind()?;
     match format {
         ArchiveFormat::Zip => extract_zip(file, dest, limits),
         ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => {
@@ -431,36 +534,48 @@ fn preflight_zip(file: &mut File, limits: ExtractionLimits) -> io::Result<()> {
     file.rewind()
 }
 
-fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Result<()> {
+fn open_zip(mut file: File, limits: ExtractionLimits) -> io::Result<zip::ZipArchive<MetadataBudget>> {
+    if file.metadata()?.len() > limits.max_input_bytes {
+        return Err(invalid("archive input exceeds byte limit"));
+    }
     preflight_zip(&mut file, limits)?;
-    let budget = Rc::new(Cell::new(limits.max_metadata_bytes.saturating_add(65557)));
+    let budget = Arc::new(AtomicU64::new(limits.max_metadata_bytes.saturating_add(65557)));
     let reader = MetadataBudget {
         file,
-        remaining: Rc::clone(&budget),
+        remaining: Arc::clone(&budget),
     };
     let config = zip::read::Config {
         archive_offset: zip::read::ArchiveOffset::Known(0),
     };
-    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(io::Error::other)?;
+    let archive = zip::ZipArchive::with_config(config, reader).map_err(io::Error::other)?;
     // Metadata parsing is complete. File data is bounded by compressed file
     // size and the independent decompressed-output counter below.
-    budget.set(u64::MAX);
+    budget.store(u64::MAX, Ordering::Relaxed);
     if archive.len() as u64 > limits.max_entries {
         return Err(invalid("too many archive entries"));
     }
+    Ok(archive)
+}
+
+fn extract_zip(file: File, dest: &Path, limits: ExtractionLimits) -> io::Result<()> {
+    let mut archive = open_zip(file, limits)?;
     let root = prepare_destination(dest)?;
     let mut remaining = limits.max_output_bytes;
     let mut link_bytes = limits.max_metadata_bytes;
     let mut links = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(io::Error::other)?;
+        if entry.size() > limits.max_entry_bytes {
+            return Err(invalid("ZIP entry exceeds byte limit"));
+        }
         let relative = relative_path(entry.name(), limits.max_path_bytes)?;
         let output = root.join(&relative);
         if entry.is_symlink() {
             let mut bytes = Vec::new();
             let mut allowed = (limits.max_path_bytes as u64)
                 .min(link_bytes)
-                .min(remaining);
+                .min(remaining)
+                .min(limits.max_entry_bytes);
             let before = allowed;
             copy_bounded(&mut entry, &mut bytes, &mut allowed)?;
             link_bytes -= before - allowed;
@@ -498,7 +613,7 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
             .write(true)
             .create_new(true)
             .open(&output)?;
-        copy_bounded(&mut entry, &mut target, &mut remaining)?;
+        copy_entry_bounded(&mut entry, &mut target, &mut remaining, limits.max_entry_bytes)?;
         target.flush()?;
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {

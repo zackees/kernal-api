@@ -1,5 +1,13 @@
 //! Windows implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform_win/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_win/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_win/autostart.rs"]
 pub(crate) mod autostart;
 
@@ -674,4 +682,10 @@ pub fn process_replace_current_image(_command: &mut std::process::Command) -> st
 /// This host has no `execve`; a caller must start a successor and exit.
 pub const fn process_can_replace_current_image() -> bool {
     false
+}
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    for key in ["SystemRoot", "WINDIR", "TEMP", "TMP", "LOCALAPPDATA"] {
+        if let Some(value) = std::env::var_os(key) { command.env(key, value); }
+    }
 }

@@ -1002,6 +1002,7 @@ impl AdmittedSketch {
         operation_cleanup.close_all(operations::Terminal::Closed);
         let children = prepared.controller.join_completed();
         let output_cleanup = operation_cleanup.join_output_jobs().await;
+        let process_cleanup = operation_cleanup.join_process_jobs().await;
         #[cfg(all(test, feature = "archive-auth-test-support"))]
         let archive_cleanup = operation_cleanup.join_archive_jobs().await;
         operation_cleanup.join_clock_jobs().await;
@@ -1039,6 +1040,7 @@ impl AdmittedSketch {
             .store(store.get_fuel().unwrap_or(0), Ordering::Release);
         let result = resolve_threaded_result(outcome, children, report, rejections)?;
         output_cleanup.map_err(|_| SketchExecutionError::OutputCleanupFailed)?;
+        process_cleanup.map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
         #[cfg(all(test, feature = "archive-auth-test-support"))]
         archive_cleanup.map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
         #[cfg(feature = "tauri-webview")]

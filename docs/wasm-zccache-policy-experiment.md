@@ -234,6 +234,40 @@ draining the queue. Both checks pass on Linux x86-64 alongside all 12 existing
 process-session tests. They do not execute a compiler, measure aggregate RSS,
 prove descendant containment, or provide Windows/macOS execution evidence.
 
+### Internal compiler-grant lifecycle foundation
+
+`src/wasm/process_resource.rs` now adds the native grant/spawn lifecycle to
+the existing operation hub, behind `wasm-sketch-host`. Grants bind an absolute
+executable and cwd, explicit environment, null stdin, and piped output. They
+require spawner ownership: an omitted binding is normalized to the spawner;
+a conflicting explicit owner is rejected. Native owner-death enforcement
+retains its platform limitations (including Linux's documented SIGTERM),
+and is not a portable descendant-tree guarantee.
+
+Operation, resource, and tracked-job capacity are reserved before consuming
+the one-shot command. At most four native jobs are retained concurrently;
+each session uses a one-chunk queue with 64-KiB chunks. Resource revocation
+signals a tracked supervisor, which explicitly kills and waits for the
+direct child outside the authority mutex. Root finalization joins these jobs.
+Join futures retain task handles in the hub, serialize their polling, and
+latch cleanup errors rather than treating a failed join as successful reaping.
+The deadline begins at admission and expired queued commands do not spawn.
+
+Linux x86-64 validation passes all 93 operation tests, including 14 process
+tests/helper cases. Two focused regressions were observed RED before their
+fixes: simultaneous cleanup joiners lost a wakeup, and an already-expired
+queued command still attempted native spawn. The tests also cover cancelled
+join retry, cancellation after spawn but before publication, uncollected
+spawn abandonment after actual output readiness, deadline reaping without
+draining output, grant/operation/resource/job admission, and owner binding.
+
+This foundation is deliberately not guest-reachable yet: no process ABI,
+root grant provisioning, public guest process API, or Component adapter is
+added by it. Output-operation accounting and a cumulative output ceiling
+remain required before exposure. These tests use controlled child fixtures,
+not rustc or the cache workflow. They do not prove abrupt worker-death cleanup,
+uninterruptible spawn containment, aggregate RSS, or six-host execution.
+
 This experiment does not replace the Component Model comparison, ten-edit
 latency measurements, sealed extension2 archive proof, or six native target
 acceptance required by #13.

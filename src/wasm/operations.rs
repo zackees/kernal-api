@@ -19,6 +19,10 @@ static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
 #[path = "hash_resource.rs"]
 mod hash_resource;
 
+#[cfg(feature = "wasm-sketch-host")]
+#[path = "process_resource.rs"]
+mod process_resource;
+
 #[cfg(all(
     test,
     feature = "archive-auth-test-support",
@@ -167,6 +171,8 @@ pub(crate) struct HubSnapshot {
     pub(crate) peak_retained_transfer_capacity: usize,
     pub(crate) native_transfer_capacity: usize,
     pub(crate) active_output_jobs: usize,
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) retained_process_jobs: usize,
     pub(crate) active_native_captures: usize,
     pub(crate) active_native_opens: usize,
     pub(crate) active_clocks: usize,
@@ -273,6 +279,10 @@ struct ResourceSlot {
 }
 
 enum ResourceValue {
+    #[cfg(feature = "wasm-sketch-host")]
+    CompilerGrant(process_resource::CompilerGrant),
+    #[cfg(feature = "wasm-sketch-host")]
+    CompilerProcess(process_resource::CompilerProcess),
     Blake3(Box<crate::hash::Blake3Hasher>),
     #[cfg(all(
         test,
@@ -306,6 +316,8 @@ enum ResourceValue {
 }
 
 struct OperationSlot {
+    #[cfg(feature = "wasm-sketch-host")]
+    is_compiler_spawn: bool,
     is_hash_operation: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     is_archive_operation: bool,
@@ -338,6 +350,10 @@ struct DeferredCompletion {
 }
 
 struct State {
+    #[cfg(feature = "wasm-sketch-host")]
+    process_jobs: Vec<crate::async_engine::Task<Result<(), HubError>>>,
+    #[cfg(feature = "wasm-sketch-host")]
+    process_job_failed: bool,
     #[cfg(feature = "wasm-sketch-host")]
     output_jobs: Vec<crate::async_engine::Task<()>>,
     resources: BTreeMap<OpaqueToken, ResourceSlot>,
@@ -425,6 +441,12 @@ impl Drop for NativeCaptureLease {
 
 /// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
+    #[cfg(feature = "wasm-sketch-host")]
+    process_join: crate::async_engine::Semaphore,
+    #[cfg(all(test, feature = "wasm-sketch-host"))]
+    process_spawn_checkpoint: Mutex<Option<process_resource::SpawnCheckpoint>>,
+    #[cfg(all(test, feature = "wasm-sketch-host"))]
+    process_spawn_attempts: AtomicU64,
     #[cfg(all(
         test,
         feature = "archive-auth-test-support",
@@ -503,6 +525,12 @@ impl OperationHub {
     ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
+            #[cfg(feature = "wasm-sketch-host")]
+            process_join: crate::async_engine::Semaphore::new(1),
+            #[cfg(all(test, feature = "wasm-sketch-host"))]
+            process_spawn_checkpoint: Mutex::new(None),
+            #[cfg(all(test, feature = "wasm-sketch-host"))]
+            process_spawn_attempts: AtomicU64::new(0),
             #[cfg(all(
                 test,
                 feature = "archive-auth-test-support",
@@ -526,6 +554,10 @@ impl OperationHub {
             maximum_resources,
             blob_limits,
             state: Mutex::new(State {
+                #[cfg(feature = "wasm-sketch-host")]
+                process_jobs: Vec::new(),
+                #[cfg(feature = "wasm-sketch-host")]
+                process_job_failed: false,
                 #[cfg(feature = "wasm-sketch-host")]
                 output_jobs: Vec::new(),
                 resources: BTreeMap::new(),
@@ -2324,6 +2356,8 @@ impl OperationHub {
         state.operations.insert(
             token,
             OperationSlot {
+                #[cfg(feature = "wasm-sketch-host")]
+                is_compiler_spawn: false,
                 is_hash_operation: false,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 is_archive_operation: false,
@@ -2722,6 +2756,8 @@ impl OperationHub {
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
             native_transfer_capacity: state.native_transfer_capacity,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
+            #[cfg(feature = "wasm-sketch-host")]
+            retained_process_jobs: state.process_jobs.len(),
             active_native_captures: self.native_capture_count.load(Ordering::Acquire) as usize,
             active_native_opens: self.native_open_count.load(Ordering::Acquire) as usize,
             active_clocks: self.clock_count.load(Ordering::Acquire) as usize,

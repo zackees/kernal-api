@@ -89,11 +89,13 @@ window-icon = ["dep:png", "dep:x11rb"]
 # runtime supplies the canonical event loop, while Wry's builder is attached
 # directly to its plain native window without an IPC handler.
 tauri-webview = [
+  "dep:gtk",
   "dep:tauri",
   "dep:tauri-runtime",
   "dep:tauri-runtime-wry",
   "dep:tauri-utils",
   "dep:url",
+  "dep:webkit2gtk",
   "dep:wry",
 ]
 # Private acceptance-only observation for the process-main-thread smoke
@@ -279,6 +281,11 @@ addr2line = { version = "=0.24.2", default-features = false, features = ["std", 
 lzma-rs = { version = "=0.3.0", optional = true }
 png = { version = "=0.17.16", optional = true }
 x11rb = { version = "=0.13.2", optional = true }
+# These are the exact GTK/WebKitGTK bindings linked privately by the pinned
+# Wry/Tauri runtime. The facade uses them only for WebKitGTK host setup and
+# permission signals; neither crate crosses the public webview boundary.
+gtk = { version = "=0.18.2", optional = true }
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

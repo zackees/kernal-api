@@ -17,6 +17,8 @@ pub const MAX_TOTAL_ARGUMENT_BYTES: usize = 1024 * 1024;
 pub enum ValueKind {
     /// Any non-NUL UTF-8 string within the input limits.
     String,
+    /// An operating-system string, retained without UTF-8 conversion.
+    OsString,
     /// One of the declared strings.
     Enumeration(Vec<String>),
     /// A finite IEEE-754 double accepted by Rust's `f64` parser.
@@ -29,6 +31,11 @@ impl ValueKind {
     /// Accept an arbitrary string value.
     pub const fn string() -> Self {
         Self::String
+    }
+
+    /// Accept a non-NUL operating-system string within the input limits.
+    pub const fn os_string() -> Self {
+        Self::OsString
     }
 
     /// Accept exactly one of `values`.
@@ -303,25 +310,23 @@ impl Command {
             if words.len() == MAX_ARGUMENTS {
                 return Err(CommandError::TooManyArguments);
             }
-            let value = argument
-                .as_ref()
-                .to_str()
-                .ok_or(CommandError::InvalidUtf8)?;
-            if value.contains('\0') {
+            let value = argument.as_ref();
+            let bytes = value.as_encoded_bytes();
+            if bytes.contains(&b'\0') {
                 return Err(CommandError::ContainsNul);
             }
-            if value.len() > MAX_ARGUMENT_BYTES {
+            if bytes.len() > MAX_ARGUMENT_BYTES {
                 return Err(CommandError::ArgumentTooLarge);
             }
             total = total
-                .checked_add(value.len())
+                .checked_add(bytes.len())
                 .ok_or(CommandError::InputTooLarge)?;
             if total > MAX_TOTAL_ARGUMENT_BYTES {
                 return Err(CommandError::InputTooLarge);
             }
-            words.push(value.to_owned());
+            words.push(value.to_os_string());
         }
-        let explicit_options = explicit_option_names(&words);
+        let explicit_options = explicit_option_names(&words)?;
         self.validate()?;
         let command = self.clap_command();
         let matches = command
@@ -366,6 +371,11 @@ impl Command {
             match &option.kind {
                 None => argument = argument.action(clap::ArgAction::SetTrue),
                 Some(ValueKind::String) => argument = argument.action(clap::ArgAction::Set),
+                Some(ValueKind::OsString) => {
+                    argument = argument
+                        .action(clap::ArgAction::Set)
+                        .value_parser(clap::value_parser!(std::ffi::OsString));
+                }
                 Some(ValueKind::Enumeration(values)) => {
                     argument = argument
                         .action(clap::ArgAction::Set)
@@ -402,6 +412,9 @@ impl Command {
                 .action(clap::ArgAction::Set);
             match &positional.kind {
                 ValueKind::String => {}
+                ValueKind::OsString => {
+                    argument = argument.value_parser(clap::value_parser!(std::ffi::OsString));
+                }
                 ValueKind::Enumeration(values) => argument = argument.value_parser(values.clone()),
                 ValueKind::F64 => argument = argument.value_parser(clap::value_parser!(f64)),
                 ValueKind::U32 => argument = argument.value_parser(clap::value_parser!(u32)),
@@ -462,7 +475,7 @@ impl Command {
                 _ => {}
             }
             if let Some(kind) = &option.kind {
-                if (option.repeated && !matches!(kind, ValueKind::String))
+                if (option.repeated && !matches!(kind, ValueKind::String | ValueKind::OsString))
                     || option
                         .default
                         .as_ref()
@@ -552,6 +565,17 @@ impl Command {
                     .cloned()
                     .map(ParsedValue::String)
                     .unwrap_or(ParsedValue::Absent),
+                Some(ValueKind::OsString) if option.repeated => matches
+                    .try_get_many::<std::ffi::OsString>(&option.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .map(|items| ParsedValue::OsStrings(items.cloned().collect()))
+                    .unwrap_or(ParsedValue::Absent),
+                Some(ValueKind::OsString) => matches
+                    .try_get_one::<std::ffi::OsString>(&option.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .cloned()
+                    .map(ParsedValue::OsString)
+                    .unwrap_or(ParsedValue::Absent),
                 Some(ValueKind::F64) => match matches
                     .try_get_one::<f64>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
@@ -577,6 +601,12 @@ impl Command {
                     .map_err(|_| CommandError::InvalidArguments)?
                     .cloned()
                     .map(ParsedValue::String)
+                    .unwrap_or(ParsedValue::Absent),
+                ValueKind::OsString => matches
+                    .try_get_one::<std::ffi::OsString>(&positional.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .cloned()
+                    .map(ParsedValue::OsString)
                     .unwrap_or(ParsedValue::Absent),
                 ValueKind::F64 => match matches
                     .try_get_one::<f64>(&positional.name)
@@ -639,20 +669,25 @@ impl Command {
     }
 }
 
-fn explicit_option_names(words: &[String]) -> std::collections::BTreeSet<String> {
+fn explicit_option_names(
+    words: &[std::ffi::OsString],
+) -> Result<std::collections::BTreeSet<String>, CommandError> {
     let mut names = std::collections::BTreeSet::new();
     let mut options_enabled = true;
     for word in words.iter().skip(1) {
-        if options_enabled && word == "--" {
+        let bytes = word.as_encoded_bytes();
+        if options_enabled && bytes == b"--" {
             options_enabled = false;
         } else if options_enabled {
-            if let Some(name) = word.strip_prefix("--") {
-                let name = name.split_once('=').map_or(name, |(name, _)| name);
-                names.insert(name.to_owned());
+            if let Some(name) = bytes.strip_prefix(b"--") {
+                let name = name.split(|byte| *byte == b'=').next().unwrap_or_default();
+                if let Ok(name) = std::str::from_utf8(name) {
+                    names.insert(name.to_owned());
+                }
             }
         }
     }
-    names
+    Ok(names)
 }
 
 fn valid_name(name: &str) -> bool {
@@ -666,6 +701,7 @@ fn valid_name(name: &str) -> bool {
 fn valid_value(kind: &ValueKind, value: &str) -> bool {
     match kind {
         ValueKind::String => !value.contains('\0'),
+        ValueKind::OsString => !value.contains('\0'),
         ValueKind::Enumeration(values) => values.iter().any(|candidate| candidate == value),
         ValueKind::F64 => value.parse::<f64>().is_ok_and(f64::is_finite),
         ValueKind::U32 => value.parse::<u32>().is_ok(),
@@ -679,8 +715,12 @@ pub enum ParsedValue {
     Flag(bool),
     /// A declared value option.
     String(String),
+    /// A declared lossless operating-system-string option or positional.
+    OsString(std::ffi::OsString),
     /// A repeated value option, in command-line order.
     Strings(Vec<String>),
+    /// A repeated declared lossless operating-system-string option.
+    OsStrings(Vec<std::ffi::OsString>),
     /// A declared `f64` option or positional.
     F64(f64),
     /// A declared `u32` option or positional.
@@ -722,6 +762,22 @@ impl ParsedCommand {
     pub fn values(&self, name: &str) -> Option<&[String]> {
         match self.values.get(name) {
             Some(ParsedValue::Strings(values)) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Read a declared operating-system-string option or positional.
+    pub fn os_value(&self, name: &str) -> Option<&OsStr> {
+        match self.values.get(name) {
+            Some(ParsedValue::OsString(value)) => Some(value.as_os_str()),
+            _ => None,
+        }
+    }
+
+    /// Read all values of a repeated declared operating-system-string option.
+    pub fn os_values(&self, name: &str) -> Option<&[std::ffi::OsString]> {
+        match self.values.get(name) {
+            Some(ParsedValue::OsStrings(values)) => Some(values),
             _ => None,
         }
     }

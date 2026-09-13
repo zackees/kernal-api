@@ -382,3 +382,97 @@ impl BlobHandle {
         OperationFuture::submit(6, self.token, (u64::from(length) << 32) | u64::from(pointer))
     }
 }
+
+/// Exact command authority selected by the host, never a guest SpawnSpec.
+pub struct CompilerGrant { token: u64 }
+pub struct CompilerProcess { token: u64 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompilerOutputEvent {
+    Stdout(usize), Stderr(usize), StdoutEof, StderrEof,
+    StdoutAbandoned, StderrAbandoned, StdoutError, StderrError, Exhausted,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompilerExit { pub code: Option<i32>, pub success: bool }
+struct CompilerOperation { inner: OperationFuture, abandon: u32 }
+impl Drop for CompilerOperation {
+    fn drop(&mut self) { let _ = imports::operation_submit(self.abandon, self.inner.operation, 0); }
+}
+impl CompilerOperation {
+    fn submit(kind: u32, token: u64, abandon: u32) -> Result<Self, OperationError> {
+        Ok(Self { inner: OperationFuture::submit(kind, token, 0)?, abandon })
+    }
+    async fn wait(&self) -> Result<u64, OperationError> {
+        loop {
+            if let Some(payload) = self.inner.poll()? { return Ok(payload); }
+            self.inner.yield_now()?;
+        }
+    }
+}
+fn compiler_terminal(packed: u64) -> Result<Option<u64>, OperationError> {
+    match packed as u8 {
+        0 => Ok(None), 1 => Ok(Some(packed >> 8)),
+        2 => Err(OperationError::Cancelled), 3 => Err(OperationError::TimedOut),
+        6 => Err(OperationError::Closed), 7 => Err(OperationError::Rejected),
+        _ => Err(OperationError::Failed),
+    }
+}
+impl CompilerGrant {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(35, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
+    pub async fn spawn(self) -> Result<CompilerProcess, OperationError> {
+        let operation = CompilerOperation::submit(36, self.token, 42)?;
+        let token = operation.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(CompilerProcess { token })
+    }
+}
+impl Drop for CompilerGrant {
+    fn drop(&mut self) { let _ = imports::operation_submit(41, self.token, 0); }
+}
+impl CompilerProcess {
+    pub async fn read_output(&mut self, destination: &mut [u8]) -> Result<CompilerOutputEvent, OperationError> {
+        if destination.len() < 65536 { return Err(OperationError::Rejected); }
+        let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let operation = CompilerOperation::submit(37, self.token, 39)?;
+        loop {
+            let packed = imports::operation_submit(38, operation.inner.operation, (65536_u64 << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+            if let Some(payload) = compiler_terminal(packed)? {
+                let count = (payload >> 8) as usize;
+                if count > 65536 { return Err(OperationError::Failed); }
+                return Ok(match payload as u8 {
+                    1 => CompilerOutputEvent::Stdout(count), 2 => CompilerOutputEvent::Stderr(count),
+                    3 if count == 0 => CompilerOutputEvent::StdoutEof,
+                    4 if count == 0 => CompilerOutputEvent::StderrEof,
+                    5 if count == 0 => CompilerOutputEvent::StdoutAbandoned,
+                    6 if count == 0 => CompilerOutputEvent::StderrAbandoned,
+                    7 if count == 0 => CompilerOutputEvent::StdoutError,
+                    8 if count == 0 => CompilerOutputEvent::StderrError,
+                    9 if count == 0 => CompilerOutputEvent::Exhausted,
+                    _ => return Err(OperationError::Failed),
+                });
+            }
+            operation.inner.yield_now()?;
+        }
+    }
+    pub async fn wait(&self) -> Result<CompilerExit, OperationError> {
+        let operation = CompilerOperation::submit(43, self.token, 47)?;
+        loop {
+            let packed = imports::operation_submit(44, operation.inner.operation, 0).map_err(|_| OperationError::Failed)?;
+            if let Some(payload) = compiler_terminal(packed)? {
+                return Ok(CompilerExit { code: if payload & (1_u64 << 32) != 0 { Some(payload as u32 as i32) } else { None }, success: payload & (1_u64 << 33) != 0 });
+            }
+            operation.inner.yield_now()?;
+        }
+    }
+    pub async fn close(mut self) -> Result<(), OperationError> {
+        let operation = CompilerOperation::submit(45, self.token, 46)?;
+        self.token = 0;
+        operation.wait().await?;
+        Ok(())
+    }
+}
+impl Drop for CompilerProcess {
+    fn drop(&mut self) { if self.token != 0 { let _ = imports::operation_submit(40, self.token, 0); } }
+}

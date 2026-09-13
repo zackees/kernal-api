@@ -14,7 +14,7 @@ const GRANT_KIND: u8 = 10;
 const PROCESS_KIND: u8 = 11;
 const PROCESS_RIGHT: u8 = 1;
 const MAX_PROCESS_JOBS: usize = 4;
-const MAX_PROCESS_OUTPUT_CHUNK: usize = 64 * 1024;
+pub(super) const MAX_PROCESS_OUTPUT_CHUNK: usize = 64 * 1024;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 // Pinned substrate: one shared queue slot, two scratch buffers, two pending
 // sends, and two Windows blocking-read buffers. Payload allowance, not RSS;
@@ -23,6 +23,10 @@ const NATIVE_PROCESS_OUTPUT_ALLOWANCE: usize = 7 * MAX_PROCESS_OUTPUT_CHUNK;
 
 #[path = "process_output.rs"]
 mod output;
+
+#[path = "process_scalar.rs"]
+mod scalar;
+pub(super) use scalar::CompilerScalarKind;
 
 #[cfg(test)]
 pub(super) struct SpawnCheckpoint {
@@ -502,16 +506,18 @@ impl OperationHub {
     }
 
     fn poll_process_jobs(state: &mut State, context: &mut Context<'_>) {
-        state
-            .process_jobs
-            .retain_mut(|job| match Pin::new(job).poll(context) {
+        let mut failed = false;
+        for jobs in [&mut state.process_jobs, &mut state.process_io_jobs] {
+            jobs.retain_mut(|job| match Pin::new(job).poll(context) {
                 Poll::Pending => true,
                 Poll::Ready(Ok(Ok(()))) => false,
                 Poll::Ready(_) => {
-                    state.process_job_failed = true;
+                    failed = true;
                     false
                 }
             });
+        }
+        state.process_job_failed |= failed;
     }
 
     pub(crate) async fn join_process_jobs(&self) -> Result<(), HubError> {
@@ -527,7 +533,7 @@ impl OperationHub {
                 return Poll::Ready(Err(HubError::WrongRights));
             }
             Self::poll_process_jobs(&mut state, context);
-            if !state.process_jobs.is_empty() {
+            if !state.process_jobs.is_empty() || !state.process_io_jobs.is_empty() {
                 return Poll::Pending;
             }
             Poll::Ready(if state.process_job_failed {

@@ -321,6 +321,16 @@ enum ResourceValue {
 
 struct OperationSlot {
     #[cfg(feature = "wasm-sketch-host")]
+    compiler_scalar: Option<process_resource::CompilerScalarKind>,
+    #[cfg(feature = "wasm-sketch-host")]
+    compiler_exit: Option<crate::ProcessSessionExit>,
+    #[cfg(feature = "wasm-sketch-host")]
+    is_compiler_read: bool,
+    // Some(None) is a ready exhausted stream, not a pending receive. The
+    // payload has no hub reference, so storing it here cannot form a cycle.
+    #[cfg(feature = "wasm-sketch-host")]
+    compiler_output: Option<Option<crate::ProcessOutputEvent>>,
+    #[cfg(feature = "wasm-sketch-host")]
     is_compiler_spawn: bool,
     is_hash_operation: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
@@ -360,6 +370,8 @@ struct State {
     reserved_process_output_bytes: usize,
     #[cfg(feature = "wasm-sketch-host")]
     process_jobs: Vec<crate::async_engine::Task<Result<(), HubError>>>,
+    #[cfg(feature = "wasm-sketch-host")]
+    process_io_jobs: Vec<crate::async_engine::Task<Result<(), HubError>>>,
     #[cfg(feature = "wasm-sketch-host")]
     process_job_failed: bool,
     #[cfg(feature = "wasm-sketch-host")]
@@ -572,6 +584,8 @@ impl OperationHub {
                 reserved_process_output_bytes: 0,
                 #[cfg(feature = "wasm-sketch-host")]
                 process_jobs: Vec::new(),
+                #[cfg(feature = "wasm-sketch-host")]
+                process_io_jobs: Vec::new(),
                 #[cfg(feature = "wasm-sketch-host")]
                 process_job_failed: false,
                 #[cfg(feature = "wasm-sketch-host")]
@@ -1150,6 +1164,10 @@ impl OperationHub {
     }
 
     pub(crate) fn cancel_wire(&self, store: u64, operation: u64) -> Result<(), HubError> {
+        #[cfg(feature = "wasm-sketch-host")]
+        if self.cancel_compiler_output_wire(store, OpaqueToken(operation))? {
+            return Ok(());
+        }
         self.take_owner(OpaqueToken(operation), store)?;
         self.terminal(
             OpaqueToken(operation),
@@ -2373,6 +2391,14 @@ impl OperationHub {
             token,
             OperationSlot {
                 #[cfg(feature = "wasm-sketch-host")]
+                compiler_scalar: None,
+                #[cfg(feature = "wasm-sketch-host")]
+                compiler_exit: None,
+                #[cfg(feature = "wasm-sketch-host")]
+                is_compiler_read: false,
+                #[cfg(feature = "wasm-sketch-host")]
+                compiler_output: None,
+                #[cfg(feature = "wasm-sketch-host")]
                 is_compiler_spawn: false,
                 is_hash_operation: false,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
@@ -2506,6 +2532,12 @@ impl OperationHub {
             if operation.owner.store != store {
                 return Err(HubError::Stale);
             }
+            #[cfg(feature = "wasm-sketch-host")]
+            if operation.is_compiler_read
+                || operation.compiler_scalar == Some(process_resource::CompilerScalarKind::Wait)
+            {
+                return Err(HubError::WrongKind);
+            }
             operation.terminal
         };
         if terminal.is_some() {
@@ -2538,8 +2570,22 @@ impl OperationHub {
     ) -> Result<Option<Arc<Notify>>, HubError> {
         let (notify, created) = {
             let operation = state.operations.get_mut(&token).ok_or(HubError::Invalid)?;
-            if operation.terminal.is_some() {
+            #[cfg(not(feature = "wasm-sketch-host"))]
+            let replace_ready = false;
+            #[cfg(feature = "wasm-sketch-host")]
+            let replace_ready = (operation.is_compiler_read
+                || operation.compiler_scalar == Some(process_resource::CompilerScalarKind::Wait))
+                && operation
+                    .terminal
+                    .is_some_and(|old| old.terminal == Terminal::Completed)
+                && result.terminal != Terminal::Completed;
+            if operation.terminal.is_some() && !replace_ready {
                 return Ok(None);
+            }
+            #[cfg(feature = "wasm-sketch-host")]
+            if result.terminal != Terminal::Completed {
+                drop(operation.compiler_output.take());
+                operation.compiler_exit = None;
             }
             operation.terminal = Some(result);
             #[cfg(all(test, feature = "archive-auth-test-support"))]
@@ -2626,7 +2672,16 @@ impl OperationHub {
             .operations
             .iter()
             .filter(|(_, operation)| {
-                operation.resource == Some(token) && operation.terminal.is_none()
+                #[cfg(not(feature = "wasm-sketch-host"))]
+                let ready_read = false;
+                #[cfg(feature = "wasm-sketch-host")]
+                let ready_read = (operation.is_compiler_read
+                    || operation.compiler_scalar
+                        == Some(process_resource::CompilerScalarKind::Wait))
+                    && operation
+                        .terminal
+                        .is_some_and(|result| result.terminal == Terminal::Completed);
+                operation.resource == Some(token) && (operation.terminal.is_none() || ready_read)
             })
             .map(|(token, _)| *token)
             .collect();
@@ -2675,7 +2730,21 @@ impl OperationHub {
                 cancel.cancel();
             }
             operation.blob_read_result = None;
-            if operation.terminal.is_none() {
+            #[cfg(not(feature = "wasm-sketch-host"))]
+            let ready_read = false;
+            #[cfg(feature = "wasm-sketch-host")]
+            let ready_read = (operation.is_compiler_read
+                || operation.compiler_scalar == Some(process_resource::CompilerScalarKind::Wait))
+                && operation
+                    .terminal
+                    .is_some_and(|result| result.terminal == Terminal::Completed);
+            #[cfg(feature = "wasm-sketch-host")]
+            drop(operation.compiler_output.take());
+            #[cfg(feature = "wasm-sketch-host")]
+            {
+                operation.compiler_exit = None;
+            }
+            if operation.terminal.is_none() || ready_read {
                 operation.pending_blob_write = None;
                 operation.pending_blob_read = None;
                 operation.terminal = Some(TerminalResult {
@@ -2705,11 +2774,18 @@ impl OperationHub {
                 _ => 0,
             })
             .chain(state.operations.values().map(|operation| {
-                operation
+                let capacity = operation
                     .pending_blob_write
                     .as_ref()
                     .map_or(0, Vec::capacity)
-                    .saturating_add(operation.blob_read_result.as_ref().map_or(0, Vec::capacity))
+                    .saturating_add(operation.blob_read_result.as_ref().map_or(0, Vec::capacity));
+                #[cfg(feature = "wasm-sketch-host")]
+                let capacity = capacity.saturating_add(if operation.compiler_output.is_some() {
+                    process_resource::MAX_PROCESS_OUTPUT_CHUNK
+                } else {
+                    0
+                });
+                capacity
             }))
             .fold(native_capacity, usize::saturating_add)
     }
@@ -2777,12 +2853,19 @@ impl OperationHub {
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
             native_transfer_capacity: state.native_transfer_capacity,
             #[cfg(feature = "wasm-sketch-host")]
-            reserved_process_output_bytes: state.reserved_process_output_bytes,
+            reserved_process_output_bytes: state.reserved_process_output_bytes.saturating_add(
+                state
+                    .operations
+                    .values()
+                    .filter(|operation| operation.compiler_output.is_some())
+                    .count()
+                    .saturating_mul(process_resource::MAX_PROCESS_OUTPUT_CHUNK),
+            ),
             #[cfg(feature = "wasm-sketch-host")]
             reserved_native_process_output_bytes: state.reserved_native_process_output_bytes,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
             #[cfg(feature = "wasm-sketch-host")]
-            retained_process_jobs: state.process_jobs.len(),
+            retained_process_jobs: state.process_jobs.len() + state.process_io_jobs.len(),
             active_native_captures: self.native_capture_count.load(Ordering::Acquire) as usize,
             active_native_opens: self.native_open_count.load(Ordering::Acquire) as usize,
             active_clocks: self.clock_count.load(Ordering::Acquire) as usize,

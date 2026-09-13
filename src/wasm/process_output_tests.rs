@@ -2,6 +2,9 @@ use super::super::output::CompilerOutputError;
 use super::*;
 use crate::{ProcessOutputChunk, ProcessOutputEvent};
 
+#[path = "process_output_wire_tests.rs"]
+mod wire;
+
 #[test]
 fn output_is_tagged_bounded_and_one_uncollected_event_per_process() {
     let runtime = runtime();

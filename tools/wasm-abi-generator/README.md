@@ -17,7 +17,7 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=6`, independently of the
+The metadata also binds `operation_protocol_revision=7`, independently of the
 scalar import signatures. Revision 1 included opcodes 1–19 and scoped
 transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
 header copy, and abandonment (20–22). Revision 3 adds authentication and scoped
@@ -30,6 +30,11 @@ finalize, resource abandonment, and operation abandonment (30–34). Updates
 copy at most 64 KiB per import into host-owned memory. Finalize validates the
 complete 32-byte output range before consuming the hash. An abandoned update
 revokes the hash rather than promising rollback of bytes already accepted.
+Revision 7 adds host-granted compiler spawn, tagged bounded output collection,
+exit observation, acknowledged close, and scoped abandonment (35–47). Command
+paths and arguments remain host-owned. Output collection requires a 64-KiB
+destination and writes directly to validated shared memory without another
+host payload copy. EOF, abandonment, read failure, and exhaustion are distinct.
 Rebuild guest code before embedding the new
 metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.

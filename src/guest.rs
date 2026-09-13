@@ -90,6 +90,81 @@ impl Blake3Hasher {
     }
 }
 
+/// One exact executable/argument/environment/deadline grant chosen by the host.
+/// The guest cannot substitute a command, working directory, or environment.
+pub struct CompilerGrant {
+    inner: bindings::CompilerGrant,
+}
+pub struct CompilerProcess {
+    inner: bindings::CompilerProcess,
+}
+
+/// A tagged event; only chunk variants refer to bytes in the read destination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompilerOutputEvent {
+    Stdout(usize),
+    Stderr(usize),
+    StdoutEof,
+    StderrEof,
+    StdoutAbandoned,
+    StderrAbandoned,
+    StdoutError,
+    StderrError,
+    Exhausted,
+}
+
+/// Host-neutral termination meaning, without native backend status types.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompilerExit {
+    pub code: Option<i32>,
+    pub success: bool,
+}
+
+impl CompilerGrant {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        Ok(bindings::CompilerGrant::granted()?.map(|inner| Self { inner }))
+    }
+    pub async fn spawn(self) -> Result<CompilerProcess, OperationError> {
+        Ok(CompilerProcess {
+            inner: self.inner.spawn().await?,
+        })
+    }
+}
+
+impl CompilerProcess {
+    /// Pull one event into a destination of at least 64 KiB. Drain output
+    /// before waiting for exit: a full pipe can keep the compiler from exiting.
+    pub async fn read_output(
+        &mut self,
+        destination: &mut [u8],
+    ) -> Result<CompilerOutputEvent, OperationError> {
+        use bindings::CompilerOutputEvent as Event;
+        Ok(match self.inner.read_output(destination).await? {
+            Event::Stdout(count) => CompilerOutputEvent::Stdout(count),
+            Event::Stderr(count) => CompilerOutputEvent::Stderr(count),
+            Event::StdoutEof => CompilerOutputEvent::StdoutEof,
+            Event::StderrEof => CompilerOutputEvent::StderrEof,
+            Event::StdoutAbandoned => CompilerOutputEvent::StdoutAbandoned,
+            Event::StderrAbandoned => CompilerOutputEvent::StderrAbandoned,
+            Event::StdoutError => CompilerOutputEvent::StdoutError,
+            Event::StderrError => CompilerOutputEvent::StderrError,
+            Event::Exhausted => CompilerOutputEvent::Exhausted,
+        })
+    }
+    /// Cancelling this observer does not revoke the compiler or consume output.
+    pub async fn wait(&self) -> Result<CompilerExit, OperationError> {
+        let exit = self.inner.wait().await?;
+        Ok(CompilerExit {
+            code: exit.code,
+            success: exit.success,
+        })
+    }
+    /// Revoke authority and await acknowledged native output cleanup and reaping.
+    pub async fn close(self) -> Result<(), OperationError> {
+        Ok(self.inner.close().await?)
+    }
+}
+
 /// Host-granted encrypted input for the archive experiment. Only its bounded
 /// public envelope metadata is readable; no path, key, or plaintext is exposed.
 /// Native input grants currently exist only in the test-support experiment.

@@ -4,6 +4,9 @@
 use super::*;
 use crate::ProcessOutputEvent;
 
+#[path = "process_output_wire.rs"]
+mod wire;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompilerOutputError {
     Admission(HubError),
@@ -23,6 +26,14 @@ pub(crate) struct CompilerOutputRead {
     session: Arc<ProcessSession>,
     cancellation: CancellationToken,
     completed: bool,
+    disposition: OutputLeaseDisposition,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OutputLeaseDisposition {
+    Native,
+    WirePending,
+    Transferred,
 }
 
 pub(crate) struct CompilerOutput {
@@ -86,6 +97,15 @@ impl OperationHub {
         process: OpaqueToken,
     ) -> Result<CompilerOutputRead, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        self.begin_compiler_output_locked(&mut state, store, process)
+    }
+
+    fn begin_compiler_output_locked(
+        self: &Arc<Self>,
+        state: &mut State,
+        store: u64,
+        process: OpaqueToken,
+    ) -> Result<CompilerOutputRead, HubError> {
         let slot = state.resources.get(&process).ok_or(HubError::Closed)?;
         Self::validate_resource(slot, store, PROCESS_KIND, PROCESS_RIGHT)?;
         let ResourceValue::CompilerProcess(value) = &slot.value else {
@@ -95,18 +115,13 @@ impl OperationHub {
             return Err(HubError::Quota);
         }
         let session = Arc::clone(value.session.as_ref().ok_or(HubError::Closed)?);
-        if Self::transfer_capacity(&state).saturating_add(MAX_PROCESS_OUTPUT_CHUNK)
+        if Self::transfer_capacity(state).saturating_add(MAX_PROCESS_OUTPUT_CHUNK)
             > self.blob_limits.maximum_sketch_bytes
         {
             return Err(HubError::Quota);
         }
-        let (operation, _) = self.submit_locked(
-            &mut state,
-            store,
-            Some(process),
-            PROCESS_KIND,
-            PROCESS_RIGHT,
-        )?;
+        let (operation, _) =
+            self.submit_locked(state, store, Some(process), PROCESS_KIND, PROCESS_RIGHT)?;
         let cancellation = CancellationSource::new();
         let token = cancellation.token();
         state
@@ -124,7 +139,7 @@ impl OperationHub {
         };
         value.output_busy = true;
         state.reserved_process_output_bytes += MAX_PROCESS_OUTPUT_CHUNK;
-        Self::record_transfer_capacity(&mut state);
+        Self::record_transfer_capacity(state);
         Ok(CompilerOutputRead {
             hub: Arc::clone(self),
             process,
@@ -132,12 +147,18 @@ impl OperationHub {
             session,
             cancellation: token,
             completed: false,
+            disposition: OutputLeaseDisposition::Native,
         })
     }
 }
 
 impl CompilerOutputRead {
     pub(crate) async fn receive(self) -> Result<CompilerOutput, CompilerOutputError> {
+        let event = self.receive_event().await?;
+        Ok(CompilerOutput { event, lease: self })
+    }
+
+    async fn receive_event(&self) -> Result<Option<ProcessOutputEvent>, CompilerOutputError> {
         let event =
             crate::async_engine::cancellable(&self.cancellation, self.session.next_output())
                 .await
@@ -190,16 +211,35 @@ impl CompilerOutputRead {
                 value.output_bytes = total;
             }
         }
-        Ok(CompilerOutput { event, lease: self })
+        Ok(event)
     }
 }
 
 impl Drop for CompilerOutputRead {
     fn drop(&mut self) {
+        if self.disposition == OutputLeaseDisposition::Transferred {
+            return;
+        }
         let Ok(mut state) = self.hub.state.lock() else {
             return;
         };
-        let operation = state.operations.remove(&self.operation);
+        let operation = if self.disposition == OutputLeaseDisposition::Native {
+            state.operations.remove(&self.operation)
+        } else {
+            // A failed or cancelled wire producer leaves a typed terminal for
+            // its guest. Panic/producer disappearance must also wake the waiter.
+            if let Ok(Some(notify)) = OperationHub::terminal_locked(
+                &mut state,
+                self.operation,
+                TerminalResult {
+                    terminal: Terminal::Closed,
+                    resource: None,
+                },
+            ) {
+                notify.notify_one();
+            }
+            None
+        };
         if let Some(ResourceSlot {
             value: ResourceValue::CompilerProcess(value),
             ..

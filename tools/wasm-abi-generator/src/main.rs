@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
-// Revision 6 adds bounded incremental BLAKE3 and scoped abandonment (30-34).
+// Revision 7 adds host-granted compiler spawn/output/exit/close (35-47).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 6;
+const OPERATION_PROTOCOL_REVISION: u32 = 7;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -407,7 +407,8 @@ impl BlobHandle {
     fs::write(&path, source)?;
     use std::io::Write as _;
     let mut file = fs::OpenOptions::new().append(true).open(path)?;
-    file.write_all(LIFECYCLE.as_bytes())
+    file.write_all(LIFECYCLE.as_bytes())?;
+    file.write_all(include_str!("compiler_guest.rs.in").as_bytes())
 }
 
 fn relocate_guest_package(output: &Path) -> std::io::Result<()> {
@@ -731,6 +732,37 @@ mod tests {
         drop(future);
         assert_eq!(SUBMISSION.get(), (0, 0, 0));
     }
+
+    #[test]
+    fn generated_compiler_grant_short_read_and_close_have_scoped_drops() {
+        let grant = generated_guest::CompilerGrant::granted().unwrap().unwrap();
+        assert_eq!(SUBMISSION.get(), (35, 0, 0));
+        drop(grant);
+        assert_eq!(SUBMISSION.get(), (41, 1, 0));
+        POLL_RESPONSE.set((42 << 8) | 1);
+        generated_guest::run(async {
+            let grant = generated_guest::CompilerGrant::granted()?.unwrap();
+            let mut process = grant.spawn().await?;
+            // Successful spawn drops the consumed grant after collecting the
+            // process, rather than revoking a still-pending spawn operation.
+            assert_eq!(SUBMISSION.get(), (41, 1, 0));
+            assert_eq!(
+                process.read_output(&mut []).await,
+                Err(generated_guest::OperationError::Rejected)
+            );
+            assert_eq!(SUBMISSION.get(), (41, 1, 0));
+            process.close().await?;
+            assert_eq!(SUBMISSION.get(), (46, 1, 0));
+            let process = generated_guest::CompilerGrant::granted()?
+                .unwrap()
+                .spawn()
+                .await?;
+            drop(process);
+            assert_eq!(SUBMISSION.get(), (40, 42, 0));
+            Ok(())
+        })
+        .unwrap();
+    }
     const EMPTY: &[u8] = b"\0asm\x01\0\0\0";
 
     #[test]
@@ -738,7 +770,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=6\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=7\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

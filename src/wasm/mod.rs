@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=6\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=7\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -790,6 +790,7 @@ impl AdmittedSketch {
             cancellation,
             RootGrants {
                 output: Some(destination),
+                compiler: None,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 archive: None,
                 #[cfg(feature = "tauri-webview")]
@@ -817,6 +818,7 @@ impl AdmittedSketch {
             RootGrants {
                 output: Some(destination),
                 webview: Some((client, url)),
+                compiler: None,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 archive: None,
             },
@@ -897,6 +899,15 @@ impl AdmittedSketch {
             .transpose()
             .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
+        let initial_compiler = grants
+            .compiler
+            .map(|(spec, deadline)| {
+                operations
+                    .grant_compiler(0, spec, deadline)
+                    .map(|token| token.wire())
+            })
+            .transpose()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         #[cfg(all(test, feature = "archive-auth-test-support"))]
         let initial_archive = grants
             .archive
@@ -935,6 +946,7 @@ impl AdmittedSketch {
                 operations,
                 store_owner: 0,
                 initial_output,
+                initial_compiler,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 initial_archive,
                 #[cfg(feature = "tauri-webview")]
@@ -1127,6 +1139,7 @@ impl AdmittedSketch {
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
                 store_owner: 0,
                 initial_output: None,
+                initial_compiler: None,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 initial_archive: None,
                 #[cfg(feature = "tauri-webview")]
@@ -1883,6 +1896,7 @@ impl Drop for LogicalRootPermit {
 
 #[derive(Default)]
 struct RootGrants {
+    compiler: Option<(crate::SpawnSpec, std::time::Duration)>,
     output: Option<std::path::PathBuf>,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     archive: Option<crate::operations::archive_input::EncryptedInput>,
@@ -1903,6 +1917,7 @@ struct ThreadStoreState {
     operations: Arc<OperationHub>,
     store_owner: u64,
     initial_output: Option<u64>,
+    initial_compiler: Option<u64>,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     initial_archive: Option<u64>,
     #[cfg(feature = "tauri-webview")]
@@ -1960,6 +1975,9 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if let Some(result) = compiler_dispatch::dispatch(self, kind, arg0, arg1) {
+            return Ok(result);
+        }
         if let Some(result) = hash_dispatch::dispatch(
             &self.operations,
             self.store_owner,
@@ -3099,6 +3117,7 @@ fn define_closed_imports(
                                 operations,
                                 store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
                                 initial_output: None,
+                                initial_compiler: None,
                                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                                 initial_archive: None,
                                 #[cfg(feature = "tauri-webview")]
@@ -3962,19 +3981,19 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=6\n",
-            b'7',
+            b"operation_protocol_revision=7\n",
+            b'8',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let mut previous_operations = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut previous_operations,
-            b"operation_protocol_revision=6\n",
-            b'5',
+            b"operation_protocol_revision=7\n",
+            b'6',
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=6\n", "");
+            .replace("operation_protocol_revision=7\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -4924,6 +4943,7 @@ fn capture_threaded_smoke_report(
     Some(report)
 }
 
+mod compiler_dispatch;
 mod hash_dispatch;
 
 #[cfg(test)]

@@ -410,3 +410,75 @@ The dual-stream test drains output before waiting and checks repeatable exit
 observation. Removing admission-time ownership validation is RED (Soldr log
 `20260913T131658Z`): a foreign owner waits on the native process instead of being
 rejected immediately. This remains a host primitive, not a guest ABI claim.
+
+## Revision-7 Core compiler guest proof
+
+The Core candidate now exposes `guest::CompilerGrant`, `CompilerProcess`, tagged
+`CompilerOutputEvent`, and semantic `CompilerExit`. The host owns the exact
+executable, arguments, cwd, cleared environment, and deadline. Grant retrieval
+is one-shot; neither a path nor a guest-authored command crosses the ABI. The
+host injection is currently the private root-grant fixture, not a general
+external host API. The operation protocol is revision 7 (35–47), so revision-6
+modules must be rebuilt, not relabeled.
+
+A completed output operation owns the native event directly, without retaining
+an `Arc<OperationHub>` inside the operation table or allocating another payload
+copy. Publication atomically transfers its 64-KiB credit from the native read
+lease to the ready result; even EOF/exhaustion retain that full credit until
+collection or abandonment. Collection validates the owner and a complete
+64-KiB destination before consuming anything, then copies directly into shared
+atomic memory. Generic lifecycle polling cannot consume an output/exit result.
+Cancellation and resource revocation still invalidate ready, uncollected output
+and preserve their terminal reason. Abandoning a read revokes an uncertain
+stream; abandoning an exit observer does not revoke the process. `close().await`
+waits for the existing native cleanup acknowledgement, not merely child exit.
+All producer handles are bounded independently of consumed operation slots and
+joined during root cleanup on the caller-supplied runtime.
+
+The fresh Cargo-built `kernal-compiler-guest-proof` executes the shared
+`benchmarks/wasm-sketch/shared/compiler_policy.rs` through these public methods.
+It checks one-shot grant retrieval and rejection of an undersized read, drains
+2 MiB from each native stream in at most 64-KiB chunks, hashes fixture marker
+runs without a second guest payload buffer, observes both EOFs and exhaustion,
+checks repeatable successful exit, and awaits close. Text emitted by the native
+self-executing test harness is intentionally excluded from the marker hashes.
+The Linux x86-64 host observes zero live resources, pending operations, retained
+process jobs, and transfer bytes afterward. This is a process-capability proof,
+not an artifact-cache workflow or a measurement of total RSS.
+
+Focused regressions cover invalid/foreign collection followed by successful
+retry, actual out-of-range shared-memory destinations, ready-result revocation
+for all terminal reasons, pending/ready teardown, exhausted-result abandonment,
+retained producer quota after observer cancellation, and delayed close
+acknowledgement. Review found an interaction where producer Drop overwrote a
+successful exit with `Closed`; the focused wire-wait test reproduced it
+(`20260913T134311Z`) and passes with an atomic pending-only Drop transition.
+
+Linux build/execute commands (native builds additionally need the system's
+OpenSSL/pkg-config development environment):
+
+```sh
+SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/extension2-guest/Cargo.toml \
+  --features guest-proof --bin kernal-compiler-guest-proof \
+  --target wasm32-wasip1-threads --release --target-dir target/extension2-stream -j1
+soldr --no-cache cargo run --locked \
+  --manifest-path tools/wasm-abi-generator/Cargo.toml \
+  --target-dir target/extension2-abi -j1
+cp target/extension2-stream/wasm32-wasip1-threads/release/kernal-compiler-guest-proof.wasm \
+  target/extension2-stream/compiler.admitted.wasm
+target/extension2-abi/debug/kernal-api-wasm-abi-generator \
+  --embed-threaded-metadata target/extension2-stream/compiler.admitted.wasm
+KERNAL_COMPILER_GUEST_WASM="$PWD/target/extension2-stream/compiler.admitted.wasm" \
+  soldr --no-cache cargo test --locked --no-default-features \
+  --features wasm-sketch-host --lib -j1 \
+  wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_waits_and_closes \
+  -- --exact --ignored --nocapture
+```
+
+The fixture lock now follows the same explicit migration-only process-substrate
+revision as the parent; it is not a published dependency acceptance claim.
+Component compiler adaptation, actual zccache artifact key/cache hit/miss logic,
+the six-host parent proof, matched candidate measurements, and final runtime
+selection remain unfinished. Existing revision-6 archive/screenshot evidence
+is historical; those guests must also be rebuilt for the revision-7 host.

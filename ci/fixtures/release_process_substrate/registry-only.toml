@@ -1,5 +1,5 @@
 [workspace.dependencies]
-running-process = { version = "=4.10.12", default-features = false, features = ["kernel-substrate", "independent-spawn"] }
+running-process = { version = "=4.10.12", default-features = false, features = ["kernel-substrate"] }
 process-substrate = { package = "running-process", version = "=4.10.12" }
 
 [target.'cfg(unix)'.build-dependencies]

@@ -28,9 +28,9 @@ have an async runtime to do that work. It must never depend on `kernal-api`.
 as hashing and profiling, and turns backend behavior into stable application
 contracts. The phase-1 bounded process adapter has landed: it uses the exact
 published `running-process` 4.10.12 release with its lightweight
-`kernel-substrate` and canonical `independent-spawn` features, as a mandatory
-dependency. First-party applications eventually depend
-on `kernal-api` only.
+`kernel-substrate` feature, as a mandatory dependency. The canonical
+`independent-spawn` surface is an explicit facade feature. First-party
+applications eventually depend on `kernal-api` only.
 
 This one-way graph resolves the async/process cycle without creating a smaller
 "base" facade that would merely move the same boundary elsewhere.
@@ -42,7 +42,8 @@ This one-way graph resolves the async/process cycle without creating a smaller
   composition. It may adapt `running-process` privately, but does not publicly
   re-export its types, with one scoped exception: the canonical independent
   spawn contract (`SpawnMode`, its options/backend/lifetime, launch payload,
-  readiness, handle/exit, and `spawn_with_options`) is re-exported unchanged.
+  readiness, handle/exit, and `spawn_with_options`) is re-exported unchanged
+  behind the explicit `independent-spawn` facade feature.
   Its live process-control handle cannot be faithfully wrapped without a
   conversion boundary; identical type identity makes the selected substrate
   contract explicit. This does not authorize general backend, Tokio, platform,

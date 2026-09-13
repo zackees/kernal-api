@@ -21,6 +21,7 @@ use std::process::ExitStatus;
 mod process_adapter;
 
 /// Canonical launch payload and readiness contract for [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
 pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// Canonical resource-placement spawn contract selected by this facade.
 ///
@@ -45,6 +46,7 @@ pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// that handle does; it is distinct from resource placement.  Readiness,
 /// cancellation, authority, and unsupported-platform failures propagate as
 /// the canonical `std::io::Error` from [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
 pub use running_process::{
     spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,
     SpawnOptions,

@@ -1,4 +1,6 @@
-//! Compile-time proof that the scoped spawn surface is not a facade mirror.
+//! #189: compile-time proof that the opt-in scoped spawn surface is not a
+//! facade mirror.
+#![cfg(feature = "independent-spawn")]
 
 use std::io;
 use std::sync::atomic::AtomicBool;

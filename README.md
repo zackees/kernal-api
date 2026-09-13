@@ -9,7 +9,8 @@ networking, storage, and other common capabilities. The private
 published `running-process` 4.10.12 registry release unconditionally. Its
 canonical independent-spawn contract is the sole backend-type exception: the
 selected mode, options, launch payload, readiness, handle, and entry point are
-re-exported unchanged so live control retains Rust type identity.
+re-exported unchanged behind the explicit `independent-spawn` feature so live
+control retains Rust type identity.
 
 In the target architecture, applications use `kernal-api`; they do not use
 `running-process` or Tokio directly. The permanent dependency direction and
@@ -48,10 +49,11 @@ direct use of implementation crates owned by this package.
 The base crate contains the async process/host facade. Its bounded process
 adapter uses `running-process` 4.10.12; that dependency is mandatory, not
 feature-gated. Except for the selected canonical independent-spawn contract,
-backend types remain private. `SpawnMode::Inherited` remains the default;
-`SpawnMode::Independent` requires verified native scheduler or already-external
-broker placement and never silently falls back. Independent placement is not
-detachment, privilege elevation, or an escape from container-wide limits.
+backend types remain private. With `independent-spawn`,
+`SpawnMode::Inherited` remains the default; `SpawnMode::Independent` requires
+verified native scheduler or already-external broker placement and never
+silently falls back. Independent placement is not detachment, privilege
+elevation, or an escape from container-wide limits.
 Optional features keep consumers from linking tooling they do not use:
 
 - `sqlite` for synchronous, bounded SQLite connection/transaction/query and
@@ -108,6 +110,9 @@ The four daemon slices are deliberately outside `full`, because each one
 carries a frozen wire that only an application already speaking it should
 compile. They are documented on docs.rs but must be enabled by name:
 
+- `independent-spawn` for the canonical scheduler/broker resource-placement
+  contract; it keeps its options, launch payload, and live handle type-identical
+  to the selected `running-process` release
 - `daemon-identity` for direct-daemon identity, sidecar, probe, and
   endpoint-mux semantics over an existing endpoint; endpoint naming, payload
   protocols, and daemon lifecycle stay with the application

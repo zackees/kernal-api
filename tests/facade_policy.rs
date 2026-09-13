@@ -92,9 +92,13 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { version = \"=4.10.12\", default-features = false, features = [\"kernel-substrate\", \"independent-spawn\"] }"
+            "running-process = { version = \"=4.10.12\", default-features = false, features = [\"kernel-substrate\"] }"
         ),
-        "the facade must retain the exact published running-process pin and selected canonical spawn feature"
+        "the facade must retain the exact published running-process pin and minimal default feature set"
+    );
+    assert!(
+        manifest.contains("independent-spawn = [\"running-process/independent-spawn\"]"),
+        "the canonical spawn exception must remain an explicit lightweight-facade opt-in"
     );
     assert!(
         manifest.contains("# Exact first-party pre-1.0 pin."),
@@ -157,6 +161,12 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
         lib.matches("pub use running_process").count(),
         spawn_reexports.len(),
         "the independent-spawn exception must not grow into a general substrate re-export"
+    );
+    assert_eq!(
+        lib.matches("#[cfg(feature = \"independent-spawn\")]")
+            .count(),
+        spawn_reexports.len(),
+        "each canonical spawn re-export must remain outside the default facade API"
     );
 
     for path in rust_sources(&root.join("src")) {
@@ -924,6 +934,7 @@ fn published_documentation_renders_every_public_module() {
         .and_then(|section| section.split("targets = [").next())
         .expect("locate docs.rs metadata");
     for feature in [
+        "independent-spawn",
         "daemon-identity",
         "daemon-frame-v1",
         "daemon-registration",

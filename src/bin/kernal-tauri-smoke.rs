@@ -39,36 +39,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error),
             }
         };
-        let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
-        // Accepted sockets inherit the listener's nonblocking mode on the
-        // supported Unix CI hosts.  The proof uses a bounded blocking read so
-        // an in-flight navigation cannot race the harness into WouldBlock.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut request = [0_u8; 4096];
-        match stream.read(&mut request) {
-            Ok(_) => {}
-            // A real WebKit navigation may establish its loopback connection
-            // just as the semantic timeout tears down the native backing,
-            // before it writes HTTP bytes. That is a successful timeout
-            // proof, not a server failure.
-            Err(error)
-                if scenario == SmokeScenario::Timeout
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(socket_stage("read document request")(error)),
-        }
         if scenario == SmokeScenario::Timeout {
-            // Keep the top-level navigation pending past the facade timeout.
-            // The client has already sent a real loopback request, so this
-            // proves teardown of an actual native backing rather than a mock.
+            let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
+            // Accepted sockets inherit the listener's nonblocking mode on the
+            // supported Unix CI hosts.  The proof uses a bounded blocking read so
+            // an in-flight navigation cannot race the harness into WouldBlock.
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = [0_u8; 4096];
+            match stream.read(&mut request) {
+                Ok(_) => {}
+                // A real WebKit navigation may establish its loopback connection
+                // just as the semantic timeout tears down the native backing,
+                // before it writes HTTP bytes. That is a successful timeout
+                // proof, not a server failure.
+                Err(error)
+                    if scenario == SmokeScenario::Timeout
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(socket_stage("read document request")(error)),
+            }
             std::thread::sleep(Duration::from_secs(1));
             return Ok(());
+        }
+        let (mut stream, request) = accept_http_request(&accept, deadline)
+            .map_err(socket_stage("read document request"))?;
+        if !request.starts_with("GET /finished HTTP/1.") {
+            return Err(std::io::Error::other(format!(
+                "unexpected document request: {request:?}"
+            )));
         }
         write!(
             stream,
@@ -76,14 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             page.len()
         )
         .map_err(socket_stage("write document response"))?;
-        let (mut report, _) = accept().map_err(socket_stage("accept isolation connection"))?;
-        report.set_nonblocking(false)?;
-        report.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut report_request = [0_u8; 4096];
-        let read = report
-            .read(&mut report_request)
+        let (mut report, report_request) = accept_http_request(&accept, deadline)
             .map_err(socket_stage("read isolation request"))?;
-        let report_request = String::from_utf8_lossy(&report_request[..read]);
         if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
             return Err(std::io::Error::other(format!(
                 "page observed a prohibited host bridge: {report_request:?}"
@@ -293,8 +291,153 @@ fn socket_stage(stage: &'static str) -> impl FnOnce(std::io::Error) -> std::io::
     move |error| std::io::Error::new(error.kind(), format!("{stage}: {error}"))
 }
 
+fn accept_http_request(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+) -> std::io::Result<(std::net::TcpStream, String)> {
+    // Browser speculative connections are not documents. Bound both discarded
+    // connections and total time; never turn a missing report into success.
+    for _ in 0..16 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let (mut stream, _) = accept()?;
+        stream.set_nonblocking(true)?;
+        let read_deadline = deadline.min(std::time::Instant::now() + Duration::from_secs(5));
+        if let Some(request) = read_http_request(&mut stream, read_deadline)? {
+            stream.set_nonblocking(false)?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            return Ok((stream, request));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "no complete HTTP request within proof limits",
+    ))
+}
+
+// The real socket must be nonblocking so this deadline bounds all partial reads.
+fn read_http_request(
+    reader: &mut impl Read,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = [0_u8; 4096];
+    let mut used = 0;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return if used == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "incomplete HTTP request",
+                ))
+            };
+        }
+        match reader.read(&mut bytes[used..]) {
+            Ok(0) if used == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated HTTP request",
+                ))
+            }
+            Ok(count) => used += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error)
+                if used == 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        }
+        if bytes[..used].windows(4).any(|part| part == b"\r\n\r\n") {
+            return String::from_utf8(bytes[..used].to_vec())
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        if used == bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request exceeds proof header limit",
+            ));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn speculative_connection_is_skipped_before_real_document() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(std::net::TcpStream::connect(address).unwrap());
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /finished HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let (_, request) = super::accept_http_request(
+            &|| listener.accept(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(request.starts_with("GET /finished HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn fragmented_headers_are_complete_and_oversize_is_rejected() {
+        struct OneByte(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for OneByte {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.0, &mut buffer[..1])
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let expected = b"GET /_isolation?ipc=0&tauri=0&platform=0 HTTP/1.1\r\n\r\n";
+        let actual = super::read_http_request(
+            &mut OneByte(std::io::Cursor::new(expected.to_vec())),
+            deadline,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.as_bytes(), expected);
+        let error = super::read_http_request(&mut std::io::Cursor::new(vec![b'x'; 4097]), deadline)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn empty_connection_is_not_an_http_request() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            super::read_http_request(&mut std::io::Cursor::new(b""), deadline)
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::read_http_request(
+            &mut std::io::Cursor::new(b"GET /finished HTTP/1.1\r\n"),
+            deadline
+        )
+        .is_err());
+        assert_eq!(
+            super::read_http_request(
+                &mut std::io::Cursor::new(b"GET /finished HTTP/1.1\r\n\r\n"),
+                deadline
+            )
+            .unwrap()
+            .as_deref(),
+            Some("GET /finished HTTP/1.1\r\n\r\n")
+        );
+    }
+
     #[test]
     fn socket_diagnostic_preserves_failure_kind_and_stage() {
         let error = super::socket_stage("read isolation request")(std::io::Error::new(

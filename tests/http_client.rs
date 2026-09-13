@@ -106,6 +106,113 @@ fn fixture(response: &[u8]) -> (String, std::thread::JoinHandle<()>) {
     (url, worker)
 }
 
+fn read_request(socket: &mut std::net::TcpStream) -> Vec<u8> {
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .unwrap();
+    let mut wire = Vec::new();
+    while !wire.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        wire.push(byte[0]);
+        assert!(wire.len() < 4096);
+    }
+    if wire.starts_with(b"POST ") {
+        let mut body = [0; 4];
+        socket.read_exact(&mut body).unwrap();
+        wire.extend_from_slice(&body);
+    }
+    wire
+}
+
+#[tokio::test]
+async fn dropping_pending_request_or_response_closes_transport() {
+    for send_headers in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let (ready, accepted) = tokio::sync::oneshot::channel();
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&mut socket);
+            if send_headers {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n")
+                    .unwrap();
+            }
+            let _ = ready.send(());
+            match socket.read(&mut [0]) {
+                Ok(0) => (),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                result => panic!("dropping HTTP operation did not close transport: {result:?}"),
+            }
+        });
+        let client = Client::new(Limits::default()).unwrap();
+        if send_headers {
+            let response = client.get(&url).await.unwrap();
+            drop(response);
+        } else {
+            let mut request = Box::pin(client.get(&url));
+            tokio::select! {
+                result = &mut request => panic!("request completed without headers: {:?}", result.err()),
+                result = accepted => result.unwrap(),
+            }
+            drop(request);
+        }
+        tokio::task::spawn_blocking(move || worker.join().unwrap())
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn relative_redirects_preserve_head_and_replay_post_only_for_307_308() {
+    for (status, method, expected) in [
+        (301, Method::Post, "GET"),
+        (302, Method::Post, "GET"),
+        (303, Method::Post, "GET"),
+        (307, Method::Post, "POST"),
+        (308, Method::Post, "POST"),
+        (303, Method::Head, "HEAD"),
+    ] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_request(&mut socket);
+            write!(socket, "HTTP/1.1 {status} Redirect\r\nLocation: /next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(socket);
+            let (mut socket, _) = listener.accept().unwrap();
+            let wire = read_request(&mut socket);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            wire
+        });
+        let response = Client::new(Limits {
+            max_redirects: 1,
+            ..Limits::default()
+        })
+        .unwrap()
+        .execute(Request {
+            method,
+            headers: &[("X-Test", "retained")],
+            body: if method == Method::Post { b"ping" } else { b"" },
+            ..Request::get(&url)
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 200);
+        let wire = String::from_utf8(worker.join().unwrap()).unwrap();
+        assert!(wire.starts_with(&format!("{expected} /next HTTP/1.1")));
+        assert!(wire.to_ascii_lowercase().contains("x-test: retained"));
+        assert_eq!(wire.ends_with("ping"), expected == "POST");
+    }
+}
+
 #[tokio::test]
 async fn opted_in_redirects_follow_and_enforce_hop_limit() {
     let (final_url, final_worker) =

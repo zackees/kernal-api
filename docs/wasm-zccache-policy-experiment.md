@@ -152,8 +152,9 @@ not yet bounded before allocation, Blob semantics remain a separate private
 probe, and no matched runtime-performance selection has been made.
 
 The freshly rebuilt revision-6 archive guest also passes all eight cases on
-Linux (42.45 s). Revision-5 screenshot runs cannot establish revision-6
-compatibility; its fresh native harness is still being rebuilt.
+Linux (42.45 s). All 16 screenshot regressions also pass on Linux against
+fresh revision-6 normal, trap, and blocked guests (165.78 s). These are local
+compatibility results, not six-target evidence for this revision.
 
 ## Remaining proof
 

@@ -45,7 +45,6 @@ class NativeProofJobsTests(unittest.TestCase):
             "toolchain: 1.95.0",
             "./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly",
             "./tests/screenshot-target-repair.ps1",
-            "--lib authenticated_",
             "uv run --no-project ci/run_extension2_guest.py --native-target",
             "uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs",
             "kernal-api-archive-build",
@@ -54,6 +53,11 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertNotIn("run_extension2_guest", screenshot)
         self.assertNotIn("--lib authenticated_", screenshot)
         self.assertNotIn("tauri-webview", archive)
+        self.assertNotIn(
+            "soldr cargo test",
+            archive,
+            "the helper must own the single native harness build",
+        )
         self.assertIn("--test wasm_tauri_screenshot", screenshot)
 
 

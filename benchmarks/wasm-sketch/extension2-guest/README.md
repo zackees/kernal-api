@@ -150,6 +150,20 @@ job passed the archive guest, then timed out building the screenshot harness
 (run `34748066733`). Separating the jobs retains both native matrices without
 making their cold builds compete for one deadline. Workflow regression tests
 check both host sets and the archive job's independent guest setup.
+
+At `7a23fdb`, run `34749620965` passed all six screenshot jobs and five
+archive jobs. Intel macOS archive job `103703608908` hit the 30-minute deadline:
+native staging tests finished at 10:00:20 UTC, but the helper's second native
+harness build took another 8m39s. Actual guest execution began at 10:12:29 and
+was cancelled at 10:13:07 without a result. This is incomplete execution, not
+a passing archive proof or an observed guest assertion failure.
+
+The helper now owns the single native harness build and runs both the existing
+`authenticated_` staging tests and the exact ignored guest test from it. The
+staging gate rejects zero executed tests, and the actual guest gate still
+requires exactly one passing execution. No native target, test gate, or timeout
+was removed. Runner regression tests first failed on the missing staging call
+and duplicate workflow build, then passed after this change.
 The archive job uses the screenshot builder's `-PrepareTargetOnly` mode to
 reuse verified core/std target repair without building any screenshot artifact.
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -119,6 +120,15 @@ def main() -> None:
         ]
     )
     harness = executable(messages, "kernal_api", test=True)
+    # Run staging and actual-guest checks from exactly the same native build.
+    # A separate cache-enabled cargo test caused a second full native build
+    # here and exhausted the Intel macOS job's deadline.
+    staging = run([str(harness), "authenticated_", "--nocapture"])
+    print(staging, end="", flush=True)
+    if not re.search(
+        r"^test result: ok\. [1-9][0-9]* passed; 0 failed;", staging, re.MULTILINE
+    ):
+        raise ValueError("authenticated staging tests did not execute successfully")
     if f"{TEST}: test" not in run([str(harness), "--list", "--ignored"]).splitlines():
         raise ValueError("streaming proof is missing from the native test harness")
     output = run(

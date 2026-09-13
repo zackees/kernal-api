@@ -44,13 +44,19 @@ class ProofRunnerTests(unittest.TestCase):
             with self.subTest(messages=messages), self.assertRaises(ValueError):
                 proof.executable(messages, "guest", test=False)
 
-    def invoke(self, listing: str, result: str):
+    def invoke(
+        self,
+        listing: str,
+        result: str,
+        staging: str = "test result: ok. 29 passed; 0 failed; 4 ignored;",
+    ):
         answers = [
             "host: native-test\n",
             artifact("kernal-extension2-guest-proof"),
             artifact("kernal-api-wasm-abi-generator"),
             "",
             artifact("kernal_api", test=True),
+            staging,
             listing,
             result,
         ]
@@ -92,6 +98,32 @@ class ProofRunnerTests(unittest.TestCase):
             .kwargs["env"]["KERNAL_EXTENSION2_STREAM_WASM"]
             .endswith(".admitted.wasm")
         )
+        staging = calls[-3].args[0]
+        self.assertEqual(
+            staging, [str(Path.cwd() / "kernal_api"), "authenticated_", "--nocapture"]
+        )
+        native_builds = [
+            call
+            for call in calls
+            if call.args[0][:4] == ["soldr", "--no-cache", "cargo", "test"]
+        ]
+        self.assertEqual(len(native_builds), 1)
+
+    def test_staging_must_execute_before_actual_guest(self):
+        for result in (
+            "",
+            "test result: ok. 0 passed; 0 failed;",
+            "test result: FAILED. 28 passed; 1 failed;",
+        ):
+            with (
+                self.subTest(result=result),
+                self.assertRaisesRegex(ValueError, "staging"),
+            ):
+                self.invoke(
+                    f"{proof.TEST}: test",
+                    "test result: ok. 1 passed; 0 failed; 0 ignored;",
+                    staging=result,
+                )
 
     def test_cross_compiler_is_rejected_before_building(self):
         with (

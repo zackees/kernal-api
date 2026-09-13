@@ -276,12 +276,7 @@ jobs:
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
           ./tests/screenshot-target-repair.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
-      - name: Run native authenticated archive staging proofs
-        shell: pwsh
-        run: |
-          & soldr cargo test --locked --no-default-features --features wasm-sketch-host,archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_
-          if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
-      - name: Run actual streaming archive guest on the native host
+      - name: Run staging and actual streaming archive guest from one native build
         shell: pwsh
         run: |
           & uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs

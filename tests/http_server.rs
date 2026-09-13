@@ -236,3 +236,119 @@ async fn response_limits_and_transport_owned_headers_are_enforced() {
     assert!(response.starts_with("HTTP/1.1 500"), "{response}");
     drop(task);
 }
+
+#[tokio::test]
+async fn file_response_streams_prefix_and_file_beyond_the_memory_body_limit() {
+    use std::io::Write;
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+    let path = file.path().to_path_buf();
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_response_body_bytes: 8,
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(move |_| {
+        let file = std::fs::File::open(&path).unwrap();
+        async move { Response::file(file, b"PREFIX".to_vec()).unwrap() }
+    }));
+    let response = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(body.len(), 256 * 1024 + 6);
+    assert!(body.starts_with("PREFIX"));
+    assert!(body[6..].bytes().all(|byte| byte == b'x'));
+    drop(task);
+}
+
+#[tokio::test]
+async fn a_client_that_stops_reading_releases_its_connection_slot() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    file.as_file().set_len(128 * 1024 * 1024).unwrap();
+    let path = file.path().to_path_buf();
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_connections: 1,
+            write_timeout: Duration::from_millis(30),
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(move |request| {
+        let path = path.clone();
+        async move {
+            if request.target() == "/file" {
+                Response::file(std::fs::File::open(path).unwrap(), Vec::new()).unwrap()
+            } else {
+                Response::new(200, b"ok".to_vec()).unwrap()
+            }
+        }
+    }));
+    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stalled
+        .write_all(b"GET /file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let response = exchange(
+        addr,
+        b"GET /ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.ends_with("ok"), "{response}");
+    drop(stalled);
+    drop(task);
+}
+
+#[cfg(feature = "event-stream")]
+#[tokio::test]
+async fn sse_response_delivers_before_source_closure_and_encodes_multiline_data() {
+    let (sender, receiver) = async_engine::broadcast_channel::<String>(4).unwrap();
+    let receiver = std::sync::Arc::new(std::sync::Mutex::new(Some(receiver)));
+    let server = Server::bind(loopback(), Limits::default()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(move |_| {
+        let receiver = receiver.lock().unwrap().take().unwrap();
+        async move {
+            Response::event_stream(
+                receiver.into_stream_with(|result| result.ok().map(Ok)),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        }
+    }));
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    sender.send("first\nsecond".into()).unwrap();
+    let mut received = String::new();
+    async_engine::timeout(Duration::from_secs(2), async {
+        while !received.contains("data: first\ndata: second\n\n") {
+            let mut buffer = [0; 1024];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            received.push_str(std::str::from_utf8(&buffer[..count]).unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    assert!(received.contains("text/event-stream"));
+    drop(sender);
+    async_engine::timeout(Duration::from_secs(2), socket.read_to_string(&mut received))
+        .await
+        .unwrap()
+        .unwrap();
+    drop(task);
+}

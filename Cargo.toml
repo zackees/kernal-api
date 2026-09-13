@@ -69,7 +69,7 @@ daemon-registration = ["running-process/daemon-registration"]
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
 pty = ["dep:portable-pty"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
-http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
+http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures-core"]
 # Window-icon and stock-icon mechanics for the host console or a child. This
 # is GUI hosting: on Linux it decodes PNG and speaks the X11 client protocol,
 # so it is gated like every peer capability rather than sitting in the

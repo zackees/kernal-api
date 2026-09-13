@@ -4,10 +4,14 @@
 //! serving future closes the listener and cancels all owned connections.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Limited};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{convert::Infallible, future::Future, io, net::SocketAddr, time::Duration};
+
+mod body;
+mod transport;
+use body::ServerBody;
 
 /// Per-server resource and time limits. Body limits bound accepted values, not
 /// memory already allocated by application handlers before returning a response.
@@ -19,6 +23,12 @@ pub struct Limits {
     pub max_request_body_bytes: usize,
     /// Maximum accepted in-memory response body bytes.
     pub max_response_body_bytes: usize,
+    /// Maximum file bytes (including an optional prefix), streamed rather than collected.
+    pub max_file_bytes: u64,
+    /// Maximum response frame size, from 1024 through 65536 bytes.
+    pub max_stream_chunk_bytes: usize,
+    /// Maximum UTF-8 SSE payload bytes before encoding (encoding adds bounded overhead).
+    pub max_event_bytes: usize,
     /// HTTP/1 parser read-buffer bound (at least 8192 bytes).
     pub max_header_bytes: usize,
     /// Maximum parsed header count.
@@ -29,6 +39,8 @@ pub struct Limits {
     pub body_timeout: Duration,
     /// Maximum time for application response preparation.
     pub handler_timeout: Duration,
+    /// Maximum time an attempted socket write/flush may remain without progress.
+    pub write_timeout: Duration,
     /// Absolute lifetime of a connection, including response transmission.
     pub connection_timeout: Duration,
 }
@@ -39,11 +51,15 @@ impl Default for Limits {
             max_connections: 64,
             max_request_body_bytes: 2 * 1024 * 1024,
             max_response_body_bytes: 64 * 1024 * 1024,
+            max_file_bytes: 16 * 1024 * 1024 * 1024,
+            max_stream_chunk_bytes: 64 * 1024,
+            max_event_bytes: 64 * 1024,
             max_header_bytes: 32 * 1024,
             max_headers: 100,
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(30),
             handler_timeout: Duration::from_secs(30),
+            write_timeout: Duration::from_secs(30),
             connection_timeout: Duration::from_secs(3600),
         }
     }
@@ -57,10 +73,14 @@ impl Limits {
             || !(1..=1024).contains(&self.max_headers)
             || self.max_request_body_bytes > 1024 * 1024 * 1024
             || self.max_response_body_bytes > 1024 * 1024 * 1024
+            || self.max_file_bytes > 1024 * 1024 * 1024 * 1024
+            || !(1024..=65536).contains(&self.max_stream_chunk_bytes)
+            || !(1..=1024 * 1024).contains(&self.max_event_bytes)
             || [
                 self.header_timeout,
                 self.body_timeout,
                 self.handler_timeout,
+                self.write_timeout,
                 self.connection_timeout,
             ]
             .into_iter()
@@ -108,7 +128,7 @@ impl Request {
 pub struct Response {
     status: hyper::StatusCode,
     headers: hyper::HeaderMap,
-    body: Vec<u8>,
+    body: ServerBody,
 }
 
 impl Response {
@@ -126,8 +146,43 @@ impl Response {
         Ok(Self {
             status: hyper::StatusCode::from_u16(status).map_err(io::Error::other)?,
             headers: hyper::HeaderMap::new(),
-            body: body.into(),
+            body: ServerBody::bytes(Bytes::from(body.into())),
         })
+    }
+
+    /// Stream an already-opened regular file from its current position to its
+    /// current length, optionally preceded by `prefix`. The caller owns file
+    /// selection/authorization. Later growth is ignored; truncation is an error.
+    ///
+    /// Metadata and position inspection are synchronous native operations. File
+    /// reads are asynchronous and bounded; cancelling does not forcibly interrupt
+    /// an OS read already running in the runtime's blocking I/O pool.
+    ///
+    /// # Errors
+    /// Rejects non-regular files, prefixes larger than 1 MiB, and native metadata
+    /// or position failures. Server acceptance also applies its configured limits.
+    pub fn file(file: std::fs::File, prefix: impl Into<Vec<u8>>) -> io::Result<Self> {
+        let mut response = Self::new(200, Vec::new())?;
+        response.body = ServerBody::file(file, prefix.into())?;
+        Ok(response)
+    }
+
+    /// Encode a pull-driven sequence of SSE data events. Keepalives are comments;
+    /// the next event is polled only when the transport requests another frame.
+    /// Dropping the response drops its source. No producer task or queue is added.
+    ///
+    /// # Errors
+    /// Rejects zero or greater-than-365-day keepalive periods and missing runtime
+    /// context. The runtime must have its timer driver enabled.
+    pub fn event_stream<S>(events: S, keepalive: Duration) -> io::Result<Self>
+    where
+        S: futures_core::Stream<Item = io::Result<String>> + Send + 'static,
+    {
+        let mut response = Self::new(200, Vec::new())?
+            .with_header("content-type", "text/event-stream")?
+            .with_header("cache-control", "no-cache")?;
+        response.body = ServerBody::events(events, keepalive)?;
+        Ok(response)
     }
 
     /// Append an application header. Framing is always transport-owned.
@@ -205,6 +260,7 @@ impl Server {
                             .header_read_timeout(limits.header_timeout)
                             .max_buf_size(limits.max_header_bytes)
                             .max_headers(limits.max_headers);
+                        let socket = transport::ProgressIo::new(socket, limits.write_timeout);
                         let connection = builder.serve_connection(TokioIo::new(socket), service);
                         let _ = tokio::time::timeout(limits.connection_timeout, connection).await;
                     });
@@ -214,8 +270,8 @@ impl Server {
     }
 }
 
-fn empty(status: hyper::StatusCode) -> hyper::Response<Full<Bytes>> {
-    let mut response = hyper::Response::new(Full::new(Bytes::new()));
+fn empty(status: hyper::StatusCode) -> hyper::Response<ServerBody> {
+    let mut response = hyper::Response::new(ServerBody::bytes(Bytes::new()));
     *response.status_mut() = status;
     response
 }
@@ -224,7 +280,7 @@ async fn dispatch<H, F>(
     request: hyper::Request<Incoming>,
     handler: H,
     limits: Limits,
-) -> Result<hyper::Response<Full<Bytes>>, Infallible>
+) -> Result<hyper::Response<ServerBody>, Infallible>
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
@@ -252,14 +308,14 @@ where
         headers: parts.headers,
         body,
     };
-    let response = match tokio::time::timeout(limits.handler_timeout, handler(request)).await {
+    let mut response = match tokio::time::timeout(limits.handler_timeout, handler(request)).await {
         Ok(response) => response,
         Err(_) => return Ok(empty(hyper::StatusCode::GATEWAY_TIMEOUT)),
     };
-    if response.body.len() > limits.max_response_body_bytes {
+    if response.body.configure(limits).is_err() {
         return Ok(empty(hyper::StatusCode::INTERNAL_SERVER_ERROR));
     }
-    let mut result = hyper::Response::new(Full::new(Bytes::from(response.body)));
+    let mut result = hyper::Response::new(response.body);
     *result.status_mut() = response.status;
     *result.headers_mut() = response.headers;
     Ok(result)

@@ -458,6 +458,21 @@ mod tests {
     }
 
     #[test]
+    fn interactive_principal_dacl_is_rejected_and_repaired() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        fs::create_dir_all(&directory).unwrap();
+        apply_protected_dacl_sddl(&directory, "D:P(A;OICI;FA;;;IU)(A;OICI;FA;;;SY)").unwrap();
+
+        assert!(!owner_private_directory(&directory).unwrap());
+        assert_eq!(
+            ensure_owner_private_directory(&directory).unwrap(),
+            OwnerPrivateDirectoryOutcome::Hardened
+        );
+        assert!(owner_private_directory(&directory).unwrap());
+    }
+
+    #[test]
     fn unprotected_identical_acl_is_rejected_and_repaired() {
         use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 

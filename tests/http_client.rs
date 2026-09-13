@@ -19,6 +19,92 @@ fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
 }
 
 #[tokio::test]
+async fn streaming_returns_before_body_completion_and_collection_keeps_only_unread_bytes() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (release, held) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = [0; 4096];
+        let _ = socket.read(&mut request).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc")
+            .unwrap();
+        held.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        socket.write_all(b"def").unwrap();
+    });
+    let mut response = Client::new(Limits {
+        max_body_bytes: 6,
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .unwrap();
+    let mut prefix = [0; 3];
+    let mut offset = 0;
+    while offset < prefix.len() {
+        let n = response.read(&mut prefix[offset..]).await.unwrap();
+        assert_ne!(n, 0);
+        offset += n;
+    }
+    assert_eq!(&prefix, b"abc");
+    release.send(()).unwrap();
+    assert_eq!(response.into_bytes().await.unwrap(), b"def");
+    worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn streaming_reads_respect_caller_buffers_and_stay_failed_after_overflow() {
+    let (url, worker) =
+        fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef");
+    let mut response = Client::new(Limits::default())
+        .unwrap()
+        .get(&url)
+        .await
+        .unwrap();
+    assert_eq!(response.read(&mut []).await.unwrap(), 0);
+    let mut buffer = [0; 2];
+    let mut body = Vec::new();
+    loop {
+        let n = response.read(&mut buffer).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&buffer[..n]);
+    }
+    assert_eq!(body, b"abcdef");
+    assert_eq!(response.read(&mut buffer).await.unwrap(), 0);
+    worker.join().unwrap();
+
+    let (url, worker) = fixture(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef");
+    let mut response = Client::new(Limits {
+        max_body_bytes: 4,
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .unwrap();
+    loop {
+        match response.read(&mut buffer).await {
+            Ok(n) => assert_ne!(n, 0, "overflow must not become EOF"),
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                break;
+            }
+        }
+    }
+    assert!(response.read(&mut buffer).await.is_err());
+    assert!(response.into_bytes().await.is_err());
+    worker.join().unwrap();
+}
+
+#[tokio::test]
 async fn head_preserves_headers_without_treating_entity_length_as_body() {
     let (url, worker) = fixture(
         b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nX-Test: value\r\nConnection: close\r\n\r\n",
@@ -207,6 +293,29 @@ async fn unsafe_urls_and_unbounded_timeout_configuration_fail() {
         ..Limits::default()
     })
     .is_err());
+}
+
+#[test]
+fn unrepresentable_deadlines_are_rejected_when_building_the_client() {
+    for limits in [
+        Limits {
+            connect_timeout: std::time::Duration::MAX,
+            ..Limits::default()
+        },
+        Limits {
+            total_timeout: std::time::Duration::MAX,
+            ..Limits::default()
+        },
+        Limits {
+            read_timeout: std::time::Duration::MAX,
+            ..Limits::default()
+        },
+    ] {
+        assert!(
+            Client::new(limits).is_err(),
+            "unrepresentable deadline accepted"
+        );
+    }
 }
 
 #[tokio::test]

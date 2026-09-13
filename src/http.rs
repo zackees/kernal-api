@@ -7,13 +7,14 @@ use std::io;
 use std::time::Duration;
 
 /// Per-request ceilings. A client can be reused for requests with this policy.
+/// All timeouts must be nonzero and at most 365 days.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Maximum buffered request body.
     pub max_request_bytes: usize,
     /// Maximum encoded URL length before parsing.
     pub max_url_bytes: usize,
-    /// Maximum response body retained by the facade.
+    /// Maximum response body accepted, including streaming reads.
     pub max_body_bytes: u64,
     /// Maximum accepted response header names and values in aggregate.
     /// Checked after the backend has parsed headers, not before allocation.
@@ -106,11 +107,19 @@ impl Client {
         if limits.max_header_count > 1024 {
             return Err(invalid("HTTP header count limit cannot exceed 1024"));
         }
-        if limits.connect_timeout.is_zero()
-            || limits.total_timeout.is_zero()
-            || limits.read_timeout.is_zero()
-        {
-            return Err(invalid("HTTP timeouts must be nonzero"));
+        for timeout in [
+            limits.connect_timeout,
+            limits.total_timeout,
+            limits.read_timeout,
+        ] {
+            if timeout.is_zero()
+                || timeout > Duration::from_secs(365 * 24 * 60 * 60)
+                || std::time::Instant::now().checked_add(timeout).is_none()
+            {
+                return Err(invalid(
+                    "HTTP timeouts must be nonzero and at most 365 days",
+                ));
+            }
         }
         let inner = reqwest::Client::builder()
             .connect_timeout(limits.connect_timeout)
@@ -207,6 +216,9 @@ impl Client {
         Ok(Response {
             inner,
             remaining: self.limits.max_body_bytes,
+            pending: bytes::Bytes::new(),
+            failed: false,
+            eof: false,
         })
     }
 }
@@ -215,6 +227,9 @@ impl Client {
 pub struct Response {
     inner: reqwest::Response,
     remaining: u64,
+    pending: bytes::Bytes,
+    failed: bool,
+    eof: bool,
 }
 
 impl Response {
@@ -229,18 +244,52 @@ impl Response {
         self.inner.status().as_u16()
     }
 
-    /// Consume a small response under the request's explicit byte ceiling.
+    /// Read at most the caller's buffer length, pulling only when needed.
+    /// An empty buffer returns zero without reading; otherwise zero means EOF.
+    /// The total body ceiling applies across all reads. Errors are terminal;
+    /// drop the response to release the transport after an error.
+    /// Retains at most one private transport chunk, not the complete body.
+    pub async fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(invalid("HTTP response body is in a failed state"));
+        }
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        while self.pending.is_empty() && !self.eof {
+            match self.inner.chunk().await {
+                Ok(Some(chunk)) => {
+                    let Some(remaining) = self.remaining.checked_sub(chunk.len() as u64) else {
+                        self.failed = true;
+                        return Err(invalid("HTTP response body exceeds limit"));
+                    };
+                    self.remaining = remaining;
+                    self.pending = chunk;
+                }
+                Ok(None) => self.eof = true,
+                Err(error) => {
+                    self.failed = true;
+                    return Err(transport(error));
+                }
+            }
+        }
+        let n = buffer.len().min(self.pending.len());
+        buffer[..n].copy_from_slice(&self.pending.split_to(n));
+        Ok(n)
+    }
+
+    /// Consume the unread part of a small response under its byte ceiling.
     /// No declared length is trusted for allocation or stream completion.
     pub async fn into_bytes(mut self) -> io::Result<Vec<u8>> {
         let mut body = Vec::new();
-        while let Some(chunk) = self.inner.chunk().await.map_err(transport)? {
-            self.remaining = self
-                .remaining
-                .checked_sub(chunk.len() as u64)
-                .ok_or_else(|| invalid("HTTP response body exceeds limit"))?;
-            body.try_reserve_exact(chunk.len())
-                .map_err(io::Error::other)?;
-            body.extend_from_slice(&chunk);
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let n = self.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            body.try_reserve_exact(n).map_err(io::Error::other)?;
+            body.extend_from_slice(&buffer[..n]);
         }
         Ok(body)
     }

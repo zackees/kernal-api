@@ -36,6 +36,21 @@ scalar guest ABI intentionally remains synthetic: it has no bounded URL
 request transport, so native-only acceptance tests use this same hub path
 until a generated URL capability is added.
 
+On Linux, before Wry initializes WebKitGTK, the facade enables
+`JSC_useSharedArrayBuffer=1` unless the user supplied a value. When NVIDIA is
+loaded it likewise sets `__NV_DISABLE_EXPLICIT_SYNC=1`, and disables the
+DMA-BUF renderer only for an X11 backend. It corrects GTK's unknown/fractional
+font DPI immediately before each view is built. These settings are private
+host mechanics; explicitly supplied environment values always win.
+
+`WebviewPermissions` is deny-by-default. Call
+`open_webview_with_permissions(url, WebviewPermissions::deny_all().allow_user_media())`
+only for pages that should receive microphone/camera access. On Linux this
+enables WebKitGTK media streams and accepts only user-media permission
+requests; all other WebKit permission kinds remain denied. GStreamer core,
+base, good, and PipeWire plugins must be available to WebKitGTK for devices to
+enumerate (notably, an unwrapped Nix shell may need to expose them).
+
 For a repeatable Linux proof outside CI, use the Nix development shell below.
 The `LD_LIBRARY_PATH` derivation is necessary when launching a Soldr-built
 binary from the ephemeral shell rather than from a Nix-wrapped derivation:

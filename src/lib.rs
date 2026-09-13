@@ -244,6 +244,9 @@ pub use platform_imp::{
     fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
 };
 
+#[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_read_private_regular_file_bounded;
+
 #[cfg(feature = "fs-watch")]
 pub use platform_imp::FsWatchWatcher;
 

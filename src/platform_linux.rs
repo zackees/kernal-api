@@ -77,6 +77,7 @@ pub use fs::{
     unlock as fs_unlock,
     user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
+    read_private_regular_file_bounded as fs_read_private_regular_file_bounded,
 };
 
 #[cfg(feature = "fs-watch")]

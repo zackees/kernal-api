@@ -1,7 +1,7 @@
 //! Windows per-user directory placement for product runtime artifacts.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Directory for `product`'s ephemeral runtime artifacts (pid files, run data).
@@ -440,4 +440,83 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
         .write(true)
         .create_new(true)
         .open(path)
+}
+
+/// Secure bounded read rooted in a protected owner-private directory.
+///
+/// Windows permissions are ACLs rather than mode bits. The existing
+/// owner-private-directory verifier checks the trusted parent for the
+/// protected owner-and-SYSTEM DACL. Independently, the opened file must be
+/// owned by the current user and have exactly the private owner-rights-and-
+/// SYSTEM full-control DACL, either direct or inherited. We open the final
+/// component's reparse point itself, reject it, and compare the opened handle
+/// identity to that final path. Ancestor paths remain caller-trusted; this is
+/// not a filesystem sandbox.
+pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_OPEN_REPARSE_POINT;
+    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file path has no parent")
+    })?;
+    if !super::ipc_private_dir::owner_private_directory(parent)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file parent does not have the protected owner-private DACL",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle as _;
+    use winapi::um::fileapi::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    use winapi::um::winnt::{FILE_ATTRIBUTE_REPARSE_POINT, HANDLE};
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the file handle remains live for this call and `information` is
+    // an initialized writable out-buffer of the exact native type.
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the API above returned success and initialized every field.
+    let information = unsafe { information.assume_init() };
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private input is not a regular non-reparse file",
+        ));
+    }
+    if !super::ipc_private_dir::opened_file_is_current_user_private(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private input is not current-user owner/SYSTEM DACL private",
+        ));
+    }
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file limit overflows")
+    })?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file)
+        .take(bound_plus_one as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    if path_identity(path)? != file_identity(&file)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private input path changed while it was read",
+        ));
+    }
+    Ok(bytes)
 }

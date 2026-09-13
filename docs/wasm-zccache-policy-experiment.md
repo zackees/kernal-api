@@ -167,9 +167,10 @@ correctness observations, not matched performance measurements. The source pin
 is migration-only and does not satisfy published-front-door acceptance.
 
 The freshly rebuilt revision-6 archive guest also passes all eight cases on
-Linux (42.45 s). All 16 screenshot regressions also pass on Linux against
-fresh revision-6 normal, trap, and blocked guests (165.78 s). These are local
-compatibility results, not six-target evidence for this revision.
+Linux (42.45 s). The screenshot guest was rebuilt for revision 8 in normal,
+trap, and blocked forms; all 16 Linux x86-64 native regressions pass in
+173.78 seconds. These are local compatibility results, not six-target evidence
+for this revision.
 
 ## Remaining proof
 
@@ -495,8 +496,9 @@ revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
 decision now exist. Artifact persistence/transfer, the six-host parent proof,
 matched candidate measurements, and final runtime selection remain unfinished.
-Existing revision-6 archive/screenshot evidence is historical; those guests
-must also be rebuilt for the revision-8 host.
+Existing revision-6 archive evidence is historical and must be rebuilt for the
+revision-8 host. The revision-8 screenshot artifact has Linux x86-64 evidence
+only; the remaining five native targets still need fresh execution.
 
 ## Component compiler candidate
 

@@ -7,6 +7,10 @@
 use std::io;
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "http_tls_tests.rs"]
+mod tls_tests;
+
 /// Per-request ceilings. A client can be reused for requests with this policy.
 /// All timeouts must be nonzero and at most 365 days.
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +194,10 @@ impl io::Read for BlockingResponse<'_> {
 impl Client {
     /// Build a transport with finite, nonzero timeouts and verified TLS.
     pub fn new(limits: Limits) -> io::Result<Self> {
+        Self::with_builder(limits, reqwest::Client::builder())
+    }
+
+    fn with_builder(limits: Limits, builder: reqwest::ClientBuilder) -> io::Result<Self> {
         if limits.max_redirects > 32 {
             return Err(invalid("HTTP redirect limit cannot exceed 32"));
         }
@@ -210,7 +218,7 @@ impl Client {
                 ));
             }
         }
-        let inner = reqwest::Client::builder()
+        let inner = builder
             // Cargo unifies backend features across the consumer's graph.
             // Preserve wire bytes even if another user enables auto-decoding.
             .no_gzip()

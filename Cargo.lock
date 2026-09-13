@@ -2486,6 +2486,7 @@ dependencies = [
  "mach2",
  "memmap2",
  "mimalloc-pprof",
+ "native-tls",
  "notify",
  "object 0.36.7",
  "pdb",

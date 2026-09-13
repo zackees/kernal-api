@@ -108,8 +108,9 @@ the full daemon suite (837 passed, 28 existing ignored integration tests,
 `double_must_use` diagnostics in untouched protocol code. Focused formatting
 and independent Astra code/documentation review passed.
 
-The PR remains open: merge API attempts failed and a subsequent read confirmed
-no merge. The sink boundary is ready for a kernel hash adapter, but neither
+The PR merged as `e1dc9f27e931300f7ba17b76ee9ffa2073abe72d`; an authoritative
+PR read confirmed the merge after the command returned a transient API error.
+The sink boundary is ready for a kernel hash adapter, but neither
 that adapter nor portable path normalization or the Wasm dependency graph is
 implemented by this prerequisite. Neither PR changes a release version.
 

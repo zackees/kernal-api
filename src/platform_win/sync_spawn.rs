@@ -446,6 +446,40 @@ impl crate::platform::process::SpawnedChildControl for SpawnedInner {
     }
 }
 
+impl Drop for SpawnedInner {
+    fn drop(&mut self) {
+        // Also covers failed setup before ownership reaches SpawnedChild.
+        self.shutdown();
+    }
+}
+
+fn resume_contained_thread(thread: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: the caller owns the primary thread handle until this returns.
+    if unsafe { ResumeThread(thread.as_raw()) } == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_SPAWN_FAILURE: std::cell::RefCell<(&'static str, Option<OwnedHandle>)> =
+        const { std::cell::RefCell::new(("", None)) };
+}
+
+#[cfg(test)]
+fn sync_spawn_checkpoint(stage: &str, process: HANDLE) -> io::Result<()> {
+    SYNC_SPAWN_FAILURE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.0 != stage {
+            return Ok(());
+        }
+        slot.0 = "";
+        slot.1 = Some(dup_inheritable(process)?);
+        Err(io::Error::other(format!("injected sync spawn {stage} failure")))
+    })
+}
+
 pub fn spawn_sync_daemon(
     command: &mut Command,
     stdio: crate::platform::process::DaemonStdio<'_>,
@@ -478,6 +512,9 @@ pub fn spawn_sync(
     let stdout_slot = resolve_slot(&stdio.stdout, SlotDir::Stdout)?;
     let stderr_slot = resolve_slot(&stdio.stderr, SlotDir::Stderr)?;
 
+    // No child exists if configuring the kill-on-close job fails.
+    let job = create_job_object()?;
+
     let (process, thread, pid) = create_process_inner(
         command,
         &stdin_slot.child_handle,
@@ -489,25 +526,42 @@ pub fn spawn_sync(
         environment,
     )?;
 
-    // Build the per-spawn Job Object and assign BEFORE ResumeThread so
+    // Assign to the per-spawn Job Object BEFORE ResumeThread so
     // the child cannot spawn grandchildren outside the job.
-    let job = create_job_object()?;
-    let ok = unsafe { AssignProcessToJobObject(job.as_raw(), process) };
-    if ok == FALSE {
-        let err = io::Error::last_os_error();
+    let process = OwnedHandle(process);
+    let thread = OwnedHandle(thread);
+    let assignment = (|| -> io::Result<()> {
+        #[cfg(test)]
+        sync_spawn_checkpoint("assign", process.as_raw())?;
+        // SAFETY: both owned handles remain live throughout assignment.
+        if unsafe { AssignProcessToJobObject(job.as_raw(), process.as_raw()) } == FALSE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if let Err(err) = assignment {
+        // The child is not in our job yet, so terminate it explicitly.
+        // SAFETY: we still own the just-created process handle.
         unsafe {
-            TerminateProcess(process, 1);
-            CloseHandle(thread);
-            CloseHandle(process);
+            TerminateProcess(process.as_raw(), 1);
         }
         return Err(err);
     }
 
+    // Own containment before any later fallible operation. Dropping this
+    // guard closes the job (terminating the tree), then the process handle.
+    let process_handle = process.as_raw();
+    let mut inner = SpawnedInner {
+        process: Some(process),
+        job: Some(job),
+        _drain_keepalive: None,
+    };
+
     // Now safe to start the child.
-    unsafe {
-        ResumeThread(thread);
-        CloseHandle(thread);
-    }
+    #[cfg(test)]
+    sync_spawn_checkpoint("resume", process_handle)?;
+    resume_contained_thread(&thread)?;
+    drop(thread);
 
     // Convert the parent-side pipe ends, if any, into Rust ChildStdin
     // etc.  The kernel keeps duplicates of the child-side handles via
@@ -531,30 +585,30 @@ pub fn spawn_sync(
     // pipes see EOF in bounded time after child exit; the watcher's
     // job here is purely the bounded sleep + signaling on drop.
     let drain_keepalive = if let Some(timeout) = stdio.drain_timeout {
-        let process_handle = dup_inheritable(process)?;
+        #[cfg(test)]
+        sync_spawn_checkpoint("duplicate", process_handle)?;
+        // The setup guard owns process_handle until success or error return.
+        let process_handle = dup_inheritable(process_handle)?;
         let keep = Arc::new(());
         let keep_watcher = Arc::clone(&keep);
         // SAFETY: process_handle is moved into the thread.  We dup it
         // so closing the outer one from shutdown() doesn't break the
         // watcher's wait.
-        thread::spawn(move || {
+        thread::Builder::new().spawn(move || {
             drain_watcher(process_handle, timeout, keep_watcher);
-        });
+        })?;
         Some(keep)
     } else {
         None
     };
 
+    inner._drain_keepalive = drain_keepalive;
     Ok(crate::platform::process::SpawnedChild {
         stdin: stdin_pipe,
         stdout: stdout_pipe,
         stderr: stderr_pipe,
         pid,
-        inner: Box::new(SpawnedInner {
-            process: Some(OwnedHandle(process)),
-            job: Some(job),
-            _drain_keepalive: drain_keepalive,
-        }),
+        inner: Box::new(inner),
     })
 }
 
@@ -1963,6 +2017,38 @@ fn build_env_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contained_spawn_failures_terminate_the_child() {
+        for stage in ["assign", "resume", "duplicate"] {
+            SYNC_SPAWN_FAILURE.with(|slot| *slot.borrow_mut() = (stage, None));
+            let mut command = Command::new("ping.exe");
+            command.args(["-n", "30", "127.0.0.1"]);
+            let result = spawn_sync(
+                &mut command,
+                crate::platform::process::SpawnStdio::default(),
+                crate::platform::process::SyncEnvironment::Inherit,
+            );
+            let error = match result {
+                Ok(_) => panic!("injected {stage} failure must reject startup"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(stage), "{error}");
+            let observed = SYNC_SPAWN_FAILURE.with(|slot| slot.borrow_mut().1.take())
+                .expect("fault checkpoint must observe a created child");
+            assert_eq!(
+                unsafe { WaitForSingleObject(observed.as_raw(), 5_000) },
+                WAIT_OBJECT_0,
+                "child survived {stage} startup failure"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_native_resume_is_reported() {
+        let invalid = OwnedHandle(INVALID_HANDLE_VALUE);
+        assert!(resume_contained_thread(&invalid).is_err());
+    }
 
     struct EnvRestore {
         key: String,

@@ -101,10 +101,11 @@ tauri-webview = [
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
 tauri-webview-test-support = ["tauri-webview"]
+hash-sha256 = ["dep:sha2"]
 conpty-sidecar = [
   "pty",
   "dep:dirs",
-  "dep:sha2",
+  "hash-sha256",
   "dep:tar",
   "dep:ureq",
   "dep:zstd",
@@ -151,7 +152,7 @@ symbolize-worker = [
   "dep:object",
   "dep:pdb",
   "dep:pdb-addr2line",
-  "dep:sha2",
+  "hash-sha256",
   "dep:tempfile",
   "dep:url",
   "dep:ureq",

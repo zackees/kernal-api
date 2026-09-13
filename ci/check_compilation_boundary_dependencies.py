@@ -19,6 +19,7 @@ CASES = (
     ("tokio-console", "console-subscriber"),
     ("allocator", "mimalloc-pprof"),
     ("fs-watch", "notify"),
+    ("hash-sha256", "sha2"),
     ("tauri-webview", "tauri"),
     ("tauri-webview", "tauri-runtime-wry"),
     ("tauri-webview", "wry"),

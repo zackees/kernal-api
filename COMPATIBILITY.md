@@ -81,6 +81,18 @@ This matrix records platform evidence rather than expanding the supported API
 surface. Native crash/parent-death claims require exact PID-plus-creation-key
 observation and bounded disappearance/exit evidence on the listed target.
 
+Linux x86-64 was revalidated locally at `d6e9882` with
+`soldr cargo test --locked --features wasm-sketch-worker,wasm-sketch-worker-test-support --test wasm_worker_containment -- --test-threads=1`:
+six outer tests passed in 12.06s, including exact-identity crash/parent-death
+checks and sequential teardown stress. Five tests were intentionally ignored:
+two externally controlled inner helpers and three artifact-dependent tests.
+The latter three then passed separately in 30.39s using the existing admitted
+threaded-smoke artifact and the filter `cargo_built_threaded_guest -- --ignored
+--test-threads=1` with the same Soldr features/test target. They cover contained
+execution, parent-owned output commit, and forced-output staging cleanup.
+This does not establish parent-death cleanup of output staging, native GUI
+descendant teardown, or fresh evidence on the other five targets.
+
 ## Client rule
 
 Until 1.0, the four first-party clients use an exact Cargo requirement:

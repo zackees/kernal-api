@@ -3,6 +3,8 @@
 //! Redirects are opt-in; credentials are never inferred.
 //! Response status interpretation and payload schemas belong to the caller.
 //! Bodies preserve content-encoded wire bytes; decoding belongs to the caller.
+//! HTTP/1 transport metadata has independent fixed parser ceilings. Caller
+//! header limits are post-parse acceptance limits, not allocator/RSS ceilings.
 
 use std::io;
 use std::time::Duration;
@@ -31,6 +33,7 @@ pub struct Limits {
     pub max_header_bytes: usize,
     /// Maximum request or response header values, including duplicates.
     /// At most 1024, to stay below the private transport's header-map ceiling.
+    /// The HTTP/1 response parser independently rejects more than 100 fields.
     pub max_header_count: usize,
     /// Maximum connection-establishment duration.
     pub connect_timeout: Duration,

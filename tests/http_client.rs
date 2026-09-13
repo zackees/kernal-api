@@ -4,6 +4,53 @@ use kernal_api::http::{Client, Limits, Method, Request};
 use std::io::{Read, Write};
 
 #[tokio::test]
+async fn private_parser_bounds_metadata_even_when_acceptance_limits_are_relaxed() {
+    let client = Client::new(Limits {
+        max_header_bytes: usize::MAX,
+        max_header_count: 1024,
+        total_timeout: std::time::Duration::from_secs(5),
+        ..Limits::default()
+    })
+    .unwrap();
+    let mut oversized_head = b"HTTP/1.1 200 OK\r\nX-Large: ".to_vec();
+    oversized_head.extend(std::iter::repeat_n(b'x', 2 * 1024 * 1024));
+    oversized_head.extend_from_slice(b"\r\nContent-Length: 0\r\n\r\n");
+    let mut excessive_fields = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+    for _ in 0..100 {
+        excessive_fields.extend_from_slice(b"X-Field: x\r\n");
+    }
+    excessive_fields.extend_from_slice(b"\r\n");
+    for wire in [oversized_head, excessive_fields] {
+        let (url, worker) = fixture(&wire);
+        let error = client
+            .get(&url)
+            .await
+            .err()
+            .expect("parser accepted excessive metadata");
+        worker.join().unwrap();
+        assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    let mut trailers =
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Large: ".to_vec();
+    trailers.extend(std::iter::repeat_n(b'x', 32 * 1024));
+    trailers.extend_from_slice(b"\r\n\r\n");
+    let mut extensions = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1;name=".to_vec();
+    extensions.extend(std::iter::repeat_n(b'x', 32 * 1024));
+    extensions.extend_from_slice(b"\r\nx\r\n0\r\n\r\n");
+    for wire in [trailers, extensions] {
+        let (url, worker) = fixture(&wire);
+        let response = client.get(&url).await.unwrap();
+        let error = response
+            .into_bytes()
+            .await
+            .expect_err("parser accepted excessive chunk metadata");
+        worker.join().unwrap();
+        assert_ne!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+}
+
+#[tokio::test]
 async fn encoded_responses_preserve_wire_bytes_and_headers() {
     // gzip -n of "hello". Also run with reqwest/gzip enabled to exercise
     // backend features unified by an unrelated downstream dependency.

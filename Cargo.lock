@@ -2479,6 +2479,7 @@ dependencies = [
  "getrandom 0.4.3",
  "globset",
  "gtk",
+ "hyper",
  "interprocess",
  "jwalk",
  "libc",

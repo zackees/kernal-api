@@ -346,6 +346,7 @@ impl TerminalInputSession {
     pub fn read_chunk(&self, timeout: std::time::Duration) -> std::io::Result<Option<PtyInputChunk>> {
         use super::terminal_input::{TerminalInputWaitOutcome, wait_for_terminal_input_event};
         match wait_for_terminal_input_event(&self.0.state, &self.0.condvar, Some(timeout)) {
+            TerminalInputWaitOutcome::Failed(error) => Err(std::io::Error::other(error)),
             TerminalInputWaitOutcome::Event(event) => Ok(Some(PtyInputChunk { data: event.data, submit: event.submit })),
             TerminalInputWaitOutcome::Timeout => Ok(None),
             TerminalInputWaitOutcome::Closed => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "native terminal input closed")),

@@ -342,20 +342,25 @@ pub fn find_child_processes(_parent_pid: u32) -> Vec<ChildProcessInfo> { Vec::ne
 pub fn find_orphan_conhosts() -> Vec<OrphanConhostInfo> { Vec::new() }
 
 #[cfg(feature = "pty")]
-pub struct TerminalInputSession { stdin_fd: i32, original_mode: libc::termios }
+pub struct TerminalInputSession {
+    stdin_fd: i32,
+    original_mode: libc::termios,
+    _input_lease: crate::platform::terminal::InputLease,
+}
 
 #[cfg(feature = "pty")]
 impl TerminalInputSession {
     pub fn new() -> std::io::Result<Option<Self>> {
         let stdin_fd = libc::STDIN_FILENO;
         if unsafe { libc::isatty(stdin_fd) } != 1 { return Ok(None); }
+        let input_lease = crate::platform::terminal::InputLease::acquire()?;
         let mut original_mode = std::mem::MaybeUninit::<libc::termios>::uninit();
         if unsafe { libc::tcgetattr(stdin_fd, original_mode.as_mut_ptr()) } != 0 { return Err(std::io::Error::last_os_error()); }
         let original_mode = unsafe { original_mode.assume_init() };
         let mut raw_mode = original_mode;
         unsafe { libc::cfmakeraw(&mut raw_mode) };
         if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_mode) } != 0 { return Err(std::io::Error::last_os_error()); }
-        Ok(Some(Self { stdin_fd, original_mode }))
+        Ok(Some(Self { stdin_fd, original_mode, _input_lease: input_lease }))
     }
 
     pub fn read_chunk(&self, timeout: std::time::Duration) -> std::io::Result<Option<PtyInputChunk>> {
@@ -388,6 +393,9 @@ pub fn active_graphics_probe(
     use std::os::fd::AsRawFd as _;
     use std::time::Instant;
 
+    let Ok(_input_lease) = crate::platform::terminal::InputLease::acquire() else {
+        return crate::platform::terminal::TerminalGraphicsProbe::default();
+    };
     let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
         return crate::platform::terminal::TerminalGraphicsProbe::default();
     };

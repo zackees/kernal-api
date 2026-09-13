@@ -50,6 +50,11 @@ pub(super) enum CleanupFault {
 pub(super) struct CompilerGrant {
     spec: Option<SpawnSpec>,
     deadline: Duration,
+    // The private fixture supplies a precomputed cache key and outcome. A
+    // production host would derive those from its metadata/content facts. The
+    // guest may compare only its bounded, already-derived key against this
+    // grant; it cannot enumerate or modify the cache.
+    cache: Option<([u8; 32], bool)>,
 }
 
 pub(super) struct CompilerProcess {
@@ -124,6 +129,16 @@ impl OperationHub {
         spec: SpawnSpec,
         deadline: Duration,
     ) -> Result<OpaqueToken, HubError> {
+        self.grant_compiler_with_cache(store, spec, deadline, None)
+    }
+
+    pub(crate) fn grant_compiler_with_cache(
+        &self,
+        store: u64,
+        spec: SpawnSpec,
+        deadline: Duration,
+        cache: Option<([u8; 32], bool)>,
+    ) -> Result<OpaqueToken, HubError> {
         // Host-owned, exact paths and environment; no ambient lookup or cwd.
         if !Path::new(&spec.program).is_absolute()
             || !spec
@@ -154,6 +169,7 @@ impl OperationHub {
                         .kill_when_owner_dies(true),
                 ),
                 deadline,
+                cache,
             }),
         )?;
         state
@@ -162,6 +178,30 @@ impl OperationHub {
             .ok_or(HubError::Closed)?
             .reserved = false;
         Ok(token)
+    }
+
+    /// Compare a guest-derived, fixed-size cache key against the exact
+    /// host-authorized identity. This has no cache mutation or process effect.
+    pub(crate) fn compiler_cache_status(
+        &self,
+        store: u64,
+        grant: OpaqueToken,
+        key: [u8; 32],
+    ) -> Result<bool, HubError> {
+        let state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let slot = state.resources.get(&grant).ok_or(HubError::Invalid)?;
+        Self::validate_resource(slot, store, GRANT_KIND, PROCESS_RIGHT)?;
+        let ResourceValue::CompilerGrant(CompilerGrant {
+            cache: Some((expected, hit)),
+            ..
+        }) = &slot.value
+        else {
+            return Err(HubError::Invalid);
+        };
+        if &key != expected {
+            return Err(HubError::Invalid);
+        }
+        Ok(*hit)
     }
 
     pub(crate) fn submit_compiler_spawn(

@@ -43,6 +43,16 @@ impl CompilerGrant {
         if token == 0 { return Err(OperationError::Failed); }
         Ok(CompilerProcess { token })
     }
+    /// Ask this exact host grant whether a guest-derived cache identity is
+    /// present. The guest receives neither paths nor cache contents.
+    pub fn cache_status(&self, key: &[u8; 32]) -> Result<bool, OperationError> {
+        let pointer = u32::try_from(key.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        match imports::operation_submit(48, self.token, u64::from(pointer)).map_err(|_| OperationError::Failed)? {
+            1 => Ok(true),
+            2 => Ok(false),
+            _ => Err(OperationError::Rejected),
+        }
+    }
 }
 impl Drop for CompilerGrant {
     fn drop(&mut self) { let _ = imports::operation_submit(41, self.token, 0); }

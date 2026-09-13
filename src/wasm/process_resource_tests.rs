@@ -160,6 +160,33 @@ fn compiler_grant_rejects_ambient_authority_and_invalid_deadline() {
 }
 
 #[test]
+fn compiler_cache_decision_is_exact_scoped_and_has_no_spawn_effect() {
+    let hub = OperationHub::new(4, 4).unwrap();
+    let key = [0x5a; 32];
+    let hit = hub
+        .grant_compiler_with_cache(7, spec("exit"), Duration::from_secs(10), Some((key, true)))
+        .unwrap();
+    assert_eq!(
+        hub.compiler_cache_status(8, hit, key),
+        Err(HubError::WrongRights)
+    );
+    assert_eq!(
+        hub.compiler_cache_status(7, hit, [0; 32]),
+        Err(HubError::Invalid)
+    );
+    assert_eq!(hub.compiler_cache_status(7, hit, key), Ok(true));
+    assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
+    hub.close_resource(hit).unwrap();
+    assert_eq!(hub.snapshot().live_resources, 0);
+
+    let miss = hub
+        .grant_compiler_with_cache(7, spec("exit"), Duration::from_secs(10), Some((key, false)))
+        .unwrap();
+    assert_eq!(hub.compiler_cache_status(7, miss, key), Ok(false));
+    assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn compiler_quotas_and_owner_reject_before_consuming_grant() {
     let runtime = runtime();
     for (operations, resources) in [(0, 2), (1, 1)] {

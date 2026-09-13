@@ -34,6 +34,12 @@ impl CompilerGrant {
             inner: compilers::spawn(self.inner).await.map_err(error)?,
         })
     }
+    pub(super) fn cache_status(&self, key: &[u8; 32]) -> Result<bool, OperationError> {
+        match compilers::lookup_cache(&self.inner, key).map_err(error)? {
+            compilers::CacheStatus::Hit => Ok(true),
+            compilers::CacheStatus::Miss => Ok(false),
+        }
+    }
 }
 
 impl CompilerProcess {

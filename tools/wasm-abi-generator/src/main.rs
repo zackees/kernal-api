@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 const CAPABILITIES: u32 = 0;
 // Revision 7 adds host-granted compiler spawn/output/exit/close (35-47).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 7;
+const OPERATION_PROTOCOL_REVISION: u32 = 8;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -770,7 +770,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=7\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=8\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

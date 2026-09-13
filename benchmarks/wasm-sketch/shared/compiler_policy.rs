@@ -1,11 +1,31 @@
-//! Shared candidate fixture: exact host command, bounded pull, hash, exit, close.
-//! This is not yet the zccache artifact-cache hit/miss workflow.
-use kernal_api::guest::{Blake3Hasher, CompilerGrant, CompilerOutputEvent, OperationError};
+//! Shared candidate fixture: cache decision plus exact controlled compiler miss.
+use kernal_api::guest::{
+    Blake3Hasher, CompilerCacheStatus, CompilerGrant, CompilerOutputEvent, OperationError,
+};
 
 pub async fn proof() -> Result<(), OperationError> {
+    proof_with_cache(true).await
+}
+
+/// Same controlled compiler miss path without the request-key list lowering.
+/// This exists only for the allocator-fault fixture, so its trap can be shown
+/// to occur while lowering output data rather than an earlier hash digest.
+#[allow(dead_code)] // used by the separately selected lowering-trap fixture
+pub async fn output_lowering_proof() -> Result<(), OperationError> {
+    proof_with_cache(false).await
+}
+
+async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
     let grant = CompilerGrant::granted()?.ok_or(OperationError::Rejected)?;
     if CompilerGrant::granted()?.is_some() {
         return Err(OperationError::Failed);
+    }
+    if cache {
+        match grant.cache_status(&request_key().await?)? {
+            // A hit must avoid even submitting the host-owned compiler grant.
+            CompilerCacheStatus::Hit => return Ok(()),
+            CompilerCacheStatus::Miss => {}
+        }
     }
     let mut process = grant.spawn().await?;
     if process.read_output(&mut []).await != Err(OperationError::Rejected) {
@@ -74,4 +94,37 @@ pub async fn proof() -> Result<(), OperationError> {
         return Err(OperationError::Failed);
     }
     process.close().await
+}
+
+/// Assemble the actual zccache request protocol through the public bounded
+/// hash facade. The private fixture represents the host identity with the
+/// grant's precomputed expected key, never with a cache path or artifact byte
+/// stream. A production host would derive that identity from metadata/content
+/// facts before instantiation.
+async fn request_key() -> Result<[u8; 32], OperationError> {
+    use zccache_hash::request_fingerprint::RequestFingerprint;
+
+    let raw = ["-MD", "-MF-", "source.c"].map(String::from);
+    let env = [("A", ""), ("Z", "last")];
+    let mut cursor =
+        RequestFingerprint::new("cc", ["-O2", "-O0", ""].into_iter(), &raw, "work", &env);
+    let mut hash = Blake3Hasher::new().await?;
+    let mut buffer = [0u8; 65536];
+    let mut used = 0;
+    while let Some(mut fragment) = cursor.next_fragment() {
+        while !fragment.is_empty() {
+            let count = fragment.len().min(buffer.len() - used);
+            buffer[used..used + count].copy_from_slice(&fragment[..count]);
+            used += count;
+            fragment = &fragment[count..];
+            if used == buffer.len() {
+                hash.update(&buffer).await?;
+                used = 0;
+            }
+        }
+    }
+    if used != 0 {
+        hash.update(&buffer[..used]).await?;
+    }
+    hash.finalize().await
 }

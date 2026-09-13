@@ -108,6 +108,14 @@ pub struct CompilerProcess {
     inner: CompilerProcessBackend,
 }
 
+/// A host-authorized decision for one guest-derived compiler cache key.
+/// Cache contents and locations never cross the guest boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompilerCacheStatus {
+    Hit,
+    Miss,
+}
+
 /// A tagged event; only chunk variants refer to bytes in the read destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompilerOutputEvent {
@@ -136,6 +144,13 @@ impl CompilerGrant {
     pub async fn spawn(self) -> Result<CompilerProcess, OperationError> {
         Ok(CompilerProcess {
             inner: self.inner.spawn().await?,
+        })
+    }
+    pub fn cache_status(&self, key: &[u8; 32]) -> Result<CompilerCacheStatus, OperationError> {
+        Ok(if self.inner.cache_status(key)? {
+            CompilerCacheStatus::Hit
+        } else {
+            CompilerCacheStatus::Miss
         })
     }
 }

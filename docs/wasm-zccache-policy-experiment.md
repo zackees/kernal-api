@@ -187,16 +187,13 @@ runs are not comparative performance evidence. The Component artifact is
 
 This uses the upstream policy implementation without native compiler/runtime
 dependencies; only its lexical `typed-path` dependency is present. It does not
-prove native Windows path equivalence, actual process execution, or a complete
-cache hit/miss workflow. The source pin is migration-only, not a published
-front-door dependency.
+prove native Windows path equivalence. The later revision-8 compiler grant adds
+the actual bounded request-key decision and controlled process miss described
+below; it still is not a complete artifact cache. The source pin is
+migration-only, not a published front-door dependency.
 
-No complete compiler-policy or cache-workflow GREEN result is claimed yet. The next
-implementation must reuse representative parser/key fixtures, supply host
-facts explicitly, and route hashing and the controlled compiler miss through
-public kernel capabilities with bounded stdout/stderr. Native and Wasm runs
-must compare the same policy outputs. Daemon, watcher, IPC, and artifact
-movement stay native.
+The remaining work must compare native and Wasm policy outputs on every host
+and keep daemon, watcher, IPC, and artifact movement native.
 
 ### Controlled compiler-miss design constraints
 
@@ -205,17 +202,34 @@ as the existing native facade seam. `ProcessSessionOptions` bounds queued
 chunks and each chunk's bytes; `next_output` preserves stdout/stderr identity
 and backpressures child pipes. Lifecycle wait/kill remain independent of a
 pending output receive. Reuse this seam rather than adding another process
-backend or executor. This is a proposed integration, not an executed guest
-process proof.
+backend or executor. The revision-8 integration now exercises this exact seam;
+the remaining artifact-cache and six-host work is called out below.
 
-The host must grant one exact command description and working directory,
-with explicit environment and stream policy. A guest should receive only a
-store-scoped opaque grant, not executable paths, arbitrary argv, environment
-mutation, or shell access. Reserve operation/resource capacity before spawn;
-revocation between reservation and attachment must reclaim a spawned session.
-Output delivery needs an aggregate in-flight byte budget in addition to the
-native queue limits. Cache-hit fixtures must prove no spawn occurred, while
-miss fixtures must compare native and guest status and both output streams.
+The host grants one exact command description, working directory, explicit
+environment/stream policy, and one opaque cache identity. The guest derives
+the real `zccache-hash` request-fingerprint bytes through the public bounded
+`Blake3Hasher`, then supplies its fixed 32-byte digest to the grant's semantic
+`cache_status` method. The current private fixture supplies a precomputed
+expected digest and outcome; a production host would derive that identity from
+its metadata/content facts before instantiation. It exposes neither paths,
+artifact bytes, nor cache enumeration. A mismatch or foreign store is rejected
+without spawning or consuming the grant.
+
+On `Hit`, the shared policy returns before submitting a process operation. The
+actual Component hit test supplies an intentionally nonexistent absolute
+compiler path: success therefore proves that no compiler was launched. On
+`Miss`, it uses the existing exact host command and bounded tagged output
+facade, drains and hashes 2 MiB from each stream, observes exit, and awaits
+close. The same cache-aware shared policy passes freshly rebuilt revision-8
+Core and Component guest artifacts on Linux x86-64. Unit coverage also checks
+exact key matching, store ownership, miss/hit values, and zero spawn attempts.
+
+This is one fixture-selected cache decision, not a cache store: artifact
+movement and cache persistence remain native. Reserve
+operation/resource capacity before the controlled miss spawn; revocation
+between reservation and attachment must reclaim a spawned session. Output
+delivery retains its aggregate in-flight byte budget in addition to native
+queue limits.
 
 The facade documents that session kill/drop terminates and reaps only the
 direct child. Post-exit drain grace reports abandoned descendant-held pipes;
@@ -411,14 +425,14 @@ observation. Removing admission-time ownership validation is RED (Soldr log
 `20260913T131658Z`): a foreign owner waits on the native process instead of being
 rejected immediately. This remains a host primitive, not a guest ABI claim.
 
-## Revision-7 Core compiler guest proof
+## Revision-8 Core compiler guest proof
 
 The Core candidate now exposes `guest::CompilerGrant`, `CompilerProcess`, tagged
 `CompilerOutputEvent`, and semantic `CompilerExit`. The host owns the exact
 executable, arguments, cwd, cleared environment, and deadline. Grant retrieval
 is one-shot; neither a path nor a guest-authored command crosses the ABI. The
 host injection is currently the private root-grant fixture, not a general
-external host API. The operation protocol is revision 7 (35–47), so revision-6
+external host API. The operation protocol is revision 8 (35–48), so revision-7
 modules must be rebuilt, not relabeled.
 
 A completed output operation owns the native event directly, without retaining
@@ -478,10 +492,11 @@ KERNAL_COMPILER_GUEST_WASM="$PWD/target/extension2-stream/compiler.admitted.wasm
 
 The fixture lock now follows the same explicit migration-only process-substrate
 revision as the parent; it is not a published dependency acceptance claim.
-Component compiler adaptation, actual zccache artifact key/cache hit/miss logic,
-the six-host parent proof, matched candidate measurements, and final runtime
-selection remain unfinished. Existing revision-6 archive/screenshot evidence
-is historical; those guests must also be rebuilt for the revision-7 host.
+The Component compiler adaptation and one exact zccache request-key hit/miss
+decision now exist. Artifact persistence/transfer, the six-host parent proof,
+matched candidate measurements, and final runtime selection remain unfinished.
+Existing revision-6 archive/screenshot evidence is historical; those guests
+must also be rebuilt for the revision-8 host.
 
 ## Component compiler candidate
 
@@ -523,16 +538,21 @@ Disabling the budget's deferred-refund branch is RED (`20260913T142420Z`):
 resource destruction prematurely reduces the expected 64-KiB charge to zero.
 Restoring the branch makes the focused test GREEN.
 
-Linux x86-64 execution passes both the shared 2-MiB-per-stream compiler workflow
-and the allocator-trap case. The success path observes zero resources, operations,
-tracked process jobs, and transfer bytes after cleanup. To reproduce, use a fresh
-output directory because the encoder intentionally refuses to overwrite files:
+Linux x86-64 execution passes the cache hit, controlled 2-MiB-per-stream miss,
+allocator-trap, and admitted-read cancellation cases. The success path observes
+zero resources, operations, tracked process jobs, and transfer bytes after
+cleanup. To reproduce, use a fresh output directory because the encoder
+intentionally refuses to overwrite files:
 
 ```sh
 SOLDR_LINKER=default soldr --no-cache cargo build --locked \
   --manifest-path benchmarks/wasm-sketch/component-guest/Cargo.toml \
   --features compiler-proof --target wasm32-unknown-unknown --release \
   --target-dir benchmarks/wasm-sketch/component-guest/target -j1
+SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/component-guest/Cargo.toml \
+  --features lowering-trap-proof --target wasm32-unknown-unknown --release \
+  --target-dir benchmarks/wasm-sketch/component-guest/target-lowering -j1
 soldr --no-cache cargo build --locked \
   --manifest-path benchmarks/wasm-sketch/component-tools/Cargo.toml -j1
 component_proof_dir=$(mktemp -d /tmp/kernal-component-compiler-XXXXXX)
@@ -540,7 +560,7 @@ benchmarks/wasm-sketch/component-tools/target/debug/kernal-component-tools \
   benchmarks/wasm-sketch/component-guest/target/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
   "$component_proof_dir/compiler.wasm"
 benchmarks/wasm-sketch/component-tools/target/debug/kernal-component-tools \
-  benchmarks/wasm-sketch/component-guest/target/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
+  benchmarks/wasm-sketch/component-guest/target-lowering/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
   "$component_proof_dir/compiler-trap.wasm" --trap-realloc
 KERNAL_COMPONENT_COMPILER_WASM="$component_proof_dir/compiler.wasm" \
 KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
@@ -549,15 +569,16 @@ KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
   wasm::component_compiler::tests -- --include-ignored --nocapture
 ```
 
-The candidate remains incomplete for #13: hostile incoming hash lists are still
-canonically allocated before the host length check; cancellation coverage and
-public blob parity are not complete. This proof is not the zccache artifact-key
-and cache hit/miss workflow, six-host parent acceptance, a total-RSS bound, or
-the matched measurements needed to choose the final runtime. Fixture source
-pins remain migration-only, not published-dependency acceptance.
+The candidate remains incomplete for #13: hostile incoming hash and cache-key
+lists are still canonically allocated before the host length check; cancellation
+coverage and public blob parity are not complete. The request-key decision is
+not a complete artifact cache: it does not persist or move artifacts. Nor is it
+six-host parent acceptance, a total-RSS bound, or the matched measurements needed to
+choose the final runtime. Fixture source pins remain migration-only, not
+published-dependency acceptance.
 
 Local regression gates also pass: 116 operation tests, four native semantic
-guest-adapter tests, the revision-7 Core compiler and 64-MiB hash artifacts,
+guest-adapter tests, the revision-8 Core compiler and 64-MiB hash artifacts,
 and the legacy Component execution probe (hash, bounded transfer, traps,
 pending-call teardown, cancellation/reuse, and backpressure). Strict Clippy
 passes for the native Component host with tests, the default native library,

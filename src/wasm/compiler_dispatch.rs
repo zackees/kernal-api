@@ -1,4 +1,4 @@
-//! Private revision-7 compiler operations over the existing scalar imports.
+//! Private revision-8 compiler operations over the existing scalar imports.
 use super::*;
 use crate::operations::OpaqueToken;
 
@@ -28,11 +28,11 @@ struct CompilerImports<'a> {
 
 impl CompilerImports<'_> {
     fn submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> Option<u64> {
-        if !(35..=47).contains(&kind) {
+        if !(35..=48).contains(&kind) {
             return None;
         }
         // Validate reserved arguments before taking grants or other authority.
-        if kind != 38 && arg1 != 0 {
+        if kind != 38 && kind != 48 && arg1 != 0 {
             return Some(0);
         }
         let hub = self.hub;
@@ -97,6 +97,27 @@ impl CompilerImports<'_> {
             44 => hub.collect_compiler_wait(store, token).unwrap_or(0x80),
             46 => u64::from(hub.abandon_compiler_scalar(store, token, true).is_ok()),
             47 => u64::from(hub.abandon_compiler_scalar(store, token, false).is_ok()),
+            48 => {
+                // The Core ABI pointer is a 32-bit wasm address. Do not let a
+                // wider host-side value alias a valid low address by truncation.
+                if arg1 >> 32 != 0 {
+                    return Some(0);
+                }
+                let Some(cells) = shared_range(self.memory, arg1 as u32 as i32, 32) else {
+                    return Some(0);
+                };
+                let mut key = [0; 32];
+                for (destination, cell) in key.iter_mut().zip(cells) {
+                    // SAFETY: shared_range validated the pinned 32-byte key.
+                    *destination =
+                        unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+                }
+                match hub.compiler_cache_status(store, token, key) {
+                    Ok(true) => 1,
+                    Ok(false) => 2,
+                    Err(_) => 0,
+                }
+            }
             _ => 0,
         })
     }
@@ -105,6 +126,12 @@ impl CompilerImports<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CACHE_KEY: [u8; 32] = [
+        0xdb, 0xed, 0xcb, 0xc5, 0x83, 0xf5, 0x1d, 0x14, 0x3b, 0xae, 0xb1, 0x9d, 0xbe, 0xac, 0xfd,
+        0x3f, 0xa0, 0xcb, 0x40, 0x8c, 0xe8, 0x39, 0x9b, 0x56, 0xce, 0xc7, 0x22, 0x24, 0xd8, 0x54,
+        0xe9, 0x93,
+    ];
 
     #[test]
     fn compiler_imports_validate_grant_arguments_and_output_ranges_before_consumption() {
@@ -124,7 +151,12 @@ mod tests {
                 .clear_env(true)
                 .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
             let grant = hub
-                .grant_compiler(7, spec, Duration::from_secs(15))
+                .grant_compiler_with_cache(
+                    7,
+                    spec,
+                    Duration::from_secs(15),
+                    Some((CACHE_KEY, false)),
+                )
                 .unwrap()
                 .wire();
             let mut initial = Some(grant);
@@ -140,6 +172,14 @@ mod tests {
             assert_eq!(imports.submit(35, 0, 1), Some(0));
             assert_eq!(imports.submit(35, 0, 0), Some(grant));
             assert_eq!(imports.submit(35, 0, 0), Some(0));
+            assert_eq!(imports.submit(48, grant, u64::from(u32::MAX)), Some(0));
+            for (cell, byte) in memory.data().iter().zip(CACHE_KEY) {
+                // SAFETY: this test owns the single shared-memory fixture.
+                unsafe { AtomicU8::from_ptr(cell.get()) }.store(byte, Ordering::Relaxed);
+            }
+            // A 64-bit host value must not alias the valid Wasm address zero.
+            assert_eq!(imports.submit(48, grant, 1_u64 << 32), Some(0));
+            assert_eq!(imports.submit(48, grant, 0), Some(2));
             assert_eq!(imports.submit(36, grant, 1), Some(0));
             let spawn = imports.submit(36, grant, 0).unwrap();
             let process = crate::async_engine::timeout(Duration::from_secs(5), async {
@@ -200,8 +240,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-7 guest"]
+    #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
     fn compiler_actual_guest_spawns_drains_hashes_waits_and_closes() {
+        execute_actual_guest(false);
+    }
+
+    #[test]
+    #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
+    fn compiler_actual_guest_cache_hit_does_not_spawn_the_granted_compiler() {
+        execute_actual_guest(true);
+    }
+
+    fn execute_actual_guest(cache_hit: bool) {
         let bytes = std::fs::read(
             std::env::var_os("KERNAL_COMPILER_GUEST_WASM").expect("compiler guest artifact"),
         )
@@ -222,19 +272,33 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-            .arg("--nocapture")
+        let spec = if cache_hit {
+            crate::SpawnSpec::new(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("cache-hit-must-not-spawn"),
+            )
             .current_dir(std::env::current_dir().unwrap())
             .clear_env(true)
-            .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+        } else {
+            crate::SpawnSpec::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
+                .arg("--nocapture")
+                .current_dir(std::env::current_dir().unwrap())
+                .clear_env(true)
+                .env("KERNAL_COMPILER_WIRE_HELPER", "dual")
+        };
         assert_eq!(
             runtime.run(sketch.execute_threaded_root_with_grant(
                 runtime.handle(),
                 crate::async_engine::CancellationSource::new().token(),
                 RootGrants {
-                    compiler: Some((spec, Duration::from_secs(15))),
+                    compiler: Some(RootCompilerGrant {
+                        spec,
+                        deadline: Duration::from_secs(15),
+                        cache: Some((CACHE_KEY, cache_hit)),
+                    }),
                     ..RootGrants::default()
                 },
             )),

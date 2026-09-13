@@ -2,6 +2,7 @@ package kernal:compiler-experiment@0.1.0;
 
 interface compilers {
     enum error { rejected, cancelled, closed, failed, timed-out }
+    enum cache-status { hit, miss }
     enum output-tag {
         stdout, stderr, stdout-eof, stderr-eof,
         stdout-abandoned, stderr-abandoned, stdout-error, stderr-error, exhausted,
@@ -16,6 +17,7 @@ interface compilers {
         copy: func() -> result<output-data, error>;
     }
     granted: func() -> result<option<grant>, error>;
+    lookup-cache: func(command: borrow<grant>, key: list<u8>) -> result<cache-status, error>;
     spawn: async func(command: own<grant>) -> result<process, error>;
     read: async func(child: borrow<process>) -> result<output, error>;
     wait: async func(child: borrow<process>) -> result<exit, error>;

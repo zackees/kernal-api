@@ -12,6 +12,11 @@ use wasmtime::component::{Accessor, HasData, Resource, ResourceTable};
 mod tests {
     use super::*;
     use std::time::Duration;
+    const CACHE_KEY: [u8; 32] = [
+        0xdb, 0xed, 0xcb, 0xc5, 0x83, 0xf5, 0x1d, 0x14, 0x3b, 0xae, 0xb1, 0x9d, 0xbe, 0xac, 0xfd,
+        0x3f, 0xa0, 0xcb, 0x40, 0x8c, 0xe8, 0x39, 0x9b, 0x56, 0xce, 0xc7, 0x22, 0x24, 0xd8, 0x54,
+        0xe9, 0x93,
+    ];
     mod proof {
         wasmtime::component::bindgen!({
             path: "src/guest_component_compiler.wit", world: "compiler-proof",
@@ -107,22 +112,33 @@ mod tests {
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
     fn actual_guest_spawns_drains_hashes_waits_and_closes() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false, false);
     }
 
     #[test]
-    #[ignore = "requires KERNAL_COMPONENT_COMPILER_TRAP_WASM encoded with --trap-realloc"]
+    #[ignore = "requires lowering-trap-proof KERNAL_COMPONENT_COMPILER_TRAP_WASM encoded with --trap-realloc"]
     fn actual_guest_lowering_trap_retains_credit_until_store_destruction() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_TRAP_WASM", true, false);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_TRAP_WASM", true, false, false);
     }
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
     fn actual_guest_cancelled_read_return_drops_pending_authority() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, true);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, true, false);
     }
 
-    fn execute_artifact(variable: &str, expect_lowering_trap: bool, cancel_read: bool) {
+    #[test]
+    #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
+    fn actual_guest_cache_hit_does_not_spawn_the_granted_compiler() {
+        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false, true);
+    }
+
+    fn execute_artifact(
+        variable: &str,
+        expect_lowering_trap: bool,
+        cancel_read: bool,
+        cache_hit: bool,
+    ) {
         let bytes = std::fs::read(std::env::var_os(variable).expect("Component compiler artifact"))
             .unwrap();
         let mut config = wasmtime::Config::new();
@@ -146,15 +162,30 @@ mod tests {
         let hub = OperationHub::new(64, 64).unwrap();
         let budget = ComponentResourceBudget::new(Arc::clone(&hub));
         let cancellation = crate::async_engine::CancellationSource::new();
-        let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-            .arg("--nocapture")
+        let spec = if cache_hit {
+            crate::SpawnSpec::new(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("cache-hit-must-not-spawn"),
+            )
             .current_dir(std::env::current_dir().unwrap())
             .clear_env(true)
-            .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+        } else {
+            crate::SpawnSpec::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
+                .arg("--nocapture")
+                .current_dir(std::env::current_dir().unwrap())
+                .clear_env(true)
+                .env("KERNAL_COMPILER_WIRE_HELPER", "dual")
+        };
         let grant = hub
-            .grant_compiler(0, spec, Duration::from_secs(15))
+            .grant_compiler_with_cache(
+                0,
+                spec,
+                Duration::from_secs(15),
+                Some((CACHE_KEY, cache_hit)),
+            )
             .unwrap();
         let mut store = wasmtime::Store::new(
             &engine,
@@ -229,6 +260,9 @@ mod tests {
             assert!(live_before_drop > 0);
             assert_eq!(early_release, Some(Err(HubError::WrongRights)));
             assert!(retained_after_store_drop >= 65536);
+        } else if cache_hit {
+            result.unwrap();
+            assert_eq!(copied, 0, "cache hit must not read compiler output");
         } else {
             result.unwrap();
             assert!(copied > 1);
@@ -383,6 +417,28 @@ impl compilers::Host for State {
             _permit: permit,
         });
         Ok(Ok(Some(self.table.push(grant)?)))
+    }
+    fn lookup_cache(
+        &mut self,
+        command: Resource<Grant>,
+        key: Vec<u8>,
+    ) -> wasmtime::Result<Result<compilers::CacheStatus, Error>> {
+        let key: [u8; 32] = match key.try_into() {
+            Ok(key) => key,
+            Err(_) => return Ok(Err(Error::Rejected)),
+        };
+        let grant = self.table.get(&command)?;
+        Ok(self
+            .hub
+            .compiler_cache_status(0, grant.0.token, key)
+            .map(|hit| {
+                if hit {
+                    compilers::CacheStatus::Hit
+                } else {
+                    compilers::CacheStatus::Miss
+                }
+            })
+            .map_err(error))
     }
 }
 impl compilers::HostGrant for State {

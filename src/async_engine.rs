@@ -390,6 +390,48 @@ pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
 }
 
+/// Wait until a shared deadline expires. Cancelling the wait does not change
+/// the deadline, so retrying uses the original expiry rather than a new budget.
+pub async fn sleep_until(deadline: Deadline) {
+    tokio::time::sleep_until(deadline.at).await;
+}
+
+/// A fixed-cadence timer with an immediate first tick.
+///
+/// Missed ticks are delivered in a burst until the original schedule catches
+/// up. No background task is spawned. Drop the timer to stop observing ticks.
+#[derive(Debug)]
+pub struct PeriodicTimer {
+    inner: tokio::time::Interval,
+}
+
+impl PeriodicTimer {
+    /// Create a periodic timer in the current runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside a runtime or when `period` is zero or exceeds
+    /// 365 days. The runtime must have its timer driver enabled.
+    pub fn new(period: Duration) -> std::io::Result<Self> {
+        if period.is_zero() || period > Duration::from_secs(365 * 24 * 60 * 60) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period must be positive and at most 365 days",
+            ));
+        }
+        RuntimeHandle::current().map_err(std::io::Error::other)?;
+        let mut inner = tokio::time::interval(period);
+        inner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+        Ok(Self { inner })
+    }
+
+    /// Wait for the next scheduled tick. Cancelling a pending call does not
+    /// consume its tick; a subsequent call observes the same scheduled time.
+    pub async fn tick(&mut self) {
+        self.inner.tick().await;
+    }
+}
+
 /// An absolute deadline that can be shared across composed async operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadline {
@@ -799,6 +841,15 @@ impl Semaphore {
     /// from it.
     pub fn available_permits(&self) -> usize {
         self.inner.available_permits()
+    }
+
+    /// Acquire one owned permit immediately, or return `None` without waiting
+    /// when no permit is available. Dropping it restores shared capacity.
+    pub fn try_acquire(&self) -> Option<SemaphorePermit> {
+        Arc::clone(&self.inner)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| SemaphorePermit { _permit: permit })
     }
 
     /// Acquire one permit, waiting until one is available.

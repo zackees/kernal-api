@@ -42,3 +42,13 @@ not an optimized reference-host benchmark or an edit-loop result. It establishes
 that the command reaches real admission and emits a result; it does not establish
 the <=2-second p50 gate. Both bounded-upload and invalid-input tests pass, as
 do strict example Clippy and formatting checks.
+
+The first optimized-host build did not complete: Cranelift's compiler received
+SIGTERM. Soldr's record
+`20260913T025516Z-home-niteris-dev-kernal-api.xml` reports zero cgroup OOM kills;
+the signal's sender is not established. The failed build also pruned intermediate
+metadata, and a concurrent Clippy rerun failed on a missing `.rmeta` file.
+These failed commands are not performance samples. The no-cache Clippy retry
+in a separate target directory passed in 176.24s with warnings denied; no
+optimized-host timing is available yet. All three example tests and the
+single-reviewer check pass.

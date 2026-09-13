@@ -757,3 +757,27 @@ The two worker proofs pass in 19.67s, and forced-output cleanup passes in
 10.81s. Strict host-library Clippy and formatting checks pass. The same
 reviewer independently reran the actual-artifact proof (6.13s) and returned
 clean for the regression, counter changes, snapshot, and evidence documents.
+
+## Public guest six-target native evidence
+
+[CI run 34733726389](https://github.com/zackees/kernal-api/actions/runs/34733726389)
+completed successfully for `8eeb166a2ee99a88f8c1f3510fa4e465379d931b`.
+Each native screenshot job's log reports 6 ordinary tests and 16 native cases
+passed, with no failures. The native cases were explicitly run, not counted
+as passing merely because the ordinary invocation ignored them.
+
+| Native target | Ordinary tests | Native cases | Native case duration |
+| --- | ---: | ---: | ---: |
+| Linux x86-64 | 6 | 16 | 155.62s |
+| Linux ARM64 | 6 | 16 | 143.08s |
+| macOS x86-64 | 6 | 16 | 166.39s |
+| macOS ARM64 | 6 | 16 | 137.82s |
+| Windows x86-64 | 6 | 16 | 156.75s |
+| Windows ARM64 | 6 | 16 | 146.17s |
+
+This validates the public-facade screenshot migration at that exact head.
+The later unsealed-output retry regression has separate local Wasm/worker
+evidence above; the admission timing example is also later work. Neither is
+represented as part of this CI run. Matching release pins, default image
+dependency isolation, the representative policy/archive experiments, and
+the binding-candidate decision remain outstanding.

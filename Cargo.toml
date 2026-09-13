@@ -39,6 +39,7 @@ secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 command-arguments = ["dep:shell-words"]
 config-toml = ["dep:toml"]
+source-cpp = ["dep:tree-sitter", "dep:tree-sitter-cpp"]
 terminal-style = []
 # Native terminal capture and key decoding without PTY process spawning.
 terminal-input = []
@@ -226,6 +227,8 @@ getrandom = { version = "=0.4.3", optional = true }
 strsim = { version = "=0.11.1", optional = true }
 toml = { version = "=0.8.23", optional = true }
 shell-words = { version = "=1.1.1", optional = true }
+tree-sitter = { version = "=0.26.11", optional = true }
+tree-sitter-cpp = { version = "=0.23.4", optional = true }
 globset = { version = "=0.4.18", optional = true }
 interprocess = { version = "=2.4.3", optional = true }
 jwalk = { version = "=0.8.1", optional = true }
@@ -387,6 +390,7 @@ toml = "=0.8.23"
 features = [
   "full",
   "config-toml",
+  "source-cpp",
   "daemon-identity",
   "daemon-frame-v1",
   "daemon-registration",

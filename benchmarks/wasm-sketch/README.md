@@ -181,3 +181,13 @@ the fresh-target sample was 28.344s and the no-op 1.339s. Every component was
 machine: it neither meets the <=2s timing threshold in this run nor establishes
 a release-mode or reference-host result. Raw logs, components, and the isolated
 source remain at `/tmp/kernal-component-measure-c1df497`.
+
+The optimized-host run is retained in
+[results/component-release-diagnostic.json](results/component-release-diagnostic.json).
+All ten edits produced distinct, validated 71,378-byte components: p50 1.157s,
+p95 1.200s, fresh-target 27.897s, and no-op 0.446s. The encoder was built with
+`--release --features engine-probe`; the guest snapshot was `ff7965e`.
+A native combined-feature check was active concurrently. This improves the
+diagnostic latency evidence but is still not a quiet reference-host run,
+same-facade comparison, full correctness gate, or candidate selection.
+Raw evidence remains at `/tmp/kernal-component-release-measure-ff7965e`.

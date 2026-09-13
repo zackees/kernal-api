@@ -1,0 +1,135 @@
+{
+  "schema": 1,
+  "status": "complete-diagnostic-only",
+  "candidate": "component-private-probe",
+  "revision": "ff7965e2c2df50db036a4d306d9532bf4742c673",
+  "host": "Linux-6.18.48-x86_64-with-glibc2.42",
+  "samples": [
+    {
+      "label": "cold",
+      "wall_ns": 27897130402,
+      "build_ns": 27835170588,
+      "encode_and_compile_command_ns": 61545661,
+      "module_bytes": 71378,
+      "source_sha256": "86bd8ee5257dac8a78a69b306ab697f2f1d75d14a27d83b4532ab9ae52a6563d",
+      "module_sha256": "bc0adc14fa00d7131613a92aa52ca734afb1f540ca14b947fa86a87e4a21a9f8"
+    },
+    {
+      "label": "noop",
+      "wall_ns": 445762351,
+      "build_ns": 382913629,
+      "encode_and_compile_command_ns": 62221307,
+      "module_bytes": 71378,
+      "source_sha256": "86bd8ee5257dac8a78a69b306ab697f2f1d75d14a27d83b4532ab9ae52a6563d",
+      "module_sha256": "bc0adc14fa00d7131613a92aa52ca734afb1f540ca14b947fa86a87e4a21a9f8"
+    },
+    {
+      "label": "edit-1",
+      "wall_ns": 1149199909,
+      "build_ns": 1086111527,
+      "encode_and_compile_command_ns": 62829811,
+      "module_bytes": 71378,
+      "source_sha256": "707daa51767667e7ea2cb8446d7f8b00e3d9f9f0776157520f67917dcd8d313b",
+      "module_sha256": "2aecb423900ac35422b99cc04d5de1f87f2df47599f658c8180eb9626ea63952"
+    },
+    {
+      "label": "edit-2",
+      "wall_ns": 1159986556,
+      "build_ns": 1095489899,
+      "encode_and_compile_command_ns": 64016437,
+      "module_bytes": 71378,
+      "source_sha256": "ff8c0cd83b66cf336bd11291f864bf57ce8577e3524ab05dd195d0c49f35a76a",
+      "module_sha256": "da408f6cc1245662538f98323af92ce994c3f67e9ff0603eef3c465059f8077a"
+    },
+    {
+      "label": "edit-3",
+      "wall_ns": 1162921255,
+      "build_ns": 1093507674,
+      "encode_and_compile_command_ns": 69099943,
+      "module_bytes": 71378,
+      "source_sha256": "82551ab01e4482dcf272cc48faadb85e201281d45e00e99017d6461991fc1404",
+      "module_sha256": "6c3b4c53caffe1f3b2a3dc11d2f8136ad349827f84ace80e31ec9ad741d9cec6"
+    },
+    {
+      "label": "edit-4",
+      "wall_ns": 1159396766,
+      "build_ns": 1097784146,
+      "encode_and_compile_command_ns": 61231231,
+      "module_bytes": 71378,
+      "source_sha256": "0fcfae5d2920175a109049a61958552bca476a8b2e23b1ba9ba2669fd19a56fa",
+      "module_sha256": "493ff1d6ea11afa5b9e0e615ece576ae8e853fd2258ac03d17ee244650a6aadb"
+    },
+    {
+      "label": "edit-5",
+      "wall_ns": 1158719944,
+      "build_ns": 1096553618,
+      "encode_and_compile_command_ns": 61836477,
+      "module_bytes": 71378,
+      "source_sha256": "06ab4029c6675fe2ad76863474c494c00992328dacdebf2ec9fe312d388983e4",
+      "module_sha256": "1c5edd535f1716683783f9db62278f705613125da060d8d003a5c2b43758ab34"
+    },
+    {
+      "label": "edit-6",
+      "wall_ns": 1199537195,
+      "build_ns": 1134245048,
+      "encode_and_compile_command_ns": 64974953,
+      "module_bytes": 71378,
+      "source_sha256": "1e4123c43ab86749bb7b6418415705f870b3b79e75de238255ab2acd9b8650d3",
+      "module_sha256": "f19e41ed7632a0977c9aa54dcc57579bb36d4be2c049b44830635fbdd86ecb04"
+    },
+    {
+      "label": "edit-7",
+      "wall_ns": 1155439033,
+      "build_ns": 1093307363,
+      "encode_and_compile_command_ns": 61824905,
+      "module_bytes": 71378,
+      "source_sha256": "da82c37427e2df7867acd630c633eaeb2c59fa2e4e4a2a1fbc0d4bd7e2095eeb",
+      "module_sha256": "9f3d078855f96b516c322dd1a5321685c0b6d59e84be43888be3e7bf0bd4838f"
+    },
+    {
+      "label": "edit-8",
+      "wall_ns": 1147372288,
+      "build_ns": 1086030222,
+      "encode_and_compile_command_ns": 60937131,
+      "module_bytes": 71378,
+      "source_sha256": "a11835c1fbd88e061cd955bf9da0183b06dffa0df6eb4c6502b76bf430273b7a",
+      "module_sha256": "8676ff3a4b92dcbcee91ad2f6efde157293d425b76c243d2d57041806a0e9255"
+    },
+    {
+      "label": "edit-9",
+      "wall_ns": 1145300248,
+      "build_ns": 1081983641,
+      "encode_and_compile_command_ns": 62920450,
+      "module_bytes": 71378,
+      "source_sha256": "29d00d6c7ce65ddaad53d6cdf2958532fc219e831d7c3dc219bd3ca881ede860",
+      "module_sha256": "0c6db7d1ba8347d632f74b671ae52c9ac4fe2d2ae1aa07d4dc96e8a50c0e9b83"
+    },
+    {
+      "label": "edit-10",
+      "wall_ns": 1124256665,
+      "build_ns": 1063996052,
+      "encode_and_compile_command_ns": 59884785,
+      "module_bytes": 71378,
+      "source_sha256": "0050bbecc40a46a9dcc704ba6e1e08ec439ced0541bf3b86293051f49d90f386",
+      "module_sha256": "5e2afccc8858cf49ef309510c705924d14dbefb7d5347f011807770e7b9ba9bc"
+    }
+  ],
+  "encoder_sha256": "38950e51e2ee43b9711d650df07c43b1b1390060a67b2425a798bc5e384fc28d",
+  "cache_mode": "soldr-disabled",
+  "cache_hit_rate": null,
+  "peak_compiler_rss_bytes": null,
+  "limitations": [
+    "shared host, not the controlled reference-host latency gate",
+    "private generated API, not the same public facade as core",
+    "cache hit rate and compiler memory are not collected",
+    "includes encoding and engine compilation, no instantiation or execution",
+    "encoder optimization profile is caller supplied; retain its build log",
+    "native combined-feature check active concurrently during this run"
+  ],
+  "edit_summary": {
+    "p50_ns": 1157079488.5,
+    "p95_ns": 1199537195
+  },
+  "evidence_directory": "/tmp/kernal-component-release-measure-ff7965e",
+  "encoder_profile": "release"
+}

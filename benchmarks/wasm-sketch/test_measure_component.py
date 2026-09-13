@@ -8,15 +8,17 @@ from measure_core import edit_summary
 
 class ComponentMeasurementTests(unittest.TestCase):
     def test_recorded_diagnostic_has_ten_distinct_compiled_edits(self):
-        path = Path(__file__).parent / "results/component-debug-diagnostic.json"
-        record = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(record["status"], "complete-diagnostic-only")
-        self.assertEqual(record["encoder_profile"], "debug")
-        self.assertEqual(len(record["samples"]), 12)
-        self.assertEqual(edit_summary(record["samples"][2:]), record["edit_summary"])
-        for sample in record["samples"]:
-            self.assertGreater(sample["module_bytes"], 0)
-            self.assertGreater(sample["encode_and_compile_command_ns"], 0)
+        for profile in ("debug", "release"):
+            with self.subTest(profile=profile):
+                path = Path(__file__).parent / f"results/component-{profile}-diagnostic.json"
+                record = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(record["status"], "complete-diagnostic-only")
+                self.assertEqual(record["encoder_profile"], profile)
+                self.assertEqual(len(record["samples"]), 12)
+                self.assertEqual(edit_summary(record["samples"][2:]), record["edit_summary"])
+                for sample in record["samples"]:
+                    self.assertGreater(sample["module_bytes"], 0)
+                    self.assertGreater(sample["encode_and_compile_command_ns"], 0)
 
     def test_edit_changes_exactly_one_runtime_limit(self):
         source = "if total > 64 * 1024 * 1024 {"

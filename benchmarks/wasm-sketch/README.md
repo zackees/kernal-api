@@ -52,3 +52,54 @@ These failed commands are not performance samples. The no-cache Clippy retry
 in a separate target directory passed in 176.24s with warnings denied; no
 optimized-host timing is available yet. All three example tests and the
 single-reviewer check pass.
+
+The separate no-cache optimized-host retry subsequently completed in 460.24s.
+That is the build time of the native measurement executable and its dependencies,
+not a guest cold-build or edit-loop sample. The optimized-host edit run is
+recorded separately from the debug diagnostic below.
+
+## Isolated core edit runner
+
+```sh
+uv run --no-project benchmarks/wasm-sketch/measure_core.py \
+  --output /absolute/new/result-directory \
+  --admission /absolute/path/to/wasm-admission \
+  --embedder /absolute/path/to/kernal-api-wasm-abi-generator
+uv run --no-project -m unittest discover -s benchmarks/wasm-sketch -p 'test_*.py'
+```
+
+The output directory must not exist. The runner retains a `git archive HEAD`
+source snapshot there, then measures a fresh guest target directory, a no-op,
+and ten real one-line clock-argument edits. Uncommitted source changes are not
+part of the snapshot. It never edits the original guest or deletes old results.
+Each sample includes guest compilation through Soldr, metadata embedding, and
+admission. Logs and module/source hashes are retained. A failed command aborts
+without producing a complete summary. Python 3.10+, Git, tar, Soldr, and the
+installed Rust Wasm target are prerequisites; both helper executables must be
+built beforehand, and their hashes are recorded.
+
+This first runner is explicitly diagnostic: it disables Soldr caching while
+retaining Cargo incremental build state, does not collect compiler RSS or cache
+hit rate, and does not run the Component Model candidate. Its `cold` label means
+an empty guest target directory, not an empty toolchain/registry or cold host
+compiler. A completed result therefore cannot by itself satisfy #13's comparison
+or selection gate. Use an optimized admission executable for performance work;
+a debug-host run only verifies the measurement pipeline.
+
+The first complete diagnostic is retained in
+[results/core-debug-diagnostic.json](results/core-debug-diagnostic.json): all ten
+edits changed both source and admitted-module hashes and passed actual admission.
+End-to-end edit p50 was 5.072s and p95 5.488s with a debug admission host, while
+an unrelated optimized admission-host build was active. This is not a quiet
+reference-host benchmark, does not pass the <=2s gate, and does not select a
+binding candidate. Full logs and the isolated source snapshot remain at the
+`evidence_directory` recorded in the result.
+
+The optimized-host run is in
+[results/core-release-diagnostic.json](results/core-release-diagnostic.json).
+All ten edits produced distinct source and module hashes and passed admission.
+End-to-end edit p50 was 1.380s and p95 1.415s; the fresh guest target-directory
+sample was 17.198s and the no-op 0.608s. The measured edit p50 is below 2s,
+but this remains diagnostic evidence on a shared development host, with caching
+disabled and compiler RSS unmeasured. It does not establish the full #13 gate,
+the Component Model comparison, fixture correctness, or a go/no-go selection.

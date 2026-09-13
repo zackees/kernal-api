@@ -14,6 +14,55 @@ fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
+#[tokio::test]
+async fn diagnostics_survive_server_and_report_rejections_and_task_failures() {
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_request_body_bytes: 1,
+            max_response_body_bytes: 1,
+            handler_timeout: Duration::from_millis(10),
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let diagnostics = server.diagnostics();
+    let task = async_engine::launch(server.serve(|request| async move {
+        match request.target() {
+            "/panic" => panic!("test handler panic"),
+            "/timeout" => std::future::pending().await,
+            _ => Response::new(200, b"too large".to_vec()).unwrap(),
+        }
+    }));
+    for path in ["/response", "/timeout", "/panic"] {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        exchange(addr, request.as_bytes()).await;
+    }
+    exchange(
+        addr,
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\naa",
+    )
+    .await;
+    async_engine::timeout(Duration::from_secs(2), async {
+        while diagnostics.snapshot().task_failures != 1 {
+            async_engine::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.cancel();
+    let _ = task.await;
+    let snapshot = diagnostics.snapshot();
+    assert_eq!(snapshot.accepted_connections, 4);
+    assert_eq!(snapshot.response_rejections, 1);
+    assert_eq!(snapshot.handler_timeouts, 1);
+    assert_eq!(snapshot.request_rejections, 1);
+    assert_eq!(snapshot.task_failures, 1);
+}
+
 #[test]
 fn bodyless_statuses_reject_payloads_and_connection_headers_are_private() {
     for status in [204, 205, 304] {
@@ -26,6 +75,43 @@ fn bodyless_statuses_reject_payloads_and_connection_headers_are_private() {
             .with_header(header, "value")
             .is_err());
     }
+}
+
+#[tokio::test]
+async fn diagnostics_report_protocol_body_and_absolute_deadlines() {
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            body_timeout: Duration::from_millis(10),
+            connection_timeout: Duration::from_millis(50),
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let diagnostics = server.diagnostics();
+    let task =
+        async_engine::launch(server.serve(|_| async { Response::new(200, Vec::new()).unwrap() }));
+    exchange(addr, b"INVALID REQUEST\r\n\r\n").await;
+    exchange(
+        addr,
+        b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    exchange(addr, b"GET / HTTP/1.1\r\n").await;
+    async_engine::timeout(Duration::from_secs(2), async {
+        loop {
+            let s = diagnostics.snapshot();
+            if s.connection_errors >= 1 && s.connection_timeouts == 1 && s.body_timeouts == 1 {
+                break;
+            }
+            async_engine::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(task);
 }
 
 #[tokio::test]

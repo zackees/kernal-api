@@ -10,8 +10,11 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{convert::Infallible, future::Future, io, net::SocketAddr, time::Duration};
 
 mod body;
+mod diagnostics;
 mod transport;
 use body::ServerBody;
+use diagnostics::increment;
+pub use diagnostics::{Diagnostics, Snapshot};
 
 /// Per-server resource and time limits. Body limits bound accepted values, not
 /// memory already allocated by application handlers before returning a response.
@@ -237,6 +240,7 @@ impl Response {
 pub struct Server {
     listener: tokio::net::TcpListener,
     limits: Limits,
+    diagnostics: Diagnostics,
 }
 
 impl Server {
@@ -249,6 +253,7 @@ impl Server {
         Ok(Self {
             listener: tokio::net::TcpListener::bind(address).await?,
             limits,
+            diagnostics: Diagnostics::default(),
         })
     }
 
@@ -258,6 +263,11 @@ impl Server {
     /// Reports a native socket inspection failure.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    /// Shared, fixed-size counters; clone before moving this server into `serve`.
+    pub fn diagnostics(&self) -> Diagnostics {
+        self.diagnostics.clone()
     }
 
     /// Serve until cancelled or a listener error occurs. Connection tasks are
@@ -273,13 +283,20 @@ impl Server {
         let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                _ = tasks.join_next(), if !tasks.is_empty() => {}
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(_)) = result {
+                        increment(&self.diagnostics.0.task_failures);
+                    }
+                }
                 accepted = self.listener.accept(), if tasks.len() < self.limits.max_connections => {
                     let (socket, _) = accepted?;
+                    increment(&self.diagnostics.0.accepted_connections);
                     let handler = handler.clone();
                     let limits = self.limits;
+                    let diagnostics = self.diagnostics.clone();
                     tasks.spawn(async move {
-                        let service = service_fn(move |request| dispatch(request, handler.clone(), limits));
+                        let request_diagnostics = diagnostics.clone();
+                        let service = service_fn(move |request| dispatch(request, handler.clone(), limits, request_diagnostics.clone()));
                         let mut builder = hyper::server::conn::http1::Builder::new();
                         builder.timer(TokioTimer::new())
                             .header_read_timeout(limits.header_timeout)
@@ -287,7 +304,11 @@ impl Server {
                             .max_headers(limits.max_headers);
                         let socket = transport::ProgressIo::new(socket, limits.write_timeout);
                         let connection = builder.serve_connection(TokioIo::new(socket), service);
-                        let _ = tokio::time::timeout(limits.connection_timeout, connection).await;
+                        match tokio::time::timeout(limits.connection_timeout, connection).await {
+                            Err(_) => increment(&diagnostics.0.connection_timeouts),
+                            Ok(Err(_)) => increment(&diagnostics.0.connection_errors),
+                            Ok(Ok(())) => increment(&diagnostics.0.completed_connections),
+                        }
                     });
                 }
             }
@@ -305,6 +326,7 @@ async fn dispatch<H, F>(
     request: hyper::Request<Incoming>,
     handler: H,
     limits: Limits,
+    diagnostics: Diagnostics,
 ) -> Result<hyper::Response<ServerBody>, Infallible>
 where
     H: Fn(Request) -> F,
@@ -317,13 +339,17 @@ where
     )
     .await;
     let body = match collected {
-        Err(_) => return Ok(empty(hyper::StatusCode::REQUEST_TIMEOUT)),
+        Err(_) => {
+            increment(&diagnostics.0.body_timeouts);
+            return Ok(empty(hyper::StatusCode::REQUEST_TIMEOUT));
+        }
         Ok(Err(error)) => {
+            increment(&diagnostics.0.request_rejections);
             return Ok(empty(if error.is::<http_body_util::LengthLimitError>() {
                 hyper::StatusCode::PAYLOAD_TOO_LARGE
             } else {
                 hyper::StatusCode::BAD_REQUEST
-            }))
+            }));
         }
         Ok(Ok(body)) => body.to_bytes().to_vec(),
     };
@@ -335,7 +361,10 @@ where
     };
     let mut response = match tokio::time::timeout(limits.handler_timeout, handler(request)).await {
         Ok(response) => response,
-        Err(_) => return Ok(empty(hyper::StatusCode::GATEWAY_TIMEOUT)),
+        Err(_) => {
+            increment(&diagnostics.0.handler_timeouts);
+            return Ok(empty(hyper::StatusCode::GATEWAY_TIMEOUT));
+        }
     };
     let header_bytes = response
         .headers
@@ -350,6 +379,7 @@ where
         || header_bytes.is_none_or(|bytes| bytes > limits.max_response_header_bytes)
         || response.body.configure(limits).is_err()
     {
+        increment(&diagnostics.0.response_rejections);
         return Ok(empty(hyper::StatusCode::INTERNAL_SERVER_ERROR));
     }
     let mut result = hyper::Response::new(response.body);

@@ -34,6 +34,13 @@ initial transport tests alone.
 - Constructors reject nonempty bodies for 204, 205 and 304, per
   [HTTP semantics](https://httpwg.org/specs/rfc9110.html). Connection-specific
   headers remain private, including keep-alive, proxy-connection and TE.
+- A cloneable diagnostics handle exposes fixed-size saturating counters for
+  accepted/completed connections, connection errors, absolute lifetime expiry,
+  failed tasks (including handler panics), body and handler deadlines, and
+  request/response acceptance failures. It survives server shutdown without
+  retaining request contents or allocating an event queue. Snapshots are not
+  transactional. Header/write/stream failures share the connection-error count;
+  shutdown cancellation is not reported as a task failure.
 
 The body limits are acceptance limits, not precise process-memory guarantees.
 Request collection currently copies the bounded collected body into a vector;
@@ -46,8 +53,6 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 
 ## Required before the server migration can land
 
-- Observable connection/protocol/timeout/handler failures; the current draft
-  isolates client failures but discards their outcomes.
 - Bounded async filesystem effects needed for screenshot persistence.
 - Request path/query handling and application-owned response-header/CORS policy,
   including behavior for transport-generated errors and HEAD/OPTIONS requests.
@@ -58,13 +63,14 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 ## Local evidence
 
 The foundation's focused test initially failed to import the missing module.
-Thirteen integration tests now pass with `http-server,event-stream` enabled:
+Fifteen integration tests cover the draft with `http-server,event-stream` enabled:
 request/response round trip, request rejection, cancellation cleanup,
 invalid limits, connection-capacity waiting, body/handler deadlines,
 header/connection deadlines, response limit/framing validation, a streamed file
 larger than the memory-body limit, SSE delivery before source closure, and a
 non-reading client releasing its connection slot, duplicate/header-byte limits,
-and bodyless-status/connection-header rejection. Five focused unit tests cover
+bodyless-status/connection-header rejection, and diagnostic counters for
+rejections, handler panics, protocol failures and deadlines. Five focused unit tests cover
 bounded file reads, growth/truncation, SSE backpressure/encoding/keepalives, and
 write-timeout activation. The full kernel suite with `http-server,event-stream`,
 strict all-target Clippy, formatting, and dependency-isolation RED -> GREEN

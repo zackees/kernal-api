@@ -33,12 +33,18 @@ jobs:
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          # The native tests use Cargo's dev profile. Prebuilding release
+          # dependencies cannot satisfy their cache keys.
+          prebuild-deps-flags: ""
       - name: Restore native pkg-config search path
         if: runner.os == 'Linux'
         run: |
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - run: soldr cargo test --locked --all-features
+      - name: Test every native feature together
+        timeout-minutes: 15
+        run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
@@ -63,6 +69,12 @@ jobs:
         run: >-
           soldr cargo run --locked --all-features
           --bin kernal-tauri-smoke -- bootstrap
+      - name: Verify native Windows interactive window lifetime
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        run: >-
+          soldr cargo run --locked --all-features
+          --bin kernal-tauri-smoke -- window-close
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.
@@ -170,6 +182,10 @@ jobs:
           - hash-sha256
           - secure-random
           - text-similarity
+          - command-arguments
+          - config-toml
+          - json
+          - source-cpp
           - terminal-style
           - terminal-input
           - event-stream
@@ -204,6 +220,11 @@ jobs:
       - run: >-
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
+      - name: Test JSON with unified arbitrary-precision backend feature
+        if: matrix.feature == 'json'
+        run: >-
+          soldr cargo test --locked --no-default-features
+          --features json,serde_json/arbitrary_precision --test json_documents
 
   # A unit test does not own process main on every test harness, while Tauri
   # requires its event loop to start there.  These executable proofs

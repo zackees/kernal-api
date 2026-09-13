@@ -52,6 +52,22 @@ pub use running_process::{
     SpawnOptions,
 };
 
+#[cfg(feature = "command-arguments")]
+pub mod arguments;
+/// Bounded command-line schema parsing with facade-owned values and diagnostics.
+#[cfg(feature = "command-schema")]
+pub mod command;
+/// Owned application error context and source chaining.
+#[cfg(feature = "error-context")]
+pub mod error;
+
+/// Bounded configuration decoding with caller-owned schemas and defaults.
+#[cfg(feature = "config-toml")]
+pub mod config;
+/// Bounded JSON values and encoding with caller-owned schemas.
+#[cfg(feature = "json")]
+pub mod json;
+
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
@@ -63,6 +79,10 @@ pub mod hash;
 /// worker. Do not call it on an async executor thread.
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+
+/// Bounded source analysis; callers own language integration and product policy.
+#[cfg(feature = "source-cpp")]
+pub mod source;
 
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
@@ -85,6 +105,9 @@ pub mod archive;
 pub mod http;
 #[cfg(feature = "http-server")]
 pub mod http_server;
+/// Owned native pseudo-terminal sessions without backend descriptor types.
+#[cfg(feature = "pty")]
+pub mod pty;
 
 /// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an
 /// existing daemon endpoint.

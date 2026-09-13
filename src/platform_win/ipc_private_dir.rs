@@ -9,13 +9,19 @@ use std::{fs::File, os::windows::io::AsRawHandle as _};
 #[cfg(feature = "ipc")]
 use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 
-/// Protected, inheritable owner-and-SYSTEM DACL for private IPC directories.
+/// Protected, inheritable current-user-and-SYSTEM DACL for private IPC directories.
 ///
 /// OICI is required because applying a protected DACL re-propagates inherited
 /// ACEs through existing descendants. The earlier non-inheritable policy could
 /// leave descendants with an empty DACL, including files with hardlinks outside
 /// the directory. Reapplying this policy repairs that legacy state.
-const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
+#[cfg(feature = "ipc")]
+fn private_dir_sddl() -> io::Result<String> {
+    Ok(format!(
+        "D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",
+        current_user_sid_sddl()?
+    ))
+}
 
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
@@ -25,7 +31,7 @@ pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDir
     if owner_private_directory(path).unwrap_or(false) {
         return Ok(OwnerPrivateDirectoryOutcome::AlreadyPrivate);
     }
-    apply_protected_dacl_sddl(path, PRIVATE_DIR_SDDL)?;
+    apply_protected_dacl_sddl(path, &private_dir_sddl()?)?;
     if owner_private_directory(path)? {
         Ok(OwnerPrivateDirectoryOutcome::Hardened)
     } else {
@@ -46,28 +52,25 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     }
     // Binary equality covers ACL revision, ACE flags/masks/SIDs/order and
     // callback or object payloads that SDDL substring checks can misclassify.
-    let expected = LocalSecurityDescriptor::from_sddl(PRIVATE_DIR_SDDL)?;
+    let expected = LocalSecurityDescriptor::from_sddl(&private_dir_sddl()?)?;
     Ok(actual.dacl()?.bytes()? == expected.dacl()?.bytes()?)
 }
 
 /// Validate the confidentiality policy of an already-open regular file.
 ///
 /// This uses `GetSecurityInfo` on the handle rather than reopening the path:
-/// a rename or reparse-point swap cannot change the object whose owner and
-/// DACL are checked. We accept only the two exact owner/SYSTEM full-control
-/// ACL forms Windows creates directly or by inheriting `PRIVATE_DIR_SDDL`.
-/// Every other ACE kind, principal, mask, order, or callback payload differs
-/// byte-for-byte and fails closed.
+/// a rename or reparse-point swap cannot change the object whose DACL is
+/// checked. We accept only the exact current-user/SYSTEM full-control
+/// ACL forms Windows creates directly or by inheriting `private_dir_sddl()`.
+/// Every other ACE kind, principal, mask, order, size, or callback payload
+/// fails closed.
 #[cfg(feature = "fs")]
 pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{
-        EqualSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    };
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
 
     let current_sid = current_user_sid_bytes()?;
-    let mut owner: PSID = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     // SAFETY: `file` owns a live handle; all output pointers refer to writable
     // locals. On success the descriptor is a LocalFree allocation adopted
@@ -76,8 +79,8 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
         GetSecurityInfo(
             file.as_raw_handle() as _,
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut owner,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -91,25 +94,74 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
         return Err(io::Error::new(io::ErrorKind::InvalidData, "file security descriptor is incomplete"));
     }
     let actual = LocalSecurityDescriptor(descriptor);
-    if owner.is_null() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file security descriptor has no owner"));
+    let is_private = dacl_is_exact_user_system_file_policy(
+        &actual.dacl()?.bytes()?,
+        &current_sid,
+    );
+    #[cfg(test)]
+    if !is_private {
+        eprintln!("private file DACL does not match the current-user/SYSTEM policy");
     }
-    // SAFETY: owner was returned from `actual` and current_sid contains the
-    // valid SID bytes copied from the current process token.
-    if unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } == 0 {
-        return Ok(false);
-    }
-    // `OW` is the Owner Rights SID rather than a literal account SID: it is
-    // exactly what the protected parent policy inherits into a child. The
-    // owner equality above independently proves this object belongs to the
-    // current user.
-    let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
-    let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
-    let actual = actual.dacl()?.bytes()?;
-    Ok(actual == direct.dacl()?.bytes()? || actual == inherited.dacl()?.bytes()?)
+    Ok(is_private)
 }
 
 #[cfg(feature = "fs")]
+fn dacl_is_exact_user_system_file_policy(dacl: &[u8], current_sid: &[u8]) -> bool {
+    // ACL header: revision, reserved, byte size, ACE count, reserved.
+    if dacl.len() < 8
+        || dacl[0] != 2
+        || u16::from_le_bytes([dacl[2], dacl[3]]) as usize != dacl.len()
+        || u16::from_le_bytes([dacl[4], dacl[5]]) != 2
+    {
+        return false;
+    }
+    const SYSTEM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let Some(next) = exact_full_control_ace(dacl, 8, current_sid) else {
+        return false;
+    };
+    exact_full_control_ace(dacl, next, SYSTEM_SID).is_some_and(|end| end == dacl.len())
+}
+
+#[cfg(feature = "fs")]
+fn exact_full_control_ace(dacl: &[u8], offset: usize, principal: &[u8]) -> Option<usize> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const INHERITED_ACE: u8 = 0x10;
+    const OBJECT_INHERIT_ACE: u8 = 0x01;
+    const CONTAINER_INHERIT_ACE: u8 = 0x02;
+    const FULL_CONTROL: u32 = 0x001f_01ff;
+
+    let header_end = offset.checked_add(8)?;
+    if header_end > dacl.len() || dacl[offset] != ACCESS_ALLOWED_ACE_TYPE {
+        return None;
+    }
+    let flags = dacl[offset + 1];
+    // Direct files use no inheritance flags. Windows may retain the parent's
+    // OI|CI flags when materializing an inherited file ACE, always with ID.
+    if flags != 0
+        && flags != INHERITED_ACE
+        && flags != (INHERITED_ACE | OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+    {
+        return None;
+    }
+    let ace_size = u16::from_le_bytes([dacl[offset + 2], dacl[offset + 3]]) as usize;
+    if ace_size != 8 + principal.len() {
+        return None;
+    }
+    let end = offset.checked_add(ace_size)?;
+    if end > dacl.len()
+        || u32::from_le_bytes([
+            dacl[offset + 4],
+            dacl[offset + 5],
+            dacl[offset + 6],
+            dacl[offset + 7],
+        ]) != FULL_CONTROL
+        || &dacl[header_end..end] != principal
+    {
+        return None;
+    }
+    Some(end)
+}
+
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
@@ -146,6 +198,37 @@ fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     if length == 0 || length > 1024 { return Err(io::Error::new(io::ErrorKind::InvalidData, "implausible current-user SID length")); }
     // SAFETY: IsValidSid and GetLengthSid above validated this live token SID.
     Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length).to_vec() })
+}
+
+#[cfg(any(feature = "fs", feature = "ipc"))]
+fn current_user_sid_sddl() -> io::Result<String> {
+    let bytes = current_user_sid_bytes()?;
+    let revision = *bytes
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty current-user SID"))?;
+    let sub_authority_count = *bytes
+        .get(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated current-user SID"))?
+        as usize;
+    let expected_len = 8 + sub_authority_count * 4;
+    if bytes.len() != expected_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid current-user SID length",
+        ));
+    }
+    let mut authority = 0_u64;
+    for byte in &bytes[2..8] {
+        authority = (authority << 8) | u64::from(*byte);
+    }
+    let mut sddl = format!("S-{revision}-{authority}");
+    for index in 0..sub_authority_count {
+        let offset = 8 + index * 4;
+        let sub_authority = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        sddl.push('-');
+        sddl.push_str(&sub_authority.to_string());
+    }
+    Ok(sddl)
 }
 
 #[cfg(feature = "ipc")]
@@ -392,8 +475,29 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(&directory, "D:P(A;OICI;FA;;;SY)(OA;OICI;FA;;;OW)")
-            .unwrap();
+        apply_protected_dacl_sddl(
+            &directory,
+            &format!(
+                "D:P(A;OICI;FA;;;SY)(OA;OICI;FA;;;{})",
+                current_user_sid_sddl().unwrap()
+            ),
+        )
+        .unwrap();
+
+        assert!(!owner_private_directory(&directory).unwrap());
+        assert_eq!(
+            ensure_owner_private_directory(&directory).unwrap(),
+            OwnerPrivateDirectoryOutcome::Hardened
+        );
+        assert!(owner_private_directory(&directory).unwrap());
+    }
+
+    #[test]
+    fn interactive_principal_dacl_is_rejected_and_repaired() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        fs::create_dir_all(&directory).unwrap();
+        apply_protected_dacl_sddl(&directory, "D:P(A;OICI;FA;;;IU)(A;OICI;FA;;;SY)").unwrap();
 
         assert!(!owner_private_directory(&directory).unwrap());
         assert_eq!(
@@ -411,14 +515,22 @@ mod tests {
         let parent = temporary.path().join("parent");
         let directory = parent.join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(&parent, "D:P(A;;FA;;;OW)(A;;FA;;;SY)").unwrap();
-        apply_protected_dacl_sddl(&directory, PRIVATE_DIR_SDDL).unwrap();
+        apply_protected_dacl_sddl(
+            &parent,
+            &format!(
+                "D:P(A;;FA;;;{})(A;;FA;;;SY)",
+                current_user_sid_sddl().unwrap()
+            ),
+        )
+        .unwrap();
+        let private_sddl = private_dir_sddl().unwrap();
+        apply_protected_dacl_sddl(&directory, &private_sddl).unwrap();
         let protected = file_security_descriptor(&directory).unwrap();
         let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
 
         apply_dacl_sddl(
             &directory,
-            PRIVATE_DIR_SDDL,
+            &private_sddl,
             UNPROTECTED_DACL_SECURITY_INFORMATION,
         )
         .unwrap();
@@ -471,7 +583,11 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(&file, b"payload").unwrap();
 
-        apply_protected_dacl_sddl(&directory, "D:P(A;;FA;;;OW)").unwrap();
+        apply_protected_dacl_sddl(
+            &directory,
+            &format!("D:P(A;;FA;;;{})", current_user_sid_sddl().unwrap()),
+        )
+        .unwrap();
         assert!(!owner_private_directory(&directory).unwrap());
         assert!(File::open(&file).is_err());
         assert_eq!(
@@ -490,9 +606,11 @@ mod tests {
         let child = directory.join("marker");
         fs::write(&child, b"marker").unwrap();
 
-        assert_eq!(
-            crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap(),
-            b"marker"
+        let read = crate::platform::fs::read_private_regular_file_bounded(&child, 6);
+        assert!(
+            matches!(read.as_deref(), Ok(bytes) if bytes == b"marker"),
+            "inherited child private-file read failed: {read:?}; child DACL bytes: {:02x?}",
+            file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap(),
         );
 
         apply_protected_dacl_sddl(&child, "D:P(A;;GR;;;WD)").unwrap();
@@ -502,5 +620,25 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn private_file_dacl_parser_accepts_only_the_expected_inherited_aces() {
+        let user_sid = [1, 2, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 7, 0, 0, 0];
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut dacl = vec![2, 0, 0, 0, 2, 0, 0, 0];
+        for sid in [&user_sid[..], &system_sid[..]] {
+            dacl.extend([0, 0x10]);
+            dacl.extend((8 + sid.len() as u16).to_le_bytes());
+            dacl.extend(0x001f_01ff_u32.to_le_bytes());
+            dacl.extend(sid);
+        }
+        let dacl_len = dacl.len() as u16;
+        dacl[2..4].copy_from_slice(&dacl_len.to_le_bytes());
+
+        assert!(dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
+        dacl[9] = 1;
+        assert!(!dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
     }
 }

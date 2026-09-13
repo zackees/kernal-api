@@ -48,6 +48,13 @@ pub struct OptionSpec {
     requires_any: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PositionalSpec {
+    name: String,
+    kind: ValueKind,
+    optional: bool,
+}
+
 impl OptionSpec {
     /// Declare a boolean `--name` flag.
     pub fn flag(name: impl Into<String>) -> Self {
@@ -115,6 +122,7 @@ impl OptionSpec {
 pub struct Command {
     name: String,
     options: Vec<OptionSpec>,
+    positionals: Vec<PositionalSpec>,
     subcommands: Vec<Self>,
     exclusive_groups: Vec<(String, Vec<String>)>,
 }
@@ -125,6 +133,7 @@ impl Command {
         Self {
             name: name.into(),
             options: Vec::new(),
+            positionals: Vec::new(),
             subcommands: Vec::new(),
             exclusive_groups: Vec::new(),
         }
@@ -133,6 +142,26 @@ impl Command {
     /// Add a long option.
     pub fn option(mut self, option: OptionSpec) -> Self {
         self.options.push(option);
+        self
+    }
+
+    /// Add a required positional value in declaration order.
+    pub fn positional(mut self, name: impl Into<String>, kind: ValueKind) -> Self {
+        self.positionals.push(PositionalSpec {
+            name: name.into(),
+            kind,
+            optional: false,
+        });
+        self
+    }
+
+    /// Add an optional positional value in declaration order.
+    pub fn optional_positional(mut self, name: impl Into<String>, kind: ValueKind) -> Self {
+        self.positionals.push(PositionalSpec {
+            name: name.into(),
+            kind,
+            optional: true,
+        });
         self
     }
 
@@ -193,7 +222,7 @@ impl Command {
             .map_err(|_| CommandError::InvalidArguments)?;
         let mut path = vec![self.name.clone()];
         let mut schema = self;
-        let mut selected = vec![self];
+        let mut selected = vec![(self, &matches)];
         let mut final_matches = &matches;
         while let Some((name, next)) = final_matches.subcommand() {
             let Some(next_schema) = schema.subcommands.iter().find(|child| child.name == name)
@@ -202,14 +231,18 @@ impl Command {
             };
             path.push(name.to_owned());
             schema = next_schema;
-            selected.push(schema);
             final_matches = next;
+            selected.push((schema, final_matches));
         }
         let mut values = BTreeMap::new();
-        for command in &selected {
-            command.collect_values(final_matches, &mut values)?;
+        for (command, command_matches) in &selected {
+            command.collect_values(command_matches, &mut values)?;
         }
-        Self::validate_selected_relations(&selected, &values)?;
+        let selected_schemas = selected
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>();
+        Self::validate_selected_relations(&selected_schemas, &values)?;
         Ok(ParsedCommand { path, values })
     }
 
@@ -217,7 +250,8 @@ impl Command {
         let mut command = clap::Command::new(self.name.clone())
             .disable_help_flag(false)
             .disable_version_flag(true)
-            .disable_help_subcommand(true);
+            .disable_help_subcommand(true)
+            .subcommand_precedence_over_arg(true);
         for option in &self.options {
             let mut argument = clap::Arg::new(option.name.clone())
                 .long(option.name.clone())
@@ -241,6 +275,17 @@ impl Command {
             }
             if option.repeated {
                 argument = argument.action(clap::ArgAction::Append);
+            }
+            command = command.arg(argument);
+        }
+        for (index, positional) in self.positionals.iter().enumerate() {
+            let mut argument = clap::Arg::new(positional.name.clone())
+                .index(index + 1)
+                .required(!positional.optional)
+                .action(clap::ArgAction::Set);
+            match &positional.kind {
+                ValueKind::String => {}
+                ValueKind::Enumeration(values) => argument = argument.value_parser(values.clone()),
             }
             command = command.arg(argument);
         }
@@ -297,6 +342,18 @@ impl Command {
                 }
                 _ => {}
             }
+        }
+        let mut optional_positional_seen = false;
+        for positional in &self.positionals {
+            if !valid_name(&positional.name)
+                || positional.name == "help"
+                || !option_names.insert(positional.name.clone())
+                || (optional_positional_seen && !positional.optional)
+                || matches!(&positional.kind, ValueKind::Enumeration(values) if values.is_empty() || values.iter().any(|value| value.contains('\0')))
+            {
+                return Err(CommandError::InvalidSchema);
+            }
+            optional_positional_seen |= positional.optional;
         }
         for child in &self.subcommands {
             if child.name == "help" || !child_names.insert(child.name.clone()) {
@@ -364,6 +421,15 @@ impl Command {
                     .unwrap_or(ParsedValue::Absent),
             };
             values.insert(option.name.clone(), value);
+        }
+        for positional in &self.positionals {
+            let value = matches
+                .try_get_one::<String>(&positional.name)
+                .map_err(|_| CommandError::InvalidArguments)?
+                .cloned()
+                .map(ParsedValue::String)
+                .unwrap_or(ParsedValue::Absent);
+            values.insert(positional.name.clone(), value);
         }
         Ok(())
     }

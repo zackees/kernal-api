@@ -571,6 +571,15 @@ the seven Linux staging/publication tests. A Windows-only identity mismatch
 test is added; the existing renamed-parent tests are unchanged. Native
 Windows runtime GREEN is still required before treating this as resolved.
 
+Native result at `b61c48f`: Windows x64 all-feature CI job `103654061802`
+in run `34731156181` passed 617 tests but failed both renamed-parent unit
+regressions at the rename itself with `AccessDenied` (3 tests ignored).
+The metadata-only handle candidate therefore does **not** resolve ancestor
+rename pinning. Its identity-mismatch test passes, but that is not evidence
+for the missing rename behavior. Keep the regression failures visible while
+revisiting directory ownership; neither cross-compilation nor the clean
+static review substitutes for this native result.
+
 The actual contained screenshot guest now also passes the renamed-parent
 scenario on Linux x86-64 (9.33s). The fixture renames the destination parent
 upon the first native HTTP request, after staging/grant creation. The guest

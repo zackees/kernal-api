@@ -62,8 +62,8 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
 /// a rename or reparse-point swap cannot change the object whose owner and
 /// DACL are checked. We accept only the exact current-user/SYSTEM full-control
 /// ACL forms Windows creates directly or by inheriting `private_dir_sddl()`.
-/// Every other ACE kind, principal, mask, order, or callback payload differs
-/// byte-for-byte and fails closed.
+/// Every other ACE kind, principal, mask, order, size, or callback payload
+/// fails closed.
 #[cfg(feature = "fs")]
 pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -105,25 +105,67 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     if unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } == 0 {
         return Ok(false);
     }
-    let current_sid_sddl = current_user_sid_sddl()?;
-    let direct = LocalSecurityDescriptor::from_sddl(&format!(
-        "D:P(A;;FA;;;{current_sid_sddl})(A;;FA;;;SY)"
-    ))?;
-    let inherited = LocalSecurityDescriptor::from_sddl(&format!(
-        "D:(A;ID;FA;;;{current_sid_sddl})(A;ID;FA;;;SY)"
-    ))?;
-    // Windows preserves the parent OI|CI inheritance flags on some inherited
-    // file ACEs (notably on the hosted Windows runners), in addition to ID.
-    // It is the same two-principal full-control policy, not a broader ACL.
-    let inherited_with_propagation = LocalSecurityDescriptor::from_sddl(&format!(
-        "D:(A;OICIID;FA;;;{current_sid_sddl})(A;OICIID;FA;;;SY)"
-    ))?;
-    let actual = actual.dacl()?.bytes()?;
-    Ok(
-        actual == direct.dacl()?.bytes()?
-            || actual == inherited.dacl()?.bytes()?
-            || actual == inherited_with_propagation.dacl()?.bytes()?,
-    )
+    Ok(dacl_is_exact_user_system_file_policy(
+        &actual.dacl()?.bytes()?,
+        &current_sid,
+    ))
+}
+
+#[cfg(feature = "fs")]
+fn dacl_is_exact_user_system_file_policy(dacl: &[u8], current_sid: &[u8]) -> bool {
+    // ACL header: revision, reserved, byte size, ACE count, reserved.
+    if dacl.len() < 8
+        || dacl[0] != 2
+        || u16::from_le_bytes([dacl[2], dacl[3]]) as usize != dacl.len()
+        || u16::from_le_bytes([dacl[4], dacl[5]]) != 2
+    {
+        return false;
+    }
+    const SYSTEM_SID: &[u8] = &[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    let Some(next) = exact_full_control_ace(dacl, 8, current_sid) else {
+        return false;
+    };
+    exact_full_control_ace(dacl, next, SYSTEM_SID).is_some_and(|end| end == dacl.len())
+}
+
+#[cfg(feature = "fs")]
+fn exact_full_control_ace(dacl: &[u8], offset: usize, principal: &[u8]) -> Option<usize> {
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const INHERITED_ACE: u8 = 0x10;
+    const OBJECT_INHERIT_ACE: u8 = 0x01;
+    const CONTAINER_INHERIT_ACE: u8 = 0x02;
+    const FULL_CONTROL: u32 = 0x001f_01ff;
+
+    let header_end = offset.checked_add(8)?;
+    if header_end > dacl.len() || dacl[offset] != ACCESS_ALLOWED_ACE_TYPE {
+        return None;
+    }
+    let flags = dacl[offset + 1];
+    // Direct files use no inheritance flags. Windows may retain the parent's
+    // OI|CI flags when materializing an inherited file ACE, always with ID.
+    if flags != 0
+        && flags != INHERITED_ACE
+        && flags != (INHERITED_ACE | OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE)
+    {
+        return None;
+    }
+    let ace_size = u16::from_le_bytes([dacl[offset + 2], dacl[offset + 3]]) as usize;
+    if ace_size != 8 + principal.len() {
+        return None;
+    }
+    let end = offset.checked_add(ace_size)?;
+    if end > dacl.len()
+        || u32::from_le_bytes([
+            dacl[offset + 4],
+            dacl[offset + 5],
+            dacl[offset + 6],
+            dacl[offset + 7],
+        ]) != FULL_CONTROL
+        || &dacl[header_end..end] != principal
+    {
+        return None;
+    }
+    Some(end)
 }
 
 #[cfg(any(feature = "fs", feature = "ipc"))]
@@ -585,5 +627,24 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn private_file_dacl_parser_accepts_only_the_expected_inherited_aces() {
+        let user_sid = [1, 2, 0, 0, 0, 0, 0, 5, 21, 0, 0, 0, 7, 0, 0, 0];
+        let system_sid = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+        let mut dacl = vec![2, 0, 0, 0, 2, 0, 0, 0];
+        for sid in [&user_sid[..], &system_sid[..]] {
+            dacl.extend([0, 0x10]);
+            dacl.extend((8 + sid.len() as u16).to_le_bytes());
+            dacl.extend(0x001f_01ff_u32.to_le_bytes());
+            dacl.extend(sid);
+        }
+        dacl[2..4].copy_from_slice(&(dacl.len() as u16).to_le_bytes());
+
+        assert!(dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
+        dacl[9] = 1;
+        assert!(!dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
     }
 }

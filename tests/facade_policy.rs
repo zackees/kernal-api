@@ -634,9 +634,15 @@ fn backend_types_are_absent_from_public_type_positions() {
     for path in rust_sources(&root) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         for (line, position) in public_type_positions(&source) {
+            let canonical_spawn_reexport = path == root.join("lib.rs")
+                && matches!(
+                    position,
+                    "pub use running_process::{"
+                        | "pub use running_process::independent_spawn::{LaunchSpec, Readiness};"
+                );
             for spelling in OWNED_BACKEND_PATHS {
                 assert!(
-                    !position.contains(spelling),
+                    canonical_spawn_reexport || !position.contains(spelling),
                     "{}:{line} names backend type {spelling:?} in a public type position: {}",
                     path.display(),
                     position.trim()

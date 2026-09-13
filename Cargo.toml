@@ -43,6 +43,8 @@ secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 command-arguments = ["dep:shell-words"]
 command-schema = ["dep:clap"]
+# Owned, bounded application-error context without a third-party error carrier.
+error-context = []
 config-toml = ["dep:toml"]
 json = ["dep:serde", "dep:serde_json"]
 source-cpp = ["dep:tree-sitter", "dep:tree-sitter-cpp"]

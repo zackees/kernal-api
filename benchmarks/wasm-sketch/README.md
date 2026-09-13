@@ -139,3 +139,45 @@ Ten distinct edits passed admission, with p50 1.372s and p95 1.391s.
 The largest GNU time build-command reading was 264,003,584 bytes (251.77 MiB),
 on the fresh-target sample. This is the scoped diagnostic described above,
 not complete compiler/process-tree memory accounting or binding selection.
+
+## Isolated component edit runner
+
+Build `component-tools` with only `--features engine-probe` (not
+`execution-probe`), then run:
+
+```sh
+uv run --no-project benchmarks/wasm-sketch/measure_component.py \
+  --output /absolute/new/component-result-directory \
+  --encoder /absolute/path/to/kernal-component-tools
+```
+
+This runner takes a committed source snapshot and an empty guest target
+directory, then measures cold/no-op/ten one-line edits. Each edit changes the
+consumer's runtime byte ceiling by one MiB, starting at 64 MiB; it is not a
+comment-only edit. Both source and resulting component hashes must differ
+across all ten edits. Every sample includes Soldr guest compilation, component
+encoding, structural/import validation, and actual Wasmtime 45 compilation.
+The encoder's two success lines and exact output size are checked, so an
+encoding-only executable cannot silently count as engine validation.
+
+The runner retains each component and command log and refuses an existing
+output directory. As with the core runner, cold means a fresh guest target,
+not a fresh registry/toolchain. Python 3.10+, Git, tar, Soldr, and the installed
+`wasm32-unknown-unknown` target are prerequisites. Build the encoder in release
+mode for performance conclusions; debug mode only diagnoses the pipeline.
+
+This is still the private Component Model probe, not the same public facade
+as the core candidate. It regenerates bindings during compilation and does
+not measure instantiation, execution, cache hit rate, or compiler memory.
+Do not treat these diagnostic timings as the controlled reference-host gate
+or a binding selection. The existing execution tests separately cover the
+unchanged 64 MiB transfer workload.
+
+The first complete run is retained in
+[results/component-debug-diagnostic.json](results/component-debug-diagnostic.json).
+Ten distinct compiled components measured 2.058s p50 and 2.359s p95 end-to-end;
+the fresh-target sample was 28.344s and the no-op 1.339s. Every component was
+71,378 bytes. This used a debug encoder/engine host on the shared development
+machine: it neither meets the <=2s timing threshold in this run nor establishes
+a release-mode or reference-host result. Raw logs, components, and the isolated
+source remain at `/tmp/kernal-component-measure-c1df497`.

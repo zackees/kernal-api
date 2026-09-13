@@ -5,7 +5,9 @@ use std::cell::RefCell;
 
 use gtk::gdk::prelude::MonitorExt as _;
 use gtk::prelude::GtkSettingsExt as _;
-use webkit2gtk::{PermissionRequestExt as _, SettingsExt as _, WebViewExt as _};
+use webkit2gtk::{
+    PermissionRequestExt as _, SettingsExt as _, UserContentManagerExt as _, WebViewExt as _,
+};
 
 use super::WebviewPermissions;
 
@@ -14,6 +16,20 @@ mod dpi;
 
 thread_local! {
     static DPI: RefCell<Option<(gtk::Settings, dpi::Correction)>> = const { RefCell::new(None) };
+}
+
+/// Published Wry installs an IPC script and endpoint even with no application
+/// handler. This capability permits neither, nor any initialization scripts.
+/// Called on the UI thread before the facade initiates the first navigation.
+pub(super) fn remove_host_bridge(
+    webview: &webkit2gtk::WebView,
+) -> Result<(), super::NativeWebviewError> {
+    let manager = webview.user_content_manager().ok_or_else(|| {
+        super::NativeWebviewError::HostFailure("webview has no user content manager".into())
+    })?;
+    manager.remove_all_scripts();
+    manager.unregister_script_message_handler("ipc");
+    Ok(())
 }
 
 /// Correct page DPI on the GTK thread without repeatedly dividing our own

@@ -641,7 +641,8 @@ mod tests {
             dacl.extend(0x001f_01ff_u32.to_le_bytes());
             dacl.extend(sid);
         }
-        dacl[2..4].copy_from_slice(&(dacl.len() as u16).to_le_bytes());
+        let dacl_len = dacl.len() as u16;
+        dacl[2..4].copy_from_slice(&dacl_len.to_le_bytes());
 
         assert!(dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
         dacl[9] = 1;

@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error),
             }
         };
-        let (mut stream, _) = accept()?;
+        let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
         // Accepted sockets inherit the listener's nonblocking mode on the
         // supported Unix CI hosts.  The proof uses a bounded blocking read so
         // an in-flight navigation cannot race the harness into WouldBlock.
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 return Ok(());
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(socket_stage("read document request")(error)),
         }
         if scenario == SmokeScenario::Timeout {
             // Keep the top-level navigation pending past the facade timeout.
@@ -74,19 +74,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stream,
             "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
             page.len()
-        )?;
-        let (mut report, _) = accept()?;
+        )
+        .map_err(socket_stage("write document response"))?;
+        let (mut report, _) = accept().map_err(socket_stage("accept isolation connection"))?;
         report.set_nonblocking(false)?;
         report.set_read_timeout(Some(Duration::from_secs(5)))?;
         let mut report_request = [0_u8; 4096];
-        let read = report.read(&mut report_request)?;
+        let read = report
+            .read(&mut report_request)
+            .map_err(socket_stage("read isolation request"))?;
         let report_request = String::from_utf8_lossy(&report_request[..read]);
         if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
             return Err(std::io::Error::other(format!(
                 "page observed a prohibited host bridge: {report_request:?}"
             )));
         }
-        report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+        report
+            .write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .map_err(socket_stage("write isolation response"))?;
         Ok(())
     });
 
@@ -282,4 +287,24 @@ fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
 
 fn host_error(error: WebviewError) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+fn socket_stage(stage: &'static str) -> impl FnOnce(std::io::Error) -> std::io::Error {
+    move |error| std::io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn socket_diagnostic_preserves_failure_kind_and_stage() {
+        let error = super::socket_stage("read isolation request")(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "native socket failure",
+        ));
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            error.to_string(),
+            "read isolation request: native socket failure"
+        );
+    }
 }

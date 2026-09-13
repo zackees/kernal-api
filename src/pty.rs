@@ -1,7 +1,9 @@
 //! Owned pseudo-terminal session facade.
 
+#[cfg(not(windows))]
+use crate::platform::terminal::PtyChild;
 use crate::{
-    platform::terminal::{PtyBackend, PtyChild, PtyMaster, PtySize, PtySlave},
+    platform::terminal::{PtyBackend, PtyMaster, PtySize, PtySlave},
     Backend,
 };
 use std::{

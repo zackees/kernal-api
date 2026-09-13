@@ -19,7 +19,7 @@ pub enum ValueKind {
     String,
     /// One of the declared strings.
     Enumeration(Vec<String>),
-    /// A finite or non-finite IEEE-754 double accepted by Rust's `f64` parser.
+    /// A finite IEEE-754 double accepted by Rust's `f64` parser.
     F64,
     /// A non-negative 32-bit integer.
     U32,
@@ -523,12 +523,15 @@ impl Command {
                     .cloned()
                     .map(ParsedValue::String)
                     .unwrap_or(ParsedValue::Absent),
-                Some(ValueKind::F64) => matches
+                Some(ValueKind::F64) => match matches
                     .try_get_one::<f64>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
                     .copied()
-                    .map(ParsedValue::F64)
-                    .unwrap_or(ParsedValue::Absent),
+                {
+                    Some(value) if value.is_finite() => ParsedValue::F64(value),
+                    Some(_) => return Err(CommandError::InvalidArguments),
+                    None => ParsedValue::Absent,
+                },
                 Some(ValueKind::U32) => matches
                     .try_get_one::<u32>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
@@ -546,12 +549,15 @@ impl Command {
                     .cloned()
                     .map(ParsedValue::String)
                     .unwrap_or(ParsedValue::Absent),
-                ValueKind::F64 => matches
+                ValueKind::F64 => match matches
                     .try_get_one::<f64>(&positional.name)
                     .map_err(|_| CommandError::InvalidArguments)?
                     .copied()
-                    .map(ParsedValue::F64)
-                    .unwrap_or(ParsedValue::Absent),
+                {
+                    Some(value) if value.is_finite() => ParsedValue::F64(value),
+                    Some(_) => return Err(CommandError::InvalidArguments),
+                    None => ParsedValue::Absent,
+                },
                 ValueKind::U32 => matches
                     .try_get_one::<u32>(&positional.name)
                     .map_err(|_| CommandError::InvalidArguments)?
@@ -626,7 +632,7 @@ fn valid_value(kind: &ValueKind, value: &str) -> bool {
     match kind {
         ValueKind::String => !value.contains('\0'),
         ValueKind::Enumeration(values) => values.iter().any(|candidate| candidate == value),
-        ValueKind::F64 => value.parse::<f64>().is_ok(),
+        ValueKind::F64 => value.parse::<f64>().is_ok_and(f64::is_finite),
         ValueKind::U32 => value.parse::<u32>().is_ok(),
     }
 }

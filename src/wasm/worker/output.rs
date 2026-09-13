@@ -22,12 +22,38 @@ pub(super) struct FinalizedOutput {
 
 impl StagedOutput {
     pub(super) fn new(destination: &Path) -> io::Result<Self> {
+        // A grant authorizes precisely one canonical parent plus one normal
+        // leaf. Reject a parent component before canonicalizing, because
+        // canonicalization could otherwise turn `approved/../result.png`
+        // into a grant rooted outside `approved`.
+        if destination
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output destination contains a parent path component",
+            ));
+        }
         let parent = destination
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "output has no parent"))?;
         let name = destination.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "output has no file name")
         })?;
+        // Keep this boundary path-free for guests and non-ambiguous for the
+        // host: the final component must be exactly one ordinary file name.
+        let mut name_components = Path::new(name).components();
+        if !matches!(
+            name_components.next(),
+            Some(std::path::Component::Normal(_))
+        ) || name_components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "output file name is not a normal path component",
+            ));
+        }
         let parent = std::fs::canonicalize(parent)?;
         let directory = crate::platform::fs::OwnedScratchDirectory::create_in(&parent)?;
         Ok(Self {
@@ -111,6 +137,19 @@ impl StagedOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_grant_rejects_parent_path_component() {
+        let root = tempfile::tempdir().unwrap();
+        let approved = root.path().join("approved");
+        std::fs::create_dir(&approved).unwrap();
+        let error = StagedOutput::new(&approved.join("..").join("result.png"))
+            .err()
+            .expect(
+            "a parent path component must not broaden an exact output grant",
+        );
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn staged_output_is_invisible_until_parent_commit() {

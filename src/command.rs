@@ -18,6 +18,10 @@ pub enum ValueKind {
     String,
     /// One of the declared strings.
     Enumeration(Vec<String>),
+    /// A finite or non-finite IEEE-754 double accepted by Rust's `f64` parser.
+    F64,
+    /// A non-negative 32-bit integer.
+    U32,
 }
 
 impl ValueKind {
@@ -33,6 +37,16 @@ impl ValueKind {
         S: Into<String>,
     {
         Self::Enumeration(values.into_iter().map(Into::into).collect())
+    }
+
+    /// Accept a Rust `f64` value.
+    pub const fn f64() -> Self {
+        Self::F64
+    }
+
+    /// Accept a Rust `u32` value.
+    pub const fn u32() -> Self {
+        Self::U32
     }
 }
 
@@ -264,6 +278,16 @@ impl Command {
                         .action(clap::ArgAction::Set)
                         .value_parser(values.clone());
                 }
+                Some(ValueKind::F64) => {
+                    argument = argument
+                        .action(clap::ArgAction::Set)
+                        .value_parser(clap::value_parser!(f64));
+                }
+                Some(ValueKind::U32) => {
+                    argument = argument
+                        .action(clap::ArgAction::Set)
+                        .value_parser(clap::value_parser!(u32));
+                }
             }
             if let Some(default) = &option.default {
                 argument = argument.default_value(default);
@@ -286,6 +310,8 @@ impl Command {
             match &positional.kind {
                 ValueKind::String => {}
                 ValueKind::Enumeration(values) => argument = argument.value_parser(values.clone()),
+                ValueKind::F64 => argument = argument.value_parser(clap::value_parser!(f64)),
+                ValueKind::U32 => argument = argument.value_parser(clap::value_parser!(u32)),
             }
             command = command.arg(argument);
         }
@@ -341,6 +367,20 @@ impl Command {
                     return Err(CommandError::InvalidSchema)
                 }
                 _ => {}
+            }
+            if let Some(kind) = &option.kind {
+                if (option.repeated && !matches!(kind, ValueKind::String))
+                    || option
+                        .default
+                        .as_ref()
+                        .is_some_and(|value| !valid_value(kind, value))
+                    || option
+                        .default_missing
+                        .as_ref()
+                        .is_some_and(|value| !valid_value(kind, value))
+                {
+                    return Err(CommandError::InvalidSchema);
+                }
             }
         }
         let mut optional_positional_seen = false;
@@ -408,27 +448,53 @@ impl Command {
                         .copied()
                         .unwrap_or(false),
                 ),
-                Some(_) if option.repeated => matches
+                Some(ValueKind::String) if option.repeated => matches
                     .try_get_many::<String>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
                     .map(|items| ParsedValue::Strings(items.cloned().collect()))
                     .unwrap_or(ParsedValue::Absent),
-                Some(_) => matches
+                Some(ValueKind::String) | Some(ValueKind::Enumeration(_)) => matches
                     .try_get_one::<String>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
                     .cloned()
                     .map(ParsedValue::String)
                     .unwrap_or(ParsedValue::Absent),
+                Some(ValueKind::F64) => matches
+                    .try_get_one::<f64>(&option.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .copied()
+                    .map(ParsedValue::F64)
+                    .unwrap_or(ParsedValue::Absent),
+                Some(ValueKind::U32) => matches
+                    .try_get_one::<u32>(&option.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .copied()
+                    .map(ParsedValue::U32)
+                    .unwrap_or(ParsedValue::Absent),
             };
             values.insert(option.name.clone(), value);
         }
         for positional in &self.positionals {
-            let value = matches
-                .try_get_one::<String>(&positional.name)
-                .map_err(|_| CommandError::InvalidArguments)?
-                .cloned()
-                .map(ParsedValue::String)
-                .unwrap_or(ParsedValue::Absent);
+            let value = match &positional.kind {
+                ValueKind::String | ValueKind::Enumeration(_) => matches
+                    .try_get_one::<String>(&positional.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .cloned()
+                    .map(ParsedValue::String)
+                    .unwrap_or(ParsedValue::Absent),
+                ValueKind::F64 => matches
+                    .try_get_one::<f64>(&positional.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .copied()
+                    .map(ParsedValue::F64)
+                    .unwrap_or(ParsedValue::Absent),
+                ValueKind::U32 => matches
+                    .try_get_one::<u32>(&positional.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .copied()
+                    .map(ParsedValue::U32)
+                    .unwrap_or(ParsedValue::Absent),
+            };
             values.insert(positional.name.clone(), value);
         }
         Ok(())
@@ -479,6 +545,7 @@ fn is_present(value: Option<&ParsedValue>) -> bool {
         Some(ParsedValue::Flag(value)) => *value,
         Some(ParsedValue::String(_)) => true,
         Some(ParsedValue::Strings(values)) => !values.is_empty(),
+        Some(ParsedValue::F64(_)) | Some(ParsedValue::U32(_)) => true,
         Some(ParsedValue::Absent) | None => false,
     }
 }
@@ -491,8 +558,17 @@ fn valid_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+fn valid_value(kind: &ValueKind, value: &str) -> bool {
+    match kind {
+        ValueKind::String => !value.contains('\0'),
+        ValueKind::Enumeration(values) => values.iter().any(|candidate| candidate == value),
+        ValueKind::F64 => value.parse::<f64>().is_ok(),
+        ValueKind::U32 => value.parse::<u32>().is_ok(),
+    }
+}
+
 /// Parsed scalar values independent of the private parser backend.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ParsedValue {
     /// A declared flag.
     Flag(bool),
@@ -500,12 +576,16 @@ pub enum ParsedValue {
     String(String),
     /// A repeated value option, in command-line order.
     Strings(Vec<String>),
+    /// A declared `f64` option or positional.
+    F64(f64),
+    /// A declared `u32` option or positional.
+    U32(u32),
     /// A declared value option was absent and has no default.
     Absent,
 }
 
 /// A facade-owned parsed command line.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ParsedCommand {
     path: Vec<String>,
     values: BTreeMap<String, ParsedValue>,
@@ -537,6 +617,22 @@ impl ParsedCommand {
     pub fn values(&self, name: &str) -> Option<&[String]> {
         match self.values.get(name) {
             Some(ParsedValue::Strings(values)) => Some(values),
+            _ => None,
+        }
+    }
+
+    /// Read a declared `f64` option or positional.
+    pub fn f64(&self, name: &str) -> Option<f64> {
+        match self.values.get(name) {
+            Some(ParsedValue::F64(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// Read a declared `u32` option or positional.
+    pub fn u32(&self, name: &str) -> Option<u32> {
+        match self.values.get(name) {
+            Some(ParsedValue::U32(value)) => Some(*value),
             _ => None,
         }
     }

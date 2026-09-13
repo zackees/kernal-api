@@ -204,6 +204,14 @@ fn typed_scalars_keep_their_types_and_reject_invalid_input() {
         Err(CommandError::InvalidArguments)
     );
     assert_eq!(
+        schema.parse(["fastled", "--timeout", "NaN"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--timeout", "inf"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
         schema.parse(["fastled", "--count", "-1"]),
         Err(CommandError::InvalidArguments)
     );

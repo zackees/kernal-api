@@ -118,7 +118,7 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     }
     assert!(
         workflow_job(&release_workflow, "publish-crates")
-            .contains("needs: [release-guard, validate-and-package]"),
+            .contains("needs: [release-guard, validate-and-package, release-assets]"),
         "publish-crates must directly depend on release-guard before cargo publish"
     );
 

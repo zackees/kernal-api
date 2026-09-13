@@ -113,6 +113,7 @@ pub(crate) enum NativeWebviewError {
 pub(crate) struct NativeWebviewRequest {
     url: Url,
     permissions: WebviewPermissions,
+    window: Option<WebviewWindowOptions>,
 }
 
 impl NativeWebviewRequest {
@@ -132,7 +133,11 @@ impl NativeWebviewRequest {
         }
         let url = Url::parse(url).map_err(|_| NativeWebviewError::InvalidUrl)?;
         if is_allowed_url(&url) {
-            Ok(Self { url, permissions })
+            Ok(Self {
+                url,
+                permissions,
+                window: None,
+            })
         } else {
             Err(NativeWebviewError::InvalidUrl)
         }
@@ -225,10 +230,13 @@ impl NativeWebviewBackend {
         let created_sender = Arc::new(Mutex::new(Some(created_sender)));
         let native_id = NEXT_LABEL.fetch_add(1, Ordering::Relaxed);
         let label = format!("kernal-api-webview-{native_id}");
-        let pending_window = match PendingWindow::<(), Wry<()>>::new(
-            WindowBuilderWrapper::new().title("kernal-api external-content proof"),
-            label,
-        ) {
+        let window_builder = match request.window.as_ref() {
+            Some(options) => WindowBuilderWrapper::new()
+                .title(options.title())
+                .inner_size(f64::from(options.width), f64::from(options.height)),
+            None => WindowBuilderWrapper::new().title("kernal-api external-content proof"),
+        };
+        let pending_window = match PendingWindow::<(), Wry<()>>::new(window_builder, label) {
             Ok(window) => window,
             Err(error) => {
                 let _ = created_sender
@@ -645,6 +653,56 @@ impl WebviewPermissions {
     }
 }
 
+/// Invalid presentation options, rejected before allocating native resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WindowOptionsError {
+    #[error("webview title exceeds 1024 UTF-8 bytes or contains a control character")]
+    InvalidTitle,
+    #[error("webview logical width and height must each be between 1 and 16384")]
+    InvalidSize,
+}
+
+/// Validated initial window presentation, independent of page permissions.
+///
+/// Dimensions are logical client-area pixels, not physical screen pixels or
+/// a guarantee of the page's CSS viewport. Desktop window managers may constrain
+/// the requested size. This supplies no script execution or native IPC authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebviewWindowOptions {
+    title: String,
+    width: u32,
+    height: u32,
+}
+
+impl WebviewWindowOptions {
+    /// Validate before copying: title is at most 1024 UTF-8 bytes, with no
+    /// Unicode control characters; each logical dimension is 1 through 16384.
+    /// An empty title is allowed. These are input bounds, not GPU-memory quotas.
+    pub fn new(title: &str, width: u32, height: u32) -> Result<Self, WindowOptionsError> {
+        if title.len() > 1024 || title.chars().any(char::is_control) {
+            return Err(WindowOptionsError::InvalidTitle);
+        }
+        if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+            return Err(WindowOptionsError::InvalidSize);
+        }
+        Ok(Self {
+            title: title.to_owned(),
+            width,
+            height,
+        })
+    }
+
+    /// Requested initial native-window title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Requested initial client-area width and height in logical pixels.
+    pub const fn logical_size(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+}
+
 /// Process-main-thread owner of the opt-in native event loop.
 ///
 /// Construct this on the UI/main thread, hand [`ExternalWebviewClient`] to
@@ -757,6 +815,29 @@ impl ExternalWebviewClient {
         permissions: WebviewPermissions,
     ) -> Result<WebviewHandle, WebviewError> {
         let request = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
+        self.open_request(request).await
+    }
+
+    /// Open an isolated external page with validated window presentation.
+    ///
+    /// Reuses the same permission, navigation, lifetime, and no-IPC policy as
+    /// [`Self::open_webview_with_permissions`]. URL validation still precedes
+    /// native effects. The options constructor performs presentation validation.
+    pub async fn open_webview_with_options(
+        &self,
+        url: &str,
+        window: WebviewWindowOptions,
+        permissions: WebviewPermissions,
+    ) -> Result<WebviewHandle, WebviewError> {
+        let mut request = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
+        request.window = Some(window);
+        self.open_request(request).await
+    }
+
+    async fn open_request(
+        &self,
+        request: NativeWebviewRequest,
+    ) -> Result<WebviewHandle, WebviewError> {
         let (resource, operation) = self
             .service
             .hub
@@ -837,6 +918,42 @@ impl ExternalWebviewClient {
 }
 
 impl WebviewHandle {
+    /// Acceptance-only check of the native title and logical client-area size.
+    /// Allows one logical pixel of native rounding. Intended for controlled
+    /// desktops: a window manager may legitimately constrain production sizes.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn verify_window_options_for_test(
+        &self,
+        expected: &WebviewWindowOptions,
+    ) -> Result<(), WebviewError> {
+        // Clone the dispatcher before native synchronous queries: never hold
+        // the backing-table lock while waiting for the UI thread.
+        let window = self
+            .service
+            .native
+            .lock()
+            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
+            .get(&self.resource)
+            .ok_or(WebviewError::WindowClosed)?
+            .window
+            .clone();
+        let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
+        let title = window.title().map_err(host_error)?;
+        let size = window.inner_size().map_err(host_error)?;
+        let scale = window.scale_factor().map_err(host_error)?;
+        if !scale.is_finite()
+            || scale <= 0.0
+            || title != expected.title
+            || (f64::from(size.width) / scale - f64::from(expected.width)).abs() > 1.0
+            || (f64::from(size.height) / scale - f64::from(expected.height)).abs() > 1.0
+        {
+            return Err(WebviewError::HostFailure(format!(
+                "window presentation mismatch: title={title:?}, physical_size={size:?}, scale={scale}, expected={expected:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Await the requested top-level page's matching `Finished` event.
     /// A timeout revokes this handle and closes the backing native window.
     pub async fn wait_until_loaded(&self, timeout: Duration) -> Result<(), WebviewError> {

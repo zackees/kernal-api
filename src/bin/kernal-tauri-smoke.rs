@@ -11,7 +11,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use kernal_api::async_engine;
-use kernal_api::webview::{ExternalWebviewClient, ExternalWebviewHost, WebviewError};
+use kernal_api::webview::{
+    ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPermissions,
+    WebviewWindowOptions,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = SmokeScenario::from_args()?;
@@ -137,7 +140,15 @@ async fn lifecycle(
     url: &str,
     scenario: SmokeScenario,
 ) -> Result<(), WebviewError> {
-    let webview = client.open_webview(url).await?;
+    let webview = if scenario == SmokeScenario::Close {
+        let window = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        client
+            .open_webview_with_options(url, window, WebviewPermissions::deny_all())
+            .await?
+    } else {
+        client.open_webview(url).await?
+    };
     if scenario == SmokeScenario::Timeout {
         let timed_out = webview.wait_until_loaded(Duration::from_millis(50)).await;
         if timed_out != Err(WebviewError::TimedOut) {
@@ -158,7 +169,12 @@ async fn lifecycle(
     }
     let loaded = webview.wait_until_loaded(Duration::from_secs(30)).await;
     match (scenario, loaded) {
-        (SmokeScenario::Close, Ok(())) => webview.close().await,
+        (SmokeScenario::Close, Ok(())) => {
+            let expected = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
+                .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+            webview.verify_window_options_for_test(&expected)?;
+            webview.close().await
+        }
         (SmokeScenario::Cancel, Ok(())) => {
             webview.cancel();
             if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::Cancelled) {

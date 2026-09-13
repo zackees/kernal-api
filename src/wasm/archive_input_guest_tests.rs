@@ -18,7 +18,20 @@ fn authenticated_guest_control(artifact_variable: &str) {
     let bytes =
         std::fs::read(std::env::var_os(artifact_variable).expect("authenticated guest artifact"))
             .unwrap();
-    let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
+    let chunk = 64 * 1024;
+    let blobs = SketchBlobLimits::new(chunk, 2 * chunk, 4 * chunk, 4, 4, 4).unwrap();
+    // Checking every byte of 17 MiB needs more than the tiny compatibility
+    // default (100k root fuel). Keep a fixed, finite workload-specific budget.
+    let execution = SketchExecutionLimits::default()
+        .with_blob_limits(blobs)
+        .with_fuel_limits(SketchFuelLimits::new(501_600_000, 500_000_000, 100_000).unwrap())
+        .unwrap();
+    let compiler = SketchCompiler::new(
+        SketchCompilerConfig::default()
+            .with_execution_limits(execution)
+            .unwrap(),
+    )
+    .unwrap();
     let policy =
         SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).unwrap();
     let runtime = crate::async_engine::RuntimeBuilder::current_thread()
@@ -60,12 +73,24 @@ fn authenticated_guest_control(artifact_variable: &str) {
         assert_eq!(snapshot.pending_operations, 0);
         assert_eq!(snapshot.archive_staging_bytes, 0);
         assert_eq!(snapshot.active_archive_jobs, 0);
+        assert_eq!(snapshot.retained_transfer_capacity, 0);
+        assert!(snapshot.peak_retained_transfer_capacity <= blobs.maximum_transfer_bytes());
+        assert!(snapshot.peak_buffered_blob_bytes <= blobs.maximum_blob_bytes());
+        if case == 0 && artifact_variable == "KERNAL_EXTENSION2_STREAM_WASM" {
+            assert!(snapshot.peak_buffered_blob_bytes > 0);
+        }
         sketch.close_threaded_root().unwrap();
     }
     assert_eq!(
         compiler.execution_limits_snapshot(),
         SketchExecutionSnapshot::default()
     );
+}
+
+#[test]
+#[ignore = "requires Cargo-built guest-proof artifact in KERNAL_EXTENSION2_STREAM_WASM"]
+fn authenticated_input_actual_guest_streams_large_zip_and_rejects_bad_tag_or_nonce() {
+    authenticated_guest_control("KERNAL_EXTENSION2_STREAM_WASM");
 }
 
 #[test]

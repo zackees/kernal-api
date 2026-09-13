@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=4\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=5\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -2004,6 +2004,28 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
             }
             #[cfg(not(all(test, feature = "archive-auth-test-support")))]
             return Ok(0x80);
+        }
+        if kind == crate::operations::OP_ARCHIVE_ENTRY_OPEN {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                if arg1 != 0 {
+                    return Ok(0);
+                }
+                let Some(runtime) = self.runtime.clone() else {
+                    return Ok(0);
+                };
+                return Ok(self
+                    .operations
+                    .submit_archive_entry_open(
+                        runtime,
+                        self.store_owner,
+                        crate::operations::OpaqueToken::from_wire(arg0),
+                    )
+                    .map(|token| token.wire())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
         }
         if kind == crate::operations::OP_ARCHIVE_ENTRY_ABANDON {
             #[cfg(all(test, feature = "archive-auth-test-support"))]
@@ -3928,19 +3950,19 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=4\n",
-            b'5',
+            b"operation_protocol_revision=5\n",
+            b'6',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let mut previous_operations = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut previous_operations,
-            b"operation_protocol_revision=4\n",
-            b'3',
+            b"operation_protocol_revision=5\n",
+            b'4',
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=4\n", "");
+            .replace("operation_protocol_revision=5\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);

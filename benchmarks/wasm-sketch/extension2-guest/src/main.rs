@@ -1,4 +1,4 @@
-//! Header/authentication/inventory controls plus the unfinished streaming contract.
+//! Header/authentication/inventory controls and the bounded streaming proof.
 use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
 use kernal_extension2_guest_proof::policy;
 

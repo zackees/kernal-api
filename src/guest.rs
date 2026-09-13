@@ -98,6 +98,7 @@ pub struct AuthenticatedArchive {
 impl AuthenticatedArchive {
     /// Read the next bounded inventory record. Returned entries retain their
     /// authenticated storage independently of this enumeration handle.
+    /// Drain or drop an open entry Blob before advancing this sequential reader.
     pub async fn next_entry(&mut self) -> Result<Option<ArchiveEntry>, OperationError> {
         let Some(inner) = self.inner.next_entry()?.wait().await? else {
             return Ok(None);
@@ -136,14 +137,21 @@ impl Drop for AuthenticatedArchive {
 
 /// One bounded inventory record and its independent scoped entry authority.
 pub struct ArchiveEntry {
-    // Retains scoped authority until Drop, even though inventory only reads
-    // the copied metadata. Entry streaming is a separate unfinished step.
+    // Retains scoped authority until opened or dropped.
     _inner: bindings::ArchiveEntry,
     name: String,
     bytes: u64,
 }
 
 impl ArchiveEntry {
+    /// Consume this entry authority and stream its checked plaintext through a
+    /// bounded read-only Blob. Drop the Blob to stop an unfinished producer.
+    /// Drain or drop it before opening another entry from the same archive.
+    pub async fn open(self) -> Result<Blob, OperationError> {
+        Ok(Blob {
+            inner: self._inner.open()?.wait().await?,
+        })
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

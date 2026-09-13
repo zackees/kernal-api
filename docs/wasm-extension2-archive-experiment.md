@@ -1,4 +1,4 @@
-# Extension2 sealed archive experiment (#13): foundation only
+# Extension2 sealed archive experiment (#13): synthetic streaming proof
 
 The native `archive` feature now has independent aggregate output and
 per-entry payload ceilings. Set `ExtractionLimits::max_entry_bytes` for the
@@ -37,7 +37,7 @@ soldr cargo clippy --locked --features archive --lib --test archive_facade -- -D
 
 ## Still required
 
-The next guest boundary is now an executable [RED contract](../benchmarks/wasm-sketch/extension2-guest/README.md).
+The guest boundary now has an executable [streaming proof](../benchmarks/wasm-sketch/extension2-guest/README.md).
 Its original `guest-proof` Wasm build failed with E0432 because
 `kernal_api::guest::EncryptedArchive` was absent (Soldr log
 `20260913T060627Z-home-niteris-dev-kernal-api.xml`). The source requires
@@ -45,23 +45,31 @@ bounded original-header validation, authentication before archive authority,
 inventory policy, and byte-for-byte 17 MiB entry reads through the public Blob
 facade. Its separate native policy tests are not Wasm execution or unchanged
 upstream-policy equivalence evidence. Generated operations, host dispatch,
-and the encrypted fixture driver must make this same full contract GREEN.
+and the encrypted fixture driver now make this synthetic contract GREEN.
 The header-only control now executes grant, bounded original-header policy,
 and revocation in a real Rust Wasm guest (valid, wrong identity, missing grant).
 The header control uses an invalid sparse
 ciphertext tail, not an encrypted ZIP; it is no authentication evidence.
 The separate authentication control now executes a genuine encrypted ZIP,
 accepts its valid tag, and rejects corrupted tags and wrong nonces. The full
-build still lacks `next_entry`; no guest entry streaming is claimed.
-Build and execution commands are in the linked README. Protocol revision 3
+guest now authenticates, checks bounded inventory, opens a read-only Blob,
+and verifies every byte of the 17 MiB payload with a 64 KiB guest buffer.
+The Linux x86-64 execution passes valid ZIP, corrupted tag, and wrong nonce
+cases in 12.73 s. Blob capacity is capped at 128 KiB; aggregate transfer peaks
+are checked against host policy, and teardown releases all tracked resources,
+operations, jobs, transfer capacity, and authenticated staging. This is not
+aggregate RSS evidence. The fixture uses a finite 500M root-fuel budget for
+byte verification, without changing production defaults.
+Build and execution commands are in the linked README. Protocol revision 5
 requires freshly rebuilt artifacts, not metadata relabeling of old binaries.
 
-This is a reusable native prerequisite, not an extension2/Wasm GREEN claim.
-The experiment still needs a real extension2 policy fixture, authenticated
-AES-GCM staging with no readable plaintext before verification, seekable
-opaque archive resources through the generated guest facade, streamed entries
-larger than 16 MiB without guest whole-archive allocation, cancellation and
-teardown proofs, and validation on all six native targets. Existing blob
+This is synthetic guest execution, not full extension2/runtime acceptance.
+The experiment still needs the full extension2 policy fixture, release-feed
+size/hash checks, nested-XPI behavior, guest cancellation/worker-containment
+proofs, aggregate RSS measurement, and validation on all six native targets.
+The native producer supports cancellation through Blob drop; the shared ZIP
+reader is sequential, so drain or drop it before advancing to another entry.
+Existing blob
 `seal` means producer EOF; it must not be mistaken for cryptographic
 authentication. Do not replace the native archive implementation with another
 guest-only extractor or introduce ambient guest file paths.

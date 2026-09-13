@@ -221,12 +221,122 @@ impl OperationHub {
 mod tests {
     use super::*;
 
+    struct Cleanup(Arc<OperationHub>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.close_all(Terminal::Cancelled);
+        }
+    }
+
     async fn terminal(hub: &OperationHub, operation: OpaqueToken) -> TerminalResult {
         loop {
             if let Some(result) = hub.observe_terminal(1, operation).unwrap() {
                 return result;
             }
             hub.suspend(operation, 1).unwrap().notified().await;
+        }
+    }
+
+    #[test]
+    fn authenticated_inventory_entry_open_streams_large_payload_with_bounded_capacity() {
+        for read_all in [true, false] {
+            let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let chunk = 64 * 1024;
+            let limits = BlobLimits::new(chunk, 2 * chunk, 4 * chunk).unwrap();
+            let hub = OperationHub::with_blob_limits(8, 4, limits).unwrap();
+            let _cleanup = Cleanup(Arc::clone(&hub));
+            let (input, _) =
+                archive_input::tests::encrypted_zip_with_header(b"{}", [7; 16], [8; 12], false);
+            let input = hub.grant_encrypted_input(1, input).unwrap();
+            let operation = hub
+                .submit_encrypted_authentication(runtime.handle(), 1, input, [8; 12])
+                .unwrap();
+            let archive = runtime.run(terminal(&hub, operation)).resource.unwrap();
+            let operation = hub
+                .submit_archive_next_entry(runtime.handle(), 1, archive)
+                .unwrap();
+            let entry = runtime.run(terminal(&hub, operation)).resource.unwrap();
+            assert!(hub
+                .submit_archive_entry_open(runtime.handle(), 2, entry)
+                .is_err());
+            let operation = hub
+                .submit_archive_entry_open(runtime.handle(), 1, entry)
+                .unwrap();
+            let blob = runtime.run(terminal(&hub, operation)).resource.unwrap();
+            assert!(hub
+                .submit_archive_entry_open(runtime.handle(), 1, entry)
+                .is_err());
+            assert_eq!(
+                hub.submit_blob_write(1, blob, b"forged"),
+                Err(HubError::WrongRights)
+            );
+            hub.abandon_authenticated_archive(1, archive.wire())
+                .unwrap();
+            if read_all {
+                runtime
+                    .run(crate::async_engine::timeout(
+                        std::time::Duration::from_secs(10),
+                        async {
+                            let mut total = 0;
+                            loop {
+                                let operation = hub.submit_blob_read(1, blob, chunk).unwrap();
+                                let count = loop {
+                                    let result = hub
+                                        .collect_blob_read_wire(
+                                            1,
+                                            operation.wire(),
+                                            chunk,
+                                            |bytes| {
+                                                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                                            },
+                                        )
+                                        .unwrap();
+                                    match result as u8 {
+                                        STATUS_PENDING => {
+                                            hub.wait_external_operation(1, operation)
+                                                .unwrap()
+                                                .notified()
+                                                .await
+                                        }
+                                        STATUS_COMPLETED => break (result >> 8) as usize,
+                                        status => panic!("unexpected stream status {status}"),
+                                    }
+                                };
+                                if count == 0 {
+                                    break;
+                                }
+                                total += count;
+                                assert!(total <= 17 * 1024 * 1024);
+                            }
+                            assert_eq!(total, 17 * 1024 * 1024);
+                        },
+                    ))
+                    .unwrap();
+            } else {
+                runtime
+                    .run(crate::async_engine::timeout(
+                        std::time::Duration::from_secs(5),
+                        async {
+                            while hub.snapshot().pending_blob_writes == 0 {
+                                crate::async_engine::yield_now().await;
+                            }
+                        },
+                    ))
+                    .unwrap();
+                assert!(hub.staging_budget.used() > 16 * 1024 * 1024);
+            }
+            hub.abandon_blob_wire(1, blob.wire()).unwrap();
+            hub.close_all(Terminal::Closed);
+            runtime.run(hub.join_archive_jobs()).unwrap();
+            let snapshot = hub.snapshot();
+            assert_eq!(snapshot.live_resources, 0);
+            assert_eq!(snapshot.pending_operations, 0);
+            assert_eq!(snapshot.retained_transfer_capacity, 0);
+            assert!(snapshot.peak_retained_transfer_capacity <= limits.maximum_transfer_bytes);
+            assert_eq!(hub.staging_budget.used(), 0);
         }
     }
 

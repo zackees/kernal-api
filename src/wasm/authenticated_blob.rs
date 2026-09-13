@@ -1,6 +1,86 @@
-//! Native authenticated entry-to-Blob bridge; no guest archive dispatch yet.
+//! Native authenticated entry-to-Blob bridge on the tracked archive job lane.
 use super::*;
 use std::io;
+
+impl OperationHub {
+    pub(crate) fn submit_archive_entry_open(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        entry: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        let producer_runtime = runtime.clone();
+        self.submit_archive_work(
+            runtime,
+            store,
+            (
+                entry,
+                archive_inventory::ENTRY_KIND,
+                archive_inventory::ENTRY_RIGHT,
+            ),
+            move |hub, operation| {
+                let (archive, index) = {
+                    let state = hub.state.lock().map_err(|_| HubError::Closed)?;
+                    let slot = state.resources.get(&entry).ok_or(HubError::Closed)?;
+                    Self::validate_resource(
+                        slot,
+                        store,
+                        archive_inventory::ENTRY_KIND,
+                        archive_inventory::ENTRY_RIGHT,
+                    )?;
+                    let ResourceValue::ArchiveEntry(entry) = &slot.value else {
+                        return Err(HubError::WrongKind);
+                    };
+                    (Arc::clone(&entry.archive), entry.index)
+                };
+                let mut sink = NativeArchiveSink::new(Arc::clone(hub), producer_runtime, store)?;
+                let mut state = hub.state.lock().map_err(|_| HubError::Closed)?;
+                if !state.resources.contains_key(&entry)
+                    || state
+                        .operations
+                        .get(&operation)
+                        .is_none_or(|slot| slot.terminal.is_some())
+                {
+                    return Err(HubError::Closed);
+                }
+                state
+                    .operations
+                    .get_mut(&operation)
+                    .ok_or(HubError::Closed)?
+                    .created_resource = Some(sink.blob());
+                let notify = Self::terminal_locked(
+                    &mut state,
+                    operation,
+                    TerminalResult {
+                        terminal: Terminal::Completed,
+                        resource: Some(sink.blob()),
+                    },
+                )?;
+                // Transfer entry authority exactly once. Publication must
+                // precede copying: the consumer releases producer capacity.
+                let notifications =
+                    Self::close_resource_with_terminal_locked(&mut state, entry, Terminal::Closed)?;
+                drop(state);
+                if let Some(notify) = notify {
+                    notify.notify_one();
+                }
+                for notify in notifications {
+                    notify.notify_one();
+                }
+                {
+                    // Never acquire this reader mutex while holding hub state.
+                    let mut reader = archive.lock().map_err(|_| HubError::Closed)?;
+                    reader
+                        .reader
+                        .copy_entry(index, &mut sink)
+                        .map_err(|_| HubError::Invalid)?;
+                }
+                // Successful EOF only follows a fully checked entry copy.
+                sink.finish().map_err(|_| HubError::Closed)
+            },
+        )
+    }
+}
 
 /// Producer authority is this non-cloneable value, never a consumer token.
 /// Constructed only alongside a new read-only blob; no token-adoption method.

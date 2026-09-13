@@ -72,6 +72,7 @@ pub(crate) const OP_AUTHENTICATED_ARCHIVE_ABANDON: u32 = 25;
 pub(crate) const OP_ARCHIVE_NEXT_ENTRY: u32 = 26;
 pub(crate) const OP_ARCHIVE_ENTRY_METADATA: u32 = 27;
 pub(crate) const OP_ARCHIVE_ENTRY_ABANDON: u32 = 28;
+pub(crate) const OP_ARCHIVE_ENTRY_OPEN: u32 = 29;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;

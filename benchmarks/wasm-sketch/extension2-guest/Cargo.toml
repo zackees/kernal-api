@@ -8,8 +8,7 @@ publish = false
 [workspace]
 
 [features]
-# Explicit unfinished acceptance contract. This binary is expected to remain
-# RED until the generated guest archive capability is implemented.
+# Source-only streaming proof; not full upstream/runtime acceptance.
 guest-proof = []
 header-proof = ["guest-proof"]
 auth-proof = ["guest-proof"]

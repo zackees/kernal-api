@@ -1,10 +1,10 @@
-# Extension2 guest contract — RED, not runtime acceptance
+# Extension2 guest streaming proof — not full runtime acceptance
 
-This source-only experiment makes the missing #13 guest capability concrete.
-The `guest-proof` binary currently **does not compile**: the public facade has
-no `ArchiveEntry::open`. The optional binary is an explicit unfinished acceptance
-contract, not a shipped example or a passing Wasm proof. Do not replace its
-kernel calls with host-side orchestration or cite library tests as guest GREEN.
+This source-only experiment exercises the #13 public guest archive capability.
+The `guest-proof` binary now compiles with authentication, inventory, and
+entry-to-Blob streaming. It remains a synthetic policy fixture, not the full
+upstream extension2 application or final runtime acceptance. Do not replace
+its kernel calls with host-side orchestration or cite library tests as guest evidence.
 
 ```sh
 soldr cargo check --locked \
@@ -38,7 +38,7 @@ soldr cargo clippy --locked \
 Recorded on Linux x86-64: both policy tests pass (0.03 s), strict library
 Clippy passes, and a `cargo check --lib` using the same Wasm target and lock
 passes (5.31 s). The original guest binary failed on the missing facade import
-with E0432; inventory is now implemented, but entry streaming remains absent.
+with E0432; inventory and entry streaming now compile through the public facade.
 These library checks are not artifact execution evidence.
 
 ## Header-only actual guest control
@@ -67,7 +67,8 @@ KERNAL_EXTENSION2_HEADER_WASM="$PWD/target/extension2-header-proof/wasm32-wasip1
   -j1 -- --ignored
 ```
 
-Operation protocol revision 4 adds inventory/metadata/entry-drop to revision
+Operation protocol revision 5 adds entry-to-Blob open to revision 4's
+inventory/metadata/entry-drop and revision
 3's authentication submissions and revision 2's grant/header/abandon submissions. Rebuild guest code before
 embedding its metadata; never relabel an older binary.
 The header control also awaits a host timer to exercise the complete admitted
@@ -123,8 +124,36 @@ cases on Linux x86-64 in 13.60 s, with all four teardown counters zero.
 Native tests cover foreign/stale entry rejection, short metadata buffers,
 entry lifetime after parent close, resource-quota cursor rollback, and dropping
 an inventory future after completion but before collecting its entry.
-The full contract remains RED solely at `ArchiveEntry::open` (E0599, Soldr
-log `20260913T075448Z-home-niteris-dev-kernal-api.xml`).
+The prior full contract was RED at `ArchiveEntry::open` (E0599, Soldr log
+`20260913T075448Z-home-niteris-dev-kernal-api.xml`); protocol 5 implements it.
+
+## Streaming guest proof
+
+Build with `--features guest-proof` and target directory
+`target/extension2-stream-proof`, copy and embed metadata as above, then run:
+
+```sh
+KERNAL_EXTENSION2_STREAM_WASM="$PWD/target/extension2-stream-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm" \
+  soldr --no-cache cargo test --locked --features wasm-sketch-host,archive-auth-test-support \
+  --lib authenticated_input_actual_guest_streams_large_zip_and_rejects_bad_tag_or_nonce \
+  -j1 -- --ignored
+```
+
+The fixture uses 64 KiB chunks, a 128 KiB per-Blob ceiling, a 256 KiB aggregate
+Blob ceiling, and a fixed total transfer-capacity budget. It checks both peak
+counters against the configured limits and requires zero retained capacity,
+archive jobs, staging bytes, resources, and operations at teardown. This is
+transfer accounting, not aggregate RSS measurement. The root has a finite
+500-million-instruction workload budget; the unchanged 100k compatibility
+default correctly exhausted during the first full-payload execution.
+The freshly built revision-5 Wasm passes valid ZIP, corrupted-tag, and
+wrong-nonce cases on Linux x86-64 in 12.73 s, including these peak and teardown
+assertions. This does not replace six-target execution or upstream policy proof.
+
+The reader is sequential: drain or drop the open Blob before advancing
+inventory or opening another entry. Entry handles independently retain storage,
+but do not promise concurrent stream progress. Closing the parent archive does
+not revoke an already-open stream; dropping that Blob stops its producer.
 
 The executable contract requires a host-granted encrypted input, a bounded
 header read, asynchronous authentication, bounded inventory, and entry-to-Blob
@@ -132,13 +161,8 @@ streaming through `kernal_api::guest`. The guest accepts exactly one `payload`
 entry and verifies every byte of its 17 MiB body with a 64 KiB buffer. The host
 must keep the original header as AAD and expose no archive or entry resource
 before the final tag succeeds. The method names are a proposed semantic
-contract; entry streaming dispatch is still absent.
+contract now implemented for this synthetic source-only fixture.
 
-To turn this RED into runtime evidence, add the generated operations and
-host-granted input, construct and encrypt the large synthetic ZIP, build and
-admit the actual Wasm artifact, execute success and corrupted-tag variants,
-and assert transfer/storage peaks and zero resources at teardown. In particular,
-the host must verify that ciphertext itself exceeds 16 MiB; this source only
-asserts the decompressed payload length. Feed encrypted-size/SHA-256 agreement,
+The host verifies the encrypted ZIP length exceeds 16 MiB. Feed encrypted-size/SHA-256 agreement,
 full release/XPI policy, cancellation, worker containment, six-native-target
 execution, and exact published dependency pins remain acceptance gaps.

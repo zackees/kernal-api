@@ -9,7 +9,8 @@ The private [Component Model guest probe](component-guest/README.md) and
 and structural encoding path. The optional execution probe also verifies a
 64 MiB stream, forced-producer-trap cleanup, and teardown after cancellation of
 an observed pending host call, plus guest-issued read cancellation and
-same-instance reuse on Linux x86-64 through the
+same-instance reuse and a fast-producer/slow-consumer pause-and-resume check
+on Linux x86-64 through the
 kernel executor. This is not yet the representative candidate behind the public
 guest facade or a comparative measurement.
 

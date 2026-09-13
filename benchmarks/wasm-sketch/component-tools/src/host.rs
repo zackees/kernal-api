@@ -40,6 +40,9 @@ struct State {
     mode: Mode,
     pending: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
+    pauses: usize,
+    batches: Arc<AtomicUsize>,
+    peak_batch: Arc<AtomicUsize>,
     limits: wasmtime::StoreLimits,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -49,6 +52,7 @@ enum Mode {
     Trap,
     CancelPending,
     GuestCancel,
+    SlowConsumer,
 }
 struct Host;
 impl HasData for Host {
@@ -58,6 +62,29 @@ impl bindings::kernal::probe::blobs::HostBlob for State {}
 impl bindings::kernal::probe::blobs::Host for State {}
 
 impl bindings::kernal::probe::blobs::HostWithStore for Host {
+    async fn pause_consumer<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<()> {
+        let (produced, batches) = accessor.with(|mut access| {
+            let state = access.get();
+            wasmtime::ensure!(
+                state.mode == Mode::SlowConsumer,
+                "pause outside slow-consumer probe"
+            );
+            wasmtime::ensure!(
+                state.produced.load(Ordering::SeqCst) == 128 * 1024
+                    && state.batches.load(Ordering::SeqCst) == 1,
+                "expected one 128 KiB batch with 64 KiB still buffered"
+            );
+            state.pauses += 1;
+            Ok::<_, wasmtime::Error>((state.produced.clone(), state.batches.clone()))
+        })?;
+        kernal_api::async_engine::sleep(std::time::Duration::from_millis(20)).await;
+        wasmtime::ensure!(
+            produced.load(Ordering::SeqCst) == 128 * 1024 && batches.load(Ordering::SeqCst) == 1,
+            "producer advanced while the consumer was paused with buffered data"
+        );
+        Ok(())
+    }
+
     async fn await_pending_read<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<()> {
         loop {
             let ready = accessor.with(|mut access| {
@@ -116,6 +143,8 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
             let mode = access.get().mode;
             let pending = access.get().pending.clone();
             let cancelled = access.get().cancelled.clone();
+            let batches = access.get().batches.clone();
+            let peak_batch = access.get().peak_batch.clone();
             live.fetch_add(1, Ordering::SeqCst);
             StreamReader::new(
                 &mut access,
@@ -126,6 +155,8 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
                     mode,
                     pending,
                     cancelled,
+                    batches,
+                    peak_batch,
                 },
             )
         })
@@ -139,6 +170,8 @@ struct Producer {
     mode: Mode,
     pending: Arc<AtomicUsize>,
     cancelled: Arc<AtomicUsize>,
+    batches: Arc<AtomicUsize>,
+    peak_batch: Arc<AtomicUsize>,
 }
 impl Drop for Producer {
     fn drop(&mut self) {
@@ -175,14 +208,20 @@ impl<T> StreamProducer<T> for Producer {
             self.pending.fetch_add(1, Ordering::SeqCst);
             return Poll::Pending;
         }
-        let count = destination
-            .remaining(&mut store)
-            .unwrap_or(64 * 1024)
-            .min(64 * 1024)
-            .min(self.remaining);
+        let count = if self.mode == Mode::SlowConsumer {
+            (128 * 1024).min(self.remaining)
+        } else {
+            destination
+                .remaining(&mut store)
+                .unwrap_or(64 * 1024)
+                .min(64 * 1024)
+                .min(self.remaining)
+        };
         destination.set_buffer(vec![0x5a; count].into());
         self.remaining -= count;
         self.produced.fetch_add(count, Ordering::SeqCst);
+        self.batches.fetch_add(1, Ordering::SeqCst);
+        self.peak_batch.fetch_max(count, Ordering::SeqCst);
         Poll::Ready(Ok(StreamResult::Completed))
     }
 }
@@ -192,7 +231,8 @@ pub(super) fn execute(bytes: &[u8]) -> wasmtime::Result<()> {
     execute_case(bytes, Mode::Trap)?;
     execute_case(bytes, Mode::CancelPending)?;
     execute_case(bytes, Mode::GuestCancel)?;
-    println!("executed component: bounded transfer, trap cleanup, pending-call teardown, and guest read cancellation with same-instance reuse passed");
+    execute_case(bytes, Mode::SlowConsumer)?;
+    println!("executed component: bounded transfer, trap cleanup, pending-call teardown, guest read cancellation with instance reuse, and slow-consumer backpressure passed");
     Ok(())
 }
 
@@ -281,14 +321,34 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
                 drop(call);
                 return Ok(());
             }
-            let count = store
-                .run_concurrent(async |accessor| sketch.call_run(accessor).await)
-                .await??;
+            let count = if mode == Mode::SlowConsumer {
+                store
+                    .run_concurrent(async |accessor| sketch.call_slow_consumer(accessor).await)
+                    .await??
+            } else {
+                store
+                    .run_concurrent(async |accessor| sketch.call_run(accessor).await)
+                    .await??
+            };
             wasmtime::ensure!(
                 count == Ok(64 * 1024 * 1024),
                 "guest did not count exactly 64 MiB"
             );
             wasmtime::ensure!(store.data().table.is_empty(), "guest blob resource leaked");
+            if mode == Mode::SlowConsumer {
+                wasmtime::ensure!(
+                    store.data().pauses == 1,
+                    "consumer never paused at buffered capacity"
+                );
+                wasmtime::ensure!(
+                    store.data().peak_batch.load(Ordering::SeqCst) == 128 * 1024,
+                    "unexpected producer batch bound"
+                );
+                wasmtime::ensure!(
+                    store.data().batches.load(Ordering::SeqCst) == 512,
+                    "production did not resume to exactly 64 MiB"
+                );
+            }
             wasmtime::ensure!(
                 store.data().produced.load(Ordering::SeqCst) == 64 * 1024 * 1024,
                 "host did not supply exactly 64 MiB"
@@ -336,6 +396,15 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
+    fn actual_component_slow_consumer_backpressure() {
+        let path = std::env::var_os("KERNAL_COMPONENT_PROBE").expect("set KERNAL_COMPONENT_PROBE");
+        let bytes = std::fs::read(path).expect("read the actual component fixture");
+        super::execute_case(&bytes, super::Mode::SlowConsumer)
+            .expect("bounded fast producer pauses then resumes");
+    }
+
     #[test]
     #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
     fn actual_component_guest_cancellation_and_reuse() {

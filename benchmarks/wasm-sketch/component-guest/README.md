@@ -15,8 +15,10 @@ forced producer trap on Linux x86-64, plus store teardown after an observed
 pending host-call cancellation. A further export explicitly cancels a pending
 read, drops its resources, and is followed by another transfer in the same
 instance. A test-only private WIT checkpoint synchronizes this proof with the
-host's pending-read observation. Write cancellation, races, slow consumers,
-and the full lifecycle contract are not yet proven.
+host's pending-read observation. Another export pauses after its first chunk;
+the host verifies production stops with buffered data and resumes on consumption.
+Write cancellation, races, other concurrent schedules, and the full lifecycle
+contract are not yet proven.
 
 From the repository root, on the pinned Rust 1.95.0 toolchain:
 

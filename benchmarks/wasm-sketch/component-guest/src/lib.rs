@@ -35,6 +35,16 @@ impl bindings::Guest for Sketch {
     }
 
     async fn run() -> Result<u64, ()> {
+        Self::consume(false).await
+    }
+
+    async fn slow_consumer() -> Result<u64, ()> {
+        Self::consume(true).await
+    }
+}
+
+impl Sketch {
+    async fn consume(slow: bool) -> Result<u64, ()> {
         let blob = bindings::kernal::probe::blobs::granted().await.ok_or(())?;
         let mut stream = blob.read().await;
         let mut buffer = Vec::with_capacity(64 * 1024);
@@ -52,6 +62,9 @@ impl bindings::Guest for Sketch {
                         return Err(());
                     }
                     buffer.clear();
+                    if slow && total == 64 * 1024 {
+                        bindings::kernal::probe::blobs::pause_consumer().await;
+                    }
                 }
                 wit_bindgen::StreamResult::Dropped => return Ok(total),
                 wit_bindgen::StreamResult::Cancelled => return Err(()),

@@ -19,14 +19,17 @@ production runtime fallback is introduced.
 ## Opt-in stream execution
 
 `--features execution-probe` additionally links the exact generated private
-world and executes four isolated instances: a 64 MiB stream, a producer trap
-after exactly one 64 KiB chunk, and host-call cancellation after observing a
-pending second read, and guest-issued read cancellation followed by a fresh
-transfer in that same instance. It grants one synthetic blob and permits one
-stream at a time, with no filesystem/network/WASI host imports. The host produces at most
-the reader's capacity and 64 KiB per call; no whole-payload vector is created.
+world and executes five isolated instances: a 64 MiB stream, a producer trap
+after exactly one 64 KiB chunk, host-call cancellation after observing a
+pending second read, guest-issued read cancellation followed by a fresh
+transfer in that same instance, and a fast-producer/slow-consumer transfer.
+It grants one synthetic blob and permits one stream at a time, with no
+filesystem/network/WASI host imports. The first four scenarios produce at most
+the reader's capacity and 64 KiB per call. The slow-consumer scenario deliberately
+offers bounded 128 KiB batches to 64 KiB reads to exercise retained-buffer
+backpressure. No whole-payload vector is created.
 Normal return requires an empty blob table and matching host/guest byte counts.
-All four runs require zero live blob and producer objects after
+All five runs require zero live blob and producer objects after
 store teardown. The probe uses the kernel runtime builder and timeout wrapper,
 not a direct Tokio dependency or a second executor implementation. Each run has
 a 30-second async timeout, 100 million fuel units, and an 8 MiB per-memory limit.
@@ -95,6 +98,25 @@ updated component is 68,382 bytes, retained at
 `1725402199c4a68725e6626d7b114203499b3c24af58acd413cca1f26d41f6f3`.
 Use this rebuilt world for current artifact tests; earlier components lack the
 new export and cannot satisfy the generated host's exact-world checks.
+
+The `slow-consumer` export reads through the same reusable 64 KiB buffer but
+calls a test-only pause checkpoint after consuming its first 64 KiB. In this
+scenario the host offers a 128 KiB batch, leaving 64 KiB retained by the runtime.
+The checkpoint verifies exactly one batch was produced, awaits a 20 ms sleep
+through the kernel executor, and verifies both byte and batch counters stayed
+unchanged. Once the guest resumes reading, it must finish exactly 64 MiB in
+512 batches, with a recorded maximum batch of 128 KiB and normal cleanup.
+This checks stop/resume behavior with a nonempty retained buffer; it is not a
+measurement of aggregate process memory or all concurrent-stream schedules.
+
+The focused test failed with `consumer never paused at buffered capacity` when
+the export used the unpaused consumer. Enabling its checkpoint made the same
+test pass. The updated component is 71,378 bytes, retained at
+`/tmp/kernal-component-backpressure-green.wasm`, SHA-256
+`bc0adc14fa00d7131613a92aa52ca734afb1f540ca14b947fa86a87e4a21a9f8`.
+Current artifact tests require this latest private world. Earlier artifacts
+lack `slow-consumer`; their historical evidence above remains scoped to the
+operations they actually contained.
 
 ## Encoding-only commands and earlier evidence
 

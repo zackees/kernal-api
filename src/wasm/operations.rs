@@ -37,6 +37,7 @@ pub(crate) const OP_WEBVIEW_LOAD: u32 = 15;
 pub(crate) const OP_WEBVIEW_CAPTURE: u32 = 16;
 pub(crate) const OP_WEBVIEW_CLOSE: u32 = 17;
 pub(crate) const OP_TRANSFER_ABANDON: u32 = 18;
+pub(crate) const OP_BLOB_ABANDON: u32 = 19;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
@@ -1046,6 +1047,27 @@ impl OperationHub {
         drop(operation);
         self.drive_blob_writes()?;
         self.drive_blob_reads()
+    }
+
+    /// Revoke an owned blob without reserving an operation slot. Guest Drop
+    /// must remain effective even when the pending-operation table is full.
+    pub(crate) fn abandon_blob_wire(&self, store: u64, token: u64) -> Result<(), HubError> {
+        let token = OpaqueToken(token);
+        let notifications = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let resource = state.resources.get(&token).ok_or(HubError::Invalid)?;
+            if resource.owner.store != store {
+                return Err(HubError::WrongRights);
+            }
+            if resource.identity.kind != BLOB_RESOURCE_KIND {
+                return Err(HubError::WrongKind);
+            }
+            Self::close_resource_with_terminal_locked(&mut state, token, Terminal::Closed)?
+        };
+        for notify in notifications {
+            notify.notify_one();
+        }
+        self.drive_blob_writes()
     }
 
     fn validate_close(&self, store: u64, resource: OpaqueToken) -> Result<(), HubError> {
@@ -4048,6 +4070,27 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_blob_releases_capacity_without_an_operation_slot() {
+        let hub = OperationHub::with_blob_limits(1, 2, BlobLimits::new(4, 4, 8).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let other = hub
+            .create_resource(1, SYNTHETIC_RESOURCE_KIND, 0, false)
+            .unwrap();
+        assert_eq!(hub.abandon_blob_wire(1, other.0), Err(HubError::WrongKind));
+        hub.close_resource(other).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let pending = hub.submit_blob_write(1, blob, b"next").unwrap();
+        assert_eq!(hub.abandon_blob_wire(2, blob.0), Err(HubError::WrongRights));
+        assert_eq!(hub.snapshot().live_blobs, 1);
+        hub.abandon_blob_wire(1, blob.0).unwrap();
+        assert_eq!(hub.snapshot().live_blobs, 0);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+        assert_eq!(hub.poll_wire(1, pending.0) as u8, STATUS_CLOSED);
+        assert_eq!(hub.abandon_blob_wire(1, blob.0), Err(HubError::Invalid));
+        assert!(hub.create_blob(1).is_ok());
+    }
+
+    #[test]
     fn abandoned_transfers_reclaim_operation_quota_and_completed_read_bytes() {
         let hub = OperationHub::with_blob_limits(1, 2, BlobLimits::new(4, 4, 8).unwrap()).unwrap();
         let blob = hub.create_blob(1).unwrap();
@@ -4060,9 +4103,15 @@ mod tests {
         assert_eq!(hub.poll_wire(1, ordinary.0) as u8, STATUS_CANCELLED);
         for _ in 0..32 {
             let pending = hub.submit_blob_read(1, blob, 4).unwrap();
-            assert_eq!(hub.abandon_transfer_wire(2, pending.0), Err(HubError::Stale));
+            assert_eq!(
+                hub.abandon_transfer_wire(2, pending.0),
+                Err(HubError::Stale)
+            );
             hub.abandon_transfer_wire(1, pending.0).unwrap();
-            assert_eq!(hub.abandon_transfer_wire(1, pending.0), Err(HubError::Invalid));
+            assert_eq!(
+                hub.abandon_transfer_wire(1, pending.0),
+                Err(HubError::Invalid)
+            );
 
             hub.blob_write(1, blob, b"data").unwrap();
             let completed = hub.submit_blob_read(1, blob, 4).unwrap();

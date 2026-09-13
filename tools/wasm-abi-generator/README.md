@@ -56,3 +56,13 @@ safe but returns 0. Explicit `operation_cancel` is unchanged: its terminal
 result remains available to poll. Public transfer guards use abandonment on
 drop. This additive opcode requires a matching guest-capable host release;
 the exact pre-1.0 client pin must not pair these guards with an older host.
+
+Opcode 19 is synchronous `blob_abandon(blob_token, 0)`. It validates the
+Store owner and blob kind under the same lock that revokes the generation,
+closes borrowing operations, and releases stored bytes. It allocates no
+operation slot, so public guest `Blob` Drop remains effective at operation
+quota. It returns 1 on success, 0 on invalid/stale/foreign/non-blob tokens or
+nonzero reserved arguments. Drop after explicit close or successful output
+commit is harmless and returns 0. Pending futures retain their typed terminal
+result until collection or their own abandonment. This additive opcode also
+requires the matching exact-pinned guest-capable host release.

@@ -220,6 +220,8 @@ impl BlobReadFuture {
     pub fn abandon_transfer(&self) { OperationFuture { operation: self.operation }.abandon_transfer(); }
 }
 impl BlobHandle {
+    /// Revoke this resource synchronously without allocating an operation.
+    pub fn abandon(&self) { let _ = imports::operation_submit(19, self.token, 0); }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { token } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {

@@ -229,6 +229,8 @@ impl BlobReadFuture {
     pub fn abandon_transfer(&self) { OperationFuture { operation: self.operation }.abandon_transfer(); }
 }
 impl BlobHandle {
+    /// Revoke this resource synchronously without allocating an operation.
+    pub fn abandon(&self) { let _ = imports::operation_submit(19, self.token, 0); }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { token } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {
@@ -478,14 +480,29 @@ mod tests {
         POLL_RESPONSE.get()
     }
     #[test]
+    fn generated_blob_abandon_is_a_scoped_scalar_submission() {
+        generated_guest::BlobHandle::from_create_payload(42).abandon();
+        assert_eq!(SUBMISSION.get(), (19, 42, 0));
+    }
+
+    #[test]
     fn generated_poll_preserves_rejected_terminal_status() {
         let operation = generated_guest::synthetic_yield().unwrap();
         POLL_RESPONSE.set(7);
-        assert_eq!(operation.poll(), Err(generated_guest::OperationError::Rejected));
+        assert_eq!(
+            operation.poll(),
+            Err(generated_guest::OperationError::Rejected)
+        );
         POLL_RESPONSE.set(3);
-        assert_eq!(operation.poll(), Err(generated_guest::OperationError::TimedOut));
+        assert_eq!(
+            operation.poll(),
+            Err(generated_guest::OperationError::TimedOut)
+        );
         POLL_RESPONSE.set(0x80);
-        assert_eq!(operation.poll(), Err(generated_guest::OperationError::Failed));
+        assert_eq!(
+            operation.poll(),
+            Err(generated_guest::OperationError::Failed)
+        );
     }
     #[test]
     fn generated_webview_sequence_exchanges_only_opaque_scalars() {
@@ -502,22 +519,30 @@ mod tests {
             let snapshot = view.capture_visible_png().await?;
             assert_eq!(SUBMISSION.get(), (16, 42, 0));
             generated_guest::OutputFile::from_granted_token(7)
-                .write_blob(&snapshot)?.wait().await?;
+                .write_blob(&snapshot)?
+                .wait()
+                .await?;
             assert_eq!(SUBMISSION.get(), (10, 42, 7));
             view.close().await?;
             assert_eq!(SUBMISSION.get(), (17, 42, 0));
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
     }
     #[test]
     fn generated_driver_rejects_foreign_pending_and_zero_resource_results() {
         assert_eq!(
-            generated_guest::run(std::future::pending::<Result<(), generated_guest::OperationError>>()),
+            generated_guest::run(std::future::pending::<
+                Result<(), generated_guest::OperationError>,
+            >()),
             Err(generated_guest::OperationError::Failed),
         );
         POLL_RESPONSE.set(1);
         let url = generated_guest::WebviewUrl::granted().unwrap().unwrap();
-        assert!(matches!(generated_guest::run(url.open()), Err(generated_guest::OperationError::Failed)));
+        assert!(matches!(
+            generated_guest::run(url.open()),
+            Err(generated_guest::OperationError::Failed)
+        ));
     }
     #[test]
     fn generated_guest_yield_accepts_only_host_success() {

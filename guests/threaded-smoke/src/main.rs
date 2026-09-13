@@ -146,6 +146,11 @@ pub extern "C" fn kernal_api_run() -> u32 {
         clock.yield_now().expect("suspend on kernel clock");
     }
     use kernal_api::guest::{self as guest, Blob, OperationError, OutputFile};
+    // Exceed the live-resource limit without explicit close. Blob Drop must
+    // revoke each host resource before the next create, not await teardown.
+    for _ in 0..128 {
+        drop(guest::run(Blob::create()).expect("dropped blob releases its quota"));
+    }
     let blob = guest::run(Blob::create()).expect("public blob create");
     // More than the host's 64 operation slots: Drop must reclaim each slot,
     // not merely leave an uncollected Cancelled result until root teardown.

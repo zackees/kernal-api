@@ -1972,6 +1972,15 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
                 0
             });
         }
+        if kind == crate::operations::OP_BLOB_ABANDON {
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_blob_wire(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+        }
         if kind == crate::operations::OP_TRANSFER_ABANDON {
             return Ok(u64::from(
                 arg1 == 0
@@ -3893,8 +3902,15 @@ mod threaded_root_observation_tests {
         // win before waiter registration; each adds at most one suspension,
         // but exactly one consumed result. The rejected unsealed commit must
         // leave both authorities usable by the subsequent successful retry.
-        assert!((8..=11).contains(&operations.suspends), "{operations:?}");
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1);
+        // The 128 additional blob creates each require the ordinary deferred
+        // create transition; their synchronous drops add no suspension.
+        assert!(
+            (8 + 128..=11 + 128).contains(&operations.suspends),
+            "{operations:?}"
+        );
+        // Each of the 128 create/drop iterations consumes one create result;
+        // synchronous Drop itself allocates and consumes no operation slot.
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),

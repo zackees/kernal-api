@@ -57,6 +57,7 @@ pub async fn sleep(milliseconds: u32) -> Result<(), OperationError> {
 }
 
 /// An opaque host-owned bulk resource, never an image buffer or ABI token.
+/// Drop revokes host authority without suspending or reserving an operation.
 pub struct Blob {
     inner: bindings::BlobHandle,
 }
@@ -100,6 +101,12 @@ impl Blob {
     pub async fn close(self) -> Result<(), OperationError> {
         self.inner.close()?.wait().await?;
         Ok(())
+    }
+}
+
+impl Drop for Blob {
+    fn drop(&mut self) {
+        self.inner.abandon();
     }
 }
 

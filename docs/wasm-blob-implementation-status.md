@@ -30,6 +30,30 @@ reads then complete with zero bytes; an empty unsealed blob stays pending.
 Producers must await preceding writes before sealing, because sealing rejects
 pending and subsequent writes.
 
+## Public guest blob Drop
+
+The public guest `Blob` now revokes its owned host blob on Drop through
+generated synchronous opcode 19. It neither suspends nor allocates an operation
+slot, so a full pending-operation table cannot prevent cleanup. Validation of
+the exact Store owner and blob kind occurs under the same mutex as generation
+revocation. Pending borrowing operations receive `Closed`; their guards still
+own collection or abandonment of those terminal results. Drop after successful
+explicit close or output commit is harmless. Older hosts do not implement this
+additive opcode; matching exact pre-1.0 host/guest pins remain required.
+
+The focused host test was RED before the abandonment method existed and now
+proves cleanup at operation quota, foreign/non-blob rejection, stale rejection,
+released transfer capacity, and subsequent resource creation. The real threaded
+guest creates and drops 128 blobs before its existing 64 MiB transfer, exceeding
+the live-resource quota without explicit close. Its in-process proof passes
+with 2,227 consumed operation results and no final resource/buffer counters.
+The added creates account for 128 additional suspensions/results; Drop itself
+adds neither. The artifact's only manifest change is `wasi_thread_start` index
+374 to 375; the closed imports, signatures, and limits are unchanged. This does
+not establish six-native-target acceptance for this latest change.
+The same rebuilt artifact also passes both killable-worker execution/output
+tests and the forced-output-cleanup test on Linux x86-64.
+
 ## Verified host behavior
 
 - Bounded chunk writes and pull reads use the existing scoped resource table.

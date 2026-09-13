@@ -68,7 +68,6 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use portable_pty",
         "pub use reflink_copy",
         "pub use rusqlite",
-        "pub use running_process",
         "pub use sysinfo",
         "pub use tokio",
         "pub use widestring",
@@ -93,9 +92,9 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { version = \"=4.10.10\", default-features = false, features = [\"kernel-substrate\"] }"
+            "running-process = { version = \"=4.10.12\", default-features = false, features = [\"kernel-substrate\", \"independent-spawn\"] }"
         ),
-        "the facade must retain the exact published running-process pin and minimal feature set"
+        "the facade must retain the exact published running-process pin and selected canonical spawn feature"
     );
     assert!(
         manifest.contains("# Exact first-party pre-1.0 pin."),
@@ -144,13 +143,29 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
         );
     }
 
+    let spawn_reexports = [
+        "pub use running_process::{\n    spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,\n    SpawnOptions,\n};",
+        "pub use running_process::independent_spawn::{LaunchSpec, Readiness};",
+    ];
+    assert!(
+        spawn_reexports
+            .iter()
+            .all(|reexport| lib.contains(reexport)),
+        "only the selected canonical spawn contract may cross the facade boundary"
+    );
+    assert_eq!(
+        lib.matches("pub use running_process").count(),
+        spawn_reexports.len(),
+        "the independent-spawn exception must not grow into a general substrate re-export"
+    );
+
     for path in rust_sources(&root.join("src")) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         for line in source.lines() {
             let line = line.trim_start();
             if line.starts_with("pub ") {
                 assert!(
-                    !line.contains("running_process"),
+                    !line.contains("running_process") || path == root.join("src/lib.rs"),
                     "{} exposes a running-process type in {line:?}",
                     path.display()
                 );
@@ -735,7 +750,7 @@ fn json_is_confined_to_the_external_firefox_export() {
 /// This is a manifest-and-source test rather than a `cargo tree` case in
 /// `ci/check_compilation_boundary_dependencies.py` on purpose. That harness
 /// proves a package is absent from the default graph, and `png`/`x11rb`
-/// cannot be: `running-process-platform-internal` 4.10.10 declares both as
+/// cannot be: `running-process-platform-internal` 4.10.12 declares both as
 /// non-optional `cfg(target_os = "linux")` dependencies, and `running-process`
 /// is a mandatory private dependency here. Gating this crate's own copy is
 /// what is in this crate's power; the graph reduction arrives when the

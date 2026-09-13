@@ -87,7 +87,7 @@ http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "de
 # rather than one host.
 #
 # This does not yet remove `png`/`x11rb` from the default *graph*:
-# `running-process-platform-internal` 4.10.10 declares both as non-optional
+# `running-process-platform-internal` 4.10.12 declares both as non-optional
 # `cfg(target_os = "linux")` dependencies and `running-process` is mandatory
 # here, so they resolve regardless. What this gates is the code and public
 # surface this crate owns; the graph reduction follows when the substrate
@@ -232,9 +232,11 @@ jwalk = { version = "=0.8.1", optional = true }
 memmap2 = "=0.9.11"
 mimalloc-pprof = { version = "=0.9.4", optional = true }
 portable-pty = { version = "=0.9.0", optional = true }
-# Exact first-party pre-1.0 pin. The substrate remains private behind facade
-# owned semantic types, with only the lightweight async process HAL enabled.
-running-process = { version = "=4.10.10", default-features = false, features = ["kernel-substrate"] }
+# Exact first-party pre-1.0 pin. Most substrate APIs remain private behind
+# facade-owned semantic types.  The narrowly scoped canonical independent
+# spawn contract is the exception: its live handles and options cross this
+# boundary unchanged, so callers and the substrate share type identity.
+running-process = { version = "=4.10.12", default-features = false, features = ["kernel-substrate", "independent-spawn"] }
 prost = { version = "=0.14.4", optional = true }
 prost-types = { version = "=0.14.4", optional = true }
 # Exact-pinned per the issue tracking this facade: reflink semantics are

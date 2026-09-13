@@ -38,7 +38,9 @@ jobs:
         run: |
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - run: soldr cargo test --locked --all-features
+      - name: Test every native feature together
+        timeout-minutes: 15
+        run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings

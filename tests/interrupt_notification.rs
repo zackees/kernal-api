@@ -67,6 +67,20 @@ fn native_interrupt_delivery_is_owned_and_cancellation_safe() {
                 .unwrap()
                 .unwrap();
         });
+        runtime.run(async {
+            use std::future::Future;
+            let mut ambient = std::pin::pin!(kernal_api::async_engine::wait_for_interrupt());
+            std::future::poll_fn(|context| {
+                assert!(ambient.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            send_interrupt_to_this_child();
+            kernal_api::async_engine::timeout(Duration::from_secs(2), ambient)
+                .await
+                .unwrap()
+                .unwrap();
+        });
         return;
     }
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())

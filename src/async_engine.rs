@@ -4,13 +4,15 @@
 //! implementation is Tokio, but no Tokio type, trait, module, or macro is
 //! re-exported across the facade.
 //!
-//! This module deliberately provides no generic race combinator. A
-//! `select!`-shaped call site -- multiple arms of differing future types,
-//! per-arm `if` guards, loop-accumulated state across iterations -- has no
-//! non-macro equivalent that is not itself a reimplementation of `select!`,
-//! so those call sites stay on the backend macro. Callers whose only need is
-//! racing one operation against cancellation should reach for [`cancellable`]
-//! instead. `join!`-shaped call sites are different: awaiting a fixed, small
+//! [`crate::biased_race!`] covers ordered selection over two to four
+//! borrowed/pinned futures. [`crate::fair_race!`] supports two to five branches
+//! with a pseudorandom initial polling position. Both snapshot optional guards
+//! and return tagged winners; neither implements pattern-mismatch disabling or
+//! an `else` arm. Preserve those behaviors explicitly when migrating a broader
+//! `select!` expression. Source-order priority is a semantic choice, so biased
+//! selection must not substitute for a previously unordered race.
+//! Callers whose only need is racing one operation against cancellation should
+//! reach for [`cancellable`] instead. `join!`-shaped call sites are different: awaiting a fixed, small
 //! set of futures unconditionally to completion has no macro-specific
 //! behavior to preserve, so [`join`] covers that shape as an ordinary
 //! function. Attribute macros (`#[tokio::test]`, `#[tokio::main]`) are the
@@ -18,23 +20,49 @@
 //! facade needs a `kernal-api-macros` companion crate, which is an open
 //! decision tracked in the meta issue rather than something this module
 //! resolves on its own.
+//!
+//! [`crate::task_local!`] declares poll-scoped bindings without exposing runtime
+//! types. [`Notify`] provides immediate borrowed/owned notification futures and
+//! explicit waiter registration; [`RwLock`] preserves queued writer preference
+//! with owned and borrowed guards. [`Mutex`] provides FIFO exclusive acquisition
+//! and owned guards for lock storage retained by background work. [`Task`] cancels
+//! on drop by default; [`Task::detach_on_drop`] explicitly preserves committed
+//! work on caller cancellation while retaining a joinable handle. These capabilities let consumers preserve
+//! cancellation and ownership contracts while removing direct runtime types.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::Notify as BackendNotify;
 
 mod broadcast;
+mod race;
+mod rw_lock;
+mod signals;
+mod task_local;
+pub use signals::wait_for_interrupt;
+#[cfg(unix)]
+pub use signals::TerminationSignal;
+mod mutex;
 pub use broadcast::{
     broadcast_channel, BroadcastReceiver, BroadcastRecvError, BroadcastSender,
     BroadcastTryRecvError,
 };
 #[cfg(feature = "event-stream")]
 pub use broadcast::{BroadcastLagged, BroadcastStream};
+pub use mutex::{Mutex, MutexGuard, MutexTryLockError, OwnedMutexGuard};
+#[doc(hidden)]
+pub use race::fair_start as __fair_race_start;
+pub use race::{BiasedRace2, BiasedRace3, BiasedRace4, FairRace2, FairRace3, FairRace4, FairRace5};
+pub use rw_lock::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockTryLockError,
+    RwLockWriteGuard,
+};
+pub use task_local::{TaskLocal, TaskLocalAccessError, TaskLocalScope};
 
 /// Current engine implementation, retained for diagnostics and bug reports.
 pub const BACKEND_NAME: &str = "tokio";
@@ -53,17 +81,26 @@ pub const BACKEND_VERSION: &str = "1.53.1";
 ///
 /// A task meant to keep running once its handle goes out of scope --
 /// a daemon accept loop, a fire-and-forget notification -- must say so
-/// explicitly by calling [`Task::detach`]. `Task` is `#[must_use]` so the
+/// explicitly by calling [`Task::detach`], or [`Task::detach_on_drop`] when
+/// the caller still needs to await the result. `Task` is `#[must_use]` so the
 /// compiler flags a bare `launch(..);` statement rather than letting it
 /// silently cancel the task it just started; `let _ = launch(..);` still
 /// drops (and therefore cancels) the task without a warning, so prefer
 /// `.detach()` over `let _ =` when the intent is to run in the background.
-#[derive(Debug)]
-#[must_use = "dropping a Task cancels it; call `.detach()` to run it in the \
-              background, or await/store the handle to join it"]
+#[must_use = "a Task cancels on drop by default; explicitly detach background \
+              work, or await/store the handle to join it"]
 pub struct Task<T> {
     inner: tokio::task::JoinHandle<T>,
     detached: bool,
+}
+
+impl<T> std::fmt::Debug for Task<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Task")
+            .field("is_finished", &self.inner.is_finished())
+            .field("detached", &self.detached)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T> Task<T> {
@@ -80,7 +117,8 @@ impl<T> Task<T> {
     /// [`RuntimeHandle::launch_blocking`], cancellation (including the
     /// implicit cancellation on drop) cannot interrupt blocking work that is
     /// already running: the closure keeps running on its worker thread to
-    /// completion, and only the join result is discarded.
+    /// completion. Retaining and awaiting the handle still yields its result;
+    /// dropping the handle discards that result without stopping the closure.
     pub fn cancel(&self) {
         self.inner.abort();
     }
@@ -99,6 +137,18 @@ impl<T> Task<T> {
     /// the default itself.
     pub fn detach(mut self) {
         self.detached = true;
+    }
+
+    /// Keep the task running if this handle is dropped, while retaining the
+    /// ability to await its result or explicitly call [`Task::cancel`].
+    ///
+    /// Use for committed work that must survive cancellation of its caller,
+    /// including blocking writes that may still be queued. Unlike [`Task::detach`],
+    /// this returns the joinable handle. Runtime shutdown can still terminate
+    /// async work; this is not independent operating-system process spawning.
+    pub fn detach_on_drop(mut self) -> Self {
+        self.detached = true;
+        self
     }
 }
 
@@ -233,6 +283,13 @@ impl RuntimeBuilder {
     /// Set the number of async worker threads.
     pub fn worker_threads(mut self, count: usize) -> Self {
         self.inner.worker_threads(count);
+        self
+    }
+
+    /// Limit additional threads used for blocking work, excluding async workers.
+    /// Once occupied, further blocking operations queue. Panics if count is zero.
+    pub fn max_blocking_threads(mut self, count: usize) -> Self {
+        self.inner.max_blocking_threads(count);
         self
     }
 
@@ -404,9 +461,14 @@ where
 /// results as they arrive rather than in launch order. Dropping the group
 /// cancels every task still running in it -- the same child-cleanup default
 /// [`Task`] applies to a single handle, extended to a collection of them.
-#[derive(Debug)]
 pub struct TaskGroup<T> {
     inner: tokio::task::JoinSet<T>,
+}
+
+impl<T> std::fmt::Debug for TaskGroup<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskGroup").finish_non_exhaustive()
+    }
 }
 
 impl<T: 'static> TaskGroup<T> {
@@ -482,11 +544,18 @@ pub async fn sleep_until(deadline: Deadline) {
 
 /// A fixed-cadence timer with an immediate first tick.
 ///
-/// Missed ticks are delivered in a burst until the original schedule catches
-/// up. No background task is spawned. Drop the timer to stop observing ticks.
+/// Missed ticks use [`MissedTickBehavior::Burst`] by default. No background task
+/// is spawned. Drop the timer to stop observing ticks.
 #[derive(Debug)]
 pub struct PeriodicTimer {
     inner: tokio::time::Interval,
+}
+
+/// How a periodic timer responds when work misses scheduled ticks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissedTickBehavior {
+    Burst,
+    Delay,
 }
 
 impl PeriodicTimer {
@@ -503,10 +572,39 @@ impl PeriodicTimer {
                 "periodic timer period must be positive and at most 365 days",
             ));
         }
+        Self::new_unbounded(period)
+    }
+
+    /// Create a timer for any nonzero duration representable by this host.
+    ///
+    /// This compatibility constructor keeps legacy persisted configuration
+    /// (such as a multi-year WAL flush interval) intact. Prefer [`Self::new`]
+    /// for new policy-bound configuration.
+    pub fn new_unbounded(period: Duration) -> std::io::Result<Self> {
+        if period.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period must be positive",
+            ));
+        }
         RuntimeHandle::current().map_err(std::io::Error::other)?;
+        if tokio::time::Instant::now().checked_add(period).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period exceeds the host clock range",
+            ));
+        }
         let mut inner = tokio::time::interval(period);
         inner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
         Ok(Self { inner })
+    }
+
+    /// Select missed-tick behavior without changing the immediate first tick.
+    pub fn set_missed_tick_behavior(&mut self, policy: MissedTickBehavior) {
+        self.inner.set_missed_tick_behavior(match policy {
+            MissedTickBehavior::Burst => tokio::time::MissedTickBehavior::Burst,
+            MissedTickBehavior::Delay => tokio::time::MissedTickBehavior::Delay,
+        });
     }
 
     /// Wait for the next scheduled tick. Cancelling a pending call does not
@@ -697,22 +795,21 @@ pub struct Cancelled;
 /// Construct one and share it (typically behind an `Arc`) between the
 /// producer and its waiters.
 ///
-/// A notification permit is not queued indefinitely: only a waiter already
-/// registered (via a `notified()` call whose future has been polled at least
-/// once) observes a given `notify_one`/`notify_waiters` call. Callers that
-/// need every state transition observed exactly once should encode that
-/// state explicitly (an atomic flag, a channel) rather than relying on
-/// notification counting.
+/// [`Notify::notify_one`] stores at most one permit when no waiter is ready;
+/// [`Notify::notify_waiters`] stores none, so waiters that must not miss a
+/// concurrent broadcast create and pin [`Notified`], call [`Notified::enable`]
+/// while holding their state lock, then release it before awaiting. Callers
+/// that need every transition should still encode state explicitly.
 #[derive(Debug)]
 pub struct Notify {
-    inner: BackendNotify,
+    inner: Arc<BackendNotify>,
 }
 
 impl Notify {
     /// Create a new notification signal with no permit outstanding.
     pub fn new() -> Self {
         Self {
-            inner: BackendNotify::new(),
+            inner: Arc::new(BackendNotify::new()),
         }
     }
 
@@ -728,9 +825,60 @@ impl Notify {
         self.inner.notify_waiters();
     }
 
-    /// Wait for the next notification.
-    pub async fn notified(&self) {
-        self.inner.notified().await;
+    /// Create a notification future immediately, before its first poll.
+    pub fn notified(&self) -> Notified<'_> {
+        Notified {
+            inner: self.inner.notified(),
+        }
+    }
+
+    /// Create an owned notification future suitable for retaining with an Arc.
+    pub fn owned_notified(self: Arc<Self>) -> OwnedNotified {
+        OwnedNotified {
+            inner: Arc::clone(&self.inner).notified_owned(),
+        }
+    }
+}
+
+/// Borrowed notification future created at [`Notify::notified`] time.
+pub struct Notified<'a> {
+    inner: tokio::sync::futures::Notified<'a>,
+}
+impl Notified<'_> {
+    /// Register this future before releasing the state lock that a notifier uses.
+    /// Returns true if the notification has already been received.
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        // SAFETY: inner is structurally pinned; no API moves it out, and the
+        // wrapper has no custom Drop implementation that could move it.
+        unsafe { self.map_unchecked_mut(|value| &mut value.inner) }.enable()
+    }
+}
+impl Future for Notified<'_> {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the private inner future remains pinned with its wrapper.
+        unsafe { self.map_unchecked_mut(|value| &mut value.inner) }.poll(cx)
+    }
+}
+
+/// Owned notification future created at [`Notify::owned_notified`] time.
+pub struct OwnedNotified {
+    inner: tokio::sync::futures::OwnedNotified,
+}
+impl OwnedNotified {
+    /// Register this future before releasing the state lock that a notifier uses.
+    /// Returns true if the notification has already been received.
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        // SAFETY: inner is structurally pinned; no API moves it out, and the
+        // wrapper has no custom Drop implementation that could move it.
+        unsafe { self.map_unchecked_mut(|value| &mut value.inner) }.enable()
+    }
+}
+impl Future for OwnedNotified {
+    type Output = ();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        // SAFETY: the private inner future remains pinned with its wrapper.
+        unsafe { self.map_unchecked_mut(|value| &mut value.inner) }.poll(cx)
     }
 }
 
@@ -786,7 +934,7 @@ pub struct ProgressReporter {
 
 #[derive(Debug)]
 struct ProgressState {
-    last_progress: Mutex<tokio::time::Instant>,
+    last_progress: StdMutex<tokio::time::Instant>,
     notify: BackendNotify,
 }
 
@@ -804,7 +952,7 @@ impl ProgressReporter {
     pub fn new() -> Self {
         Self {
             state: Arc::new(ProgressState {
-                last_progress: Mutex::new(tokio::time::Instant::now()),
+                last_progress: StdMutex::new(tokio::time::Instant::now()),
                 notify: BackendNotify::new(),
             }),
         }
@@ -987,9 +1135,14 @@ pub struct SemaphorePermit {
 ///
 /// Cloning a `Sender` adds another producer; the channel closes for
 /// receiving once every clone (and the original) has been dropped.
-#[derive(Debug)]
 pub struct Sender<T> {
     inner: tokio::sync::mpsc::Sender<T>,
+}
+
+impl<T> std::fmt::Debug for Sender<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Sender").finish_non_exhaustive()
+    }
 }
 
 impl<T> Clone for Sender<T> {
@@ -1054,9 +1207,14 @@ impl<T> Sender<T> {
 
 /// Receiving half of a bounded, multi-producer channel created by
 /// [`channel`].
-#[derive(Debug)]
 pub struct Receiver<T> {
     inner: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> std::fmt::Debug for Receiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver").finish_non_exhaustive()
+    }
 }
 
 impl<T> Receiver<T> {
@@ -1101,9 +1259,14 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 
 /// Sending half of an unbounded, multi-producer channel created by
 /// [`unbounded_channel`].
-#[derive(Debug)]
 pub struct UnboundedSender<T> {
     inner: tokio::sync::mpsc::UnboundedSender<T>,
+}
+
+impl<T> std::fmt::Debug for UnboundedSender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnboundedSender").finish_non_exhaustive()
+    }
 }
 
 impl<T> Clone for UnboundedSender<T> {
@@ -1134,9 +1297,14 @@ impl<T> UnboundedSender<T> {
 
 /// Receiving half of an unbounded, multi-producer channel created by
 /// [`unbounded_channel`].
-#[derive(Debug)]
 pub struct UnboundedReceiver<T> {
     inner: tokio::sync::mpsc::UnboundedReceiver<T>,
+}
+
+impl<T> std::fmt::Debug for UnboundedReceiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnboundedReceiver").finish_non_exhaustive()
+    }
 }
 
 impl<T> UnboundedReceiver<T> {
@@ -1222,9 +1390,14 @@ pub enum TryRecvError {
 }
 
 /// Sending half of a single-value channel created by [`oneshot_channel`].
-#[derive(Debug)]
 pub struct OneshotSender<T> {
     inner: tokio::sync::oneshot::Sender<T>,
+}
+
+impl<T> std::fmt::Debug for OneshotSender<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneshotSender").finish_non_exhaustive()
+    }
 }
 
 impl<T> OneshotSender<T> {
@@ -1249,9 +1422,14 @@ impl<T> OneshotSender<T> {
 /// Awaiting a `OneshotReceiver` resolves once the paired [`OneshotSender`]
 /// sends its value or is dropped; it composes with [`timeout`] and
 /// [`cancellable`] like any other future.
-#[derive(Debug)]
 pub struct OneshotReceiver<T> {
     inner: tokio::sync::oneshot::Receiver<T>,
+}
+
+impl<T> std::fmt::Debug for OneshotReceiver<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneshotReceiver").finish_non_exhaustive()
+    }
 }
 
 impl<T> OneshotReceiver<T> {
@@ -1479,6 +1657,55 @@ mod tests {
             tokio::time::advance(Duration::from_millis(10)).await;
             assert_eq!(result.await, Err(ProgressIdleElapsed));
         });
+    }
+
+    #[test]
+    fn detached_handle_launch_uses_selected_runtime_not_ambient_runtime() {
+        let selected = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ambient = RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let selected_handle = selected.handle();
+        let expected_handle = selected_handle.clone();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+
+        ambient.run(async {
+            assert_ne!(RuntimeHandle::current().unwrap(), selected_handle);
+            selected_handle
+                .launch(async move {
+                    let current = RuntimeHandle::current().unwrap();
+                    sender.send(current).expect("receiver still owned");
+                })
+                .detach();
+            tokio::task::yield_now().await;
+            // A current-thread runtime cannot drive the other runtime's task.
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+        });
+
+        selected.run(async {
+            let actual = tokio::time::timeout(Duration::from_secs(5), receiver)
+                .await
+                .expect("selected runtime must drive its detached task")
+                .expect("task must send its runtime identity");
+            assert_eq!(actual, expected_handle);
+        });
+    }
+
+    #[test]
+    fn channel_sender_debug_and_clone_do_not_require_payload_traits() {
+        struct OpaquePayload;
+        fn assert_debug<T: std::fmt::Debug>(_: &T) {}
+        let (sender, _receiver) = channel::<OpaquePayload>(1);
+        assert_debug(&sender);
+        assert_debug(&sender.clone());
+        assert_eq!(format!("{sender:?}"), "Sender { .. }");
     }
 
     #[test]

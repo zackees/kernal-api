@@ -29,11 +29,7 @@ impl Endpoint {
     }
 
     pub fn retire(&self) -> io::Result<()> {
-        match std::fs::remove_file(&self.0) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        crate::platform::ipc::retire_socket_endpoint(std::path::Path::new(&self.0))
     }
 
     pub fn ensure_owner_private_parent(&self) -> io::Result<()> {

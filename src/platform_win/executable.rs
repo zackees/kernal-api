@@ -18,6 +18,18 @@ pub fn file_name(bare: &str) -> String {
     }
 }
 
+/// Spell an executable name without losing host-native string representation.
+/// Existing extensions are retained so callers never receive `tool.exe.exe`.
+pub fn file_name_os(bare: &OsStr) -> OsString {
+    if Path::new(bare).extension().is_some() {
+        bare.to_os_string()
+    } else {
+        let mut name = bare.to_os_string();
+        name.push(".exe");
+        name
+    }
+}
+
 /// Path to a sibling program installed beside the running image.
 ///
 /// Returns `None` when the current image cannot be resolved, has no parent

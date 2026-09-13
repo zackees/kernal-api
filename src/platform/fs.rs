@@ -18,10 +18,489 @@
 //! a maintained backend privately, because there is no std equivalent and a
 //! hand-rolled reflink ioctl is not something to get wrong silently.
 
+mod positioned_io;
+#[cfg(feature = "tar-stream")]
+mod tar_stream;
+#[cfg(feature = "tar-stream")]
+pub use tar_stream::extract_tar_stream;
+mod archive_link_path;
+pub use archive_link_path::resolve_archive_link_target;
+mod retirement;
+pub use retirement::{open_for_retire, retire_open_file};
+mod volume_label;
+pub use volume_label::volume_label;
+#[cfg(feature = "file-fingerprint")]
+mod fingerprint;
+#[cfg(feature = "file-fingerprint")]
+pub use fingerprint::{file_fingerprint, same_file_by_fingerprint, FileFingerprint};
+pub use positioned_io::write_at;
+mod path_encoding;
+pub mod path_file;
+mod permissions;
+pub mod replacement;
+pub use path_encoding::{native_call_path, path_from_raw_bytes};
+mod change_marker;
+pub use change_marker::{file_change_marker, FileChangeMarker};
+#[cfg(unix)]
+#[path = "fs/private_directory_unix.rs"]
+mod private_directory;
+#[cfg(windows)]
+#[path = "fs/private_directory_win.rs"]
+mod private_directory;
+
+/// Tighten a directory according to the host's deployment-directory policy.
+///
+/// Returns true only when permissions were changed. Unix leaves sticky shared
+/// roots untouched and accepts modes without group/other write bits; otherwise
+/// sets 0700 and re-reads. Windows requires a protected DACL restricted to the
+/// current user, SYSTEM or Administrators, and verifies any change by readback.
+/// Missing paths and failed verification are errors.
+///
+/// This follows links and is not a secure-open operation. A false result does
+/// not mean owner-only access: Unix sticky roots and readable directories are
+/// deliberately accepted. Callers must control the parent path.
+pub use private_directory::ensure_dir_private;
+
+pub use permissions::{apply_metadata_mode, metadata_mode};
+pub use permissions::{
+    make_executable, make_executable_from, make_private, mode, restore_mode, set_readonly,
+};
+/// Recursively create directories with restrictive creation-time permissions:
+/// Unix mode 0700 (subject to umask), or a protected user+SYSTEM Windows DACL.
+///
+/// Existing directories are unchanged, including racing creators. Call
+/// `ensure_dir_private` afterwards to check the deployment-directory policy.
+/// Filesystems must support the requested permissions; creation alone does not
+/// verify persisted ACLs. This follows links in parent paths.
+pub use private_directory::create_dir_all_private;
+
+/// Adopt source permissions onto an open private copy, making it writable.
+/// Unix adds only owner-write to the source mode; Windows clears the source
+/// readonly attribute. This operates on the held file, not a reopened path.
+pub fn make_writable_like(
+    file: &std::fs::File,
+    source: &std::fs::Permissions,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(source.mode() | 0o200))
+    }
+    #[cfg(windows)]
+    {
+        let mut permissions = source.clone();
+        permissions.set_readonly(false);
+        file.set_permissions(permissions)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, source);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "permission adoption unavailable",
+        ))
+    }
+}
+
+/// Whether a native file-lock failure indicates lock or sharing contention.
+/// Recognizes `WouldBlock` on every host and Windows sharing/lock violations
+/// on Windows only. This classifies an error, not whether retry will succeed.
+pub fn is_lock_contention(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(feature = "fs")]
 mod temporary;
 #[cfg(feature = "fs")]
 pub use temporary::{TemporaryDirectory, MAX_TEMP_PREFIX_BYTES};
+
+/// A no-follow classification of one directory entry.
+///
+/// `Regular` includes ordinary files and directories. `Symlink` names a
+/// symbolic link. On Windows, every non-symlink reparse point (including a
+/// junction or mount point) is `Reparse` and must not be traversed as a
+/// regular directory entry.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LinkKind {
+    Regular,
+    Symlink,
+    Reparse,
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod volume_contract_tests {
+    use super::*;
+
+    #[test]
+    fn paths_on_one_volume_share_an_opaque_identity_and_raw_value() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::write(&first, b"first").expect("write first");
+        std::fs::write(&second, b"second").expect("write second");
+
+        assert_eq!(
+            volume_identity(&first).expect("first volume identity"),
+            volume_identity(&second).expect("second volume identity")
+        );
+        assert_eq!(
+            volume_identity_u128(&first).expect("first raw volume identity"),
+            volume_identity_u128(&second).expect("second raw volume identity")
+        );
+    }
+
+    #[test]
+    fn volume_capabilities_have_supported_width_and_report_allocation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("allocation");
+        std::fs::write(&path, b"allocated bytes").expect("write allocation subject");
+        let metadata = std::fs::metadata(&path).expect("allocation metadata");
+
+        assert!(matches!(file_id_width(), 64 | 128));
+        let _ = allocated_bytes(&path, &metadata);
+    }
+}
+
+/// Create a symbolic link to a file using the native host operation.
+#[cfg(all(feature = "fs", unix))]
+pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Create a symbolic link to a file using the native host operation.
+#[cfg(all(feature = "fs", windows))]
+pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
+/// Create a symbolic link from archive-style target text.
+///
+/// `is_dir` records the intended target kind while it may still be dangling:
+/// Windows needs that bit to choose its file or directory reparse flavor,
+/// whereas Unix stores one link representation for both. The caller owns
+/// target-containment and archive replay policy.
+#[cfg(all(feature = "fs", unix))]
+pub fn create_symlink(target: &str, destination: &Path, _is_dir: bool) -> io::Result<()> {
+    std::os::unix::fs::symlink(target, destination)
+}
+
+/// Create a symbolic link from archive-style target text.
+#[cfg(all(feature = "fs", windows))]
+pub fn create_symlink(target: &str, destination: &Path, is_dir: bool) -> io::Result<()> {
+    let native = target.replace('/', "\\");
+    if is_dir {
+        std::os::windows::fs::symlink_dir(native, destination)
+    } else {
+        std::os::windows::fs::symlink_file(native, destination)
+    }
+}
+
+/// Remove a link name without following its target.
+///
+/// On Unix this is the native unlink operation and therefore also removes an
+/// ordinary file if the caller passes one. Callers that require a link-only
+/// policy must classify before calling it.
+#[cfg(all(feature = "fs", unix))]
+pub fn remove_link(path: &Path) -> io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+/// Remove a link name without following its target.
+///
+/// Windows requires the directory removal operation for a directory link,
+/// including a dangling one, so try the file flavor first and then directory.
+#[cfg(all(feature = "fs", windows))]
+pub fn remove_link(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(_) => std::fs::remove_dir(path),
+    }
+}
+
+/// Report whether already-fetched no-follow metadata names a link or reparse
+/// point. This never performs another filesystem lookup.
+#[cfg(all(feature = "fs", unix))]
+pub fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+/// Report whether already-fetched no-follow metadata names a link or reparse
+/// point. This never performs another filesystem lookup.
+#[cfg(all(feature = "fs", windows))]
+pub fn is_link_or_reparse(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// Return the hard-link count for the object retained by `file`.
+///
+/// Unlike [`hard_link_count`], this cannot be redirected by a path rename or
+/// replacement between inspection and use.
+#[cfg(all(feature = "fs", unix))]
+pub fn hard_link_count_file(file: &std::fs::File) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(file.metadata()?.nlink())
+}
+
+/// Return the hard-link count for the object retained by `file`.
+#[cfg(all(feature = "fs", windows))]
+pub fn hard_link_count_file(file: &std::fs::File) -> io::Result<u64> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut info = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, info.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(unsafe { info.assume_init() }.nNumberOfLinks))
+}
+
+/// Return the hard-link count for the object currently named by `path`.
+/// This follows symlinks, matching ordinary metadata semantics.
+#[cfg(all(feature = "fs", unix))]
+pub fn hard_link_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(std::fs::metadata(path)?.nlink())
+}
+
+/// Return the hard-link count for the object currently named by `path`.
+/// The handle is opened with permissive sharing so observing a count does not
+/// evict an existing writer.
+#[cfg(all(feature = "fs", windows))]
+pub fn hard_link_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut info = std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>();
+        let got_info = GetFileInformationByHandle(handle, &mut info);
+        // Capture this before CloseHandle can overwrite the thread error.
+        let info_error = (got_info == 0).then(std::io::Error::last_os_error);
+        let closed = CloseHandle(handle);
+        if got_info == 0 {
+            return Err(info_error.expect("failed handle query has a native error"));
+        }
+        if closed == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.nNumberOfLinks as u64)
+    }
+}
+
+/// Classify a path without following its final entry.
+#[cfg(all(feature = "fs", unix))]
+pub fn classify(path: &std::path::Path) -> std::io::Result<LinkKind> {
+    Ok(
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            LinkKind::Symlink
+        } else {
+            LinkKind::Regular
+        },
+    )
+}
+
+/// Classify a path without following its final entry. Windows distinguishes
+/// name-surrogate symbolic links from other reparse points (junctions, mount
+/// points, cloud placeholders, and so on).
+#[cfg(all(feature = "fs", windows))]
+pub fn classify(path: &std::path::Path) -> std::io::Result<LinkKind> {
+    use std::os::windows::fs::MetadataExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+        return Ok(LinkKind::Regular);
+    }
+
+    const IO_REPARSE_TAG_SYMLINK: u32 = 0xA000_000C;
+    Ok(match reparse_tag(path) {
+        Some(IO_REPARSE_TAG_SYMLINK) => LinkKind::Symlink,
+        Some(_) | None => LinkKind::Reparse,
+    })
+}
+
+#[cfg(all(feature = "fs", windows))]
+fn reparse_tag(path: &std::path::Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // Reparse payloads contain variable-length UTF-16 names. A tiny
+        // header-sized buffer turns ordinary long symlinks into opaque
+        // reparses, so use the documented maximum reparse data size.
+        let mut buffer = [0_u8; 16 * 1024];
+        let mut returned = 0_u32;
+        let read = DeviceIoControl(
+            handle,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buffer.as_mut_ptr().cast(),
+            buffer.len() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+        let _ = CloseHandle(handle);
+        (read != 0 && returned >= 4)
+            .then(|| u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]))
+    }
+}
+
+#[cfg(all(test, feature = "fs"))]
+mod link_tests {
+    use super::{
+        classify, create_symlink, hard_link_count, hard_link_count_file, is_link_or_reparse,
+        remove_link, LinkKind,
+    };
+
+    #[test]
+    fn hard_link_count_tracks_each_new_name() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let source = directory.path().join("source");
+        let peer = directory.path().join("peer");
+        std::fs::write(&source, b"link content").expect("source file");
+        let before = hard_link_count(&source).expect("initial count");
+        std::fs::hard_link(&source, &peer).expect("hard link");
+        let after = hard_link_count(&source).expect("new count");
+        assert_eq!(after, before + 1);
+        assert_eq!(after, hard_link_count(&peer).expect("peer count"));
+
+        let held = std::fs::File::open(&source).expect("hold source");
+        assert_eq!(
+            after,
+            hard_link_count_file(&held).expect("held-object count")
+        );
+    }
+
+    #[test]
+    fn classify_does_not_follow_an_ordinary_entry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let file = directory.path().join("ordinary");
+        std::fs::write(&file, b"regular").expect("ordinary file");
+        assert_eq!(
+            classify(&file).expect("classify ordinary file"),
+            LinkKind::Regular
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_reports_a_symlink_without_following_it() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("target");
+        let link = directory.path().join("link");
+        std::fs::write(&target, b"target").expect("target file");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert_eq!(
+            classify(&link).expect("classify symlink"),
+            LinkKind::Symlink
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_link_classification_and_count_have_distinct_follow_policy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("missing-target");
+        let link = directory.path().join("link");
+        super::symlink_file(&target, &link).expect("create dangling symlink");
+        assert_eq!(
+            classify(&link).expect("classify link itself"),
+            LinkKind::Symlink
+        );
+        assert_eq!(
+            hard_link_count(&link).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_directory_link_is_created_and_removed_without_following_target() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("missing-target-directory");
+        let link = directory.path().join("directory-link");
+        create_symlink(target.to_str().expect("utf-8 target"), &link, true)
+            .expect("create dangling directory link");
+
+        let metadata = std::fs::symlink_metadata(&link).expect("link metadata");
+        assert!(is_link_or_reparse(&metadata));
+        remove_link(&link).expect("remove link name");
+        assert_eq!(
+            std::fs::symlink_metadata(&link).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "the dangling link name is gone"
+        );
+        assert!(!target.exists(), "target was never followed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_link_leaves_file_type_validation_with_its_caller() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let regular = directory.path().join("regular-file");
+        std::fs::write(&regular, b"regular").expect("write regular file");
+
+        remove_link(&regular).expect("Unix unlink accepts the caller-provided name");
+        assert!(!regular.exists());
+    }
+}
 
 /// A descriptor the caller already owns and has asked us to write to.
 ///
@@ -117,14 +596,17 @@ pub fn user_home_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(feature = "fs")]
 pub use crate::{
-    fs_create_private_file as create_private_file, fs_decode_path_bytes as decode_path_bytes,
-    fs_encode_path_bytes as encode_path_bytes, fs_file_identity as file_identity,
+    fs_allocated_bytes as allocated_bytes, fs_create_private_file as create_private_file,
+    fs_decode_path_bytes as decode_path_bytes, fs_encode_path_bytes as encode_path_bytes,
+    fs_file_id_width as file_id_width, fs_file_identity as file_identity,
     fs_is_lock_conflict as is_lock_conflict, fs_open_lock_file as open_lock_file,
-    fs_path_identity as path_identity, fs_replace_file as replace_file,
-    fs_sync_directory as sync_directory, fs_user_config_dir as user_config_dir,
-    fs_user_data_dir as user_data_dir, fs_user_run_data_root as user_run_data_root,
-    fs_user_runtime_dir as user_runtime_dir, fs_user_state_dir as user_state_dir,
-    FsFileIdentity as FileIdentity,
+    fs_open_shared_append as open_shared_append, fs_path_identity as path_identity,
+    fs_replace_file as replace_file, fs_sync_directory as sync_directory,
+    fs_sync_directory_if_supported as sync_directory_if_supported,
+    fs_user_config_dir as user_config_dir, fs_user_data_dir as user_data_dir,
+    fs_user_run_data_root as user_run_data_root, fs_user_runtime_dir as user_runtime_dir,
+    fs_user_state_dir as user_state_dir, fs_volume_identity as volume_identity_raw,
+    fs_volume_identity_u128 as volume_identity_u128, FsFileIdentity as FileIdentity,
 };
 
 /// Largest byte limit accepted by [`read_private_regular_file_bounded`].
@@ -427,6 +909,22 @@ pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::R
 
 #[cfg(feature = "fs")]
 use std::ffi::{OsStr, OsString};
+
+/// Opaque, hashable identity of the volume that currently hosts a path.
+///
+/// Equality is only meaningful for values returned on the same host. The raw
+/// host value remains available through [`volume_identity_u128`] for callers
+/// whose persisted format explicitly needs it.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VolumeIdentity(u64);
+
+/// Return the volume identity for the object currently named by `path`.
+#[cfg(feature = "fs")]
+pub fn volume_identity(path: &Path) -> io::Result<VolumeIdentity> {
+    volume_identity_raw(path).map(VolumeIdentity)
+}
+
 #[cfg(feature = "fs")]
 use std::fs::File;
 #[cfg(feature = "fs")]
@@ -1151,6 +1649,69 @@ mod tests {
 
     const PRODUCT: &str = "rp-fs-facade-test";
 
+    #[test]
+    fn shared_append_preserves_existing_bytes() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("events.log");
+        std::fs::write(&path, b"before\n").expect("seed log");
+
+        let mut first = open_shared_append(&path).expect("first append handle");
+        let mut second = open_shared_append(&path).expect("second append handle");
+        first.write_all(b"first\n").expect("write first entry");
+        second.write_all(b"second\n").expect("write second entry");
+        drop((first, second));
+
+        assert_eq!(
+            std::fs::read(&path).expect("read append log"),
+            b"before\nfirst\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn shared_append_handle_survives_rename() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("active.log");
+        let renamed = directory.path().join("rotated.log");
+        std::fs::write(&path, b"before\n").expect("seed log");
+
+        let mut append = open_shared_append(&path).expect("append handle");
+        std::fs::rename(&path, &renamed).expect("rename while append handle is held");
+        let mut replacement = open_shared_append(&path).expect("replacement active log");
+        replacement
+            .write_all(b"replacement\n")
+            .expect("write replacement log");
+        append.write_all(b"after\n").expect("append after rename");
+        drop((append, replacement));
+
+        assert_eq!(
+            std::fs::read(&renamed).expect("read renamed log"),
+            b"before\nafter\n"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read replacement active log"),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supported_directory_sync_rejects_a_missing_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        assert!(sync_directory_if_supported(&directory.path().join("missing")).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn supported_directory_sync_is_a_noop_when_directory_fsync_is_unavailable() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        sync_directory_if_supported(&directory.path().join("missing"))
+            .expect("Windows has no directory fsync primitive");
+    }
+
     /// Every role resolves to an absolute directory that names the product.
     ///
     /// Asserted as a property rather than against one host's spelling: the
@@ -1448,10 +2009,8 @@ mod tests {
     /// everywhere.
     #[test]
     fn syncing_a_directory_that_does_not_exist_is_an_error() {
-        let missing = std::env::temp_dir()
-            .join(format!("rp-fs-no-such-dir-{}", std::process::id()))
-            .join("nested");
-        let _ = std::fs::remove_dir_all(&missing);
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing").join("nested");
         sync_directory(&missing).expect_err("a missing directory cannot be synced");
     }
 

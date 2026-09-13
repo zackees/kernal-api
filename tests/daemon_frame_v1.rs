@@ -2,8 +2,6 @@
 
 #![cfg(feature = "daemon-frame-v1")]
 
-use std::path::Path;
-
 use kernal_api::daemon_frame_v1::{
     DaemonFrame, DaemonFrameCodec, DaemonFrameDecode, DaemonFrameError, DaemonFrameKind,
     DaemonPayloadEncoding,
@@ -140,29 +138,14 @@ fn partial_foreign_malformed_and_oversize_buffers_keep_the_frozen_contract() {
     ));
 }
 
+fn backend_to_facade_frame(value: running_process::daemon_frame_v1::DaemonFrame) -> DaemonFrame {
+    value
+}
+fn facade_to_backend_frame(value: DaemonFrame) -> running_process::daemon_frame_v1::DaemonFrame {
+    value
+}
+
 #[test]
-fn facade_public_source_does_not_name_backend_or_runtime_types() {
-    let source = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon_frame_v1.rs"),
-    )
-    .expect("read facade source");
-    for line in source
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("pub "))
-    {
-        for forbidden in [
-            "running_process",
-            "prost",
-            "BytesMut",
-            "tokio",
-            "RawFd",
-            "RawHandle",
-        ] {
-            assert!(
-                !line.contains(forbidden),
-                "public facade declaration leaks {forbidden:?}: {line}"
-            );
-        }
-    }
+fn facade_frame_types_are_exact_canonical_identities() {
+    let _ = (backend_to_facade_frame, facade_to_backend_frame);
 }

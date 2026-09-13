@@ -228,7 +228,7 @@ pub(crate) fn run_bounded(
         output_limit,
         BoundedRunOptions::default()
             .kill_when_owner_dies(kill_when_owner_dies)
-            .nice(priority.substrate_nice()),
+            .priority(priority),
     )
     .map(|output| BoundedProcessOutput {
         exit: ProcessExit::new(output.exit_code),
@@ -398,7 +398,7 @@ fn builder(spec: SpawnSpec) -> AsyncProcessBuilder {
         .stderr(stdio(stderr))
         .create_process_group(create_process_group)
         .kill_when_owner_dies(kill_when_owner_dies)
-        .nice(priority.substrate_nice())
+        .priority(priority)
 }
 
 /// Whether the substrate's own pre-exec containment is the binding asked for.
@@ -418,6 +418,10 @@ fn session_options(options: ProcessSessionOptions) -> AsyncProcessSessionOptions
             ProcessPostExitDrain::AbandonAfter(grace) => Some(grace),
         },
         kill_on_drop: options.kill_on_drop,
+        // Facade sessions retain their established direct-child drop policy.
+        // Tree sweep is an explicit canonical opt-in; its current snapshot is
+        // not descendant containment after the root has already been reaped.
+        kill_tree_on_drop: false,
     }
 }
 

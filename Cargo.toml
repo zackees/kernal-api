@@ -59,6 +59,8 @@ wasm-component-compiler-experiment = [
 # inherited process operations remain the useful default HAL and do not select
 # scheduler/broker serialization or control code.
 independent-spawn = ["running-process/independent-spawn"]
+file-fingerprint = ["dep:serde"]
+tar-stream = ["dep:tar"]
 # Bounded OS entropy, independent of crash/profiling facilities.
 secure-random = ["dep:getrandom"]
 # Synchronous, bounded SQLite mechanics.  Applications retain schema, SQL,
@@ -108,6 +110,12 @@ daemon-registration = ["running-process/daemon-registration"]
 # separate from v1 records and pulls no broker client, identity, IPC, or
 # runtime policy into applications that dual-write during the v1-to-v2 rollout.
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
+# Canonical broker client/identity/frame aliases. This is deliberately opt-in:
+# it selects the substrate's client graph, never the default process HAL.
+broker = ["running-process/client"]
+# Tokio-compatible async child construction is an opt-in migration surface;
+# the public aliases themselves name no Tokio types.
+async-process-client = ["running-process/client-async"]
 pty = ["dep:portable-pty", "terminal-input"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
 http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures-core"]
@@ -323,7 +331,7 @@ wit-bindgen = { version = "=0.58.0", default-features = false, features = ["macr
 # facade-owned semantic types. The opt-in `independent-spawn` feature is the
 # narrowly scoped exception: its live handles and options cross this boundary
 # unchanged, so callers and the substrate share type identity.
-running-process = { version = "=4.10.12", default-features = false, features = ["kernel-substrate"] }
+running-process = { version = "=4.10.13", default-features = false, features = ["kernel-substrate", "independent-spawn"] }
 # `rayon` backs native parallel memory-mapped hashing; its global pool is lazy.
 # Keep native SIMD enabled: Soldr supplies the clang/SDK needed by BLAKE3's
 # ARM64 NEON C backend, including Linux-hosted Windows ARM64 cross-checks.
@@ -422,8 +430,10 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_Console",
   "Win32_System_Diagnostics_Debug",
+  "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Environment",
   "Win32_System_IO",
+  "Win32_System_Ioctl",
   "Win32_System_JobObjects",
   "Win32_System_Kernel",
   "Win32_System_LibraryLoader",
@@ -431,10 +441,12 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_System_Pipes",
   "Win32_System_Registry",
   "Win32_System_SystemInformation",
+  "Win32_System_ProcessStatus",
   "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
+serde_json = "=1.0.151"
 native-tls = "=0.2.18"
 tempfile = "=3.27.0"
 tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "test-util", "time"] }

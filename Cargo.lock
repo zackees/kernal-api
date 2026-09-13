@@ -577,6 +577,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
 dependencies = [
  "clap_builder",
+ "clap_derive",
 ]
 
 [[package]]
@@ -589,6 +590,18 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4519,14 +4532,21 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.12"
+version = "4.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "492c9f25a9a886d7e4281eae987e2d90732ee07f01a35860899618b3b3484cc3"
+checksum = "6eee98b1f2f29a7852b77328f097b0a4a7350e93b84f63ba9de6ab942f04bad4"
 dependencies = [
+ "anyhow",
  "blake3",
+ "bytes",
+ "clap",
+ "dirs 6.0.0",
+ "futures-util",
  "getrandom 0.4.3",
+ "interprocess",
  "libc",
  "prost",
+ "prost-types",
  "running-process-platform-internal",
  "running-process-protocol",
  "serde",
@@ -4535,15 +4555,17 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
+ "toml 0.8.23",
  "winapi",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.12"
+version = "4.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce466bd3d8c281e4f3f409bf0931011306172fbd74032787958eaf5272505391"
+checksum = "a8a3a322c2972ff33785e73a04c68a1dd4590887a46d4e57b595d8703c14546d"
 dependencies = [
  "blake3",
  "dirs 6.0.0",
@@ -4565,9 +4587,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.12"
+version = "4.10.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24283b500a0f98fec340534d7d72a5885a9d0d55aa09555fa144ff3250d16bf5"
+checksum = "857a9c98297410fe2b7e085e9e179337c355a2a3f0a2a0a53992e8f7c60e6a52"
 dependencies = [
  "prost",
  "prost-build",
@@ -5727,18 +5749,9 @@ dependencies = [
 
 [[package]]
 name = "tinyvec"
-version = "1.13.2"
+version = "1.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cf0ded5c4e56918d8f8a339e1bb67d038d3bc6d144ac407904015ba2e4cde9b"
-dependencies = [
- "tinyvec_macros",
-]
-
-[[package]]
-name = "tinyvec_macros"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"

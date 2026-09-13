@@ -104,3 +104,49 @@ mod tests {
         );
     }
 }
+#[cfg(target_os = "linux")]
+#[path = "resources/physical_linux.rs"]
+mod physical;
+#[cfg(target_os = "macos")]
+#[path = "resources/physical_macos.rs"]
+mod physical;
+#[cfg(windows)]
+#[path = "resources/physical_win.rs"]
+mod physical;
+pub use physical::physical_cores;
+#[cfg(target_os = "linux")]
+#[path = "resources/rss_linux.rs"]
+mod rss;
+#[cfg(target_os = "macos")]
+#[path = "resources/rss_macos.rs"]
+mod rss;
+#[cfg(windows)]
+#[path = "resources/rss_win.rs"]
+mod rss;
+pub use rss::process_rss_bytes;
+
+#[path = "resources/cgroup.rs"]
+mod cgroup;
+pub use cgroup::cgroup_v2_dir;
+
+#[path = "resources/snapshot.rs"]
+mod snapshot;
+pub use snapshot::HostResourceSnapshot;
+
+#[cfg(windows)]
+#[path = "resources/windows_telemetry.rs"]
+mod windows_telemetry;
+#[cfg(windows)]
+pub use windows_telemetry::{commit_charge_mb, process_table};
+
+/// Windows ToolHelp process snapshot; unsupported on other hosts.
+#[cfg(not(windows))]
+pub fn process_table() -> Option<Vec<(u32, String)>> {
+    None
+}
+
+/// Windows commit charge in MiB; unsupported on other hosts.
+#[cfg(not(windows))]
+pub fn commit_charge_mb() -> Option<(u64, u64)> {
+    None
+}

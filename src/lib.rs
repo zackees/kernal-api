@@ -27,7 +27,6 @@ use std::process::ExitStatus;
 mod process_adapter;
 
 /// Canonical launch payload and readiness contract for [`spawn_with_options`].
-#[cfg(feature = "independent-spawn")]
 pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// Canonical resource-placement spawn contract selected by this facade.
 ///
@@ -52,11 +51,40 @@ pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// that handle does; it is distinct from resource placement.  Readiness,
 /// cancellation, authority, and unsupported-platform failures propagate as
 /// the canonical `std::io::Error` from [`spawn_with_options`].
-#[cfg(feature = "independent-spawn")]
 pub use running_process::{
     spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,
     SpawnOptions,
 };
+
+/// Canonical daemon spawning with inherited or independently placed native
+/// resources. The namespace preserves the exact dependency's type identity;
+/// no facade enums or conversion tables are maintained here.
+pub use running_process::independent_spawn;
+
+/// Explicit foreground commands preserving the caller's native launch context.
+/// Unlike contained sessions or detached daemons, this boundary does not add
+/// process groups, descriptor sanitization, or owner-death policy. Commands
+/// remain subject to their existing cgroup or Job limits.
+pub use running_process::foreground;
+
+pub use independent_spawn::{spawn as spawn_independent, IndependentChild};
+
+/// Canonical semantic asynchronous child/session primitives. The opt-in
+/// `async-process-client` migration bridge additionally exposes Tokio-compatible
+/// construction; that bridge is not the completed semantic migration.
+pub mod async_process;
+
+/// Canonical contained process-group, child, and originator primitives.
+pub mod containment;
+
+/// Canonical synchronous process/stdin-stdout/observer migration primitives.
+/// Its broker-dependent hash helper is opt-in with [`broker`].
+pub mod process;
+
+/// Canonical opt-in broker client, identity, refusal, and frozen-v1 framing
+/// contract. These are direct aliases rather than facade copies.
+#[cfg(feature = "broker")]
+pub mod broker;
 
 #[cfg(feature = "command-arguments")]
 pub mod arguments;
@@ -129,7 +157,9 @@ pub mod daemon_identity;
 /// This opt-in surface preserves the shared frame bytes while leaving endpoint
 /// selection, product payload identifiers, and connection policy to callers.
 #[cfg(feature = "daemon-frame-v1")]
-pub mod daemon_frame_v1;
+pub use running_process::daemon_frame_v1;
+#[cfg(feature = "daemon-frame-v1")]
+pub use running_process::register_daemon_frame_payload_protocol;
 
 /// Facade-owned frozen v1 daemon-registration records and persistence.
 ///
@@ -137,7 +167,7 @@ pub mod daemon_frame_v1;
 /// definition bytes while leaving endpoints, broker client policy, and daemon
 /// lifecycle policy to applications.
 #[cfg(feature = "daemon-registration")]
-pub mod daemon_registration;
+pub use running_process::daemon_registration_compat as daemon_registration;
 
 /// Facade-owned frozen v2 service-definition registration and persistence.
 ///
@@ -145,7 +175,7 @@ pub mod daemon_registration;
 /// directory, and non-atomic persistence behavior while leaving v1 records,
 /// broker negotiation, transport, identity, and runtime policy to callers.
 #[cfg(feature = "daemon-registration-v2")]
-pub mod daemon_registration_v2;
+pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;
 
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
@@ -265,15 +295,19 @@ cfg_select! {
 // root. Neutral capability facades re-export only crate-root names and never
 // name the private `platform_imp` alias themselves.
 pub use platform_imp::{
-    active_graphics_probe, assign_child_to_windows_job, cancel_capture_reader,
-    canonical_environment_pairs, capture_reader_done, compat_shell_command, configure_exact_trace,
-    configure_process_command, configure_sync_contained_command, configure_sync_daemon_command,
-    configure_trampoline_command, current_executable_build_id, exact_trace_capability, exit_code,
-    monitor_console_windows, parent_has_console, prepare_capture_reader, set_process_name,
-    shell_command, soft_terminate_process_group, spawn_sync, spawn_sync_daemon,
-    start_descendant_monitor, start_exact_trace, sync_child_native_handle, trampoline_exit_code,
+    active_graphics_probe, apply_priority_to_async_child, assign_child_to_windows_job,
+    cancel_capture_reader, canonical_environment_pairs, capture_reader_done, compat_shell_command,
+    configure_exact_trace, configure_process_command, configure_session_leader_command,
+    configure_sync_contained_command, configure_sync_daemon_command, configure_trampoline_command,
+    current_executable_build_id, detach_standard_streams, exact_trace_capability, exit_code,
+    force_terminate_pid, force_terminate_process_group, monitor_console_windows,
+    native_jobserver_supported, parent_has_console, prepare_capture_reader, process_cpu_ticks,
+    redirect_standard_streams_to_log, set_process_name, shell_command,
+    soft_terminate_process_group, spawn_sync, spawn_sync_daemon, start_descendant_monitor,
+    start_exact_trace, sync_child_native_handle, trampoline_exit_code,
     unix_mark_extra_fds_close_on_exec, unix_set_priority, unix_signal_process,
-    unix_signal_process_group, unix_signal_raw, CaptureCancellation, TracedChild, WindowsJobHandle,
+    unix_signal_process_group, unix_signal_raw, CaptureCancellation, NativeJobserver, TracedChild,
+    WindowsJobHandle,
 };
 
 // Window-icon mechanics are a GUI capability, not part of the default async
@@ -293,7 +327,8 @@ pub use platform_imp::fs_write_all_to_descriptor;
 
 pub use platform_imp::{process_can_replace_current_image, process_replace_current_image};
 
-pub use platform_imp::{process_same_executable_path, ProcessLiveness};
+pub use platform_imp::{process_executable_path, process_same_executable_path};
+pub use running_process::ProcessLiveness;
 
 pub use platform_imp::{
     resources_available_space, resources_fd_exhaustion_error, resources_inode_capacity,
@@ -302,18 +337,19 @@ pub use platform_imp::{
 };
 
 pub use platform_imp::{
-    executable_file_name, executable_find_in_paths, executable_native_library_name,
-    executable_sibling_of_current_image, executable_stem_matches,
+    executable_file_name, executable_file_name_os, executable_find_in_paths,
+    executable_native_library_name, executable_sibling_of_current_image, executable_stem_matches,
     executable_unlock_for_replacement, EXECUTABLE_EXTENSION,
 };
 
 #[cfg(feature = "fs")]
 pub use platform_imp::{
-    fs_create_private_file, fs_decode_path_bytes, fs_encode_path_bytes, fs_file_identity,
-    fs_is_lock_conflict, fs_lock_exclusive, fs_lock_shared, fs_open_lock_file, fs_path_identity,
-    fs_replace_file, fs_set_file_mtime, fs_sync_directory, fs_try_lock_exclusive,
-    fs_try_lock_shared, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
-    fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
+    fs_allocated_bytes, fs_create_private_file, fs_decode_path_bytes, fs_encode_path_bytes,
+    fs_file_id_width, fs_file_identity, fs_is_lock_conflict, fs_lock_exclusive, fs_lock_shared,
+    fs_open_lock_file, fs_open_shared_append, fs_path_identity, fs_replace_file, fs_set_file_mtime,
+    fs_sync_directory, fs_sync_directory_if_supported, fs_try_lock_exclusive, fs_try_lock_shared,
+    fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root, fs_user_runtime_dir,
+    fs_user_state_dir, fs_volume_identity, fs_volume_identity_u128, FsFileIdentity,
 };
 
 #[cfg(feature = "fs")]
@@ -499,68 +535,9 @@ pub enum StreamMode {
     Null,
 }
 
-/// Relative scheduling intent for one spawned process.
-///
-/// These are semantic bands, not Unix niceness or Windows priority-class
-/// constants. The private substrate maps each band at launch, preserving the
-/// product distinction between low and idle background work.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ProcessPriority {
-    /// Prefer this work in the host's non-realtime foreground band.
-    High,
-    /// Preserve the host's ordinary process scheduling policy.
-    #[default]
-    Normal,
-    /// Defer this work behind ordinary foreground activity.
-    Low,
-    /// Run only when the host has no more urgent work.
-    Idle,
-}
-
-impl ProcessPriority {
-    /// Translate semantic priority into the selected substrate's existing
-    /// launch policy. These values are private implementation details: Unix
-    /// treats them as nice levels while Windows maps their bands to process
-    /// priority classes.
-    pub(crate) const fn substrate_nice(self) -> Option<i32> {
-        match self {
-            // The substrate consumes a portable niceness hint. Its Windows
-            // mapping is intentionally different from Unix's numeric scale:
-            // -15 selects HIGH, +1 BELOW_NORMAL, and +15 IDLE.
-            Self::High => {
-                #[cfg(windows)]
-                {
-                    Some(-15)
-                }
-                #[cfg(not(windows))]
-                {
-                    Some(-5)
-                }
-            }
-            Self::Normal => None,
-            Self::Low => {
-                #[cfg(windows)]
-                {
-                    Some(1)
-                }
-                #[cfg(not(windows))]
-                {
-                    Some(10)
-                }
-            }
-            Self::Idle => {
-                #[cfg(windows)]
-                {
-                    Some(15)
-                }
-                #[cfg(not(windows))]
-                {
-                    Some(19)
-                }
-            }
-        }
-    }
-}
+/// Canonical cross-platform scheduling intent. This direct alias retains the
+/// substrate's exact Linux niceness and Windows priority-class mapping.
+pub use running_process::ProcessPriority;
 
 /// Typed spawn description accepted by the blessed process boundary.
 #[derive(Debug, Clone)]
@@ -1380,20 +1357,11 @@ mod tests {
     }
 
     #[test]
-    fn semantic_priority_bands_have_exact_private_substrate_mappings() {
-        #[cfg(windows)]
-        assert_eq!(ProcessPriority::High.substrate_nice(), Some(-15));
-        #[cfg(not(windows))]
-        assert_eq!(ProcessPriority::High.substrate_nice(), Some(-5));
-        assert_eq!(ProcessPriority::Normal.substrate_nice(), None);
-        #[cfg(windows)]
-        assert_eq!(ProcessPriority::Low.substrate_nice(), Some(1));
-        #[cfg(not(windows))]
-        assert_eq!(ProcessPriority::Low.substrate_nice(), Some(10));
-        #[cfg(windows)]
-        assert_eq!(ProcessPriority::Idle.substrate_nice(), Some(15));
-        #[cfg(not(windows))]
-        assert_eq!(ProcessPriority::Idle.substrate_nice(), Some(19));
+    fn semantic_priority_is_the_canonical_substrate_type() {
+        let facade: ProcessPriority = running_process::ProcessPriority::Low;
+        let backend: running_process::ProcessPriority = ProcessPriority::High;
+        assert!(matches!(facade, ProcessPriority::Low));
+        assert!(matches!(backend, running_process::ProcessPriority::High));
     }
 
     #[tokio::test]

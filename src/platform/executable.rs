@@ -4,8 +4,16 @@
 //! `runpm` or `runpm.exe`, and where a sibling install lives relative to the
 //! running image, is a host mechanic and is decided here.
 
+mod supplied_path;
+/// Observe the running executable's path using the standard host query.
+/// The result is not a held file identity or a guarantee that the path still
+/// names the running image after rename/replacement.
+pub use std::env::current_exe as current_image;
+pub use supplied_path::{candidate_extensions, find_on_path_using, find_on_supplied_path};
+
 pub use crate::{
-    executable_file_name as file_name, executable_find_in_paths as find_in_paths,
+    executable_file_name as file_name, executable_file_name_os as file_name_os,
+    executable_find_in_paths as find_in_paths,
     executable_native_library_name as native_library_name,
     executable_sibling_of_current_image as sibling_of_current_image,
     executable_stem_matches as stem_matches,
@@ -28,6 +36,60 @@ pub fn find_on_path(name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    #[test]
+    fn current_image_retains_native_query_signature() {
+        let _: fn() -> std::io::Result<std::path::PathBuf> = current_image;
+        // Compare immediate queries; do not assert the executable remains
+        // present on disk, since the host can unlink a running image.
+        assert_eq!(current_image().unwrap(), std::env::current_exe().unwrap());
+    }
+
+    #[test]
+    fn native_file_name_preserves_existing_extensions() {
+        for name in ["tool.exe", "tool.cmd", "tool.custom", "tool."] {
+            assert_eq!(file_name_os(OsStr::new(name)), OsStr::new(name));
+        }
+    }
+
+    #[test]
+    fn native_file_name_adds_only_the_host_suffix() {
+        assert_eq!(
+            file_name_os(OsStr::new("tool")),
+            OsStr::new(&file_name("tool"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_file_name_preserves_non_unicode_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let name = OsStr::from_bytes(b"tool-\xff");
+        assert_eq!(file_name_os(name).as_os_str().as_bytes(), name.as_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_file_name_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let raw = [0x0074, 0xd800];
+        let name = std::ffi::OsString::from_wide(&raw);
+        let mut expected = raw.to_vec();
+        expected.extend(".exe".encode_utf16());
+        assert_eq!(
+            file_name_os(&name).encode_wide().collect::<Vec<_>>(),
+            expected
+        );
+        let mut extended = name;
+        extended.push(".cmd");
+        assert_eq!(file_name_os(&extended), extended);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bare_string_naming_retains_its_original_suffix_contract() {
+        assert_eq!(file_name("tool.custom"), "tool.custom.exe");
+    }
 
     /// The host decides the spelling; the caller never does.
     ///

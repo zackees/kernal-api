@@ -106,26 +106,159 @@ fn implementation_crates_are_not_publicly_reexported() {
                 path.display()
             );
         }
+        if source.contains("pub use running_process") {
+            if path == root.join("lib.rs") {
+                for line in source.lines().map(str::trim) {
+                    if line.starts_with("pub use running_process") {
+                        assert!(
+                            matches!(line,
+                                "pub use running_process::independent_spawn;"
+                                | "pub use running_process::foreground;"
+                                | "pub use running_process::ProcessPriority;"
+                                | "pub use running_process::ProcessLiveness;"
+                                | "pub use running_process::IndependentBackend;"
+                                | "pub use running_process::SpawnLifetime;"
+                                | "pub use running_process::SpawnMode;"
+                                | "pub use running_process::SpawnOptions;"
+                                | "pub use running_process::daemon_frame_v1;"
+                                | "pub use running_process::register_daemon_frame_payload_protocol;"
+                                | "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;"
+                                | "pub use running_process::daemon_registration_compat as daemon_registration;"
+                            ),
+                            "only reviewed canonical module aliases are approved at root"
+                        );
+                    }
+                }
+            }
+            let approved = match path.file_name().and_then(|name| name.to_str()) {
+                Some("lib.rs") => &[
+                    "pub use running_process::independent_spawn;",
+                    "pub use running_process::foreground;",
+                    "pub use running_process::ProcessPriority;",
+                    "pub use running_process::ProcessLiveness;",
+                    "pub use running_process::IndependentBackend;",
+                    "pub use running_process::SpawnLifetime;",
+                    "pub use running_process::SpawnMode;",
+                    "pub use running_process::SpawnOptions;",
+                    "pub use running_process::daemon_frame_v1;",
+                    "pub use running_process::register_daemon_frame_payload_protocol;",
+                    "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;",
+                    "pub use running_process::daemon_registration_compat as daemon_registration;",
+                ][..],
+                Some("broker.rs") => &[
+                    "pub use running_process::broker::*;",
+                    "BackendHandle",
+                    "DaemonProcess",
+                    "BrokerClientError",
+                    "RefusalKind",
+                    "Frame",
+                    "encode_framed",
+                    "pub use running_process::broker::backend_lifecycle::verify_pid;",
+                ][..],
+                Some("platform_linux.rs" | "platform_macos.rs" | "platform_win.rs") => {
+                    for line in source.lines().map(str::trim) {
+                        if line.starts_with("pub use running_process") {
+                            assert!(matches!(
+                                line,
+                                "pub use running_process::native_exit_code as exit_code;"
+                                    | "pub use running_process::monitor_console_windows;"
+                                    | "pub use running_process::{process_executable_path, process_same_executable_path, ProcessLiveness};"
+                            ));
+                        }
+                    }
+                    &[
+                        "pub use running_process::native_exit_code as exit_code;",
+                        "pub use running_process::monitor_console_windows;",
+                        "pub use running_process::{process_executable_path, process_same_executable_path, ProcessLiveness};",
+                    ][..]
+                }
+                Some("daemon_registration_v2.rs") => &[
+                    "pub mod canonical",
+                    "ServiceDefinition",
+                    "ServiceDefinitionBuilder",
+                    "ServiceDefinitionError",
+                    "LoadedServiceDefinitionV2",
+                    "read_service_definition_v2",
+                ][..],
+                Some("async_process.rs") => &[
+                    "AsyncProcess",
+                    "AsyncProcessBuilder",
+                    "AsyncProcessSession",
+                    "AsyncProcessSessionEvent",
+                    "AsyncStdio",
+                    "StreamKind",
+                    "AsyncProcessError",
+                    "ProcessTreeKill",
+                    "ProcessPriority",
+                    "SpawnAdmission",
+                ][..],
+                Some("containment.rs") => &[
+                    "ContainedProcessGroup",
+                    "ORIGINATOR_ENV_VAR",
+                    "SpawnedChild",
+                ][..],
+                Some("process.rs") if path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str()) != Some("platform") => &[
+                    "blake3_file",
+                    "run_std_command_bounded",
+                    "spawn",
+                    "spawn_daemon",
+                    "spawn_daemon_with_explicit_environment",
+                    "spawn_daemon_with_environment",
+                    "spawn_daemon_with_stdio_and_env_policy",
+                    "spawn_with_environment",
+                    "spawn_with_explicit_environment",
+                    "DaemonChild",
+                    "DaemonStdio",
+                    "DaemonStdioSource",
+                    "ProcessError",
+                    "RunOutput",
+                    "SpawnStdio",
+                    "SpawnedChild",
+                    "StdioSource",
+                    "SyncEnvironment",
+                    "running_process::observer::*",
+                ][..],
+                Some("process.rs") if path.parent().and_then(|parent| parent.file_name()).and_then(|name| name.to_str()) == Some("platform") => &[
+                    "DaemonChild",
+                    "DaemonStdio",
+                    "DaemonStdioSource",
+                    "SpawnStdio",
+                    "StdioSource",
+                    "SpawnedChild",
+                    "SpawnedChildControl",
+                    "SyncEnvironment",
+                    "ConsoleWindowInfo",
+                    "CaptureStream",
+                    "ProcessInspectError",
+                    "ProcessInspectErrorKind",
+                ][..],
+                other => panic!(
+                    "only reviewed canonical modules may expose running-process names, got {other:?}"
+                ),
+            };
+            for spelling in approved {
+                assert!(
+                    source.contains(spelling),
+                    "the canonical re-export module must retain its reviewed surface: {spelling}"
+                );
+            }
+        }
     }
 }
 
 #[test]
-fn process_substrate_is_exact_feature_minimal_and_private() {
+fn process_substrate_is_feature_minimal_and_tracks_the_temporary_canonical_spawn_subgit() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { version = \"=4.10.12\", default-features = false, features = [\"kernel-substrate\"] }"
+            "running-process = { version = \"=4.10.13\", default-features = false, features = [\"kernel-substrate\", \"independent-spawn\"] }"
         ),
-        "the facade must retain the exact published running-process pin and minimal default feature set"
+        "the facade must retain the exact published running-process pin and selected canonical capabilities"
     );
     assert!(
-        manifest.contains("independent-spawn = [\"running-process/independent-spawn\"]"),
-        "the canonical spawn exception must remain an explicit lightweight-facade opt-in"
-    );
-    assert!(
-        manifest.contains("# Exact first-party pre-1.0 pin."),
-        "the released process substrate must retain its exact first-party pin rationale"
+        !manifest.contains("_vender/running-process"),
+        "a released facade must not retain a temporary process-substrate checkout"
     );
 
     let release_workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
@@ -162,7 +295,7 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     for mapping in [
         ".create_process_group(create_process_group)",
         ".kill_when_owner_dies(kill_when_owner_dies)",
-        ".nice(priority.substrate_nice())",
+        ".priority(priority)",
     ] {
         assert!(
             adapter.contains(mapping),
@@ -198,13 +331,37 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
             let line = line.trim_start();
             if line.starts_with("pub ") {
                 assert!(
-                    !line.contains("running_process") || path == root.join("src/lib.rs"),
+                    !line.contains("running_process")
+                        || matches!(
+                            path.file_name().and_then(|name| name.to_str()),
+                            Some(
+                                "lib.rs"
+                                    | "broker.rs"
+                                    | "daemon_registration_v2.rs"
+                                    | "async_process.rs"
+                                    | "process.rs"
+                                    | "containment.rs"
+                                    | "platform_linux.rs"
+                                    | "platform_macos.rs"
+                                    | "platform_win.rs"
+                            )
+                        ),
                     "{} exposes a running-process type in {line:?}",
                     path.display()
                 );
             }
         }
     }
+
+    let canonical = &lib;
+    assert!(
+        canonical.contains("pub use running_process::independent_spawn;"),
+        "the approved exception must be a direct namespace re-export, not a wrapper"
+    );
+    assert!(
+        !canonical.contains("enum SpawnMode") && !canonical.contains("impl From<"),
+        "the approved exception must not recreate canonical types or conversion tables"
+    );
 }
 
 #[test]
@@ -301,35 +458,11 @@ fn daemon_frame_v1_remains_transport_free_and_product_neutral() {
 
     let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
     assert!(
-        lib.contains("#[cfg(feature = \"daemon-frame-v1\")]\npub mod daemon_frame_v1;"),
-        "default builds must omit the daemon frame facade module"
+        lib.contains(
+            "#[cfg(feature = \"daemon-frame-v1\")]\npub use running_process::daemon_frame_v1;"
+        ),
+        "default builds must omit the canonical daemon frame namespace"
     );
-
-    let frame = std::fs::read_to_string(root.join("src/daemon_frame_v1.rs"))
-        .expect("read daemon-frame facade");
-    assert!(
-        !frame.contains("0x7A63"),
-        "zccache's product protocol identifier must not be owned by kernal-api"
-    );
-    for line in frame
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("pub "))
-    {
-        for forbidden in [
-            "running_process",
-            "prost",
-            "BytesMut",
-            "tokio",
-            "RawFd",
-            "RawHandle",
-        ] {
-            assert!(
-                !line.contains(forbidden),
-                "daemon-frame facade leaks {forbidden:?}: {line}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -371,44 +504,8 @@ fn daemon_registration_remains_opt_in_and_client_free() {
 
     let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
     assert!(
-        lib.contains("#[cfg(feature = \"daemon-registration\")]\npub mod daemon_registration;"),
-        "default builds must omit the daemon-registration facade module"
-    );
-
-    let registration = std::fs::read_to_string(root.join("src/daemon_registration.rs"))
-        .expect("read daemon-registration facade");
-    for forbidden in ["protocol_v2", "0x7A63", "zccache"] {
-        assert!(
-            !registration.contains(forbidden),
-            "daemon-registration must not own {forbidden:?}"
-        );
-    }
-    for line in registration
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("pub "))
-    {
-        for forbidden in [
-            "running_process",
-            "prost",
-            "backend::",
-            "tokio",
-            "BytesMut",
-            "RawFd",
-            "RawHandle",
-            "platform",
-        ] {
-            assert!(
-                !line.contains(forbidden),
-                "daemon-registration facade leaks {forbidden:?}: {line}"
-            );
-        }
-    }
-    assert!(
-        registration.contains("self.inner.install().map_err(service_error)")
-            && registration.contains("self.inner.install_in(root.as_ref()).map_err(service_error)")
-            && !registration.contains("fs::write"),
-        "service-definition persistence must delegate to the frozen upstream non-atomic v1 writer"
+        lib.contains("#[cfg(feature = \"daemon-registration\")]\npub use running_process::daemon_registration_compat as daemon_registration;"),
+        "default builds must omit the canonical daemon-registration namespace"
     );
 
     let consumer_root = root.join("tests/daemon-registration-consumer");
@@ -486,46 +583,10 @@ fn daemon_registration_v2_remains_opt_in_and_client_free() {
     let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
     assert!(
         lib.contains(
-            "#[cfg(feature = \"daemon-registration-v2\")]\npub mod daemon_registration_v2;"
+            "#[cfg(feature = \"daemon-registration-v2\")]\npub use running_process::daemon_registration_v2_compat as daemon_registration_v2;"
         ),
-        "default builds must omit the daemon-registration-v2 facade module"
+        "default builds must omit the canonical daemon-registration-v2 namespace"
     );
-
-    let registration = std::fs::read_to_string(root.join("src/daemon_registration_v2.rs"))
-        .expect("read daemon-registration-v2 facade");
-    for forbidden in ["protocol_v2", "http_server", "zccache"] {
-        assert!(
-            !registration.contains(forbidden),
-            "daemon-registration-v2 must not own {forbidden:?}"
-        );
-    }
-    for line in registration
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("pub "))
-    {
-        for forbidden in [
-            "running_process",
-            "prost",
-            "backend",
-            "tokio",
-            "BytesMut",
-            "RawFd",
-            "RawHandle",
-            "platform",
-        ] {
-            assert!(
-                !line.contains(forbidden),
-                "daemon-registration-v2 facade leaks {forbidden:?}: {line}"
-            );
-        }
-    }
-    assert!(
-        registration.contains("backend::write_service_definition_v2")
-            && !registration.contains("fs::write"),
-        "v2 persistence must delegate to the frozen upstream non-atomic writer"
-    );
-
     let consumer_root = root.join("tests/daemon-registration-v2-consumer");
     let consumer_manifest = std::fs::read_to_string(consumer_root.join("Cargo.toml"))
         .expect("read external daemon-registration-v2 consumer manifest");
@@ -709,7 +770,7 @@ fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
     for (index, raw) in source.lines().enumerate() {
         let line = raw.trim_start();
         let indent = raw.len() - line.len();
-        if line.starts_with("//") {
+        if line.starts_with("//") || line.starts_with("pub use ") {
             continue;
         }
         if let Some((body_indent, fields_are_public)) = open {
@@ -986,17 +1047,24 @@ fn published_documentation_renders_every_public_module() {
     );
 
     // Every module the metadata exists to render must actually be public.
-    for (feature, module) in [
-        ("daemon-identity", "daemon_identity"),
-        ("daemon-frame-v1", "daemon_frame_v1"),
-        ("daemon-registration", "daemon_registration"),
-        ("daemon-registration-v2", "daemon_registration_v2"),
+    for (feature, public_item) in [
+        ("daemon-identity", "pub mod daemon_identity;"),
+        (
+            "daemon-frame-v1",
+            "pub use running_process::daemon_frame_v1;",
+        ),
+        (
+            "daemon-registration",
+            "pub use running_process::daemon_registration_compat as daemon_registration;",
+        ),
+        (
+            "daemon-registration-v2",
+            "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;",
+        ),
     ] {
         assert!(
-            lib.contains(&format!(
-                "#[cfg(feature = \"{feature}\")]\npub mod {module};"
-            )),
-            "{module} must stay a public module gated on {feature}"
+            lib.contains(&format!("#[cfg(feature = \"{feature}\")]\n{public_item}")),
+            "{public_item} must stay a public feature-gated facade item"
         );
     }
 

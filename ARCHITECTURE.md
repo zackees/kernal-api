@@ -26,28 +26,47 @@ have an async runtime to do that work. It must never depend on `kernal-api`.
 `kernal-api` is the higher semantic facade used by applications. It depends on
 `running-process`, selects shared implementation versions, adds facilities such
 as hashing and profiling, and turns backend behavior into stable application
-contracts. The phase-1 bounded process adapter has landed: it uses the exact
-published `running-process` 4.10.12 release with its lightweight
-`kernel-substrate` feature, as a mandatory dependency. The canonical
-`independent-spawn` surface is an explicit facade feature. First-party
-applications eventually depend on `kernal-api` only.
+contracts. The bounded process adapter uses the exact published
+`running-process` 4.10.13 release with `default-features = false`; its
+lightweight `kernel-substrate` and opt-in `independent-spawn` capabilities are
+selected explicitly. First-party applications eventually depend on `kernal-api`
+only.
 
 This one-way graph resolves the async/process cycle without creating a smaller
 "base" facade that would merely move the same boundary elsewhere.
 
 ## Boundary rules
 
+Native exit-status conversion is also a narrow canonical function re-export:
+the selected platform module exposes `running_process::native_exit_code` as
+`exit_code`. It uses standard-library arguments/results and removes three
+duplicated native implementations without exposing a backend handle or runtime.
+Console-popup monitoring follows the same narrow rule: the selected platform
+modules expose `running_process::monitor_console_windows`, and
+`platform::process::ConsoleWindowInfo` is its exact return element type. This
+removes copied empty Unix stubs and the Windows polling loop without adding a
+backend runtime surface. `platform::process::CaptureStream` similarly aliases
+the canonical `StreamKind` while retaining its capture-hook spelling. The
+facade policy test permits only these reviewed platform aliases.
+
 - `running-process` owns low-level process, OS, and current broker mechanisms.
 - `kernal-api` owns public semantic types, policies, defaults, and capability
-  composition. It may adapt `running-process` privately, but does not publicly
-  re-export its types, with one scoped exception: the canonical independent
-  spawn contract (`SpawnMode`, its options/backend/lifetime, launch payload,
-  readiness, handle/exit, and `spawn_with_options`) is re-exported unchanged
-  behind the explicit `independent-spawn` facade feature.
-  Its live process-control handle cannot be faithfully wrapped without a
-  conversion boundary; identical type identity makes the selected substrate
-  contract explicit. This does not authorize general backend, Tokio, platform,
-  or runtime re-exports.
+  composition. It normally adapts `running-process` privately. Approved,
+  policy-tested canonical exceptions are the independent-spawn contract at
+  `kernal_api::independent_spawn` (and its documented root aliases), the
+  opt-in `kernal_api::broker` contract, the feature-gated `daemon_frame_v1`
+  namespace and registration macro, and the renamed `daemon_registration`
+  and `daemon_registration_v2` namespaces (including the latter's
+  `canonical` namespace), plus the semantic
+  `kernal_api::async_process` primitives and opt-in `kernal_api::process`
+  migration primitives, plus `kernal_api::containment` and the explicit
+  `kernal_api::foreground` command namespace:
+  `SpawnMode::{Inherited, Independent}`, its options/capability/error/control
+  types, and its spawn/capability entry points are direct Rust re-exports from
+  `running-process`. They retain identical type identity; no matching facade
+  enum, wrapper, conversion, or fallback may be introduced. These exceptions are
+  narrow and do not expose the crate wholesale or its platform/runtime
+  internals.
 - Applications own product policy and product protocols. zccache, for example,
   keeps its cache payload schema, protocol identifiers, and deployment policy.
 - Applications may not directly depend on `running-process`, Tokio, or another
@@ -55,8 +74,42 @@ This one-way graph resolves the async/process cycle without creating a smaller
 - New facade operations bake in safe defaults: bounded resources, cancellation,
   connection and progress timeouts, child cleanup, and diagnostic visibility.
 
+`foreground` is an explicit compatibility boundary for caller-configured
+`std::process::Command` execution, not a managed session. It preserves native
+status/output semantics, including caller stdio overrides, launch hooks,
+process-group/session configuration and inheritable resources. It adds no
+timeout, output limit, owner-death containment, or independent placement;
+existing cgroup and Job limits still apply. Use managed or bounded operations
+when those guarantees are required. Both functions are provided by the native
+substrate and namespace-re-exported through `running-process` and `kernal-api`.
+
 The public API describes intent rather than backend vocabulary. This allows a
 backend to be trimmed, vendored, or rewritten without changing every client.
+
+### Canonical independent spawn exception
+
+Canonical namespace aliases preserve identity with the selected dependency,
+not with whatever version happens to be newest in the registry. For example,
+`pub use running_process::daemon_registration_compat as daemon_registration;`
+gives callers a kernal-api namespace without copying its types or maintaining
+conversion tables. Dependency updates remain explicit. The reviewed spelling
+allowlist and feature-isolation assertions live in `tests/facade_policy.rs`;
+this policy supersedes earlier blanket prohibitions on these selected reexports.
+
+`SpawnMode::Inherited` is the default and retains ordinary caller containment.
+`SpawnMode::Independent` requests placement outside the requesting worker's
+Linux cgroup or Windows Job Object. It remains subject to enclosing user,
+container, and system limits; it is neither privilege elevation nor a Docker
+escape. The canonical substrate reports unsupported manager access, permission,
+launch, readiness, cancellation, and cleanup failures directly. It must never
+silently fall back to inherited placement. Detached terminal/parent lifetime is
+separate from independent resource placement.
+
+The exception is selected by an exact `running-process` release pin. A local
+`_vender/running-process` path is allowed only during coordinated development;
+release validation rejects it. The dependency must be published, available in
+the registry, exactly version-pinned, and the nested checkout removed before a
+release branch or package validation.
 
 ### Native platform boundary
 

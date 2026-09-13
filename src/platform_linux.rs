@@ -29,9 +29,8 @@ pub use autostart::{
     unregister as autostart_unregister,
 };
 
-#[path = "platform_linux/process_inspect.rs"]
-pub(crate) mod process_inspect;
-pub use process_inspect::{process_same_executable_path, ProcessLiveness};
+#[allow(unused_imports)] // Kept for the platform-path compatibility facade.
+pub use running_process::{process_executable_path, process_same_executable_path, ProcessLiveness};
 
 #[path = "platform_linux/raw_write.rs"]
 pub(crate) mod raw_write;
@@ -72,17 +71,22 @@ pub use host::login_environment_block as host_login_environment_block;
 pub(crate) mod fs;
 #[cfg(feature = "fs")]
 pub use fs::{
+    allocated_bytes as fs_allocated_bytes,
     create_private_file as fs_create_private_file,
     decode_path_bytes as fs_decode_path_bytes,
-    replace_file as fs_replace_file, sync_directory as fs_sync_directory,
+    open_shared_append as fs_open_shared_append, replace_file as fs_replace_file,
+    sync_directory as fs_sync_directory,
+    sync_directory_if_supported as fs_sync_directory_if_supported,
     user_config_dir as fs_user_config_dir,
     user_data_dir as fs_user_data_dir, encode_path_bytes as fs_encode_path_bytes,
-    file_identity as fs_file_identity, is_lock_conflict as fs_is_lock_conflict,
+    file_id_width as fs_file_id_width, file_identity as fs_file_identity,
+    is_lock_conflict as fs_is_lock_conflict,
     lock_exclusive as fs_lock_exclusive, lock_shared as fs_lock_shared,
     open_lock_file as fs_open_lock_file, path_identity as fs_path_identity,
     set_file_mtime as fs_set_file_mtime,
     try_lock_exclusive as fs_try_lock_exclusive, try_lock_shared as fs_try_lock_shared,
     unlock as fs_unlock,
+    volume_identity as fs_volume_identity, volume_identity_u128 as fs_volume_identity_u128,
     user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
     read_context_regular_file_bounded as fs_read_context_regular_file_bounded,
@@ -98,7 +102,8 @@ pub use fs_watch::Watcher as FsWatchWatcher;
 #[path = "platform_linux/executable.rs"]
 pub(crate) mod executable;
 pub use executable::{
-    file_name as executable_file_name, find_in_paths as executable_find_in_paths,
+    file_name as executable_file_name, file_name_os as executable_file_name_os,
+    find_in_paths as executable_find_in_paths,
     native_library_name as executable_native_library_name,
     sibling_of_current_image as executable_sibling_of_current_image,
     stem_matches as executable_stem_matches,
@@ -270,11 +275,7 @@ pub fn canonical_environment_pairs(pairs: Vec<(String, String)>) -> Vec<(String,
     pairs
 }
 
-pub fn monitor_console_windows(
-    _duration: std::time::Duration,
-) -> Vec<crate::platform::process::ConsoleWindowInfo> {
-    Vec::new()
-}
+pub use running_process::monitor_console_windows;
 
 use std::ffi::OsStr;
 use std::io;
@@ -424,10 +425,7 @@ pub(crate) fn kill_tree_identity(
     process_tree::kill_tree(identity, timeout, capture_process_identity, force_kill_identity)
 }
 
-pub fn exit_code(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    status.code().unwrap_or_else(|| -status.signal().unwrap_or(1))
-}
+pub use running_process::native_exit_code as exit_code;
 
 pub fn set_process_name(name: &str) {
     let truncated: String = name.chars().take(15).collect();
@@ -436,6 +434,24 @@ pub fn set_process_name(name: &str) {
 }
 
 pub fn configure_trampoline_command(_command: &mut std::process::Command) {}
+
+/// Make a synchronous child the leader of a new Unix session. This is the
+/// historical daemon-tree contract (`setsid`), intentionally distinct from
+/// [`configure_process_command`]'s child process-group (`setpgid`) policy.
+/// No descriptor cleanup, owner-death binding, stdio policy, or resource limit
+/// is added here; callers retain those independent policies.
+pub fn configure_session_leader_command(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
 
 pub fn configure_process_command(
     command: &mut std::process::Command,
@@ -709,6 +725,23 @@ fn parse_proc_stat(stat: &str) -> Option<(u32, u64)> {
     Some((parent_pid, start_ticks))
 }
 
+/// Return the cumulative user-plus-kernel CPU time for `pid` in Linux clock
+/// ticks. This is a best-effort snapshot of a numeric PID, not a retained
+/// process identity: `None` covers disappearance, access failure, and an
+/// incomplete `/proc` read.
+pub fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` is parenthesized and can itself contain spaces or ')'; only the
+    // final delimiter starts the fixed-position fields. utime and stime are
+    // fields 14 and 15, hence positions 11 and 12 after field 2.
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
+    let _state = fields.next()?;
+    let _parent = fields.next()?;
+    let user = fields.nth(9)?.parse::<u64>().ok()?;
+    let kernel = fields.next()?.parse::<u64>().ok()?;
+    Some(user.wrapping_add(kernel))
+}
+
 /// Mark inherited descriptors close-on-exec without breaking std's exec-error pipe.
 ///
 /// # Safety
@@ -809,6 +842,158 @@ pub fn unix_set_priority(pid: u32, nice: i32) -> io::Result<()> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     if unsafe { libc::setpriority(libc::PRIO_PROCESS, pid.get(), nice) } == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
+
+/// Forcibly terminate one numeric PID for compatibility-only callers.
+///
+/// This cannot prove that a PID has not been recycled between the caller's
+/// observation and the signal. New control flows must retain and use a
+/// verified [`ProcessIdentity`] instead. The compatibility spelling retains
+/// the historical direct-PID behavior while applying the mandatory signed-PID
+/// range check.
+///
+/// [`ProcessIdentity`]: crate::platform::process::ProcessIdentity
+pub fn force_terminate_pid(pid: u32) -> io::Result<()> {
+    unix_signal_process(pid, crate::platform::process::UnixSignalKind::Kill)
+}
+
+/// Forcibly terminate the child-owned process group whose leader is `pid`.
+///
+/// This is numeric-PID compatibility behavior: it validates that `pid` cannot
+/// become a broadcast signal, but does not prove the group still belongs to a
+/// previously observed process. Verified control flows must use an owned
+/// process/session capability instead.
+pub fn force_terminate_process_group(pid: u32) -> io::Result<()> {
+    let pid = crate::platform::process::ProcessId::new(pid)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    unix_signal_process_group(
+        pid.native_signed(),
+        crate::platform::process::UnixSignalKind::Kill,
+    )
+}
+
+/// Replace this process's three standard streams with `/dev/null`.
+///
+/// This deliberately mutates process-global state and is intended only for a
+/// daemon's early bootstrap path.
+pub fn detach_standard_streams() {
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDWR) };
+    if null < 0 {
+        return;
+    }
+    for target in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let _ = unsafe { libc::dup2(null, target) };
+    }
+    if null > libc::STDERR_FILENO {
+        let _ = unsafe { libc::close(null) };
+    }
+}
+
+/// Redirect standard input to `/dev/null` and standard output/error to an
+/// append-only log file. Returns `false` without changing the output streams
+/// when the log pathname cannot be opened.
+pub fn redirect_standard_streams_to_log(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    if null < 0 {
+        return false;
+    }
+    let _ = unsafe { libc::dup2(null, libc::STDIN_FILENO) };
+    if null > libc::STDERR_FILENO {
+        let _ = unsafe { libc::close(null) };
+    }
+    let log = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        )
+    };
+    if log < 0 {
+        return false;
+    }
+    let _ = unsafe { libc::dup2(log, libc::STDOUT_FILENO) };
+    let _ = unsafe { libc::dup2(log, libc::STDERR_FILENO) };
+    if log > libc::STDERR_FILENO {
+        let _ = unsafe { libc::close(log) };
+    }
+    true
+}
+
+/// Whether this host supports an inheritable GNU make jobserver pipe pair.
+#[must_use]
+pub fn native_jobserver_supported() -> bool {
+    true
+}
+
+/// Apply a canonical scheduling band to an already-spawned async child.
+/// A child without a visible PID has already exited and needs no adjustment.
+pub fn apply_priority_to_async_child(
+    child: &tokio::process::Child,
+    priority: crate::ProcessPriority,
+) -> io::Result<()> {
+    let nice = match priority {
+        crate::ProcessPriority::Normal => return Ok(()),
+        crate::ProcessPriority::Low => 10,
+        crate::ProcessPriority::Idle => 19,
+        crate::ProcessPriority::High => -5,
+    };
+    let Some(pid) = child.id() else {
+        return Ok(());
+    };
+    unix_set_priority(pid, nice)
+}
+
+/// A host-owned GNU make jobserver pipe pair.
+#[derive(Debug)]
+pub struct NativeJobserver {
+    read: std::os::fd::OwnedFd,
+    write: std::os::fd::OwnedFd,
+}
+
+impl NativeJobserver {
+    /// Construct and prime a jobserver with `capacity` tokens.
+    pub fn create(capacity: usize) -> io::Result<Self> {
+        use std::os::fd::FromRawFd;
+
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "jobserver capacity must be greater than zero",
+            ));
+        }
+        let mut fds = [0_i32; 2];
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let read = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        let write = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        use std::os::fd::AsRawFd;
+        let tokens = vec![b'+'; capacity];
+        let written = unsafe { libc::write(write.as_raw_fd(), tokens.as_ptr().cast(), tokens.len()) };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if written as usize != tokens.len() {
+            return Err(io::Error::other(format!(
+                "jobserver pipe priming wrote {written} of {} bytes",
+                tokens.len()
+            )));
+        }
+        Ok(Self { read, write })
+    }
+
+    /// Return the GNU make `--jobserver-auth` descriptor pair.
+    #[must_use]
+    pub fn auth_string(&self) -> String {
+        use std::os::fd::AsRawFd;
+        format!("{},{}", self.read.as_raw_fd(), self.write.as_raw_fd())
+    }
+}
+
 /// Signal one process, never a process group.
 ///
 /// The range check is not decoration. `pid_t` is signed, so an unchecked
@@ -908,31 +1093,37 @@ pub(crate) fn configure_native_worker_environment(command: &mut std::process::Co
 
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 fn worker_from_spawned_child(
-    child: crate::platform::process::SpawnedChild,
+    mut child: crate::platform::process::SpawnedChild,
 ) -> Result<crate::platform::process::WorkerChild, crate::platform::process::WorkerError> {
-    let (stdin, stdout, pid, inner) = child.into_worker_parts();
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    drop(child.stderr.take());
+    let pid = child.id();
     Ok(crate::platform::process::WorkerChild::new(
         stdin,
         stdout,
         pid,
-        Box::new(UnixWorkerControl { inner }),
+        Box::new(UnixWorkerControl { child: Some(child) }),
     ))
 }
 
 #[allow(dead_code)] // Phase-A foundation; the phase-B supervisor owns it.
 struct UnixWorkerControl {
-    inner: Box<dyn crate::platform::process::SpawnedChildControl>,
+    child: Option<crate::platform::process::SpawnedChild>,
 }
 
 impl crate::platform::process::WorkerChildControl for UnixWorkerControl {
-    fn try_wait(&mut self) -> io::Result<Option<i32>> { self.inner.try_wait() }
+    fn try_wait(&mut self) -> io::Result<Option<i32>> {
+        self.child.as_mut().map_or(Ok(None), |child| child.try_wait())
+    }
 
     fn force_and_reap(&mut self, timeout: std::time::Duration) -> Result<(), crate::platform::process::WorkerError> {
         use crate::platform::process::{WorkerError, WorkerStage};
-        self.inner.kill().map_err(|error| WorkerError::new(WorkerStage::Terminate, error))?;
+        let Some(child) = self.child.as_mut() else { return Ok(()); };
+        child.kill().map_err(|error| WorkerError::new(WorkerStage::Terminate, error))?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if self.inner.try_wait().map_err(|error| WorkerError::new(WorkerStage::Reap, error))?.is_some() {
+            if child.try_wait().map_err(|error| WorkerError::new(WorkerStage::Reap, error))?.is_some() {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -942,7 +1133,7 @@ impl crate::platform::process::WorkerChildControl for UnixWorkerControl {
         }
     }
 
-    fn shutdown(&mut self) { self.inner.shutdown(); }
+    fn shutdown(&mut self) { drop(self.child.take()); }
 }
 
 #[cfg(all(test, feature = "ipc"))]

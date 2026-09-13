@@ -12,10 +12,14 @@ pub const EXECUTABLE_EXTENSION: Option<&str> = None;
 /// called `bare` or `bare.exe`. Only the file spelling changes here — PATH
 /// search order and `PATHEXT` are search concerns, not naming ones.
 pub fn file_name(bare: &str) -> String {
-    match EXECUTABLE_EXTENSION {
-        Some(extension) => format!("{bare}.{extension}"),
-        None => bare.to_owned(),
-    }
+    file_name_os(OsStr::new(bare))
+        .into_string()
+        .expect("a Unicode input remains Unicode")
+}
+
+/// Spell an executable name without losing non-Unicode host bytes.
+pub fn file_name_os(bare: &OsStr) -> OsString {
+    bare.to_os_string()
 }
 
 /// Path to a sibling program installed beside the running image.

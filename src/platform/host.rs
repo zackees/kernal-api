@@ -45,6 +45,31 @@ pub const fn process_target() -> ProcessTarget {
     }
 }
 
+/// Whether this binary targets Windows, available in constant expressions.
+/// This is a compile-target fact, not a runtime platform or capability probe.
+pub const fn target_is_windows() -> bool {
+    cfg!(target_os = "windows")
+}
+
+/// Whether this binary targets macOS, available in constant expressions.
+pub const fn target_is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// Whether this binary targets Linux, available in constant expressions.
+pub const fn target_is_linux() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// Whether this binary was built for Rust's musl target environment.
+///
+/// This does not detect the host distribution's dominant libc: a statically
+/// linked musl executable can run on a glibc host. Artifact-selection policy
+/// and runtime libc heuristics remain separate from this compile-time fact.
+pub const fn target_uses_musl() -> bool {
+    cfg!(target_env = "musl")
+}
+
 /// Logical concurrency this host exposes to this process.
 ///
 /// A thin, host-neutral restatement of [`std::thread::available_parallelism`]
@@ -89,9 +114,22 @@ pub fn cpu_identity_material() -> String {
     material
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn append_cpu_feature_material(material: &mut String) {
-    for (name, present) in [
+    for name in cpu_compatibility_features() {
+        material.push_str("\0feature=");
+        material.push_str(name);
+    }
+}
+
+/// Ordered compatibility-key feature subset visible to this process.
+///
+/// On x86/x86-64, reports detected sse2, sse4.2, avx, avx2, avx512f, fma,
+/// bmi1 and bmi2 in that order. Other architectures return an empty list.
+/// This is not a complete CPU inventory or a host-architecture probe.
+/// Keep ordering/spellings stable: consumers may include them in cache keys.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn cpu_compatibility_features() -> Vec<&'static str> {
+    [
         ("sse2", std::arch::is_x86_feature_detected!("sse2")),
         ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
         ("avx", std::arch::is_x86_feature_detected!("avx")),
@@ -100,16 +138,17 @@ fn append_cpu_feature_material(material: &mut String) {
         ("fma", std::arch::is_x86_feature_detected!("fma")),
         ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
         ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-    ] {
-        if present {
-            material.push_str("\0feature=");
-            material.push_str(name);
-        }
-    }
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect()
 }
 
+/// No x86 compatibility-key features are reported on this architecture.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn append_cpu_feature_material(_material: &mut String) {}
+pub fn cpu_compatibility_features() -> Vec<&'static str> {
+    Vec::new()
+}
 
 /// Resolve a machine identity from the first readable of `machine_id_paths`,
 /// falling back to a boot-scoped id.

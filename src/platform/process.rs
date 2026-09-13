@@ -1,16 +1,19 @@
 //! Process spawning, containment, inspection, termination, and stdio.
 
 pub use crate::{
-    assign_child_to_windows_job, cancel_capture_reader, canonical_environment_pairs,
-    capture_reader_done, compat_shell_command, configure_exact_trace, configure_process_command,
-    configure_sync_contained_command, configure_sync_daemon_command, configure_trampoline_command,
-    current_executable_build_id, exact_trace_capability, exit_code, monitor_console_windows,
-    parent_has_console, prepare_capture_reader, run_bounded_command, run_bounded_command_async,
+    apply_priority_to_async_child, assign_child_to_windows_job, cancel_capture_reader,
+    canonical_environment_pairs, capture_reader_done, compat_shell_command, configure_exact_trace,
+    configure_process_command, configure_session_leader_command, configure_sync_contained_command,
+    configure_sync_daemon_command, configure_trampoline_command, current_executable_build_id,
+    detach_standard_streams, exact_trace_capability, exit_code, force_terminate_pid,
+    force_terminate_process_group, monitor_console_windows, native_jobserver_supported,
+    parent_has_console, prepare_capture_reader, process_cpu_ticks as cpu_ticks_for_pid,
+    redirect_standard_streams_to_log, run_bounded_command, run_bounded_command_async,
     set_process_name, shell_command, soft_terminate_process_group, spawn_sync, spawn_sync_daemon,
     start_descendant_monitor, start_exact_trace, sync_child_native_handle, trampoline_exit_code,
     unix_mark_extra_fds_close_on_exec, BoundedProcessAsyncError, BoundedProcessError,
-    BoundedProcessOutput, CaptureCancellation, PlatformChild, ProcessCaptureError, ProcessExit,
-    ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion, ProcessOutputEvent,
+    BoundedProcessOutput, CaptureCancellation, NativeJobserver, PlatformChild, ProcessCaptureError,
+    ProcessExit, ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion, ProcessOutputEvent,
     ProcessOutputFault, ProcessPostExitDrain, ProcessPriority, ProcessSession, ProcessSessionExit,
     ProcessSessionOptions, SpawnSpec, StreamMode, TracedChild, WindowsJobHandle,
 };
@@ -158,20 +161,13 @@ impl Default for DescendantMonitorStop {
     }
 }
 
-/// Identifies one captured child output stream.
-#[derive(Clone, Copy)]
-pub enum CaptureStream {
-    Stdout,
-    Stderr,
-}
+/// Canonical output-stream selector used by capture reader lifecycle hooks.
+/// The preserved `CaptureStream` spelling keeps the platform API stable while
+/// retaining exact native type identity.
+pub use running_process::StreamKind as CaptureStream;
 
-/// Metadata about one visible window observed by console-popup monitoring.
-#[derive(Debug, Clone)]
-pub struct ConsoleWindowInfo {
-    pub pid: u32,
-    pub title: String,
-    pub hwnd: u64,
-}
+/// Exact native metadata returned by canonical console-popup monitoring.
+pub use running_process::ConsoleWindowInfo;
 
 /// A process identifier this host could actually have issued.
 ///
@@ -478,13 +474,7 @@ mod identity_tests {
 ///
 /// Explicit `Command::env` additions and removals remain on the command and
 /// are applied after this base by the selected platform implementation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SyncEnvironment {
-    /// Start with the spawning process's ambient environment.
-    Inherit,
-    /// Start with this complete, caller-assembled base environment.
-    Explicit(Vec<(std::ffi::OsString, std::ffi::OsString)>),
-}
+pub use running_process::SyncEnvironment;
 
 /// Private, facade-owned bounds for one contained worker process tree.
 ///
@@ -877,186 +867,21 @@ mod worker_child_tests {
     }
 }
 
-/// Caller-supplied stdio bindings for a contained synchronous child.
-///
-/// Each stream is independently configured. `drain_timeout` bounds how long
-/// wrapper-owned pipe ends remain open after the child exits; `None` leaves
-/// pipe closure entirely to the caller. `show_console` only affects Windows.
-pub struct SpawnStdio<'a> {
-    /// Child standard input source.
-    pub stdin: StdioSource<'a>,
-    /// Child standard output destination.
-    pub stdout: StdioSource<'a>,
-    /// Child standard error destination.
-    pub stderr: StdioSource<'a>,
-    /// Maximum post-exit pipe drain interval.
-    pub drain_timeout: Option<std::time::Duration>,
-    /// Whether a Windows child may inherit or allocate a visible console.
-    pub show_console: bool,
-}
+/// Canonical synchronous-child stdio configuration. These aliases preserve
+/// exact substrate type identity; the platform facade adds no policy or
+/// conversion layer to their field/default/variant contract.
+pub use running_process::{DaemonStdio, DaemonStdioSource, SpawnStdio, StdioSource};
 
-impl Default for SpawnStdio<'_> {
-    fn default() -> Self {
-        Self {
-            stdin: StdioSource::Null,
-            stdout: StdioSource::Parent,
-            stderr: StdioSource::Parent,
-            drain_timeout: Some(std::time::Duration::from_secs(2)),
-            show_console: false,
-        }
-    }
-}
+/// Canonical detached-child lifecycle handle. Native platform launchers use
+/// its verified external-launch constructor, preserving their environment,
+/// stdio, Windows Job/breakaway, and cleanup behavior without a copied type.
+pub use running_process::DaemonChild;
 
-/// Caller-supplied output bindings for a detached synchronous child.
-///
-/// Detached children may write only to the platform null device or to a
-/// caller-owned file. Parent stdio and anonymous pipes are intentionally not
-/// available because either can retain or depend on the launching process.
-pub struct DaemonStdio<'a> {
-    /// Child standard output destination.
-    pub stdout: DaemonStdioSource<'a>,
-    /// Child standard error destination.
-    pub stderr: DaemonStdioSource<'a>,
-}
-
-impl Default for DaemonStdio<'_> {
-    fn default() -> Self {
-        Self {
-            stdout: DaemonStdioSource::Null,
-            stderr: DaemonStdioSource::Null,
-        }
-    }
-}
-
-/// Output destination accepted by the detached-child path.
-pub enum DaemonStdioSource<'a> {
-    /// Route output to the platform null device.
-    Null,
-    /// Duplicate a caller-owned file into the child.
-    File(&'a std::fs::File),
-}
-
-/// Standard-stream source or destination for a contained child.
-pub enum StdioSource<'a> {
-    /// Route the stream to the platform null device.
-    Null,
-    /// Inherit the matching stream from the parent process.
-    Parent,
-    /// Duplicate a caller-owned file into the child.
-    File(&'a std::fs::File),
-    /// Create and return an anonymous parent/child pipe pair.
-    Pipe,
-}
-
-/// Handle for a detached child that is not terminated when dropped.
-pub struct DaemonChild {
-    pub(crate) pid: u32,
-    pub(crate) inner: Box<dyn DaemonChildControl>,
-}
-
-pub(crate) trait DaemonChildControl:
-    Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
-{
-    fn kill(&mut self) -> std::io::Result<()>;
-    fn wait(&mut self) -> std::io::Result<i32>;
-    fn try_wait(&mut self) -> std::io::Result<Option<i32>>;
-}
-
-impl DaemonChild {
-    /// Return the operating-system process identifier.
-    pub fn id(&self) -> u32 {
-        self.pid
-    }
-
-    /// Terminate the child process.
-    pub fn kill(&mut self) -> std::io::Result<()> {
-        self.inner.kill()
-    }
-
-    /// Wait for the child and return its numeric exit code.
-    pub fn wait(&mut self) -> std::io::Result<i32> {
-        self.inner.wait()
-    }
-
-    /// Return the exit code if the child has finished without blocking.
-    pub fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner.try_wait()
-    }
-}
-
-/// Handle and optional parent pipe ends for a contained child.
-///
-/// Dropping this value shuts down the contained process group.
-pub struct SpawnedChild {
-    /// Writable parent end when standard input was configured as a pipe.
-    pub stdin: Option<std::process::ChildStdin>,
-    /// Readable parent end when standard output was configured as a pipe.
-    pub stdout: Option<std::process::ChildStdout>,
-    /// Readable parent end when standard error was configured as a pipe.
-    pub stderr: Option<std::process::ChildStderr>,
-    pub(crate) pid: u32,
-    pub(crate) inner: Box<dyn SpawnedChildControl>,
-}
-
-pub(crate) trait SpawnedChildControl:
-    Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
-{
-    fn kill(&mut self) -> std::io::Result<()>;
-    fn wait(&mut self) -> std::io::Result<i32>;
-    fn try_wait(&mut self) -> std::io::Result<Option<i32>>;
-    fn shutdown(&mut self);
-}
-
-impl SpawnedChild {
-    /// Transfer the private process owner and the parent protocol pipes to a
-    /// more specialized contained-child facade without running this wrapper's
-    /// shutdown-on-drop path.
-    #[allow(dead_code)] // Used only by Unix platform worker adapters.
-    pub(crate) fn into_worker_parts(
-        self,
-    ) -> (
-        Option<std::process::ChildStdin>,
-        Option<std::process::ChildStdout>,
-        u32,
-        Box<dyn SpawnedChildControl>,
-    ) {
-        let mut child = std::mem::ManuallyDrop::new(self);
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        drop(child.stderr.take());
-        let pid = child.pid;
-        // SAFETY: `child` is ManuallyDrop so its Drop implementation cannot
-        // shut down `inner`; this is the one ownership transfer of `inner`.
-        let inner = unsafe { std::ptr::read(&child.inner) };
-        (stdin, stdout, pid, inner)
-    }
-
-    /// Return the operating-system process identifier.
-    pub fn id(&self) -> u32 {
-        self.pid
-    }
-
-    /// Forcibly terminate the child on a best-effort basis.
-    pub fn kill(&mut self) -> std::io::Result<()> {
-        self.inner.kill()
-    }
-
-    /// Wait for the child and return its numeric exit code.
-    pub fn wait(&mut self) -> std::io::Result<i32> {
-        self.inner.wait()
-    }
-
-    /// Return the exit code if the child has finished without blocking.
-    pub fn try_wait(&mut self) -> std::io::Result<Option<i32>> {
-        self.inner.try_wait()
-    }
-}
-
-impl Drop for SpawnedChild {
-    fn drop(&mut self) {
-        self.inner.shutdown();
-    }
-}
+/// Canonical contained-child handle and lifecycle-control contract. Local
+/// Unix/Windows controls remain responsible for native group/Job containment
+/// and drain policy; the substrate-owned handle supplies pipes and one-shot
+/// drop shutdown, but does not itself establish containment.
+pub use running_process::{SpawnedChild, SpawnedChildControl};
 
 #[derive(Clone, Copy)]
 pub enum ObserverScope {
@@ -1211,64 +1036,13 @@ pub use crate::{
     process_owner_death_cleanup_target as owner_death_cleanup_target,
 };
 
-/// Why a host could not answer a question about a process.
-///
-/// The three named cases are the ones a caller can act on: a PID that could
-/// never name a process, a process that is not there, and a question this
-/// host does not answer. Everything else is the host's own report, kept
-/// whole rather than flattened into one of the three.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProcessInspectErrorKind {
-    /// The PID is outside the range this host issues.
-    InvalidPid,
-    /// No process on this host currently has that PID.
-    NotFound,
-    /// This host has no such primitive.
-    Unsupported,
-    /// The host was asked and refused, or failed.
-    Host,
-}
+/// Canonical native inspection errors retain both classification and OS detail.
+pub use running_process::{ProcessInspectError, ProcessInspectErrorKind};
 
-/// A failure to inspect or signal a process, and what kind of failure it was.
-#[derive(Debug)]
-pub struct ProcessInspectError {
-    /// Which of the four situations this is.
-    pub kind: ProcessInspectErrorKind,
-    /// What the host reported.
-    pub source: std::io::Error,
-}
-
-impl ProcessInspectError {
-    /// Build an error of `kind` carrying the host's last reported error.
-    pub fn last_os_error(kind: ProcessInspectErrorKind) -> Self {
-        Self {
-            kind,
-            source: std::io::Error::last_os_error(),
-        }
-    }
-
-    /// Build an error of `kind` with a message this crate composed itself.
-    pub fn stated(kind: ProcessInspectErrorKind, message: &str) -> Self {
-        Self {
-            kind,
-            source: std::io::Error::other(message.to_string()),
-        }
-    }
-}
-
-impl std::fmt::Display for ProcessInspectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.source)
-    }
-}
-
-impl std::error::Error for ProcessInspectError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
-}
-
-pub use crate::{process_same_executable_path as same_executable_path, ProcessLiveness};
+pub use crate::{
+    process_executable_path as executable_path_for_pid,
+    process_same_executable_path as same_executable_path, ProcessLiveness,
+};
 
 /// What a host was able to say about an exit once it had happened.
 ///

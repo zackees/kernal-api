@@ -28,9 +28,7 @@ pub use autostart::{
     unregister as autostart_unregister,
 };
 
-#[path = "platform_win/process_inspect.rs"]
-pub(crate) mod process_inspect;
-pub use process_inspect::{process_same_executable_path, ProcessLiveness};
+pub use running_process::{process_executable_path, process_same_executable_path, ProcessLiveness};
 
 #[path = "platform_win/raw_write.rs"]
 pub(crate) mod raw_write;
@@ -71,17 +69,20 @@ pub use host::{
 pub(crate) mod fs;
 #[cfg(feature = "fs")]
 pub use fs::{
-    create_private_file as fs_create_private_file, decode_path_bytes as fs_decode_path_bytes,
-    encode_path_bytes as fs_encode_path_bytes, file_identity as fs_file_identity,
+    allocated_bytes as fs_allocated_bytes, create_private_file as fs_create_private_file,
+    decode_path_bytes as fs_decode_path_bytes, encode_path_bytes as fs_encode_path_bytes,
+    file_id_width as fs_file_id_width, file_identity as fs_file_identity,
     is_lock_conflict as fs_is_lock_conflict, lock_exclusive as fs_lock_exclusive,
     lock_shared as fs_lock_shared, open_lock_file as fs_open_lock_file,
-    path_identity as fs_path_identity,
+    open_shared_append as fs_open_shared_append, path_identity as fs_path_identity,
     read_context_regular_file_bounded as fs_read_context_regular_file_bounded,
     read_private_regular_file_bounded as fs_read_private_regular_file_bounded,
     replace_file as fs_replace_file, set_file_mtime as fs_set_file_mtime,
-    sync_directory as fs_sync_directory, try_lock_exclusive as fs_try_lock_exclusive,
+    sync_directory as fs_sync_directory, sync_directory_if_supported as fs_sync_directory_if_supported,
+    try_lock_exclusive as fs_try_lock_exclusive,
     try_lock_shared as fs_try_lock_shared, unlock as fs_unlock,
     user_config_dir as fs_user_config_dir, user_data_dir as fs_user_data_dir,
+    volume_identity as fs_volume_identity, volume_identity_u128 as fs_volume_identity_u128,
     user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };
@@ -95,7 +96,8 @@ pub use fs_watch::Watcher as FsWatchWatcher;
 #[path = "platform_win/executable.rs"]
 pub(crate) mod executable;
 pub use executable::{
-    file_name as executable_file_name, find_in_paths as executable_find_in_paths,
+    file_name as executable_file_name, file_name_os as executable_file_name_os,
+    find_in_paths as executable_find_in_paths,
     native_library_name as executable_native_library_name,
     sibling_of_current_image as executable_sibling_of_current_image,
     stem_matches as executable_stem_matches,
@@ -218,9 +220,7 @@ mod session_relay;
 #[cfg(feature = "session-relay")]
 pub use session_relay::relay_local_socket_session;
 
-#[path = "platform_win/console.rs"]
-mod console;
-pub use console::monitor_console_windows;
+pub use running_process::monitor_console_windows;
 
 #[path = "platform_win/terminal.rs"]
 pub mod terminal;
@@ -429,15 +429,20 @@ pub(crate) fn kill_tree_identity(
     )
 }
 
-pub fn exit_code(status: std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
-}
+pub use running_process::native_exit_code as exit_code;
 
 pub fn set_process_name(_name: &str) {}
 
 pub fn configure_trampoline_command(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
     command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+
+/// Give a synchronous child its own Windows console-control process group.
+/// Console visibility remains the caller's separate policy.
+pub fn configure_session_leader_command(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0000_0200); // CREATE_NEW_PROCESS_GROUP
 }
 
 pub fn configure_process_command(
@@ -543,6 +548,31 @@ pub(crate) fn capture_process_identity(
         }
         Some(error) => Capture::Error(error),
     }
+}
+
+/// Return the cumulative kernel-plus-user CPU time for `pid` in 100-nanosecond
+/// units. This is a best-effort numeric-PID snapshot, not a retained identity;
+/// missing or inaccessible processes return `None`.
+pub fn process_cpu_ticks(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation: FILETIME = unsafe { std::mem::zeroed() };
+    let mut exit: FILETIME = unsafe { std::mem::zeroed() };
+    let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
+    let mut user: FILETIME = unsafe { std::mem::zeroed() };
+    let result = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    unsafe { CloseHandle(handle) };
+    let value = |time: FILETIME| {
+        (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+    };
+    (result != 0).then(|| value(kernel).wrapping_add(value(user)))
 }
 
 pub(crate) fn force_kill_identity(
@@ -658,33 +688,169 @@ pub fn observer_backend(
     }
 }
 
-pub fn unix_set_priority(_pid: u32, _nice: i32) -> io::Result<()> {
+pub fn unix_set_priority(_pid: u32, _nice: i32) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix priority is unavailable on Windows")) }
+/// Forcibly terminate one numeric PID for compatibility-only callers.
+///
+/// This opens a fresh process handle and therefore cannot defend against PID
+/// reuse. New control flows must retain a verified process identity instead.
+pub fn force_terminate_pid(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let result = unsafe { TerminateProcess(handle, 1) };
+    let error = (result == 0).then(io::Error::last_os_error);
+    unsafe { CloseHandle(handle) };
+    error.map_or(Ok(()), Err)
+}
+/// Windows has no kernel-equivalent numeric process-group kill primitive.
+/// Consumers needing tree termination must use a retained identity or retain
+/// their product-specific command policy.
+pub fn force_terminate_process_group(_pid: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "Unix priority is unavailable on Windows",
+        "numeric process-group termination is unavailable on Windows",
     ))
 }
-pub fn unix_signal_process(
-    _pid: u32,
-    _signal: crate::platform::process::UnixSignalKind,
+/// Replace this process's three standard streams with `NUL`.
+///
+/// This deliberately mutates process-global state and is intended only for a
+/// daemon's early bootstrap path.
+pub fn detach_standard_streams() {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+    for (slot, access) in [
+        (STD_INPUT_HANDLE, GENERIC_READ),
+        (STD_OUTPUT_HANDLE, GENERIC_WRITE),
+        (STD_ERROR_HANDLE, GENERIC_WRITE),
+    ] {
+        if let Some(handle) = open_standard_stream_file(OsStr::new("NUL"), access, windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING) {
+            replace_standard_handle(slot, handle);
+        }
+    }
+}
+
+/// Redirect standard input to `NUL` and standard output/error to an append
+/// log file. Returns `false` without changing the output streams when the log
+/// file cannot be opened.
+pub fn redirect_standard_streams_to_log(path: &std::path::Path) -> bool {
+    use std::ffi::OsStr;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{OPEN_ALWAYS, OPEN_EXISTING, SetFilePointerEx, FILE_END};
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+
+    if let Some(handle) = open_standard_stream_file(OsStr::new("NUL"), GENERIC_READ, OPEN_EXISTING) {
+        replace_standard_handle(STD_INPUT_HANDLE, handle);
+    }
+    let Some(log) = open_standard_stream_file(path.as_os_str(), GENERIC_WRITE, OPEN_ALWAYS) else {
+        return false;
+    };
+    let _ = unsafe { SetFilePointerEx(log, 0, std::ptr::null_mut(), FILE_END) };
+    replace_standard_handle(STD_OUTPUT_HANDLE, log);
+    replace_standard_handle(STD_ERROR_HANDLE, log);
+    true
+}
+
+fn open_standard_stream_file(
+    path: &std::ffi::OsStr,
+    access: u32,
+    disposition: u32,
+) -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let path: Vec<u16> = path.encode_wide().chain(Some(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            disposition,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    (!handle.is_null() && handle != INVALID_HANDLE_VALUE).then_some(handle)
+}
+
+fn replace_standard_handle(slot: u32, handle: windows_sys::Win32::Foundation::HANDLE) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle};
+
+    let old = unsafe { GetStdHandle(slot) };
+    let _ = unsafe { SetStdHandle(slot, handle) };
+    if !old.is_null() && old != INVALID_HANDLE_VALUE && old != handle {
+        let _ = unsafe { CloseHandle(old) };
+    }
+}
+/// Whether this host supports an inheritable GNU make jobserver pipe pair.
+#[must_use]
+pub fn native_jobserver_supported() -> bool {
+    false
+}
+
+/// Apply a canonical scheduling band to an already-spawned async child.
+/// A child without a native handle has already exited and needs no adjustment.
+pub fn apply_priority_to_async_child(
+    child: &tokio::process::Child,
+    priority: crate::ProcessPriority,
 ) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Unix signals are unavailable on Windows",
-    ))
+    use windows_sys::Win32::System::Threading::{
+        SetPriorityClass, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+        IDLE_PRIORITY_CLASS,
+    };
+
+    let class = match priority {
+        crate::ProcessPriority::Normal => return Ok(()),
+        crate::ProcessPriority::Low => BELOW_NORMAL_PRIORITY_CLASS,
+        crate::ProcessPriority::Idle => IDLE_PRIORITY_CLASS,
+        crate::ProcessPriority::High => HIGH_PRIORITY_CLASS,
+    };
+    let Some(handle) = child.raw_handle() else {
+        return Ok(());
+    };
+    if unsafe { SetPriorityClass(handle.cast(), class) } != 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
-pub fn unix_signal_process_group(
-    _pid: i32,
-    _signal: crate::platform::process::UnixSignalKind,
-) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "Unix signals are unavailable on Windows",
-    ))
+
+/// Windows marker type for the unsupported GNU make jobserver capability.
+#[derive(Debug)]
+pub struct NativeJobserver;
+
+impl NativeJobserver {
+    /// Windows has no compatible inheritable GNU make jobserver pipe pair.
+    pub fn create(capacity: usize) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "jobserver capacity must be greater than zero",
+            ));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "GNU make jobserver pipes are unavailable on Windows",
+        ))
+    }
+
+    /// This value cannot exist on Windows because construction always fails.
+    #[must_use]
+    pub fn auth_string(&self) -> String {
+        unreachable!("Windows cannot construct a native jobserver")
+    }
 }
-pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 {
-    0
-}
+pub fn unix_signal_process(_pid: u32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
+pub fn unix_signal_process_group(_pid: i32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
+pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 { 0 }
 
 pub(crate) fn shell_spec(command: &OsStr) -> SpawnSpec {
     SpawnSpec::new("cmd.exe").arg("/C").arg(command)

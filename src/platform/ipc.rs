@@ -28,6 +28,45 @@
 //! Neither predicate takes an unclassifiable failure as a licence to reclaim an
 //! endpoint: `target_exists` returns the error and `is_stale` reports `false`.
 
+#[cfg(all(windows, feature = "ipc-async"))]
+mod pipe_instance;
+#[cfg(all(windows, feature = "ipc-async"))]
+pub use pipe_instance::{LocalPipeClient, OwnerOnlyPipeInstance};
+
+#[cfg(all(unix, feature = "ipc-async"))]
+mod socket_instance;
+#[cfg(all(unix, feature = "ipc-async"))]
+pub use socket_instance::{LocalSocketListener, LocalSocketStream, SocketPeerCredentials};
+
+/// Remove a caller-owned Unix socket pathname, refusing non-sockets and
+/// symlinks. Missing paths succeed. Windows is a no-op because named pipes
+/// have no persistent filesystem endpoint to unlink.
+///
+/// This does not probe liveness: the caller must establish that retirement
+/// is appropriate. Inspection and unlink are separate operations, so the
+/// parent directory must be protected against concurrent path replacement.
+#[cfg(feature = "ipc")]
+pub fn retire_socket_endpoint(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "IPC endpoint is not a socket",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "ipc")]
 pub use crate::{
     ipc_current_user_id as current_user_id, IpcEndpoint as Endpoint,

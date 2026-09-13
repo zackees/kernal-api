@@ -5,12 +5,11 @@ target architecture builds on `running-process`, the trusted low-level
 native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
-`running-process` phase-1 adapter has landed: this crate depends on the exact
-published `running-process` 4.10.12 registry release unconditionally. Its
-canonical independent-spawn contract is the sole backend-type exception: the
-selected mode, options, launch payload, readiness, handle, and entry point are
-re-exported unchanged behind the explicit `independent-spawn` feature so live
-control retains Rust type identity.
+`running-process` phase-1 adapter uses the exact published 4.10.13 registry
+release unconditionally. Its canonical independent-spawn contract is the narrow
+backend-type exception: selected options, launch payload, readiness, handle,
+and entry point are re-exported unchanged behind the explicit
+`independent-spawn` feature so live control retains Rust type identity.
 
 In the target architecture, applications use `kernal-api`; they do not use
 `running-process` or Tokio directly. The permanent dependency direction and
@@ -47,9 +46,9 @@ direct use of implementation crates owned by this package.
 ## Rust features
 
 The base crate contains the async process/host facade. Its bounded process
-adapter uses `running-process` 4.10.12; that dependency is mandatory, not
-feature-gated. Except for the selected canonical independent-spawn contract,
-backend types remain private. With `independent-spawn`,
+adapter uses `running-process` 4.10.13; that dependency is mandatory, not
+feature-gated. Except for selected canonical namespace aliases, backend types
+remain private. With `independent-spawn`,
 `SpawnMode::Inherited` remains the default; `SpawnMode::Independent` requires
 verified native scheduler or already-external broker placement and never
 silently falls back. Independent placement is not detachment, privilege

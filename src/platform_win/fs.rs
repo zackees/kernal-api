@@ -31,11 +31,15 @@ pub fn user_run_data_root(product: &str) -> PathBuf {
 
 /// Stable identity of an open file on this host.
 ///
-/// Two paths that resolve to the same bytes on disk report the same identity,
-/// which is what lets a caller notice that the file it opened has since been
-/// replaced. The two fields are whatever this host uses to say that: a device
+/// Two names for the same filesystem object report the same identity; a byte
+/// copy is a different object. IDs can be reused after deletion, so comparison
+/// is not a content hash or a permanent identity guarantee. The two fields are a device
 /// and inode, a volume serial and file index, or an equivalent pair. Callers
 /// compare them; they do not interpret them.
+///
+/// This legacy representation uses the 64-bit file index. It does not preserve
+/// ReFS's full 128-bit identifier. For path observations requiring that width,
+/// use `platform::fs::path_file::FileIdentity`; the APIs are not interchangeable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdentity {
     /// Device, volume, or platform-equivalent file namespace.
@@ -80,6 +84,140 @@ pub fn path_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .open(path)?;
     file_identity(&file)
+}
+
+/// Opaque native identity of the volume currently hosting `path`.
+pub fn volume_identity(path: &Path) -> io::Result<u64> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileIdInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let verbatim = verbatim_path(path).unwrap_or_else(|_| path.to_path_buf());
+    let wide = metadata_query_path(&verbatim)?;
+    unsafe {
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut native: FILE_ID_INFO = std::mem::zeroed();
+        if GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut native).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        ) != 0
+        {
+            let _ = CloseHandle(handle);
+            return Ok(native.VolumeSerialNumber);
+        }
+
+        let mut legacy: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let legacy_ok = GetFileInformationByHandle(handle, &mut legacy);
+        let legacy_error = if legacy_ok == 0 {
+            Some(io::Error::last_os_error())
+        } else {
+            None
+        };
+        let _ = CloseHandle(handle);
+        legacy_error.map_or_else(|| Ok(u64::from(legacy.dwVolumeSerialNumber)), Err)
+    }
+}
+
+/// Return the native volume serial when `path` can be inspected.
+pub fn volume_identity_u128(path: &Path) -> Option<u128> {
+    volume_identity(path).ok().map(u128::from)
+}
+
+/// NTFS/ReFS can expose 128-bit file identifiers.
+pub const fn file_id_width() -> u32 {
+    128
+}
+
+/// Return the compressed allocation size when Windows reports it, falling
+/// back to logical bytes when the filesystem has no value for this query.
+pub fn allocated_bytes(path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+    let verbatim = verbatim_path(path).unwrap_or_else(|_| path.to_path_buf());
+    let Ok(wide) = metadata_query_path(&verbatim) else { return metadata.len(); };
+    let mut high = 0_u32;
+    unsafe {
+        SetLastError(0);
+        let low = GetCompressedFileSizeW(wide.as_ptr(), &mut high);
+        allocated_size_result(low, high, GetLastError(), metadata.len())
+    }
+}
+
+/// Convert a file path to the absolute spelling direct Win32 calls need for
+/// long paths. A caller that cannot be canonicalized retains its original
+/// spelling so the native API still returns its own useful error/fallback.
+use crate::platform::fs::native_call_path as verbatim_path;
+
+fn metadata_query_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+/// Combine the high/low words returned by `GetCompressedFileSizeW`.
+///
+/// `u32::MAX` is a valid low word when last-error remains zero; it signals an
+/// error only when Windows records a nonzero error immediately after the call.
+fn allocated_size_result(low: u32, high: u32, error: u32, fallback: u64) -> u64 {
+    if low == u32::MAX && error != 0 {
+        fallback
+    } else {
+        (u64::from(high) << 32) | u64::from(low)
+    }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::allocated_size_result;
+
+    #[test]
+    fn volume_identity_opens_directories_and_readonly_files_without_write_access() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("readonly");
+        std::fs::write(&path, b"contents").expect("write readonly subject");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).expect("mark readonly");
+
+        assert!(super::volume_identity(directory.path()).is_ok());
+        assert!(super::volume_identity(&path).is_ok());
+    }
+
+    #[test]
+    fn compressed_size_keeps_valid_sentinel_low_word_and_high_word() {
+        assert_eq!(
+            allocated_size_result(u32::MAX, 7, 0, 99),
+            (7_u64 << 32) | u64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn compressed_size_falls_back_only_for_sentinel_with_an_error() {
+        assert_eq!(allocated_size_result(u32::MAX, 0, 5, 99), 99);
+        assert_eq!(allocated_size_result(7, 1, 0, 99), (1_u64 << 32) | 7);
+    }
 }
 
 /// Open `path` for use as an advisory lock file, creating it if absent.
@@ -423,6 +561,28 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
 pub fn sync_directory(directory: &Path) -> io::Result<()> {
     std::fs::metadata(directory)?;
     Ok(())
+}
+
+/// Succeed where the host has no directory-fsync primitive.
+///
+/// This compatibility operation intentionally does not resolve `directory`
+/// and makes no durability guarantee for arbitrary writes or renames. KA's
+/// [`replace_file`] uses `MOVEFILE_WRITE_THROUGH` separately.
+pub fn sync_directory_if_supported(_directory: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Open an append-only file while allowing readers, writers, rename, and
+/// deletion to coexist with the handle.
+pub fn open_shared_append(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
 }
 
 /// Create a new file that only its owner can read, failing if it exists.

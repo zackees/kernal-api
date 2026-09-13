@@ -39,9 +39,9 @@ pub fn user_run_data_root(product: &str) -> PathBuf {
 
 /// Stable identity of an open file on this host.
 ///
-/// Two paths that resolve to the same bytes on disk report the same identity,
-/// which is what lets a caller notice that the file it opened has since been
-/// replaced. The two fields are whatever this host uses to say that: a device
+/// Two names for the same filesystem object report the same identity; a byte
+/// copy is a different object. IDs can be reused after deletion, so comparison
+/// is not a content hash or a permanent identity guarantee. The two fields are a device
 /// and inode, a volume serial and file index, or an equivalent pair. Callers
 /// compare them; they do not interpret them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +72,31 @@ pub fn path_identity(path: &Path) -> io::Result<Option<FileIdentity>> {
         device: metadata.dev(),
         file: metadata.ino(),
     }))
+}
+
+/// Opaque native identity of the volume currently hosting `path`.
+pub fn volume_identity(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(std::fs::metadata(path)?.dev())
+}
+
+/// Return the native volume value when `path` can be inspected.
+pub fn volume_identity_u128(path: &Path) -> Option<u128> {
+    volume_identity(path).ok().map(u128::from)
+}
+
+/// The native file-id width used by Unix identity consumers.
+pub const fn file_id_width() -> u32 {
+    64
+}
+
+/// Return disk blocks actually allocated for a file, rather than its logical
+/// byte length. Unix reports blocks in 512-byte units.
+pub fn allocated_bytes(_path: &Path, metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.blocks().saturating_mul(512)
 }
 
 /// Open `path` for use as an advisory lock file, creating it if absent.
@@ -272,6 +297,19 @@ pub fn replace_file(tmp: &Path, target: &Path) -> io::Result<()> {
 /// not flush with the file.
 pub fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
+}
+
+/// Flush a directory when the host exposes directory fsync.
+///
+/// This spelling is for callers whose durability protocol can use directory
+/// fsync where it exists, but must remain portable to hosts without it.
+pub fn sync_directory_if_supported(directory: &Path) -> io::Result<()> {
+    sync_directory(directory)
+}
+
+/// Open an append-only file without truncating its existing bytes.
+pub fn open_shared_append(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// Create a new file that only its owner can read, failing if it exists.

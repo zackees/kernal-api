@@ -5,11 +5,11 @@ example_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$example_dir/../.." && pwd)"
 : "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR to caller-managed writable storage}"
 guest_name="kernal-api-wasm-tauri-guest"
-guest_features=()
+guest_feature=""
 case "${1-}" in
   "") ;;
-  --trap-after-capture) guest_name="${guest_name}-trap"; guest_features=(--features proof-trap-after-capture) ;;
-  --block-after-capture) guest_name="${guest_name}-block"; guest_features=(--features proof-block-after-capture) ;;
+  --trap-after-capture) guest_name="${guest_name}-trap"; guest_feature=proof-trap-after-capture ;;
+  --block-after-capture) guest_name="${guest_name}-block"; guest_feature=proof-block-after-capture ;;
   *) echo "usage: build-guest.sh [--trap-after-capture|--block-after-capture]" >&2; exit 2 ;;
 esac
 if [ "$#" -gt 1 ]; then echo "too many arguments" >&2; exit 2; fi
@@ -23,9 +23,13 @@ target="wasm32-wasip1-threads"
 # real Rust smoke artifact. Never substitute a hand-authored Wasm fixture.
 (
   cd "$example_dir/guest"
-  SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  set -- --no-cache cargo build --locked \
     --manifest-path Cargo.toml --target "$target" --release \
-    --target-dir "$guest_target_dir" "${guest_features[@]}"
+    --target-dir "$guest_target_dir"
+  # Bash 3.2 treats an empty array as unset under nounset. Positional
+  # arguments preserve exact quoting without relying on that behavior.
+  if [ -n "$guest_feature" ]; then set -- "$@" --features "$guest_feature"; fi
+  SOLDR_LINKER=default soldr "$@"
 )
 built="$guest_target_dir/$target/release/kernal-api-wasm-tauri-guest.wasm"
 admitted="$guest_target_dir/$target/release/kernal-api-wasm-tauri-guest.admitted.wasm"

@@ -294,6 +294,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          bash tests/screenshot-build-arguments.sh
           soldr --no-cache rustup target add wasm32-wasip1-threads
           bash examples/wasm-tauri-screenshot/build-guest.sh
           bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture
@@ -302,6 +303,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          ./tests/screenshot-target-repair.ps1
           & soldr --no-cache rustup target add wasm32-wasip1-threads
           if ($LASTEXITCODE -ne 0) { throw 'Wasm target installation failed' }
           ./examples/wasm-tauri-screenshot/build-guest.ps1

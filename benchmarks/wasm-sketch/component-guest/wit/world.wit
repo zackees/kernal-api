@@ -1,0 +1,13 @@
+package kernal:probe@0.1.0;
+
+interface blobs {
+    resource blob {
+        read: func() -> stream<u8>;
+    }
+    granted: func() -> option<blob>;
+}
+
+world sketch {
+    import blobs;
+    export run: async func() -> result<u64>;
+}

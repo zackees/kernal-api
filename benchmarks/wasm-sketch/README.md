@@ -4,6 +4,11 @@ Issue #13 requires both binding candidates, at least ten warm one-line edits
 per candidate, and a correctness-qualified selection. No comparative result
 or latency gate is claimed yet.
 
+The private [Component Model guest probe](component-guest/README.md) and
+[encoder](component-tools/README.md) establish a non-WASI Rust 1.95.0 build
+and structural encoding path. They do not yet execute the component or measure
+the representative candidate behind the public guest facade.
+
 The native admission-only example gives the core-Wasm candidate a measurement
 boundary without running the screenshot application or guest entry point:
 

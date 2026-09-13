@@ -1,0 +1,48 @@
+# Private component encoder probe
+
+This standalone, unpublished workspace encodes the sibling guest's core Wasm
+using pinned `wit-component = 0.251.0`, matching wit-bindgen 0.58's metadata
+format. It does not instantiate a component, add a runtime, or grant effects.
+
+From the repository root:
+
+```sh
+soldr --no-cache cargo run --locked \
+  --manifest-path benchmarks/wasm-sketch/component-tools/Cargo.toml \
+  --target-dir benchmarks/wasm-sketch/component-tools/target -j1 -- \
+  benchmarks/wasm-sketch/component-guest/target/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
+  /absolute/new/probe.component.wasm
+soldr --no-cache cargo test --locked \
+  --manifest-path benchmarks/wasm-sketch/component-tools/Cargo.toml \
+  --target-dir benchmarks/wasm-sketch/component-tools/target -j1
+```
+
+The input read is bounded at 32 MiB; the output path must not exist. Encoding
+and structural validation happen before creating the output. A write failure
+can leave a partial output file; an unsuccessful command is never admission
+evidence. The validator requires a component with exactly one top-level imported
+instance named `kernal:probe/blobs@0.1.0` and rejects ambient/other interfaces.
+Tests also reject a core module and an empty component.
+
+This is not production admission: validation enables all parser features,
+does not constrain internal memory or instructions, and does not verify the
+imported instance's complete semantic type or the exported entry point. The
+future host must link against the exact generated world and enforce the same
+quotas and lifecycle rules as the core candidate before comparison. Structural
+validity does not establish Wasmtime 45 compatibility or guest correctness.
+
+The first Linux x86-64 toolchain run encoded and validated a 52,326-byte
+component, with no WASI adapter and one top-level kernel interface import.
+The guest's initial missing-trait implementation failed compilation (E0277);
+adding the async stream consumer made the non-ambient Rust 1.95.0 build pass.
+The initial encoder compilation caught the new `ComponentExternName.name`
+API shape; the corrected encoder completed successfully. No timings here are
+reference-host edit samples and no execution or selection is claimed.
+
+The retained local component is `/tmp/kernal-component-probe-1.wasm`, SHA-256
+`1cfd6d2a1cbf26d6ec939b15c5661d2336bb4c0e9fa9ee24e1aa619e0e1d3748`.
+Its input core module SHA-256 is
+`fbd170175ce093fbf4b67a0c09e479cc50872a1d68c6164181bc0dda0bba8009`.
+All three validator tests, strict tools/guest Clippy, formatting, and the parent
+dependency-isolation check pass locally. Six-target native execution remains
+unproven for this new candidate.

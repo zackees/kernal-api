@@ -2,6 +2,8 @@
 /target/
 /src/wasm/generated/v1/guest/target/
 /tools/wasm-abi-generator/target/
+/benchmarks/wasm-sketch/component-guest/target/
+/benchmarks/wasm-sketch/component-tools/target/
 /guests/threaded-smoke/target/
 /.extern-repos/
 *.egg-info/

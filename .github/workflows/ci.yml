@@ -163,6 +163,8 @@ jobs:
           - hash-sha256
           - secure-random
           - text-similarity
+          - terminal-style
+          - terminal-input
           - event-stream
           - http-server
           - http-client

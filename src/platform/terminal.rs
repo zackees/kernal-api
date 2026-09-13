@@ -5,6 +5,80 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+static INPUT_OWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(windows, all(test, feature = "terminal-input")))]
+pub(crate) struct InputQueue<T> {
+    events: std::collections::VecDeque<(T, usize)>,
+    bytes: usize,
+}
+
+#[cfg(any(windows, all(test, feature = "terminal-input")))]
+impl<T> InputQueue<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            events: std::collections::VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, event: T, bytes: usize) -> bool {
+        if self.events.len() >= 256 || bytes > 65_536 - self.bytes {
+            return false;
+        }
+        self.events.push_back((event, bytes));
+        self.bytes += bytes;
+        true
+    }
+
+    pub(crate) fn pop_front(&mut self) -> Option<T> {
+        self.events.pop_front().map(|(event, bytes)| {
+            self.bytes -= bytes;
+            event
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.events.clear();
+        self.bytes = 0;
+    }
+
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.bytes = 0;
+        self.events.drain(..).map(|(event, _)| event)
+    }
+}
+
+/// Admission shared by this kernel instance's stdin capture and tty probes.
+/// It cannot coordinate unrelated libraries or another process reading the tty.
+pub(crate) struct InputLease(());
+
+impl InputLease {
+    pub(crate) fn acquire() -> io::Result<Self> {
+        INPUT_OWNED
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .map(|_| Self(()))
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "terminal input is already owned")
+            })
+    }
+}
+
+impl Drop for InputLease {
+    fn drop(&mut self) {
+        INPUT_OWNED.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Caller-facing PTY dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -164,8 +238,11 @@ pub mod input {
 #[cfg(feature = "pty")]
 pub use crate::{
     Backend, ChildProcessInfo, ConPtyBackendKind, OrphanConhostInfo, PtyProcessGuard,
-    PtySpawnContext, TerminalInputSession,
+    PtySpawnContext,
 };
+
+#[cfg(feature = "terminal-input")]
+pub use crate::TerminalInputSession;
 
 #[cfg(feature = "pty")]
 pub use crate::current_backend_kind;
@@ -250,4 +327,39 @@ pub fn find_child_processes(parent_pid: u32) -> Vec<ChildProcessInfo> {
 #[cfg(feature = "pty")]
 pub fn find_orphan_conhosts() -> Vec<OrphanConhostInfo> {
     crate::find_orphan_conhosts()
+}
+
+#[cfg(all(test, feature = "terminal-input"))]
+mod ownership_tests {
+    #[test]
+    fn capture_queue_enforces_event_and_byte_limits() {
+        let mut queue = super::InputQueue::new();
+        for value in 0..256 {
+            assert!(queue.push(value, 1));
+        }
+        assert!(!queue.push(999, 1));
+        assert_eq!(queue.pop_front(), Some(0));
+        assert!(queue.push(256, 1));
+        queue.clear();
+        assert!(queue.push(1, 65_536));
+        assert!(!queue.push(2, 1));
+        assert_eq!(queue.pop_front(), Some(1));
+        assert!(!queue.push(3, 65_537));
+        assert!(queue.is_empty());
+        assert!(queue.push(4, 1));
+        assert_eq!(queue.drain().collect::<Vec<_>>(), [4]);
+        assert!(queue.push(5, 65_536));
+    }
+
+    #[test]
+    fn input_ownership_rejects_overlap_and_releases_on_drop() {
+        let first = super::InputLease::acquire().unwrap();
+        assert_eq!(
+            super::InputLease::acquire().err().unwrap().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(first);
+        let next = super::InputLease::acquire().unwrap();
+        drop(next);
+    }
 }

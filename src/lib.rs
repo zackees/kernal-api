@@ -38,6 +38,14 @@ pub mod random;
 #[cfg(feature = "text-similarity")]
 pub mod text;
 
+/// Bounded terminal key decoding and owned native polling.
+#[cfg(feature = "terminal-input")]
+pub mod keys;
+
+/// Allocation-free diagnostic styling and native ANSI output preparation.
+#[cfg(feature = "terminal-style")]
+pub mod terminal_style;
+
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]
 pub mod archive;
@@ -392,8 +400,11 @@ pub use platform_imp::terminal::{
     input_payload, is_ignorable_process_control_error, prepare_unmanaged_pty_child,
     query_responses, resize_pty, shell_argv, signal_pty_tree, terminate_pty_child,
     wait_before_pty_close_supported, Backend, ChildProcessInfo, ConPtyBackendKind,
-    OrphanConhostInfo, PtyProcessGuard, PtySpawnContext, TerminalInputSession,
+    OrphanConhostInfo, PtyProcessGuard, PtySpawnContext,
 };
+
+#[cfg(feature = "terminal-input")]
+pub use platform_imp::terminal::TerminalInputSession;
 
 #[cfg(feature = "session-relay")]
 pub use platform_imp::relay_local_socket_session;

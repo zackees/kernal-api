@@ -430,16 +430,57 @@ pub fn sync_directory(directory: &Path) -> io::Result<()> {
 /// `create_new` is part of the contract, not a convenience: a private file
 /// opened over one that already exists inherits whatever that one allowed.
 ///
-/// Windows carries no mode bits here; the file inherits its directory's ACL.
-/// That is the same protection by a different route as long as the caller
-/// creates it somewhere already scoped to one user -- a per-user temp
-/// directory, or one of the [`user_runtime_dir`] roles -- which is why the
-/// directory choice is the caller's and matters.
+/// Windows carries no mode bits here. The file inherits its directory's ACL,
+/// then records the current token user as its owner. That second step matters
+/// for elevated tokens, whose default owner can be the Administrators group:
+/// `OW` would otherwise grant every group member the owner-rights ACE. If
+/// ownership cannot be set, the exclusively-created file is marked for
+/// handle-bound deletion and the operation fails closed. Callers must still
+/// create the file in a verified private directory: assigning an owner alone
+/// does not remove access inherited from a permissive parent.
 pub fn create_private_file(path: &Path) -> io::Result<File> {
-    std::fs::OpenOptions::new()
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winnt::{DELETE, GENERIC_WRITE, WRITE_OWNER};
+
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
+        // Ownership is set on this exact handle below. DELETE makes cleanup
+        // handle-bound too, so a rename cannot redirect it to another file.
+        // `access_mode` replaces, rather than augments, `.write(true)` on
+        // this host, so retain generic data-write access explicitly.
+        .access_mode(GENERIC_WRITE | WRITE_OWNER | DELETE)
+        .open(path)?;
+    if let Err(error) = super::ipc_private_dir::apply_current_user_owner(&file) {
+        let _ = delete_file_on_close(&file);
+        return Err(error);
+    }
+    Ok(file)
+}
+
+/// Mark the already-open file for deletion, never resolving a pathname.
+fn delete_file_on_close(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
+    };
+
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `file` owns a live handle opened with DELETE access and
+    // `disposition` is the exact buffer FileDispositionInfo requires.
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Secure bounded read rooted in a protected owner-private directory.

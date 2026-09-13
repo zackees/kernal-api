@@ -44,6 +44,14 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     if !actual.dacl_is_protected()? {
         return Ok(false);
     }
+    // `OW` follows the file owner's SID.  An elevated token may otherwise
+    // create a directory owned by the Administrators group, which would make
+    // every member of that group an Owner Rights principal.  A private
+    // directory is private to this token's user SID, not to its default-owner
+    // group.
+    if actual.owner_sid_bytes()? != current_user_sid_bytes()? {
+        return Ok(false);
+    }
     // Binary equality covers ACL revision, ACE flags/masks/SIDs/order and
     // callback or object payloads that SDDL substring checks can misclassify.
     let expected = LocalSecurityDescriptor::from_sddl(PRIVATE_DIR_SDDL)?;
@@ -134,7 +142,6 @@ fn owner_system_private_file_dacl(actual: &[u8]) -> bool {
     })
 }
 
-#[cfg(feature = "fs")]
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{
@@ -181,6 +188,40 @@ fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
 }
 
+/// Assign the current token user as an open file's owner without accepting
+/// its default owner SID (which can be an elevated local group).
+///
+/// This operates on the caller's handle, rather than reopening its pathname:
+/// the object whose owner changes is necessarily the one the caller created
+/// and still holds. The handle must have `WRITE_OWNER` access.
+#[cfg(feature = "fs")]
+pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let current_sid = current_user_sid_bytes()?;
+    // SAFETY: `file` owns a live handle with WRITE_OWNER access, and the
+    // current-user SID was copied from a live process token. The API consumes
+    // neither buffer and changes the handle's object, never a path lookup.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            current_sid.as_ptr().cast_mut().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
 #[cfg(feature = "ipc")]
 fn apply_dacl_sddl(
     path: &Path,
@@ -189,10 +230,11 @@ fn apply_dacl_sddl(
 ) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
 
     let descriptor = LocalSecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
+    let current_sid = current_user_sid_bytes()?;
 
     let wide = path
         .as_os_str()
@@ -201,13 +243,15 @@ fn apply_dacl_sddl(
         .collect::<Vec<_>>();
     // SAFETY: `wide` is NUL-terminated; `dacl` borrows the live descriptor
     // for this call; all unused owner/group/SACL pointers are null as the
-    // requested flags update only the DACL.
+    // requested flags update the DACL and make the current token user the
+    // owner. `OW` in the DACL then remains a single-user principal even for
+    // elevated tokens whose default owner is a local group.
     let status = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | inheritance_control,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | inheritance_control,
+            current_sid.as_ptr().cast_mut().cast(),
             std::ptr::null_mut(),
             dacl.as_ptr(),
             std::ptr::null_mut(),
@@ -223,7 +267,9 @@ fn apply_dacl_sddl(
 fn file_security_descriptor(path: &Path) -> io::Result<LocalSecurityDescriptor> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
 
     let wide = path
         .as_os_str()
@@ -237,7 +283,7 @@ fn file_security_descriptor(path: &Path) -> io::Result<LocalSecurityDescriptor> 
         GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -326,6 +372,35 @@ impl LocalSecurityDescriptor {
             pointer,
             descriptor: std::marker::PhantomData,
         })
+    }
+
+    fn owner_sid_bytes(&self) -> io::Result<Vec<u8>> {
+        use windows_sys::Win32::Security::{
+            GetLengthSid, GetSecurityDescriptorOwner, IsValidSid, PSID,
+        };
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `self.0` is a live descriptor; both output pointers are
+        // writable locals. The returned SID remains owned by the descriptor.
+        if unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "security descriptor has no valid owner SID",
+            ));
+        }
+        let length = unsafe { GetLengthSid(owner) } as usize;
+        if length == 0 || length > 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "implausible security descriptor owner SID length",
+            ));
+        }
+        // SAFETY: the validated SID is borrowed from the live descriptor.
+        Ok(unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), length).to_vec() })
     }
 }
 
@@ -514,7 +589,13 @@ mod tests {
         let directory = temporary.path().join("private");
         ensure_owner_private_directory(&directory).unwrap();
         let child = directory.join("marker");
-        fs::write(&child, b"marker").unwrap();
+        // An elevated token can default file ownership to Administrators.
+        // Exercise the production creator to ensure its handle-bound TokenUser
+        // assignment preserves the inherited Owner Rights ACL as private.
+        let mut child_file = crate::platform::fs::create_private_file(&child).unwrap();
+        use std::io::Write as _;
+        child_file.write_all(b"marker").unwrap();
+        drop(child_file);
 
         let child_dacl = file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap();
         assert!(owner_system_private_file_dacl(&child_dacl));

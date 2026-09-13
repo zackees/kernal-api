@@ -147,7 +147,7 @@ pub struct ContextFileObservation {
 }
 
 #[cfg(feature = "fs")]
-fn context_path_kind(metadata: &std::fs::Metadata) -> ContextPathKind {
+pub(crate) fn context_path_kind(metadata: &std::fs::Metadata) -> ContextPathKind {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
@@ -244,6 +244,101 @@ pub fn read_context_regular_file_bounded(
     crate::fs_read_context_regular_file_bounded(path, max_bytes)
 }
 
+// ---------------------------------------------------------------------------
+// Demand-driven directory cursor
+// ---------------------------------------------------------------------------
+
+/// One owned entry observed by a [`DirectoryCursor`].
+///
+/// `kind` is a point-in-time, non-following classification of the entry's
+/// final component. It is not a handle observation and does not make a later
+/// open race-free.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCursorEntry {
+    path: PathBuf,
+    file_name: OsString,
+    kind: ContextPathKind,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryCursorEntry {
+    /// The entry path formed from the cursor's supplied directory path and
+    /// this entry's name. It is owned but is not canonicalized or guaranteed
+    /// to be absolute.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The entry's final component, owned independently of the native handle.
+    pub fn file_name(&self) -> &OsStr {
+        &self.file_name
+    }
+
+    /// The entry's observed final-component kind without following a link.
+    pub fn kind(&self) -> ContextPathKind {
+        self.kind
+    }
+}
+
+/// A synchronous, demand-driven, nonrecursive directory enumeration.
+///
+/// The cursor owns one native directory-enumeration handle. Each
+/// [`next_entry`](Self::next_entry) call asks the host for at most the next
+/// entry; it neither descends into child directories nor collects, sorts, or
+/// prefetches the rest of the directory. Native APIs can still buffer entries
+/// internally, so this is not a claim that the operating system reads exactly
+/// one directory record per call.
+///
+/// Dropping the cursor deterministically releases its native handle, which
+/// lets a bounded consumer stop without enumerating the remainder. Calls are
+/// synchronous native operations and may block. Opening a directory by path
+/// follows the final link where the host does so. This cursor is not a hostile
+/// path sandbox or an atomic directory snapshot: callers must trust and police
+/// the root and its ancestors, and make separate observations before any
+/// security-sensitive operation.
+#[cfg(feature = "fs")]
+pub struct DirectoryCursor {
+    // Kept private so callers cannot retain a native entry/handle. `ReadDir`
+    // is the kernel's native directory cursor on every supported host.
+    native: std::fs::ReadDir,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryCursor {
+    /// Open `directory` for demand-driven, nonrecursive enumeration.
+    ///
+    /// Missing paths, non-directories, and inaccessible directories return the
+    /// host error. The supplied spelling is retained in each entry path; it is
+    /// not canonicalized.
+    pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self {
+            native: std::fs::read_dir(directory)?,
+        })
+    }
+
+    /// Yield the next entry, or `None` after the directory is exhausted.
+    ///
+    /// An error from native enumeration or entry classification is returned to
+    /// the caller; it is not hidden or converted into end-of-directory.
+    pub fn next_entry(&mut self) -> io::Result<Option<DirectoryCursorEntry>> {
+        let Some(entry) = self.native.next() else {
+            return Ok(None);
+        };
+        let entry = entry?;
+        // Copy every facade value before `DirEntry` is dropped. On Unix a
+        // retained `DirEntry` can retain the directory descriptor.
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let kind = context_path_kind(&std::fs::symlink_metadata(&path)?);
+        Ok(Some(DirectoryCursorEntry {
+            path,
+            file_name,
+            kind,
+        }))
+    }
+}
+
 /// Read a current-user-private regular file, rejecting links and oversized
 /// input.
 ///
@@ -284,6 +379,8 @@ pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::R
     crate::fs_read_private_regular_file_bounded(path, max_bytes)
 }
 
+#[cfg(feature = "fs")]
+use std::ffi::{OsStr, OsString};
 #[cfg(feature = "fs")]
 use std::fs::File;
 #[cfg(feature = "fs")]

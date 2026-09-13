@@ -113,6 +113,7 @@ fn implementation_crates_are_not_publicly_reexported() {
                         assert!(
                             matches!(line,
                                 "pub use running_process::independent_spawn;"
+                                | "pub use running_process::spawn_with_options as spawn_independent;"
                                 | "pub use running_process::foreground;"
                                 | "pub use running_process::ProcessPriority;"
                                 | "pub use running_process::ProcessLiveness;"
@@ -135,6 +136,7 @@ fn implementation_crates_are_not_publicly_reexported() {
             let approved = match path.file_name().and_then(|name| name.to_str()) {
                 Some("lib.rs") => &[
                     "pub use running_process::independent_spawn;",
+                    "pub use running_process::spawn_with_options as spawn_independent;",
                     "pub use running_process::foreground;",
                     "pub use running_process::ProcessPriority;",
                     "pub use running_process::ProcessLiveness;",

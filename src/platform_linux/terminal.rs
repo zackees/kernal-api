@@ -397,6 +397,14 @@ pub struct TerminalInputSession {
 #[cfg(feature = "pty")]
 impl TerminalInputSession {
     pub fn new() -> std::io::Result<Option<Self>> {
+        Self::new_with_mode(true)
+    }
+
+    pub(crate) fn new_for_keys() -> std::io::Result<Option<Self>> {
+        Self::new_with_mode(false)
+    }
+
+    fn new_with_mode(raw: bool) -> std::io::Result<Option<Self>> {
         let stdin_fd = libc::STDIN_FILENO;
         if unsafe { libc::isatty(stdin_fd) } != 1 {
             return Ok(None);
@@ -408,7 +416,18 @@ impl TerminalInputSession {
         }
         let original_mode = unsafe { original_mode.assume_init() };
         let mut raw_mode = original_mode;
-        unsafe { libc::cfmakeraw(&mut raw_mode) };
+        if raw {
+            // SAFETY: raw_mode is an initialized writable termios value.
+            unsafe { libc::cfmakeraw(&mut raw_mode) };
+        } else {
+            // Key polling is noncanonical/no-echo but preserves signal keys,
+            // input translations and output processing from the saved mode.
+            raw_mode.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHONL);
+            // A signal can flush input between poll and read. Never block the
+            // post-poll key read waiting for replacement bytes.
+            raw_mode.c_cc[libc::VMIN] = 0;
+            raw_mode.c_cc[libc::VTIME] = 0;
+        }
         if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_mode) } != 0 {
             return Err(std::io::Error::last_os_error());
         }

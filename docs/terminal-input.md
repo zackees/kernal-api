@@ -30,13 +30,18 @@ pasted input can contain those bytes. Use the decoded API below for key policy.
 
 ## Decoded keys
 
-`keys::TerminalKeys` owns the existing raw capture session and returns one
+`keys::TerminalKeys` reuses native capture in noncanonical, no-echo mode and returns one
 facade-owned `KeyEvent` per `poll`. Calls accept a requested wait of at most
 100 ms and examine at most 64 KiB of bytes. Remaining queued bytes survive
 subsequent calls, including zero-wait calls. Drop uses the native session's
-best-effort restoration. Raw capture changes signal-key behavior: consumers
-must handle the decoded control-C event rather than rely on a cooked-terminal
-signal. Opening still has the platform-specific non-terminal behavior above.
+best-effort restoration. Existing signal-key behavior is preserved (Unix ISIG
+and Windows processed input), as are Unix input translations and output flags.
+With normal initial settings Ctrl+C therefore remains a native signal, not a
+decoded event. Applications must register graceful signal handling before
+opening capture so interruption can drop the owner and restore modes; abrupt
+process termination cannot run Rust Drop. Opening still has the platform-specific
+non-terminal behavior above. The raw `TerminalInputSession::new` API used for
+PTY forwarding is unchanged.
 
 `keys::KeyDecoder` is the same incremental decoder without native ownership;
 callers feeding bytes directly own its timing and use `finish_pending` after

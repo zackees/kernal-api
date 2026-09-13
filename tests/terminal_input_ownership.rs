@@ -41,6 +41,16 @@ fn native_session_rejects_overlap_and_restores_mode() {
         assert_eq!(before.c_cc, after.c_cc);
         drop(kernal_api::TerminalInputSession::new().unwrap().unwrap());
         let mut keys = kernal_api::keys::TerminalKeys::new().unwrap().unwrap();
+        let key_mode = stdin_mode();
+        assert_eq!(before.c_lflag & libc::ISIG, key_mode.c_lflag & libc::ISIG);
+        assert_eq!(before.c_oflag, key_mode.c_oflag);
+        assert_eq!(before.c_iflag, key_mode.c_iflag);
+        assert_eq!(key_mode.c_cc[libc::VMIN], 0);
+        assert_eq!(key_mode.c_cc[libc::VTIME], 0);
+        assert_eq!(
+            key_mode.c_lflag & (libc::ICANON | libc::ECHO | libc::ECHONL),
+            0
+        );
         use kernal_api::keys::Key;
         for expected in [
             Key::Other,
@@ -51,6 +61,10 @@ fn native_session_rejects_overlap_and_restores_mode() {
             assert_eq!(keys.poll(Duration::ZERO).unwrap().unwrap().key, expected);
         }
         assert!(keys.poll(Duration::ZERO).unwrap().is_none());
+        let mut empty = [0u8; 1];
+        // SAFETY: stdin is this child's live PTY and empty is writable. This
+        // read must return zero without poll, modeling readiness invalidation.
+        assert_eq!(unsafe { libc::read(0, empty.as_mut_ptr().cast(), 1) }, 0);
         assert_eq!(
             keys.poll(Duration::from_secs(1)).unwrap_err().kind(),
             io::ErrorKind::InvalidInput

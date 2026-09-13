@@ -337,6 +337,12 @@ pub struct TerminalInputSession(super::terminal_input::TerminalInputCore);
 
 #[cfg(feature = "pty")]
 impl TerminalInputSession {
+    pub(crate) fn new_for_keys() -> std::io::Result<Option<Self>> {
+        let input = super::terminal_input::TerminalInputCore::new();
+        input.start_for_keys()?;
+        Ok(Some(Self(input)))
+    }
+
     pub fn new() -> std::io::Result<Option<Self>> {
         let input = super::terminal_input::TerminalInputCore::new();
         input.start_impl()?;

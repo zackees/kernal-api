@@ -63,6 +63,15 @@ fn native_console_session_restores_mode_and_excludes_overlap() {
         assert_eq!(before, mode());
         drop(kernal_api::TerminalInputSession::new().unwrap().unwrap());
         assert_eq!(before, mode());
+        let keys = kernal_api::keys::TerminalKeys::new().unwrap().unwrap();
+        use winapi::um::wincon::{ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT};
+        assert_eq!(
+            before & ENABLE_PROCESSED_INPUT,
+            mode() & ENABLE_PROCESSED_INPUT
+        );
+        assert_eq!(mode() & (ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT), 0);
+        drop(keys);
+        assert_eq!(before, mode());
         // SAFETY: all capture workers have joined before this owned handle closes.
         assert_ne!(unsafe { CloseHandle(input) }, 0);
         // SAFETY: releases only this child's console attachment.

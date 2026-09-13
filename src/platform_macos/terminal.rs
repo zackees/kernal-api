@@ -351,6 +351,14 @@ pub struct TerminalInputSession {
 #[cfg(feature = "pty")]
 impl TerminalInputSession {
     pub fn new() -> std::io::Result<Option<Self>> {
+        Self::new_with_mode(true)
+    }
+
+    pub(crate) fn new_for_keys() -> std::io::Result<Option<Self>> {
+        Self::new_with_mode(false)
+    }
+
+    fn new_with_mode(raw: bool) -> std::io::Result<Option<Self>> {
         let stdin_fd = libc::STDIN_FILENO;
         if unsafe { libc::isatty(stdin_fd) } != 1 { return Ok(None); }
         let input_lease = crate::platform::terminal::InputLease::acquire()?;
@@ -358,7 +366,15 @@ impl TerminalInputSession {
         if unsafe { libc::tcgetattr(stdin_fd, original_mode.as_mut_ptr()) } != 0 { return Err(std::io::Error::last_os_error()); }
         let original_mode = unsafe { original_mode.assume_init() };
         let mut raw_mode = original_mode;
-        unsafe { libc::cfmakeraw(&mut raw_mode) };
+        if raw {
+            // SAFETY: raw_mode is an initialized writable termios value.
+            unsafe { libc::cfmakeraw(&mut raw_mode) };
+        } else {
+            raw_mode.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHONL);
+            // Signals can invalidate readiness by flushing the input queue.
+            raw_mode.c_cc[libc::VMIN] = 0;
+            raw_mode.c_cc[libc::VTIME] = 0;
+        }
         if unsafe { libc::tcsetattr(stdin_fd, libc::TCSANOW, &raw_mode) } != 0 { return Err(std::io::Error::last_os_error()); }
         Ok(Some(Self { stdin_fd, original_mode, _input_lease: input_lease }))
     }

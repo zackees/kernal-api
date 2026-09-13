@@ -867,6 +867,15 @@ impl TerminalInputCore {
     #[cfg(windows)]
     /// Starts native terminal input capture for the attached Windows console.
     pub fn start_impl(&self) -> Result<(), std::io::Error> {
+        self.start_with_signal_keys(false)
+    }
+
+    #[cfg(feature = "pty")]
+    pub(crate) fn start_for_keys(&self) -> Result<(), std::io::Error> {
+        self.start_with_signal_keys(true)
+    }
+
+    fn start_with_signal_keys(&self, preserve_signal_keys: bool) -> Result<(), std::io::Error> {
         use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
         use winapi::um::handleapi::INVALID_HANDLE_VALUE;
         use winapi::um::processenv::GetStdHandle;
@@ -895,7 +904,10 @@ impl TerminalInputCore {
             ));
         }
 
-        let active_mode = native_terminal_input_mode(original_mode);
+        let mut active_mode = native_terminal_input_mode(original_mode);
+        if preserve_signal_keys {
+            active_mode |= original_mode & winapi::um::wincon::ENABLE_PROCESSED_INPUT;
+        }
         let set_mode = unsafe { SetConsoleMode(input_handle, active_mode) };
         if set_mode == 0 {
             return Err(std::io::Error::last_os_error());

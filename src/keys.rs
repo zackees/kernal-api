@@ -228,9 +228,10 @@ impl KeyDecoder {
     }
 }
 
-/// Exclusive raw input owner. Drop restores modes best-effort via the existing
-/// native session. Raw capture changes signal-key behavior: the application
-/// must handle control-C events. No background listener or channel is added.
+/// Exclusive noncanonical, no-echo input owner. Existing native signal-key and
+/// output processing are preserved; normally Ctrl+C remains a signal, not an
+/// input event. Drop restores modes best-effort via the existing native session.
+/// No additional background listener or channel is added.
 pub struct TerminalKeys {
     input: crate::TerminalInputSession,
     decoder: KeyDecoder,
@@ -241,7 +242,7 @@ pub struct TerminalKeys {
 
 impl TerminalKeys {
     pub fn new() -> io::Result<Option<Self>> {
-        crate::TerminalInputSession::new().map(|input| {
+        crate::TerminalInputSession::new_for_keys().map(|input| {
             input.map(|input| Self {
                 input,
                 decoder: KeyDecoder::new(),

@@ -179,7 +179,14 @@ newly embedded ABI metadata. Its native host staging group passed 29 tests (4
 artifact-dependent tests ignored) in 0.45 seconds; the selected actual guest
 streaming/authentication proof then passed once in 31.91 seconds. This is a
 current Linux x86-64 execution of the one exact ignored proof, not a rerun of
-the prior eight-case group and not evidence for the remaining five targets.
+the prior eight-case group.
+
+Hosted CI run `34783064265` at `983d3ee` then ran that checked-in staging plus
+actual-streaming harness successfully on all six native targets: Linux,
+macOS, and Windows on x86-64 and ARM64. This is six-target execution evidence
+for this exact sealed archive guest proof; it does not turn the earlier local
+timing into a cross-host performance comparison or satisfy the separate
+Component/facade selection gates below.
 
 ## Remaining proof
 

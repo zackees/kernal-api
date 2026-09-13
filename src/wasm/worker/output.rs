@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 pub(super) struct StagedOutput {
-    directory: tempfile::TempDir,
+    directory: crate::platform::fs::OwnedScratchDirectory,
     destination: PathBuf,
     #[cfg(test)]
     fail_cleanup: bool,
@@ -29,9 +29,7 @@ impl StagedOutput {
             io::Error::new(io::ErrorKind::InvalidInput, "output has no file name")
         })?;
         let parent = std::fs::canonicalize(parent)?;
-        let directory = tempfile::Builder::new()
-            .prefix(".kernal-worker-output-")
-            .tempdir_in(&parent)?;
+        let directory = crate::platform::fs::OwnedScratchDirectory::create_in(&parent)?;
         Ok(Self {
             directory,
             destination: parent.join(name),
@@ -144,6 +142,60 @@ mod tests {
             assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
         }
+    }
+
+    #[test]
+    fn parent_discard_cleans_staging_after_destination_parent_is_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("destination-parent");
+        let moved = root.path().join("moved-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let final_path = parent.join("result.png");
+        std::fs::write(&final_path, b"original").unwrap();
+        let output = StagedOutput::new(&final_path).unwrap();
+        std::fs::write(output.worker_destination(), b"uncommitted").unwrap();
+        let staging_name = output.directory.path().file_name().unwrap().to_owned();
+        std::fs::rename(&parent, &moved).unwrap();
+        // Reusing the old pathname must not redirect cleanup to new data.
+        let replacement = parent.join(staging_name);
+        std::fs::create_dir_all(&replacement).unwrap();
+        std::fs::write(replacement.join("keep"), b"unrelated").unwrap();
+
+        output.discard().unwrap();
+
+        assert_eq!(
+            std::fs::read(moved.join("result.png")).unwrap(),
+            b"original"
+        );
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            1,
+            "discard must remove staging from the original directory after rename"
+        );
+        assert_eq!(
+            std::fs::read(replacement.join("keep")).unwrap(),
+            b"unrelated"
+        );
+    }
+
+    #[test]
+    fn commit_error_cleans_staging_after_destination_parent_is_renamed() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&parent).unwrap();
+        let destination = parent.join("result.png");
+        std::fs::write(&destination, b"original").unwrap();
+        let output = StagedOutput::new(&destination).unwrap();
+        std::fs::write(output.worker_destination(), b"uncommitted").unwrap();
+        std::fs::rename(&parent, &moved).unwrap();
+
+        assert!(output.commit(|| None).is_err());
+        assert_eq!(
+            std::fs::read(moved.join("result.png")).unwrap(),
+            b"original"
+        );
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
     }
 
     #[test]

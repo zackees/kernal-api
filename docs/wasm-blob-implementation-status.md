@@ -533,3 +533,23 @@ direct containment reports with completed validation markers. All five
 direct reports record zero live workers, protocol tasks, and pending root
 leases. Forced termination still does not claim a final child-owned trace.
 This is local Linux evidence only, not a hosted CI run or completion of #22.
+
+## Renamed-parent staging cleanup
+
+A focused RED regression reproduced `NotFound` from parent-owned staging
+discard after renaming the destination's parent. The private filesystem
+capability now retains an open scratch-directory handle using optional
+`cap-std`, enabled only by `wasm-sketch-worker`. Ownership transfers from
+`TempDir` after the handle opens; explicit cleanup and best-effort Drop use
+the handle, never TempDir's stale pathname. The Linux regression now passes,
+including reuse of the old path with unrelated data that must survive.
+A second regression covers cleanup after commit fails following parent rename.
+All 29 focused worker unit tests and strict worker-feature Clippy pass.
+The default normal dependency tree excludes the new backend; the previously
+recorded upstream PNG/X11 isolation gap remains.
+
+This fixes cleanup after an ancestor rename, not every filesystem race:
+publication and the worker's output grant remain path-based. The backend
+does not promise atomic removal against concurrent directory renames, and
+abrupt parent death does not run Drop. Windows/macOS runtime validation and
+the real contained renamed-parent scenario remain required.

@@ -248,8 +248,7 @@ impl Client {
                     deadline,
                 )
                 .await?;
-            if self.limits.max_redirects == 0
-                || !matches!(response.status(), 301..=303 | 307..=308)
+            if self.limits.max_redirects == 0 || !matches!(response.status(), 301..=303 | 307..=308)
             {
                 return Ok(response);
             }

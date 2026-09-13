@@ -3,6 +3,27 @@
 use kernal_api::http::{Client, Limits, Method, Request};
 use std::io::{Read, Write};
 
+#[tokio::test]
+#[ignore = "requires KERNAL_HTTP_HTTPS_FIXTURE pointing to a trusted public HTTPS resource"]
+async fn trusted_https_fixture_uses_verified_tls_and_bounded_body() {
+    let url = std::env::var("KERNAL_HTTP_HTTPS_FIXTURE").expect("HTTPS fixture URL");
+    assert!(url.starts_with("https://"));
+    let response = Client::new(Limits {
+        max_redirects: 5,
+        max_body_bytes: 4 * 1024 * 1024,
+        ..Limits::default()
+    })
+    .unwrap()
+    .execute(Request {
+        headers: &[("User-Agent", "kernal-api-https-acceptance")],
+        ..Request::get(&url)
+    })
+    .await
+    .unwrap();
+    assert!((200..300).contains(&response.status()));
+    assert!(!response.into_bytes().await.unwrap().is_empty());
+}
+
 #[test]
 fn blocking_adapter_streams_on_the_callers_runtime_and_rejects_nested_use() {
     use kernal_api::async_engine::RuntimeBuilder;

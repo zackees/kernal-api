@@ -505,8 +505,11 @@ mod tests {
         let child = directory.join("marker");
         fs::write(&child, b"marker").unwrap();
 
+        let child_dacl = file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap();
         assert_eq!(
-            crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap(),
+            crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap_or_else(
+                |error| panic!("private inherited child DACL {child_dacl:02x?}: {error}"),
+            ),
             b"marker"
         );
 

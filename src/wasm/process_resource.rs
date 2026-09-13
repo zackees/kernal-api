@@ -388,7 +388,9 @@ impl OperationHub {
             .await
         {
             Ok(session) => Arc::new(session),
-            Err(_) => {
+            Err(_error) => {
+                #[cfg(test)]
+                eprintln!("compiler-session spawn rejected: {_error:?}");
                 let _ = self.terminal(
                     operation,
                     TerminalResult {

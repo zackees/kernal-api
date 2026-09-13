@@ -677,7 +677,7 @@ fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
 }
 
 #[test]
-fn json_is_confined_to_the_external_firefox_export() {
+fn json_backend_is_confined_to_owned_document_and_firefox_adapters() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     for path in rust_sources(&root) {
         let relative = path.strip_prefix(&root).expect("source below root");
@@ -687,9 +687,9 @@ fn json_is_confined_to_the_external_firefox_export() {
             assert!(
                 matches!(
                     normalized.as_str(),
-                    "profile/export/firefox.rs" | "profile/tests.rs"
+                    "json.rs" | "profile/export/firefox.rs" | "profile/tests.rs"
                 ),
-                "{} uses JSON outside the Firefox export boundary",
+                "{} uses JSON outside the owned adapter boundaries",
                 path.display()
             );
         }

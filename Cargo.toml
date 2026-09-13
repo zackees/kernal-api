@@ -39,6 +39,7 @@ secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 command-arguments = ["dep:shell-words"]
 config-toml = ["dep:toml"]
+json = ["dep:serde", "dep:serde_json"]
 source-cpp = ["dep:tree-sitter", "dep:tree-sitter-cpp"]
 terminal-style = []
 # Native terminal capture and key decoding without PTY process spawning.
@@ -245,7 +246,7 @@ prost-types = { version = "=0.14.4", optional = true }
 # the exact set of supported hosts/filesystems this release covers.
 reflink-copy = { version = "=0.1.30", optional = true }
 serde = { version = "=1.0.229", features = ["derive"], optional = true }
-serde_json = { version = "=1.0.151", optional = true }
+serde_json = { version = "=1.0.151", optional = true, features = ["raw_value"] }
 sha2 = { version = "=0.10.9", optional = true }
 sysinfo = "=0.30.13"
 tar = { version = "=0.4.46", default-features = false, optional = true }
@@ -390,6 +391,7 @@ toml = "=0.8.23"
 features = [
   "full",
   "config-toml",
+  "json",
   "source-cpp",
   "daemon-identity",
   "daemon-frame-v1",

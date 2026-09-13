@@ -178,6 +178,7 @@ jobs:
           - text-similarity
           - command-arguments
           - config-toml
+          - json
           - source-cpp
           - terminal-style
           - terminal-input
@@ -210,6 +211,11 @@ jobs:
       - run: >-
           soldr cargo check
           --locked --no-default-features --features ${{ matrix.feature }}
+      - name: Test JSON with unified arbitrary-precision backend feature
+        if: matrix.feature == 'json'
+        run: >-
+          soldr cargo test --locked --no-default-features
+          --features json,serde_json/arbitrary_precision --test json_documents
 
   # A unit test does not own process main on every test harness, while Tauri
   # requires its event loop to start there.  These executable proofs

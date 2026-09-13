@@ -39,17 +39,18 @@ as *unresolved/non-candidates*, not cleared.
 The independent-spawn namespace now aliases the entire public substrate module
 in `src/lib.rs` (`pub use running_process::independent_spawn`).
 There is no local module export list to update when the selected dependency adds
-public items. Root convenience exports retain their existing names. Type and
-function identity checks are authored but have not yet been executed.
+public items. Root convenience exports retain their existing names. The
+cross-namespace type/function identity and facade-policy checks passed locally
+on the selected release candidate.
 
-Substrate references use integration revision
-[`0e39d9d403883dc87c71d677012bc0c0a5d0c693`](https://github.com/zackees/running-process/tree/0e39d9d403883dc87c71d677012bc0c0a5d0c693)
-(workspace version `4.10.12`, pending publication). Line references are intentionally included so a
+Substrate references use release-candidate revision
+[`6db662c`](https://github.com/zackees/running-process/commit/6db662c)
+(workspace version `4.10.13`, pending publication in running-process#1208). Line references are intentionally included so a
 later substrate revision can be compared rather than assumed equivalent.
 
 | Facade surface | Current canonical/source comparison | Finding and proposed action | Gate/consumer risk | Closure evidence |
 | --- | --- | --- | --- | --- |
-| `independent_spawn::{LaunchSpec, Readiness, IndependentChild, spawn}` plus root `SpawnMode`, `SpawnOptions`, `SpawnLifetime`, and `IndependentBackend` | Canonical public substrate contract owned by native spawn | Confirmed canonical contract: the entire module is directly aliased in `src/lib.rs`, with root types directly re-exported; no local module or mapping. The default remains inherited placement and independent placement never falls back | `kernel-substrate`; native scheduler/broker selection is explicit | Cross-namespace assignment; default is `Inherited`; native Linux/Windows placement, unsupported, cancellation/readiness, partial-launch cleanup tests |
+| `independent_spawn::{LaunchSpec, Readiness, IndependentChild, spawn}` plus root `SpawnMode`, `SpawnOptions`, `SpawnLifetime`, and `IndependentBackend` | Canonical public substrate contract owned by native spawn | Confirmed canonical contract: the entire module is directly aliased in `src/lib.rs`, with root types directly re-exported; no local module or mapping. The default remains inherited placement and independent placement never falls back | explicit `independent-spawn` alongside minimal `kernel-substrate`; native scheduler/broker selection is explicit | Cross-namespace assignment and facade policy passed; native Linux/Windows placement, unsupported, cancellation/readiness, partial-launch cleanup tests |
 | `broker::{protocol, protocol_v2, session_codec, server, backend_lifecycle, backend_sdk, host_identity, …}` and its root aliases (`src/broker.rs`) | Existing direct aliases exported through [`broker/mod.rs`](https://github.com/zackees/running-process/blob/0e39d9d403883dc87c71d677012bc0c0a5d0c693/crates/running-process/src/broker/mod.rs), [`backend_identity.rs:17-31`](https://github.com/zackees/running-process/blob/0e39d9d403883dc87c71d677012bc0c0a5d0c693/crates/running-process/src/backend_identity.rs#L17-L31), and `broker::client` | Confirmed canonical opt-in broker namespace: direct re-export of the public broker module tree exposes handle/probe, identity sidecar, frozen framing, route/refusal/client types, protocol v1/v2, session codec, server and lifecycle utilities without a type layer. `BackendHandle` already has public `service_name`, `service_version`, and `daemon_process`; its endpoint is `daemon_process.ipc_endpoint`, so no redundant accessor is needed | opt-in `broker = [running-process/client]`; no default graph expansion | Cross-namespace assignments; frozen-frame golden bytes; refusal class/code/detail and verified probe behavior |
 | `broker::verify_pid` | Exact `pub use running_process::broker::backend_lifecycle::verify_pid` namespace alias | Confirmed identity-safe stale-daemon migration surface. `verify_daemon_process_for_control` verifies boot, liveness, exact executable path and hash while retaining a control-capable `ProcessHandle`; `force_kill_handle` acts on that same native object, avoiding PID reuse between verification and destructive cleanup. The handle distinguishes a terminated Windows process from a merely open handle through `is_alive`. No PID-only executable-path alias is exposed because it cannot be made generation-safe | opt-in `broker`; no default graph expansion | Cross-namespace namespace/type/function assignments and Windows terminated-handle, PID reuse, path/hash mismatch tests |
 | `daemon_registration_v2::canonical::{ServiceDefinition, ServiceDefinitionBuilder, ServiceDefinitionError, LoadedServiceDefinitionV2, read_service_definition_v2, service_definition_*}` | Existing public substrate v2 API, including the integration reader that returns decoded definition plus frozen bytes | Confirmed canonical subset: direct namespace is available alongside the narrower compatibility API. `read_service_definition_v2(root, name)` preserves bytes and uses typed errors for missing/private/malformed/name-mismatch cases without creating a directory | `daemon-registration-v2`; no default graph expansion | Cross-namespace assignments and v2 persisted roundtrip/error tests |
@@ -173,9 +174,10 @@ does not. The selected-versus-ambient runtime regression has been authored in
 `src/async_engine.rs`, but has not been executed. Audit writer queue pressure,
 flush acknowledgment, and shutdown ordering remain consumer validation gates.
 
-1. Complete #189 and publish the substrate's canonical independent-spawn API.
-   Replace the temporary path with the exact released version, remove the
-   nested checkout, and retain the identity/policy tests.
+1. Await publication of the canonical independent-spawn API from
+   running-process#1208, then replace the temporary path with the exact
+   released version, remove the nested checkout, and retain the identity/policy
+   tests.
 2. Define a substrate-owned frame-v1 compatibility contract that preserves raw
    unknown values and trace bytes. Migrate `daemon_frame_v1` only after golden
    wire tests demonstrate no protocol change.

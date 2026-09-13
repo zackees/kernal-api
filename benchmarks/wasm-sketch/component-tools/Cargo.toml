@@ -7,10 +7,15 @@ publish = false
 
 [workspace]
 
+[features]
+default = []
+engine-probe = ["dep:wasmtime"]
+
 [dependencies]
 anyhow = "=1.0.104"
 wit-component = "=0.251.0"
 wasmparser = "=0.251.0"
+wasmtime = { version = "=45.0.0", optional = true, default-features = false, features = ["cranelift", "runtime", "component-model", "component-model-async"] }
 
 [dev-dependencies]
 wasm-encoder = "=0.251.0"

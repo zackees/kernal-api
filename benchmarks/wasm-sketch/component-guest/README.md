@@ -31,7 +31,9 @@ describes a newer linker requirement for its WASI-based async example. This
 probe instead compiled successfully on Rust 1.95.0 for the non-ambient target
 and encoded with matching `wit-component = 0.251.0`. This establishes that
 the documented WASI linker issue does not prevent this separate encoding path;
-it does not prove Wasmtime 45 runtime compatibility.
+it does not prove runtime execution compatibility. The sibling encoder's
+optional `engine-probe` has subsequently compiled the actual component with
+Wasmtime 45.0.0; instantiation and execution remain unproven.
 
 Remaining work includes adapting the same public Rust guest facade, deterministic
 checked-in bindings, host execution through the existing kernel executor,

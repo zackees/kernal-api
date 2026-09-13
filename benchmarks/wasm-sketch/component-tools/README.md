@@ -4,6 +4,18 @@ This standalone, unpublished workspace encodes the sibling guest's core Wasm
 using pinned `wit-component = 0.251.0`, matching wit-bindgen 0.58's metadata
 format. It does not instantiate a component, add a runtime, or grant effects.
 
+The optional `engine-probe` feature additionally compiles the encoded component
+with the production runtime's pinned Wasmtime 45.0.0, enabling Component Model
+async support. It still does not instantiate or execute it. Add
+`--features engine-probe` to the Cargo commands below to require this extra
+check. Compilation errors occur before the output is created. Without the
+feature, only structural validation is performed; the success output states
+explicitly when engine compilation has also passed.
+
+This experimental tool has its own lockfile and does not change the parent
+crate's features or dependencies. Wasmtime is optional here and no second
+production runtime fallback is introduced.
+
 From the repository root:
 
 ```sh
@@ -46,3 +58,13 @@ Its input core module SHA-256 is
 All three validator tests, strict tools/guest Clippy, formatting, and the parent
 dependency-isolation check pass locally. Six-target native execution remains
 unproven for this new candidate.
+
+The subsequent `engine-probe` run successfully compiled that same 52,326-byte
+component with Wasmtime 45.0.0 on Linux x86-64. Its output is retained at
+`/tmp/kernal-component-engine-probe-1.wasm`. No instance was created and no
+guest function was called. This proves compiler acceptance of the actual async
+component encoding, not import linking, stream progress, cancellation, or
+resource cleanup. The initial probe build failed on a Rust error-conversion
+mismatch; preserving `wasmtime::Result` inside the compiler helper and converting
+its diagnostic at the CLI boundary fixed that build error without changing
+component bytes or weakening validation.

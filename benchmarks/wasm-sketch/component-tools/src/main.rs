@@ -5,6 +5,15 @@ use wasmparser::{Encoding, Parser, Payload, Validator, WasmFeatures};
 
 const MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
 
+#[cfg(feature = "engine-probe")]
+fn compile_component(bytes: &[u8]) -> wasmtime::Result<()> {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model_async(true);
+    let engine = wasmtime::Engine::new(&config)?;
+    wasmtime::component::Component::new(&engine, bytes)?;
+    Ok(())
+}
+
 fn validate_component(bytes: &[u8]) -> Result<()> {
     Validator::new_with_features(WasmFeatures::all()).validate_all(bytes)?;
     let mut depth = 0_u32;
@@ -57,6 +66,8 @@ fn main() -> Result<()> {
         .validate(true)
         .encode()?;
     validate_component(&component)?;
+    #[cfg(feature = "engine-probe")]
+    compile_component(&component).map_err(|error| anyhow::anyhow!("{error:#}"))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -66,12 +77,20 @@ fn main() -> Result<()> {
         "validated component: {} bytes; one kernel import; not executed",
         component.len()
     );
+    #[cfg(feature = "engine-probe")]
+    println!("Wasmtime 45 component compilation passed; not instantiated or executed");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "engine-probe")]
+    #[test]
+    fn engine_compilation_rejects_core_module_input() {
+        assert!(compile_component(b"\0asm\x01\0\0\0").is_err());
+    }
 
     #[test]
     fn ambient_and_other_kernel_interfaces_are_rejected() {

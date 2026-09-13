@@ -287,11 +287,41 @@ accepted EOF after the failed write (Soldr log
 
 These are native integration tests, not execution of the guest archive
 contract. The driver still needs generated operations, host grant/dispatch,
-bounded queued/running archive-job accounting and draining, progress deadlines,
+bounded entry-copy job accounting and draining, progress deadlines,
 worker containment and actual guest/six-target validation. Operation-slot limits
 alone do not bound native jobs that outlive a cancelled operation. The fixture's
 owned reader is supplied directly by trusted native test code, not discovered
 through guest archive authority.
+
+## Tracked native encrypted-input authentication
+
+The test-only `archive_input` driver now consumes an input grant into a tracked
+job on the supplied kernel runtime's blocking lane. It reads ciphertext in
+64 KiB chunks, passes the original prefix/header as AAD to the existing staged
+authentication implementation, and publishes through the existing atomic
+final-tag handoff. The old input token becomes stale at admission. No source
+path is reopened, no Store is retained, and no whole archive is allocated.
+
+Queued/running authentication jobs have a separate ceiling equal to the hub's
+operation limit. Collecting a cancellation terminal does not release that job
+slot. Root teardown revokes operations and awaits these jobs outside the hub
+mutex; worker panics remain recorded even after finished handles are pruned.
+An idle staging object can be reclaimed immediately on cancellation; an
+in-flight staging write retains its own charge until the write returns.
+
+The first driver test failed because submission/draining APIs were absent
+(Soldr log `20260913T071734Z-home-niteris-dev-kernal-api.xml`). Native tests now
+cover a real encrypted ZIP containing 17 MiB of byte-verified payload, bad-tag
+rejection, foreign/consumed input rejection, cancellation with worker quota
+retained after terminal collection, and panic reporting after handle pruning.
+The complete authentication-related filter passes 25 tests on Linux x86-64;
+the actual header-only guest control remains a separate explicitly ignored
+artifact test, not evidence that this driver executes from a guest.
+
+Generated authentication/inventory/entry operations, cancellation-safe guest
+future ownership, entry-copy job accounting, progress deadlines, killable
+worker execution, and current six-native runs still remain. This does not
+interrupt blocked filesystem calls or claim process RSS bounds.
 
 ## Native portability gate
 

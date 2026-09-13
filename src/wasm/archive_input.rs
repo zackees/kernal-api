@@ -6,6 +6,36 @@ pub(crate) const MAX_HEADER_BYTES: usize = 16 * 1024 + 12;
 const INPUT_KIND: u8 = 7;
 const READ_HEADER: u8 = 1;
 
+#[derive(Default)]
+pub(super) struct ArchiveJobs {
+    tasks: Vec<crate::async_engine::Task<()>>,
+    active: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+}
+
+struct ArchiveJobLease {
+    hub: Arc<OperationHub>,
+    operation: OpaqueToken,
+    active: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Drop for ArchiveJobLease {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.failed.store(true, Ordering::Release);
+            let _ = self.hub.terminal(
+                self.operation,
+                TerminalResult {
+                    terminal: Terminal::Rejected,
+                    resource: None,
+                },
+            );
+        }
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub(crate) struct EncryptedInput {
     file: File,
     key: [u8; 16],
@@ -14,6 +44,58 @@ pub(crate) struct EncryptedInput {
 }
 
 impl EncryptedInput {
+    fn authenticate_into(
+        mut self,
+        hub: &OperationHub,
+        store: u64,
+        operation: OpaqueToken,
+        nonce: [u8; 12],
+        after_started: impl FnOnce(),
+    ) -> Result<(), HubError> {
+        hub.start_archive_authentication(
+            store,
+            operation,
+            &self.key,
+            &nonce,
+            &self.header,
+            self.ciphertext_bytes,
+        )?;
+        after_started();
+        let active = || {
+            let state = hub.state.lock().map_err(|_| HubError::Closed)?;
+            if state.closed
+                || state
+                    .operations
+                    .get(&operation)
+                    .is_none_or(|slot| slot.terminal.is_some())
+            {
+                Err(HubError::Closed)
+            } else {
+                Ok(())
+            }
+        };
+        let mut chunk = [0; 64 * 1024];
+        let mut remaining = self.ciphertext_bytes;
+        while remaining != 0 {
+            active()?;
+            let count = remaining.min(chunk.len() as u64) as usize;
+            self.file
+                .read_exact(&mut chunk[..count])
+                .map_err(|_| HubError::Invalid)?;
+            hub.update_archive_authentication(store, operation, &chunk[..count])?;
+            remaining -= count as u64;
+        }
+        active()?;
+        let mut tag = [0; 16];
+        self.file
+            .read_exact(&mut tag)
+            .map_err(|_| HubError::Invalid)?;
+        if self.file.read(&mut [0; 1]).map_err(|_| HubError::Invalid)? != 0 {
+            return Err(HubError::Invalid);
+        }
+        hub.finish_archive_authentication(store, operation, &tag)
+    }
+
     /// Read only the bounded public envelope prefix before the guest starts.
     /// Retain the opened source and key on the host, never in guest memory.
     pub(crate) fn open(mut file: File, key: [u8; 16], maximum_bytes: u64) -> io::Result<Self> {
@@ -54,6 +136,108 @@ impl EncryptedInput {
 }
 
 impl OperationHub {
+    pub(crate) fn submit_encrypted_authentication(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        token: OpaqueToken,
+        nonce: [u8; 12],
+    ) -> Result<OpaqueToken, HubError> {
+        self.submit_encrypted_authentication_with(runtime, store, token, nonce, || {})
+    }
+
+    fn submit_encrypted_authentication_with(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        token: OpaqueToken,
+        nonce: [u8; 12],
+        after_started: impl FnOnce() + Send + 'static,
+    ) -> Result<OpaqueToken, HubError> {
+        // The operation does not borrow the input: successful admission moves
+        // the entire authority into one worker and invalidates the old token.
+        let (operation, _) = self.submit(store, None, 0, 0)?;
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let mut jobs = self.archive_jobs.lock().map_err(|_| HubError::Closed)?;
+        let admission = (|| {
+            if state.closed {
+                return Err(HubError::Closed);
+            }
+            if jobs.active.load(Ordering::Acquire) >= self.maximum_operations as u64 {
+                return Err(HubError::Quota);
+            }
+            let slot = state.resources.get_mut(&token).ok_or(HubError::Invalid)?;
+            Self::validate_resource(slot, store, INPUT_KIND, READ_HEADER)?;
+            if !matches!(slot.value, ResourceValue::EncryptedInput(_)) {
+                return Err(HubError::WrongKind);
+            }
+            let ResourceValue::EncryptedInput(input) =
+                std::mem::replace(&mut slot.value, ResourceValue::Synthetic)
+            else {
+                return Err(HubError::WrongKind);
+            };
+            let notifications =
+                Self::close_resource_with_terminal_locked(&mut state, token, Terminal::Closed)?;
+            Ok((input, notifications))
+        })();
+        let (input, notifications) = match admission {
+            Ok(value) => value,
+            Err(error) => {
+                state.operations.remove(&operation);
+                return Err(error);
+            }
+        };
+        jobs.tasks.retain(|task| !task.is_finished());
+        jobs.active.fetch_add(1, Ordering::AcqRel);
+        let lease = ArchiveJobLease {
+            hub: Arc::clone(self),
+            operation,
+            active: Arc::clone(&jobs.active),
+            failed: Arc::clone(&jobs.failed),
+        };
+        let hub = Arc::clone(self);
+        jobs.tasks.push(runtime.launch_blocking(move || {
+            let _lease = lease;
+            if input
+                .authenticate_into(&hub, store, operation, nonce, after_started)
+                .is_err()
+            {
+                let _ = hub.terminal(
+                    operation,
+                    TerminalResult {
+                        terminal: Terminal::Rejected,
+                        resource: None,
+                    },
+                );
+            }
+        }));
+        drop(jobs);
+        drop(state);
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(operation)
+    }
+
+    pub(crate) async fn join_archive_jobs(&self) -> Result<(), HubError> {
+        if !self.state.lock().map_err(|_| HubError::Closed)?.closed {
+            return Err(HubError::WrongRights);
+        }
+        let (tasks, failed) = {
+            let mut jobs = self.archive_jobs.lock().map_err(|_| HubError::Closed)?;
+            (std::mem::take(&mut jobs.tasks), Arc::clone(&jobs.failed))
+        };
+        let mut join_failed = false;
+        for task in tasks {
+            join_failed |= task.await.is_err();
+        }
+        if join_failed || failed.load(Ordering::Acquire) {
+            Err(HubError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn grant_encrypted_input(
         &self,
         store: u64,
@@ -117,6 +301,187 @@ impl OperationHub {
 mod tests {
     use super::*;
 
+    fn encrypted_zip() -> (EncryptedInput, u64) {
+        use openssl::symm::{Cipher, Crypter, Mode};
+        let mut zip = zip::ZipWriter::new(tempfile::tempfile().unwrap());
+        zip.start_file(
+            "payload",
+            zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored),
+        )
+        .unwrap();
+        let mut chunk = [0x5a; 64 * 1024];
+        for _ in 0..272 {
+            zip.write_all(&chunk).unwrap();
+        }
+        let mut zip = zip.finish().unwrap();
+        let length = zip.metadata().unwrap().len();
+        assert!(length > 16 * 1024 * 1024);
+        zip.rewind().unwrap();
+        let mut source = source(b"{}", 0);
+        source.rewind().unwrap();
+        let mut aad = [0; 14];
+        source.read_exact(&mut aad).unwrap();
+        let mut encoder = Crypter::new(
+            Cipher::aes_128_gcm(),
+            Mode::Encrypt,
+            &[7; 16],
+            Some(&[8; 12]),
+        )
+        .unwrap();
+        encoder.aad_update(&aad).unwrap();
+        let mut encrypted = [0; 64 * 1024 + 16];
+        loop {
+            let count = zip.read(&mut chunk).unwrap();
+            if count == 0 {
+                break;
+            }
+            let count = encoder.update(&chunk[..count], &mut encrypted).unwrap();
+            source.write_all(&encrypted[..count]).unwrap();
+        }
+        assert_eq!(encoder.finalize(&mut encrypted).unwrap(), 0);
+        let mut tag = [0; 16];
+        encoder.get_tag(&mut tag).unwrap();
+        source.write_all(&tag).unwrap();
+        (
+            EncryptedInput::open(source, [7; 16], 512 * 1024 * 1024).unwrap(),
+            length,
+        )
+    }
+
+    async fn terminal(hub: &OperationHub, operation: OpaqueToken) -> TerminalResult {
+        loop {
+            if let Some(result) = hub.observe_terminal(1, operation).unwrap() {
+                return result;
+            }
+            hub.suspend(operation, 1).unwrap().notified().await;
+        }
+    }
+
+    #[test]
+    fn authenticated_input_job_authenticates_large_zip_before_resource_publication() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(2, 2).unwrap();
+        let (input, length) = encrypted_zip();
+        let token = hub.grant_encrypted_input(1, input).unwrap();
+        assert!(hub
+            .submit_encrypted_authentication(runtime.handle(), 2, token, [8; 12])
+            .is_err());
+        let operation = hub
+            .submit_encrypted_authentication(runtime.handle(), 1, token, [8; 12])
+            .unwrap();
+        assert!(hub
+            .read_encrypted_header(1, token.wire(), MAX_HEADER_BYTES, |_| panic!("consumed"))
+            .is_err());
+        let result = runtime.run(terminal(&hub, operation));
+        assert_eq!(result.terminal, Terminal::Completed);
+        assert_eq!(hub.staging_budget.used(), length);
+        let archive = {
+            let mut state = hub.state.lock().unwrap();
+            let slot = state.resources.get_mut(&result.resource.unwrap()).unwrap();
+            let ResourceValue::AuthenticatedArchive(archive) =
+                std::mem::replace(&mut slot.value, ResourceValue::Synthetic)
+            else {
+                panic!("wrong resource")
+            };
+            archive
+        };
+        let mut reader = archive
+            .into_reader(crate::archive::ExtractionLimits::default())
+            .unwrap();
+        assert_eq!(reader.entry(0).unwrap().unwrap().name, "payload");
+        struct Sink(u64);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                assert!(bytes.len() <= 64 * 1024);
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+                self.0 += bytes.len() as u64;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink(0);
+        reader.copy_entry(0, &mut sink).unwrap();
+        assert_eq!(sink.0, 17 * 1024 * 1024);
+        drop(reader);
+        hub.close_all(Terminal::Closed);
+        runtime.run(hub.join_archive_jobs()).unwrap();
+        assert_eq!(hub.staging_budget.used(), 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
+    #[test]
+    fn authenticated_input_cancelled_job_keeps_worker_quota_until_exit() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(1, 2).unwrap();
+        let input = EncryptedInput::open(source(b"{}", 32), [0; 16], 1024).unwrap();
+        let token = hub.grant_encrypted_input(1, input).unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        struct Resume(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let resume_on_drop = Resume(Some(release));
+        let operation = hub
+            .submit_encrypted_authentication_with(runtime.handle(), 1, token, [0; 12], move || {
+                started.send(()).unwrap();
+                resume.recv().unwrap();
+            })
+            .unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(hub.staging_budget.used(), 16);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        hub.cancel_wire(1, operation.wire()).unwrap();
+        assert_eq!(
+            runtime.run(terminal(&hub, operation)).terminal,
+            Terminal::Cancelled
+        );
+        let another = EncryptedInput::open(source(b"{}", 32), [0; 16], 1024).unwrap();
+        let another = hub.grant_encrypted_input(1, another).unwrap();
+        assert_eq!(
+            hub.submit_encrypted_authentication(runtime.handle(), 1, another, [0; 12]),
+            Err(HubError::Quota)
+        );
+        assert_eq!(
+            hub.archive_jobs
+                .lock()
+                .unwrap()
+                .active
+                .load(Ordering::Acquire),
+            1
+        );
+        hub.close_all(Terminal::Closed);
+        drop(resume_on_drop);
+        runtime.run(hub.join_archive_jobs()).unwrap();
+        assert_eq!(
+            hub.archive_jobs
+                .lock()
+                .unwrap()
+                .active
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(hub.staging_budget.used(), 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
     pub(crate) fn source(header: &[u8], tail_bytes: usize) -> File {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"TWPV1AES").unwrap();
@@ -178,5 +543,84 @@ mod tests {
         wrong.rewind().unwrap();
         wrong.write_all(b"BADMAGIC").unwrap();
         assert!(EncryptedInput::open(wrong, [0; 16], 1024).is_err());
+    }
+
+    #[test]
+    fn authenticated_input_job_rejects_bad_tag_and_drains_storage() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(2, 2).unwrap();
+        let input = EncryptedInput::open(source(b"{}", 32), [0; 16], 1024).unwrap();
+        let token = hub.grant_encrypted_input(1, input).unwrap();
+        let operation = hub
+            .submit_encrypted_authentication(runtime.handle(), 1, token, [0; 12])
+            .unwrap();
+        runtime.run(async {
+            loop {
+                if let Some(result) = hub.observe_terminal(1, operation).unwrap() {
+                    assert_eq!(result.terminal, Terminal::Rejected);
+                    assert_eq!(result.resource, None);
+                    break;
+                }
+                hub.suspend(operation, 1).unwrap().notified().await;
+            }
+            hub.close_all(Terminal::Closed);
+            hub.join_archive_jobs().await.unwrap();
+        });
+        assert_eq!(hub.staging_budget.used(), 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
+    }
+
+    #[test]
+    fn authenticated_input_job_panic_is_reported_after_finished_handle_pruning() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hub = OperationHub::new(1, 2).unwrap();
+        let input = EncryptedInput::open(source(b"{}", 32), [0; 16], 1024).unwrap();
+        let token = hub.grant_encrypted_input(1, input).unwrap();
+        let operation = hub
+            .submit_encrypted_authentication_with(runtime.handle(), 1, token, [0; 12], || {
+                panic!("injected worker unwind")
+            })
+            .unwrap();
+        runtime.run(async {
+            assert_eq!(terminal(&hub, operation).await.terminal, Terminal::Rejected);
+            crate::async_engine::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if hub
+                        .archive_jobs
+                        .lock()
+                        .unwrap()
+                        .tasks
+                        .iter()
+                        .all(|task| task.is_finished())
+                    {
+                        break;
+                    }
+                    crate::async_engine::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let input = EncryptedInput::open(source(b"{}", 32), [0; 16], 1024).unwrap();
+        let token = hub.grant_encrypted_input(1, input).unwrap();
+        let operation = hub
+            .submit_encrypted_authentication(runtime.handle(), 1, token, [0; 12])
+            .unwrap();
+        assert_eq!(
+            runtime.run(terminal(&hub, operation)).terminal,
+            Terminal::Rejected
+        );
+        hub.close_all(Terminal::Closed);
+        assert_eq!(runtime.run(hub.join_archive_jobs()), Err(HubError::Closed));
+        assert_eq!(hub.staging_budget.used(), 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.snapshot().pending_operations, 0);
     }
 }

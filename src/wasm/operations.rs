@@ -384,6 +384,12 @@ impl Drop for NativeCaptureLease {
 
 /// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
+    #[cfg(all(
+        test,
+        feature = "archive-auth-test-support",
+        feature = "wasm-sketch-host"
+    ))]
+    archive_jobs: Mutex<archive_input::ArchiveJobs>,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     staging_budget: crate::archive::authenticated_staging::StagingBudget,
     #[cfg(all(test, feature = "wasm-sketch-host"))]
@@ -456,6 +462,12 @@ impl OperationHub {
     ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
+            #[cfg(all(
+                test,
+                feature = "archive-auth-test-support",
+                feature = "wasm-sketch-host"
+            ))]
+            archive_jobs: Mutex::new(archive_input::ArchiveJobs::default()),
             #[cfg(all(test, feature = "archive-auth-test-support"))]
             staging_budget: crate::archive::authenticated_staging::StagingBudget::new(
                 512 * 1024 * 1024,

@@ -17,6 +17,35 @@ impl OperationHub {
     ) -> Result<OpaqueToken, HubError> {
         // Reserve operation authority before touching crypto or storage.
         let (operation, _) = self.submit(store, None, 0, 0)?;
+        if let Err(error) =
+            self.start_archive_authentication(store, operation, key, nonce, aad, expected)
+        {
+            self.state
+                .lock()
+                .map_err(|_| HubError::Closed)?
+                .operations
+                .remove(&operation);
+            return Err(error);
+        }
+        Ok(operation)
+    }
+
+    pub(super) fn start_archive_authentication(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+        key: &[u8; 16],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        expected: u64,
+    ) -> Result<(), HubError> {
+        {
+            let state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state.operations.get(&operation).ok_or(HubError::Closed)?;
+            if slot.owner.store != store || slot.terminal.is_some() {
+                return Err(HubError::Closed);
+            }
+        }
         let pending = Authentication::begin(key, nonce, aad, expected, &self.staging_budget);
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
         let active = state
@@ -30,11 +59,9 @@ impl OperationHub {
                     .get_mut(&operation)
                     .ok_or(HubError::Closed)?
                     .pending_authentication = Some(pending);
-                Ok(operation)
+                Ok(())
             }
             result => {
-                // The token has not escaped, so there is no terminal consumer.
-                state.operations.remove(&operation);
                 drop(result);
                 Err(if active {
                     HubError::Invalid
@@ -45,7 +72,7 @@ impl OperationHub {
         }
     }
 
-    fn update_archive_authentication(
+    pub(super) fn update_archive_authentication(
         &self,
         store: u64,
         operation: OpaqueToken,
@@ -97,7 +124,7 @@ impl OperationHub {
         Err(HubError::Invalid)
     }
 
-    fn finish_archive_authentication(
+    pub(super) fn finish_archive_authentication(
         &self,
         store: u64,
         operation: OpaqueToken,

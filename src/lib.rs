@@ -71,6 +71,10 @@ pub mod hash;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+/// Bounded source analysis; callers own language integration and product policy.
+#[cfg(feature = "source-cpp")]
+pub mod source;
+
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
 pub mod random;

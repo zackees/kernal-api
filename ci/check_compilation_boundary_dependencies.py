@@ -15,6 +15,8 @@ CASES = (
     ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
     ("command-arguments", "shell-words"),
+    ("source-cpp", "tree-sitter"),
+    ("source-cpp", "tree-sitter-cpp"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),

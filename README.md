@@ -49,6 +49,12 @@ types; that dependency is mandatory, not feature-gated. Optional features keep
 consumers from linking tooling they do not use:
 
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
+- `fs` also enables `hash::blake3_tree`: content-authoritative fingerprints of
+  glob-selected directory trees, with bounded parallel streaming reads and a
+  versioned path/content encoding. Include/exclude rules remain caller policy.
+  Defaults admit at most one million selected files, 16 GiB per file, and eight
+  readers (limited by host parallelism). Digests ignore absolute roots and
+  timestamps; symlinks are skipped and non-UTF-8 regular-file paths fail explicitly.
 - `fs-watch` for filesystem-change watcher construction and event
   classification (created/modified/removed/renamed plus an explicit
   overflow-or-lost-watch rescan signal); debouncing, ignore-lists, and

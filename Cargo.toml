@@ -288,7 +288,10 @@ tauri = { version = "=2.11.5", default-features = false, optional = true }
 tauri-runtime = { version = "=2.11.3", optional = true }
 tauri-runtime-wry = { version = "=2.11.4", default-features = false, optional = true }
 tauri-utils = { version = "=2.9.3", optional = true }
-wry = { version = "=0.55.1", default-features = false, features = ["os-webview"], optional = true }
+# 0.57 makes the no-handler Windows/macOS IPC bridge conditional. Published
+# Tauri runtime still uses private Wry 0.55 for its event-loop integration;
+# only this direct Wry creates the facade's isolated external webviews.
+wry = { version = "=0.57.0", default-features = false, features = ["os-webview"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

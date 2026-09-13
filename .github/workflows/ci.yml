@@ -43,6 +43,15 @@ jobs:
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - run: soldr cargo fmt --all -- --check
+      - name: Build native Windows external-page isolation proof
+        if: runner.os == 'Windows'
+        run: >-
+          soldr cargo build --locked --all-features
+          --bin kernal-tauri-smoke
+      - name: Verify native Windows external-page isolation
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        run: .\target\debug\kernal-tauri-smoke.exe close
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.

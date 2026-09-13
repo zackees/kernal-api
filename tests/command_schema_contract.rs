@@ -74,6 +74,18 @@ fn invalid_schema_never_exposes_a_backend_error() {
     );
     assert_eq!(
         Command::new("fastled")
+            .option(OptionSpec::flag("flag").default("true"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
+            .option(OptionSpec::flag("flag").optional_value("true"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
             .option(OptionSpec::flag("same"))
             .subcommand(Command::new("child").option(OptionSpec::flag("same")))
             .parse(["fastled"]),
@@ -96,6 +108,53 @@ fn root_and_sibling_subcommands_only_collect_selected_schema_values() {
     assert_eq!(selected.command_path(), ["fastled", "two"]);
     assert_eq!(selected.value("second"), Some("value"));
     assert_eq!(selected.value("first"), None);
+}
+
+#[test]
+fn optional_and_repeated_values_and_option_relations_are_enforced() {
+    let schema = Command::new("fastled")
+        .option(
+            OptionSpec::value("init", ValueKind::string())
+                .optional_value("__init__")
+                .conflicts("purge"),
+        )
+        .option(OptionSpec::flag("purge").conflicts("init"))
+        .option(OptionSpec::flag("test"))
+        .option(OptionSpec::flag("check"))
+        .option(
+            OptionSpec::value("test-cmd", ValueKind::string())
+                .repeated()
+                .requires_any(["test", "check"]),
+        )
+        .exclusive_group("production-test", ["test", "check"]);
+
+    let parsed = schema
+        .parse([
+            "fastled",
+            "--init",
+            "--test",
+            "--test-cmd=first",
+            "--test-cmd",
+            "second",
+        ])
+        .unwrap();
+    assert_eq!(parsed.value("init"), Some("__init__"));
+    assert_eq!(
+        parsed.values("test-cmd").unwrap(),
+        &["first".to_owned(), "second".to_owned()]
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--test-cmd=first"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--test", "--check"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--init", "--purge"]),
+        Err(CommandError::InvalidArguments)
+    );
 }
 
 #[cfg(unix)]

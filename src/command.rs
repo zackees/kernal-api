@@ -42,6 +42,10 @@ pub struct OptionSpec {
     name: String,
     kind: Option<ValueKind>,
     default: Option<String>,
+    default_missing: Option<String>,
+    repeated: bool,
+    conflicts: Vec<String>,
+    requires_any: Vec<String>,
 }
 
 impl OptionSpec {
@@ -51,6 +55,10 @@ impl OptionSpec {
             name: name.into(),
             kind: None,
             default: None,
+            default_missing: None,
+            repeated: false,
+            conflicts: Vec::new(),
+            requires_any: Vec::new(),
         }
     }
 
@@ -60,12 +68,44 @@ impl OptionSpec {
             name: name.into(),
             kind: Some(kind),
             default: None,
+            default_missing: None,
+            repeated: false,
+            conflicts: Vec::new(),
+            requires_any: Vec::new(),
         }
     }
 
     /// Supply a value used when this option is absent.
     pub fn default(mut self, value: impl Into<String>) -> Self {
         self.default = Some(value.into());
+        self
+    }
+
+    /// Allow this value option without a value and use `value` in that case.
+    pub fn optional_value(mut self, value: impl Into<String>) -> Self {
+        self.default_missing = Some(value.into());
+        self
+    }
+
+    /// Preserve every occurrence of this value option in declaration order.
+    pub fn repeated(mut self) -> Self {
+        self.repeated = true;
+        self
+    }
+
+    /// Reject this option when `other` is also present.
+    pub fn conflicts(mut self, other: impl Into<String>) -> Self {
+        self.conflicts.push(other.into());
+        self
+    }
+
+    /// Require one of these option names whenever this option is present.
+    pub fn requires_any<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.requires_any.extend(names.into_iter().map(Into::into));
         self
     }
 }
@@ -76,6 +116,7 @@ pub struct Command {
     name: String,
     options: Vec<OptionSpec>,
     subcommands: Vec<Self>,
+    exclusive_groups: Vec<(String, Vec<String>)>,
 }
 
 impl Command {
@@ -85,6 +126,7 @@ impl Command {
             name: name.into(),
             options: Vec::new(),
             subcommands: Vec::new(),
+            exclusive_groups: Vec::new(),
         }
     }
 
@@ -97,6 +139,17 @@ impl Command {
     /// Add a nested subcommand.
     pub fn subcommand(mut self, command: Self) -> Self {
         self.subcommands.push(command);
+        self
+    }
+
+    /// Require at most one named option from this group.
+    pub fn exclusive_group<I, S>(mut self, name: impl Into<String>, options: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.exclusive_groups
+            .push((name.into(), options.into_iter().map(Into::into).collect()));
         self
     }
 
@@ -153,9 +206,10 @@ impl Command {
             final_matches = next;
         }
         let mut values = BTreeMap::new();
-        for command in selected {
+        for command in &selected {
             command.collect_values(final_matches, &mut values)?;
         }
+        Self::validate_selected_relations(&selected, &values)?;
         Ok(ParsedCommand { path, values })
     }
 
@@ -180,6 +234,14 @@ impl Command {
             if let Some(default) = &option.default {
                 argument = argument.default_value(default);
             }
+            if let Some(default_missing) = &option.default_missing {
+                argument = argument
+                    .num_args(0..=1)
+                    .default_missing_value(default_missing);
+            }
+            if option.repeated {
+                argument = argument.action(clap::ArgAction::Append);
+            }
             command = command.arg(argument);
         }
         for child in &self.subcommands {
@@ -190,7 +252,8 @@ impl Command {
 
     fn validate(&self) -> Result<(), CommandError> {
         let mut option_names = std::collections::BTreeSet::new();
-        self.validate_into(&mut option_names)
+        self.validate_into(&mut option_names)?;
+        self.validate_references(&option_names)
     }
 
     fn validate_into(
@@ -208,18 +271,28 @@ impl Command {
             {
                 return Err(CommandError::InvalidSchema);
             }
-            match (&option.kind, &option.default) {
-                (None, Some(_)) => return Err(CommandError::InvalidSchema),
-                (Some(ValueKind::Enumeration(values)), default)
+            match (&option.kind, &option.default, &option.default_missing) {
+                (None, Some(_), _) | (None, _, Some(_)) => return Err(CommandError::InvalidSchema),
+                (None, _, _) if option.repeated => return Err(CommandError::InvalidSchema),
+                (Some(_), Some(_), Some(_)) | (Some(_), Some(_), _) if option.repeated => {
+                    return Err(CommandError::InvalidSchema)
+                }
+                (Some(ValueKind::Enumeration(values)), default, default_missing)
                     if values.is_empty()
                         || values.iter().any(|value| value.contains('\0'))
                         || default
+                            .as_ref()
+                            .is_some_and(|value| !values.contains(value))
+                        || default_missing
                             .as_ref()
                             .is_some_and(|value| !values.contains(value)) =>
                 {
                     return Err(CommandError::InvalidSchema);
                 }
-                (_, Some(value)) if value.contains('\0') => {
+                (_, Some(value), _) if value.contains('\0') => {
+                    return Err(CommandError::InvalidSchema)
+                }
+                (_, _, Some(value)) if value.contains('\0') => {
                     return Err(CommandError::InvalidSchema)
                 }
                 _ => {}
@@ -230,6 +303,36 @@ impl Command {
                 return Err(CommandError::InvalidSchema);
             }
             child.validate_into(option_names)?;
+        }
+        Ok(())
+    }
+
+    fn validate_references(
+        &self,
+        option_names: &std::collections::BTreeSet<String>,
+    ) -> Result<(), CommandError> {
+        for option in &self.options {
+            if option
+                .conflicts
+                .iter()
+                .chain(&option.requires_any)
+                .any(|name| !option_names.contains(name))
+            {
+                return Err(CommandError::InvalidSchema);
+            }
+        }
+        let mut group_names = std::collections::BTreeSet::new();
+        for (name, options) in &self.exclusive_groups {
+            if !valid_name(name)
+                || !group_names.insert(name)
+                || options.len() < 2
+                || options.iter().any(|option| !option_names.contains(option))
+            {
+                return Err(CommandError::InvalidSchema);
+            }
+        }
+        for child in &self.subcommands {
+            child.validate_references(option_names)?;
         }
         Ok(())
     }
@@ -248,6 +351,11 @@ impl Command {
                         .copied()
                         .unwrap_or(false),
                 ),
+                Some(_) if option.repeated => matches
+                    .try_get_many::<String>(&option.name)
+                    .map_err(|_| CommandError::InvalidArguments)?
+                    .map(|items| ParsedValue::Strings(items.cloned().collect()))
+                    .unwrap_or(ParsedValue::Absent),
                 Some(_) => matches
                     .try_get_one::<String>(&option.name)
                     .map_err(|_| CommandError::InvalidArguments)?
@@ -258,6 +366,54 @@ impl Command {
             values.insert(option.name.clone(), value);
         }
         Ok(())
+    }
+
+    fn validate_selected_relations(
+        selected: &[&Self],
+        values: &BTreeMap<String, ParsedValue>,
+    ) -> Result<(), CommandError> {
+        for command in selected {
+            for option in &command.options {
+                if is_present(values.get(&option.name))
+                    && option
+                        .conflicts
+                        .iter()
+                        .any(|name| is_present(values.get(name)))
+                {
+                    return Err(CommandError::InvalidArguments);
+                }
+                if is_present(values.get(&option.name))
+                    && !option.requires_any.is_empty()
+                    && !option
+                        .requires_any
+                        .iter()
+                        .any(|name| is_present(values.get(name)))
+                {
+                    return Err(CommandError::InvalidArguments);
+                }
+            }
+            for (_, options) in &command.exclusive_groups {
+                if options
+                    .iter()
+                    .filter(|name| is_present(values.get(*name)))
+                    .take(2)
+                    .count()
+                    > 1
+                {
+                    return Err(CommandError::InvalidArguments);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_present(value: Option<&ParsedValue>) -> bool {
+    match value {
+        Some(ParsedValue::Flag(value)) => *value,
+        Some(ParsedValue::String(_)) => true,
+        Some(ParsedValue::Strings(values)) => !values.is_empty(),
+        Some(ParsedValue::Absent) | None => false,
     }
 }
 
@@ -276,6 +432,8 @@ pub enum ParsedValue {
     Flag(bool),
     /// A declared value option.
     String(String),
+    /// A repeated value option, in command-line order.
+    Strings(Vec<String>),
     /// A declared value option was absent and has no default.
     Absent,
 }
@@ -305,6 +463,14 @@ impl ParsedCommand {
     pub fn value(&self, name: &str) -> Option<&str> {
         match self.values.get(name) {
             Some(ParsedValue::String(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Read all values of a repeated option.
+    pub fn values(&self, name: &str) -> Option<&[String]> {
+        match self.values.get(name) {
+            Some(ParsedValue::Strings(values)) => Some(values),
             _ => None,
         }
     }

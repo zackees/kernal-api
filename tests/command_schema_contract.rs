@@ -275,15 +275,53 @@ fn version_is_rendered_from_facade_owned_metadata() {
 
 #[cfg(unix)]
 #[test]
-fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {
+fn non_utf8_native_arguments_require_an_os_string_schema_value() {
     use std::os::unix::ffi::OsStringExt;
 
-    let schema = Command::new("fastled");
+    let string_schema =
+        Command::new("fastled").optional_positional("directory", ValueKind::string());
     assert_eq!(
-        schema.parse([
+        string_schema.parse([
             std::ffi::OsString::from("fastled"),
             std::ffi::OsString::from_vec(vec![0xff])
         ]),
-        Err(CommandError::InvalidUtf8)
+        Err(CommandError::InvalidArguments)
+    );
+
+    let os_schema =
+        Command::new("fastled").optional_positional("directory", ValueKind::os_string());
+    let parsed = os_schema
+        .parse([
+            std::ffi::OsString::from("fastled"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ])
+        .unwrap();
+    assert_eq!(
+        parsed.os_value("directory").unwrap().as_encoded_bytes(),
+        [0xff]
+    );
+
+    let guarded = Command::new("fastled")
+        .option(OptionSpec::flag("enabled"))
+        .option(
+            OptionSpec::value("path", ValueKind::os_string())
+                .repeated()
+                .requires_any(["enabled"]),
+        );
+    let inline = std::ffi::OsString::from_vec(b"--path=\xff".to_vec());
+    assert_eq!(
+        guarded.parse([std::ffi::OsString::from("fastled"), inline.clone()]),
+        Err(CommandError::InvalidArguments)
+    );
+    let parsed = guarded
+        .parse([
+            std::ffi::OsString::from("fastled"),
+            std::ffi::OsString::from("--enabled"),
+            inline,
+        ])
+        .unwrap();
+    assert_eq!(
+        parsed.os_values("path").unwrap()[0].as_encoded_bytes(),
+        b"\xff"
     );
 }

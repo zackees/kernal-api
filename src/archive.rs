@@ -14,6 +14,39 @@ use std::rc::Rc;
 
 mod tar_format;
 
+#[cfg(test)]
+mod owned_source_tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_seekable_source_extracts_large_entry_without_a_source_path() {
+        const LENGTH: u64 = 17 * 1024 * 1024;
+        let mut writer = zip::ZipWriter::new(tempfile::tempfile().unwrap());
+        writer.start_file("payload", zip::write::SimpleFileOptions::default()).unwrap();
+        let chunk = [0x5a; 64 * 1024];
+        for _ in 0..LENGTH / chunk.len() as u64 {
+            writer.write_all(&chunk).unwrap();
+        }
+        let source = writer.finish().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        extract_file(source, output.path(), ArchiveFormat::Zip, ExtractionLimits {
+            max_entry_bytes: LENGTH,
+            max_output_bytes: LENGTH,
+            ..ExtractionLimits::default()
+        }).unwrap();
+        let mut payload = File::open(output.path().join("payload")).unwrap();
+        let mut read = [0; 64 * 1024];
+        let mut total = 0;
+        loop {
+            let count = payload.read(&mut read).unwrap();
+            if count == 0 { break; }
+            assert!(read[..count].iter().all(|byte| *byte == 0x5a));
+            total += count as u64;
+        }
+        assert_eq!(total, LENGTH);
+    }
+}
+
 struct MetadataBudget {
     file: File,
     remaining: Rc<Cell<u64>>,
@@ -369,9 +402,22 @@ pub fn extract(
     limits: ExtractionLimits,
 ) -> io::Result<()> {
     let file = File::open(archive)?;
+    extract_file(file, dest, format, limits)
+}
+
+// Consume the already-authorized source without reopening a pathname. Future
+// authenticated staging must reach this boundary only after verification.
+// File ownership itself is not an authentication verdict.
+pub(crate) fn extract_file(
+    mut file: File,
+    dest: &Path,
+    format: ArchiveFormat,
+    limits: ExtractionLimits,
+) -> io::Result<()> {
     if file.metadata()?.len() > limits.max_input_bytes {
         return Err(invalid("archive input exceeds byte limit"));
     }
+    file.rewind()?;
     match format {
         ArchiveFormat::Zip => extract_zip(file, dest, limits),
         ArchiveFormat::TarGzip | ArchiveFormat::TarZstd => {

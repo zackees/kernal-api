@@ -173,6 +173,14 @@ normal, trap, and blocked forms; all 16 Linux x86-64 native regressions pass in
 173.78 seconds. These are local compatibility results, not six-target evidence
 for this revision.
 
+Fresh local revalidation at `3dbafa2` ran the checked-in
+`ci/run_extension2_guest.py` harness against a newly compiled archive guest and
+newly embedded ABI metadata. Its native host staging group passed 29 tests (4
+artifact-dependent tests ignored) in 0.45 seconds; the selected actual guest
+streaming/authentication proof then passed once in 31.91 seconds. This is a
+current Linux x86-64 execution of the one exact ignored proof, not a rerun of
+the prior eight-case group and not evidence for the remaining five targets.
+
 ## Remaining proof
 
 The actual Rustc parser is now exercised by the shared `rustc_policy.rs`

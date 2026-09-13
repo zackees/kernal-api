@@ -627,10 +627,14 @@ still run through Soldr, and harness execution follows the outer Soldr exit.
 Each target gets distinct always-upload proof artifacts and fail-fast is off.
 
 Workflow actionlint and syntax parsing of all five PowerShell steps pass
-locally. This configuration has not yet run on the five additional native
-targets. Runner, toolchain, GUI-session, or native-adapter failures must remain
-visible and be resolved or recorded as infrastructure blockers; this matrix
-does not close #22 or replace required runtime evidence.
+locally. Hosted [run 34787261950](https://github.com/zackees/kernal-api/actions/runs/34787261950)
+at `ad11917` completed every `wasm-tauri-screenshot-native` pair successfully:
+Linux x86-64/ARM64, macOS x86-64/ARM64, and Windows x86-64/ARM64. This is
+native execution evidence for the exact six-target screenshot matrix, not
+cross-compilation. It does not make later commits green, replace the remaining
+worker-containment evidence, or excuse a future runner, toolchain, GUI-session,
+or native-adapter failure; those must remain visible and be resolved or recorded
+as infrastructure blockers.
 
 The local explicit-target Linux build failed at linking before native test
 execution. Soldr selected its GNU sysroot linker, which reported unresolved

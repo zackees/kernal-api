@@ -164,12 +164,14 @@ pub(crate) struct HubSnapshot {
     pub(crate) peak_buffered_blob_bytes: usize,
     pub(crate) pending_write_bytes: usize,
     pub(crate) completed_read_bytes: usize,
-    /// Actual buffer capacities currently retained by the hub, including
-    /// unused blob capacity, pending inputs, and uncollected read results.
+    /// Transfer capacity charged to the hub: retained buffer capacities plus
+    /// reserved compiler-output allowance, including uncollected results.
     pub(crate) retained_transfer_capacity: usize,
     /// High-water mark of hub-owned capacities, including copy overlap.
     pub(crate) peak_retained_transfer_capacity: usize,
     pub(crate) native_transfer_capacity: usize,
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) reserved_process_output_bytes: usize,
     pub(crate) active_output_jobs: usize,
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) retained_process_jobs: usize,
@@ -350,6 +352,8 @@ struct DeferredCompletion {
 }
 
 struct State {
+    #[cfg(feature = "wasm-sketch-host")]
+    reserved_process_output_bytes: usize,
     #[cfg(feature = "wasm-sketch-host")]
     process_jobs: Vec<crate::async_engine::Task<Result<(), HubError>>>,
     #[cfg(feature = "wasm-sketch-host")]
@@ -554,6 +558,8 @@ impl OperationHub {
             maximum_resources,
             blob_limits,
             state: Mutex::new(State {
+                #[cfg(feature = "wasm-sketch-host")]
+                reserved_process_output_bytes: 0,
                 #[cfg(feature = "wasm-sketch-host")]
                 process_jobs: Vec::new(),
                 #[cfg(feature = "wasm-sketch-host")]
@@ -2676,6 +2682,9 @@ impl OperationHub {
     }
 
     fn transfer_capacity(state: &State) -> usize {
+        let native_capacity = state.native_transfer_capacity;
+        #[cfg(feature = "wasm-sketch-host")]
+        let native_capacity = native_capacity.saturating_add(state.reserved_process_output_bytes);
         state
             .resources
             .values()
@@ -2690,7 +2699,7 @@ impl OperationHub {
                     .map_or(0, Vec::capacity)
                     .saturating_add(operation.blob_read_result.as_ref().map_or(0, Vec::capacity))
             }))
-            .fold(state.native_transfer_capacity, usize::saturating_add)
+            .fold(native_capacity, usize::saturating_add)
     }
 
     fn record_transfer_capacity(state: &mut State) {
@@ -2755,6 +2764,8 @@ impl OperationHub {
             retained_transfer_capacity: Self::transfer_capacity(&state),
             peak_retained_transfer_capacity: state.peak_retained_transfer_capacity,
             native_transfer_capacity: state.native_transfer_capacity,
+            #[cfg(feature = "wasm-sketch-host")]
+            reserved_process_output_bytes: state.reserved_process_output_bytes,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
             #[cfg(feature = "wasm-sketch-host")]
             retained_process_jobs: state.process_jobs.len(),

@@ -263,10 +263,50 @@ draining output, grant/operation/resource/job admission, and owner binding.
 
 This foundation is deliberately not guest-reachable yet: no process ABI,
 root grant provisioning, public guest process API, or Component adapter is
-added by it. Output-operation accounting and a cumulative output ceiling
+added by it. Complete output accounting and ABI integration
 remain required before exposure. These tests use controlled child fixtures,
 not rustc or the cache workflow. They do not prove abrupt worker-death cleanup,
 uninterruptible spawn containment, aggregate RSS, or six-host execution.
+
+### Scoped compiler-output collection
+
+The internal `process_output.rs` path reserves one operation and 64 KiB of
+the existing shared transfer budget before receiving a native output event.
+Only one pending or uncollected event is allowed per process. Its payload is
+dropped before its reservation is released, even if the process is revoked
+while the event is held. Successful collection validates authority and runs
+the bounded delivery callback under the same lock. Dropping a pending or
+uncollected event revokes the process rather than permitting continuation
+from an uncertain byte position. Callback unwind releases the lock before
+revocation, without poisoning the authority. Receive and collection preserve
+distinct cancellation, deadline, trap, owner-exit, and closure terminal reasons.
+
+Stdout/stderr tags and native completion events are retained. A fixed 64-MiB
+combined output ceiling rejects the overflow event before exposing it to a
+consumer. The transfer-capacity snapshot now distinguishes the reserved
+process-event allowance from native blob-buffer capacity; it is charged
+capacity, not an RSS observation. Linux validation passes 101 operation tests,
+including 22 process tests/helper cases and a 4-MiB dual-stream fixture. A
+cancellation-after-receive regression was RED before collection and delivery
+were made atomic. Pending-read Drop, uncollected-result Drop, callback unwind,
+owner/budget rejection, and cumulative counting are covered.
+
+This event reservation does **not** account for all native process buffers.
+Source inspection of `running-process` 4.10.10 `process_runtime.rs` finds one
+shared queue, two pump scratch buffers, and two blocked-send payloads. Tokio
+1.53.1's Windows process pipes additionally use two blocking-read buffers.
+Thus a conservative payload allowance is eight 64-KiB chunks including one
+facade event, or nine with a separate host copy; allocator overhead, task
+metadata, error strings, kernel pipes, child memory, and guest memory are
+separate. These are source-derived allowances, not measured peak allocation.
+
+`ProcessSession::wait` proves direct-child reaping, not buffer release. Normal
+channel exhaustion is stronger for pump/queue storage, but Windows blocking
+reads can outlive post-exit abandonment. The substrate needs an explicit,
+tracked output-shutdown acknowledgement (including outstanding platform I/O)
+before native reservations can be safely recycled. No such acknowledgement,
+native-buffer ledger, guest ABI, or cache hit/miss integration is claimed by
+this internal output step; they remain required before guest exposure.
 
 This experiment does not replace the Component Model comparison, ten-edit
 latency measurements, sealed extension2 archive proof, or six native target

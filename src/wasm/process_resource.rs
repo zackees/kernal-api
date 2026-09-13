@@ -13,6 +13,11 @@ const GRANT_KIND: u8 = 10;
 const PROCESS_KIND: u8 = 11;
 const PROCESS_RIGHT: u8 = 1;
 const MAX_PROCESS_JOBS: usize = 4;
+const MAX_PROCESS_OUTPUT_CHUNK: usize = 64 * 1024;
+const MAX_PROCESS_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+#[path = "process_output.rs"]
+mod output;
 
 #[cfg(test)]
 pub(super) struct SpawnCheckpoint {
@@ -28,6 +33,9 @@ pub(super) struct CompilerGrant {
 pub(super) struct CompilerProcess {
     session: Option<Arc<ProcessSession>>,
     cancel: CancellationSource,
+    output_busy: bool,
+    output_bytes: usize,
+    output_limit: usize,
 }
 
 impl Drop for CompilerProcess {
@@ -120,6 +128,9 @@ impl OperationHub {
             ResourceValue::CompilerProcess(CompilerProcess {
                 session: None,
                 cancel,
+                output_busy: false,
+                output_bytes: 0,
+                output_limit: MAX_PROCESS_OUTPUT_BYTES,
             }),
         ) {
             Ok(token) => token,
@@ -190,7 +201,7 @@ impl OperationHub {
         let session = match spec
             .spawn_session(ProcessSessionOptions {
                 max_queued_chunks: 1,
-                max_chunk_bytes: 64 * 1024,
+                max_chunk_bytes: MAX_PROCESS_OUTPUT_CHUNK,
                 kill_on_drop: true,
                 ..ProcessSessionOptions::default()
             })

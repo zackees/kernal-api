@@ -31,9 +31,22 @@ fn compiler_helper() {
             }
         }
         Ok("exit") => println!("native compiler fixture output"),
+        Ok("dual") => {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let mut stderr = std::io::stderr().lock();
+            for _ in 0..512 {
+                stdout.write_all(&[0xf1; 4096]).unwrap();
+                stderr.write_all(&[0xf2; 4096]).unwrap();
+            }
+        }
+        Ok("silent") => std::thread::sleep(Duration::from_secs(30)),
         _ => {}
     }
 }
+
+#[path = "process_output_tests.rs"]
+mod output;
 
 async fn published(
     hub: &OperationHub,

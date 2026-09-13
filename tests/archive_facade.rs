@@ -391,7 +391,6 @@ fn zip_preserves_internal_link_chains_and_relative_parent_targets() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn zip_rejects_escaping_cyclic_and_dangling_links_before_creating_them() {
     for links in [

@@ -2,6 +2,8 @@
 //!
 //! The destination must be absent or empty and remain exclusively controlled
 //! by the caller throughout extraction. Failure may leave partial output.
+//! Symbolic targets retain their relative spelling on Unix; Windows converts
+//! archive `/` separators to native `\` separators for usable relative links.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -227,6 +229,30 @@ fn resolve_link_path(
     Ok(resolved)
 }
 
+#[cfg(any(windows, test))]
+fn windows_link_target(target: &Path) -> io::Result<PathBuf> {
+    // CreateSymbolicLinkW stores relative targets without translating `/`.
+    // NT path resolution then rejects those otherwise-valid archive targets.
+    // Replace separators only: do not collapse `..`, `.`, or link chains.
+    Ok(PathBuf::from(
+        target
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF-8 link target"))?
+            .replace('/', "\\"),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn windows_link_target_preserves_relative_components_and_trailing_separator() {
+    assert_eq!(
+        windows_link_target(Path::new("../alias/./tool/"))
+            .unwrap()
+            .as_os_str(),
+        std::ffi::OsStr::new("..\\alias\\.\\tool\\")
+    );
+}
+
 fn install_links(
     root: &Path,
     links: BTreeMap<PathBuf, ArchiveLink>,
@@ -273,17 +299,19 @@ fn install_links(
             fs::hard_link(canonical, output)?;
             continue;
         }
-        let target = &link.target;
         #[cfg(unix)]
         {
             let _ = is_dir;
-            std::os::unix::fs::symlink(target, output)?;
+            std::os::unix::fs::symlink(&link.target, output)?;
         }
         #[cfg(windows)]
-        if is_dir {
-            std::os::windows::fs::symlink_dir(target, output)?;
-        } else {
-            std::os::windows::fs::symlink_file(target, output)?;
+        {
+            let target = windows_link_target(&link.target)?;
+            if is_dir {
+                std::os::windows::fs::symlink_dir(target, output)?;
+            } else {
+                std::os::windows::fs::symlink_file(target, output)?;
+            }
         }
     }
     Ok(())

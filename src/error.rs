@@ -29,8 +29,8 @@ impl Display for ContextError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)?;
         if formatter.alternate() {
-        let mut source: Option<&(dyn StdError + 'static)> = Some(self.source.as_ref());
-        while let Some(error) = source {
+            let mut source: Option<&(dyn StdError + 'static)> = Some(self.source.as_ref());
+            while let Some(error) = source {
                 write!(formatter, ": {error}")?;
                 source = error.source();
             }
@@ -143,9 +143,7 @@ mod tests {
         assert_eq!(error.to_string(), "opening test file");
         assert!(error.source().is_some());
         assert_eq!(
-            message("x".repeat(MAX_CONTEXT_BYTES + 1))
-                .to_string()
-                .len(),
+            message("x".repeat(MAX_CONTEXT_BYTES + 1)).to_string().len(),
             MAX_CONTEXT_BYTES
         );
         assert!(format!("{error:#}").contains("source detail"));

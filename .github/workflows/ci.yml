@@ -56,6 +56,13 @@ jobs:
         run: >-
           soldr cargo run --locked --all-features
           --bin kernal-tauri-smoke -- close
+      - name: Verify native Windows page bootstrap
+        # WebView2 needs the explicit main-frame guard even with Wry main-only.
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        run: >-
+          soldr cargo run --locked --all-features
+          --bin kernal-tauri-smoke -- bootstrap
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.
@@ -221,6 +228,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- bootstrap
           dbus-run-session -- xvfb-run -a bash -c '
             soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;

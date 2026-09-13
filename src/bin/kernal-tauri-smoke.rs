@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use kernal_api::async_engine;
 use kernal_api::webview::{
-    ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPermissions,
-    WebviewWindowOptions,
+    ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPageBootstrap,
+    WebviewPermissions, WebviewWindowOptions,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,6 +42,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error),
             }
         };
+        if scenario == SmokeScenario::Bootstrap {
+            return bootstrap_server(&accept, deadline, address.port());
+        }
         if scenario == SmokeScenario::Timeout {
             let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
             // Accepted sockets inherit the listener's nonblocking mode on the
@@ -140,6 +143,25 @@ async fn lifecycle(
     url: &str,
     scenario: SmokeScenario,
 ) -> Result<(), WebviewError> {
+    if scenario == SmokeScenario::Bootstrap {
+        let window = WebviewWindowOptions::new("kernal-api bootstrap proof", 800, 600)
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        let bootstrap = WebviewPageBootstrap::new("window.__kernal_bootstrap = 17;")
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        let outcome = match client
+            .open_webview_with_bootstrap(url, window, WebviewPermissions::deny_all(), bootstrap)
+            .await
+        {
+            Ok(webview) => webview.wait_until_terminal(Duration::from_secs(30)).await,
+            Err(error) => Err(error),
+        };
+        return match outcome {
+            Err(WebviewError::RejectedNavigation(_)) => assert_clean(client),
+            other => Err(WebviewError::HostFailure(format!(
+                "bootstrap must reject cross-origin navigation, got {other:?}"
+            ))),
+        };
+    }
     let webview = if scenario == SmokeScenario::Close {
         let window = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
             .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
@@ -237,6 +259,7 @@ async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeScenario {
+    Bootstrap,
     Close,
     Popup,
     ProhibitedRedirect,
@@ -248,6 +271,7 @@ enum SmokeScenario {
 impl SmokeScenario {
     fn from_args() -> Result<Self, Box<dyn std::error::Error>> {
         match std::env::args().nth(1).as_deref() {
+            Some("bootstrap") => Ok(Self::Bootstrap),
             None | Some("close") => Ok(Self::Close),
             Some("popup") => Ok(Self::Popup),
             Some("redirect") => Ok(Self::ProhibitedRedirect),
@@ -255,7 +279,7 @@ impl SmokeScenario {
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use close, popup, redirect, timeout, cancel, window-close, or bootstrap"
             )
             .into()),
         }
@@ -263,7 +287,7 @@ impl SmokeScenario {
 
     fn page(self, address: &str) -> String {
         let action = match self {
-            Self::Close => "",
+            Self::Close | Self::Bootstrap => "",
             Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with
@@ -283,6 +307,74 @@ impl SmokeScenario {
              {action}</script>"
         )
     }
+}
+
+fn bootstrap_server(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+    port: u16,
+) -> std::io::Result<()> {
+    // Every stage must report bootstrap-before-page execution, no subframe
+    // execution, and absence of host IPC. The second document is a real reload
+    // into a fresh global, followed by a prohibited same-port/different-host URL.
+    for stage in 1..=2 {
+        let (mut document, request) = accept_http_request(accept, deadline)
+            .map_err(socket_stage("read bootstrap document"))?;
+        let path = if stage == 1 { "/finished" } else { "/reload" };
+        if !request.starts_with(&format!("GET {path} HTTP/1.")) {
+            return Err(std::io::Error::other(format!(
+                "unexpected bootstrap document: {request:?}"
+            )));
+        }
+        let next = if stage == 1 {
+            "/reload".to_owned()
+        } else {
+            format!("http://localhost:{port}/rejected")
+        };
+        let page = format!(
+            r#"<!doctype html><body><script>
+const beforePage = window.__kernal_bootstrap === 17;
+const noIpc = typeof window.ipc === 'undefined' && typeof window.__TAURI_INTERNALS__ === 'undefined' && !window.webkit?.messageHandlers?.ipc;
+const frame = document.createElement('iframe');
+window.addEventListener('message', (event) => {{
+  if (event.source !== frame.contentWindow) return;
+  const ok = Number(beforePage && noIpc && event.data === 'undefined');
+  const request = new XMLHttpRequest();
+  request.open('GET', '/_bootstrap?stage={stage}&ok=' + ok, false);
+  request.send();
+  location.href = '{next}';
+}}, {{ once: true }});
+frame.src = '/frame';
+document.body.append(frame);
+</script>"#
+        );
+        write!(
+            document,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
+            page.len()
+        )?;
+        drop(document);
+        let (mut frame, frame_request) = accept_http_request(accept, deadline)
+            .map_err(socket_stage("read bootstrap subframe"))?;
+        if !frame_request.starts_with("GET /frame HTTP/1.") {
+            return Err(std::io::Error::other(format!(
+                "unexpected bootstrap frame: {frame_request:?}"
+            )));
+        }
+        let frame_page =
+            "<script>parent.postMessage(typeof window.__kernal_bootstrap, '*')</script>";
+        write!(frame, "HTTP/1.0 200 OK\r\nCache-Control: no-store\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{frame_page}", frame_page.len())?;
+        drop(frame);
+        let (mut report, request) =
+            accept_http_request(accept, deadline).map_err(socket_stage("read bootstrap report"))?;
+        if !request.starts_with(&format!("GET /_bootstrap?stage={stage}&ok=1 HTTP/1.")) {
+            return Err(std::io::Error::other(format!(
+                "bootstrap ordering/frame/isolation proof failed: {request:?}"
+            )));
+        }
+        report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+    }
+    Ok(())
 }
 
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
@@ -311,8 +403,9 @@ fn accept_http_request(
     accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
     deadline: std::time::Instant,
 ) -> std::io::Result<(std::net::TcpStream, String)> {
-    // Browser speculative connections are not documents. Bound both discarded
-    // connections and total time; never turn a missing report into success.
+    // Browser speculative connections and automatic favicon requests are not
+    // proof messages. Bound both discarded connections and total time; never
+    // turn a missing report into success or discard arbitrary unexpected paths.
     for _ in 0..16 {
         if std::time::Instant::now() >= deadline {
             break;
@@ -323,6 +416,13 @@ fn accept_http_request(
         if let Some(request) = read_http_request(&mut stream, read_deadline)? {
             stream.set_nonblocking(false)?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            if matches!(
+                request.lines().next(),
+                Some("GET /favicon.ico HTTP/1.0" | "GET /favicon.ico HTTP/1.1")
+            ) {
+                stream.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+                continue;
+            }
             return Ok((stream, request));
         }
     }
@@ -390,6 +490,31 @@ fn read_http_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_favicon_is_answered_before_required_proof_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut icon = std::net::TcpStream::connect(address).unwrap();
+        icon.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        icon.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut frame = std::net::TcpStream::connect(address).unwrap();
+        frame
+            .write_all(b"GET /frame HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let (_, request) = super::accept_http_request(
+            &|| listener.accept(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(request.starts_with("GET /frame HTTP/1.1\r\n"));
+        let mut response = String::new();
+        icon.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.0 204 No Content\r\n"));
+    }
+
     #[test]
     fn speculative_connection_is_skipped_before_real_document() {
         use std::io::Write;

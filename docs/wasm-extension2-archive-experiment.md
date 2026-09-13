@@ -209,12 +209,42 @@ authenticated resource registry tests on Linux,
 macOS, and Windows, each on x86-64 and ARM64. The independent `each-feature`
 matrix also checks this feature without relying on `--all-features`.
 
-This adds a gate, not six-platform success evidence. Record the successful
-run and per-target steps before claiming portability. The native vendored
+Matrix configuration alone is not six-platform success evidence. Record the
+successful per-target steps before claiming portability. The native vendored
 crypto build, anonymous-file lifecycle, and authenticated ZIP extraction
 must succeed on each host; a cross-compilation or screenshot-only result
 does not substitute for this step. These native tests still do not exercise
 the generated guest archive API or complete the extension2 acceptance gate.
+
+### Verified native staging baseline
+
+CI run [34740154679](https://github.com/zackees/kernal-api/actions/runs/34740154679)
+at `978afc4e1e1b1c711ee9183add74631db24218b1` executed all four original
+`archive::authenticated_staging` tests on every native target. Each job log
+contains the individual passing tests and `4 passed; 0 failed; 0 ignored`.
+The durations below are test-harness elapsed times, not build timings.
+
+| Native target | Test time | Verified job |
+| --- | ---: | --- |
+| Linux x86-64 | 0.23 s | [103678392539](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392539) |
+| Linux ARM64 | 0.38 s | [103678392560](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392560) |
+| macOS x86-64 | 1.67 s | [103678392530](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392530) |
+| macOS ARM64 | 0.34 s | [103678392535](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392535) |
+| Windows x86-64 | 0.57 s | [103678392524](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392524) |
+| Windows ARM64 | 1.69 s | [103678392568](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392568) |
+
+This proves native execution of the NIST vector, quota/update cleanup, large
+single-message mutation cases, and authenticated large-ZIP extraction at that
+revision, including the vendored crypto build and anonymous-file path. It does
+not validate the later immutable-budget, registry, or pending-operation changes,
+which were absent from this source revision. Those require fresh native runs.
+
+The overall workflow is **not green**: the separate Windows `rust-native` job
+[103678392556](https://github.com/zackees/kernal-api/actions/runs/34740154679/job/103678392556)
+failed `profile::tests::a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends`.
+It reported 4,514,326,200 ns against a four-second assertion, with 631 tests
+passing and one failing. The profiling cause remains unproven; do not waive
+that failure or present these six passing native jobs as full-PR validation.
 
 `shared_staging_budget_has_one_ceiling_under_contention` holds concurrent
 reservations behind barriers: eight producers each request eight bytes from

@@ -18,6 +18,8 @@ CASES = (
     ("allocator", "mimalloc-pprof"),
     ("fs-watch", "notify"),
     ("hash-sha256", "sha2"),
+    ("http-client", "reqwest"),
+    ("http-client", "hyper"),
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),

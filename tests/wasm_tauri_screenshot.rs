@@ -6,6 +6,27 @@ use kernal_api::wasm::{
     SketchModulePolicy,
 };
 
+// Cargo check/Dylint do not necessarily build binaries or define their paths.
+// Actual test execution still requires an explicit binary; no runtime fallback.
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+fn screenshot_binary(worker: bool) -> std::path::PathBuf {
+    let (runtime_key, built) = if worker {
+        (
+            "NEXTEST_BIN_EXE_kernal-wasm-worker",
+            option_env!("CARGO_BIN_EXE_kernal-wasm-worker"),
+        )
+    } else {
+        (
+            "NEXTEST_BIN_EXE_kernal-api-wasm-tauri",
+            option_env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"),
+        )
+    };
+    std::env::var_os(runtime_key)
+        .map(std::path::PathBuf::from)
+        .or_else(|| built.map(std::path::PathBuf::from))
+        .expect("Cargo test or nextest must supply the actual screenshot binary")
+}
+
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
 #[test]
 #[ignore = "requires a native display and actual screenshot artifact"]
@@ -155,16 +176,13 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         }
     });
     let _server = Server(stop, Some(thread));
-    let config = SketchWorkerConfig::new(
-        std::path::PathBuf::from(env!("CARGO_BIN_EXE_kernal-wasm-worker")),
-        Duration::from_secs(2),
-    )
-    .unwrap()
-    .with_webview_capture(
-        kernal_api::webview::WebviewUrlGrant::new(&format!("http://{address}/")).unwrap(),
-        output.clone(),
-    )
-    .unwrap();
+    let config = SketchWorkerConfig::new(screenshot_binary(true), Duration::from_secs(2))
+        .unwrap()
+        .with_webview_capture(
+            kernal_api::webview::WebviewUrlGrant::new(&format!("http://{address}/")).unwrap(),
+            output.clone(),
+        )
+        .unwrap();
     let trace = kernal_api::wasm::SketchWorkerTrace::default();
     let config = config.with_trace(trace.clone());
     let epochs = SketchEpochLimits::default();
@@ -381,7 +399,7 @@ fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes()
         "http://user:password@example.test/",
         "http://[broken",
     ] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
+        let result = std::process::Command::new(screenshot_binary(false))
             .args(["--url", url, "--output"])
             .arg(&output)
             .arg("--module")
@@ -400,7 +418,7 @@ fn screenshot_cli_rejects_invalid_urls_before_module_loading_or_output_changes()
     }
     // Negative control: a valid URL gets past URL validation to the missing
     // module error. Neither case needs a display or grants ambient network.
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"))
+    let result = std::process::Command::new(screenshot_binary(false))
         .args(["--url", "http://127.0.0.1:1/", "--output"])
         .arg(&output)
         .arg("--module")
@@ -639,7 +657,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
             | NativeScenario::Timeout
             | NativeScenario::PublicationFailure
     );
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kernal-api-wasm-tauri"));
+    let mut command = std::process::Command::new(screenshot_binary(false));
     if !contained {
         command.arg("--diagnostic-in-process");
     }

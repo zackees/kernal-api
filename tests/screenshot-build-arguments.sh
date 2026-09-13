@@ -2,9 +2,16 @@
 set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Only inspect script argument construction; no compiler or file copies run.
-soldr() { printf 'SOLD R'; printf ' <%s>' "$@"; printf '\n'; }
+soldr() {
+  case "$*" in
+    *'rustc --print target-libdir'*) printf '/mock/guest/lib\n' ;;
+    *) printf 'SOLD R'; printf ' <%s>' "$@"; printf '\n' ;;
+  esac
+}
+# This argument-only test models a healthy target; no actual filesystem probe.
+compgen() { return 0; }
 cp() { :; }
-export -f soldr cp
+export -f soldr cp compgen
 export CARGO_TARGET_DIR="/tmp/screenshot mock storage"
 for mode in normal trap block; do
   case "$mode" in

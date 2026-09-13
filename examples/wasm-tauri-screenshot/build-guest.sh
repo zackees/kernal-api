@@ -23,6 +23,32 @@ target="wasm32-wasip1-threads"
 # real Rust smoke artifact. Never substitute a hand-authored Wasm fixture.
 (
   cd "$example_dir/guest"
+  guest_target_materialized() {
+    local libdir
+    libdir="$(soldr --no-cache rustc --print target-libdir --target "$target")" || exit "$?"
+    case "$libdir" in /*) ;; *) echo 'guest target libdir must be absolute' >&2; exit 1 ;; esac
+    compgen -G "$libdir/libcore-*.rlib" >/dev/null &&
+      compgen -G "$libdir/libstd-*.rlib" >/dev/null
+  }
+  if ! guest_target_materialized; then
+    soldr --no-cache rustup target add "$target"
+    if ! guest_target_materialized; then
+      guest_sysroot="$(soldr --no-cache rustc --print sysroot)"
+      case "$guest_sysroot" in /*) ;; *) echo 'guest sysroot must be absolute' >&2; exit 1 ;; esac
+      guest_manifest="$guest_sysroot/lib/rustlib/manifest-rust-std-$target"
+      # Repair only missing bookkeeping for an already incomplete target;
+      # preserve any existing manifest so rustup can uninstall correctly.
+      if [ ! -e "$guest_manifest" ]; then
+        (set -o noclobber; : > "$guest_manifest")
+      fi
+      soldr --no-cache rustup target remove "$target"
+      soldr --no-cache rustup target add "$target"
+      if ! guest_target_materialized; then
+        echo 'guest target still lacks core/std after reinstall' >&2
+        exit 1
+      fi
+    fi
+  fi
   set -- --no-cache cargo build --locked \
     --manifest-path Cargo.toml --target "$target" --release \
     --target-dir "$guest_target_dir"

@@ -295,6 +295,7 @@ jobs:
         shell: bash
         run: |
           bash tests/screenshot-build-arguments.sh
+          bash tests/screenshot-target-repair.sh
           soldr --no-cache rustup target add wasm32-wasip1-threads
           bash examples/wasm-tauri-screenshot/build-guest.sh
           bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture

@@ -12,6 +12,12 @@
 //! `kernal_api` types and never name the underlying async runtime, allocator,
 //! profiler, symbol parser, or native platform APIs directly.
 
+// Guest ABI selection is separate from native operating-system selection.
+std::cfg_select! {
+    target_family = "wasm" => {
+        pub mod guest;
+    }
+    _ => {
 use std::cfg_select;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -1725,5 +1731,7 @@ mod tests {
                 "blocking command occupied the current-thread runtime for {tick:?}"
             );
         });
+    }
+}
     }
 }

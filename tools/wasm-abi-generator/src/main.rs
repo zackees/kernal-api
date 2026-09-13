@@ -5,6 +5,17 @@ use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
 const METADATA_SECTION: &str = "kernal-api.abi";
+
+#[test]
+fn packaged_bindings_match_the_standalone_generated_fixture() {
+    // Nested Cargo packages are excluded from the facade archive. Its private
+    // support file must nevertheless contain exactly the same generated ABI.
+    assert_eq!(
+        include_bytes!("../../../src/wasm/generated/v1/guest_bindings.rs").as_slice(),
+        include_bytes!("../../../src/wasm/generated/v1/guest/src/lib.rs").as_slice(),
+    );
+}
+
 fp_import! {
     fn kernel_yield();
     fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> u64;
@@ -43,6 +54,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     relocate_guest_package(&output)?;
     append_semantic_lifecycle(&output)?;
+    // Cargo excludes nested packages when packaging the facade. Emit the
+    // same private implementation outside the standalone fixture package so
+    // the published facade never depends on an omitted source-tree file.
+    fs::copy(
+        output.join("guest/src/lib.rs"),
+        output.join("guest_bindings.rs"),
+    )?;
     make_operation_yield_async(&output)?;
     let manifest = fs::read_to_string(output.join("kernal-api-v1.abi.toml"))?;
     fs::write(
@@ -102,6 +120,9 @@ impl OperationFuture {
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { if imports::operation_yield(self.operation).map_err(|_| OperationError::Failed)? == 1 { Ok(()) } else { Err(OperationError::Failed) } }
     pub fn cancel(&self) { let _ = imports::operation_cancel(self.operation); }
+    /// Discard a blob transfer and its result without allocating another slot.
+    /// Non-transfer operation tokens are rejected by the host.
+    pub fn abandon_transfer(&self) { let _ = imports::operation_submit(18, self.operation, 0); }
     /// The async host import parks this Wasm stack until the operation wakes.
     /// No native thread blocks and no guest-side scheduler is constructed.
     pub async fn wait(self) -> Result<u64, OperationError> {
@@ -205,6 +226,7 @@ impl BlobReadFuture {
     }
     pub fn yield_now(&self) -> Result<(), OperationError> { OperationFuture { operation: self.operation }.yield_now() }
     pub fn cancel(&self) { OperationFuture { operation: self.operation }.cancel(); }
+    pub fn abandon_transfer(&self) { OperationFuture { operation: self.operation }.abandon_transfer(); }
 }
 impl BlobHandle {
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }

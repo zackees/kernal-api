@@ -91,12 +91,12 @@ transfers.
 
 ## Remaining acceptance work
 
-### Public Rust guest API remains unimplemented (#13)
+### Public Rust guest API migration remains incomplete (#13)
 
-The threaded smoke and screenshot guests currently depend directly on
+Before this migration, the threaded smoke and screenshot guests depended directly on
 `kernal-api-v1-bindings` through source-tree paths in
 `guests/threaded-smoke/Cargo.toml` and
-`examples/wasm-tauri-screenshot/guest/Cargo.toml`. They call generated operations,
+`examples/wasm-tauri-screenshot/guest/Cargo.toml`. They called generated operations,
 not facade-owned public `kernal_api` guest operations. These unpublished fixtures
 prove ABI/runtime behavior only; they do not satisfy #13's public guest API or
 exact pre-1.0 consumer-pin acceptance criteria.
@@ -112,14 +112,47 @@ default features alone is demonstrably insufficient. Target-scoping the native
 dependency graph must accompany the source/API split; merely gating native
 modules cannot prevent this earlier dependency failure.
 
-The native package currently selects only Linux/macOS/Windows implementations
-in `src/lib.rs` and has an unconditional mandatory `running-process` dependency.
-Simply renaming the generated dependency to `kernal-api` would conceal rather
-than resolve this gap. Implement the explicit host/guest boundary while keeping
-one public API and generated support types private. Preserve the mandatory
-native substrate dependency, native default-feature behavior, and the single
-native platform selector. Do not introduce a second public facade or release
-path patch as a workaround.
+The package now selects `kernal_api::guest` for Wasm separately from its existing
+native OS selector. Native Tokio, running-process, hashing, memory mapping, and
+process inspection dependencies are target-scoped, not made optional for native
+consumers. The guest exposes facade-owned errors, blob/output/viewport handles,
+and sleep operations around private generated bindings. The screenshot source
+fixture now calls that API. The threaded fixture's 64 MiB blob transfer and
+exact-output path also use the public API; its separate synthetic-resource and
+low-level threading probes deliberately still name generated bindings.
+
+The migrated threaded artifact passes
+`supplied_threaded_artifact_admits_and_executes_the_public_profile` with worker
+features on Linux x86-64 in 6.09 seconds. Existing assertions retain the 1 MiB
+peak buffered-byte budget, 1 MiB plus two 64 KiB chunks of peak retained transfer
+capacity, capacity-awaited producer/consumer behavior, typed pending read/write
+cancellation, exact final bytes, and zero final resource/operation/buffer counts.
+Its exact artifact snapshot changed only compiler-assigned function/type indices:
+resolved import/export signatures, memory limits, and the complete internal type
+signature multiset were compared and remained identical before snapshot update.
+This is public bulk-operation evidence, not yet an exclusively public-host-call
+fixture or the outstanding zccache/extension2 experiment.
+The same artifact also passes both worker containment/output tests in 19.22
+seconds and `cargo_built_threaded_guest_forced_output_cleanup` in 10.98 seconds.
+The latter observes a partial staged file before cancellation, requires forced
+containment, and checks reaping, unchanged final output, and staging removal.
+
+The previous compiler RED is GREEN for the no-default Wasm library and native
+library checks. All thirteen native facade-policy tests pass, as does strict
+Wasm library Clippy. A real release screenshot guest built through Soldr,
+received ABI metadata, and passed `actual_screenshot_guest_runs_inside_containment`
+on Linux x86-64 in 9.49 seconds. This includes module admission and native
+capture/output/teardown assertions, not just adapter compilation.
+
+Cargo packaging initially omitted the nested generated guest package. The ABI
+generator now also emits the identical private implementation as
+`src/wasm/generated/v1/guest_bindings.rs`, outside that package boundary.
+Generated drift checking passes. A 228-file Cargo archive was extracted into
+`/tmp/kernal-package-proof.A5BUI0`; a locked no-default Wasm library check using
+only the extracted package passes in 6.35 seconds. This verifies source closure,
+not publication. The screenshot fixture still uses a migration-only local path
+with `version = "=0.1.0"`; replacing that path with a real exact published
+guest-capable release remains required before release acceptance.
 
 Acceptance needs a real guest consuming the exact published facade version,
 with semantic public handles/errors and no direct generated-binding imports;
@@ -672,3 +705,35 @@ not identify its sender. After confirming the failed process was terminal,
 the unchanged focused Clippy command passed on retry in 20.29s; formatting
 and diff checks also passed. The original interruption remains recorded
 rather than being attributed to an unproven OOM cause.
+
+## Public transfer cleanup follow-up
+
+Review found that cancellation on guest transfer Drop retained a terminal
+operation slot; completed reads could also retain their result bytes. The
+candidate now uses generated submit opcode 18 for synchronous transfer
+abandonment. Explicit cancellation remains pollable. The host validates Store
+ownership and transfer kind before removing the slot; no extra slot or guest
+scratch allocation is needed. Output publication now borrows the guest blob
+and output wrappers so preflight rejection does not lose the caller's handles.
+
+The 68 focused host operation tests pass, including repeated abandonment with
+a one-operation limit, completed-read byte reclamation, foreign-store rejection,
+duplicate abandonment, and non-transfer rejection. Four native adapter tests,
+strict host-library Clippy, and the default-free Wasm library check also pass.
+These checks do not replace actual Wasm execution: the threaded guest now
+drops 128 pending reads before its bounded streaming proof, exceeding the host's
+64-slot limit. Its rebuilt artifact preserved all signatures and imports while
+changing three function indices in the exact snapshot. Its in-process Wasmtime
+execution passes in 6.16s, including the 128 dropped reads and 64 MiB streamed
+round trip. Both worker-containment tests also pass (19.68s), as does the
+forced-output cancellation cleanup test (10.62s). Review and native acceptance of the
+complete candidate remain required before merge.
+
+The rebuilt public-facade screenshot guest passes the Linux x86-64 contained
+native capture test under Xvfb (9.35s). The packaged 228-file crate was extracted
+outside the checkout and passed a locked, default-free
+`wasm32-wasip1-threads` library check, proving the private generated support file
+is included. All 13 facade-policy tests pass. The existing single reviewer
+rechecked both ownership findings and found them resolved with no new actionable
+findings. This is local candidate evidence, not six-target native acceptance or
+authorization to publish a matching release.

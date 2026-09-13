@@ -7,6 +7,17 @@ grants, then performs open → matching load completion → five-second kernel
 sleep → native viewport capture → opaque output write → close. It neither
 receives a URL/path string nor reads PNG bytes into guest memory.
 
+Guest host effects now use the public `kernal_api::guest` surface: `WebviewUrl`,
+`OutputFile`, `sleep`, and the capture-only `Webview` methods. Generated ABI
+types remain private inside the facade. Successful `OutputFile::write_blob`
+consumes both host authorities, so the guest does not close them again. The
+method borrows its handles so preflight failure does not discard the caller's
+ability to seal, retry, or close a blob.
+The source fixture uses an exact `=0.1.0` version plus a **migration-only local
+path**; it must switch to an actually published guest-capable release before
+release acceptance. The packaged facade has separately passed a Wasm check,
+but this is not evidence that the guest-capable package has been published.
+
 ## Current acceptance stage
 
 The library's `SketchWorkerConfig::with_webview_capture` now runs this real

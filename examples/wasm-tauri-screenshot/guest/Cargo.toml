@@ -13,4 +13,6 @@ proof-trap-after-capture = []
 proof-block-after-capture = []
 
 [dependencies]
-kernal-api-v1-bindings = { path = "../../../src/wasm/generated/v1/guest" }
+# Migration-only source fixture. Replace the path with the exact release pin
+# after the guest-capable facade is published; this is not release acceptance.
+kernal-api = { version = "=0.1.0", path = "../../..", default-features = false }

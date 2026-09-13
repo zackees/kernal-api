@@ -46,3 +46,13 @@ single generated command; the async host yield suspends the Wasm stack rather
 than constructing a guest runtime. The driver rejects unrelated futures that
 return `Pending`. See `examples/wasm-tauri-screenshot` for the actual Rust
 application and the remaining native-runner evidence.
+
+Opcode 18 is synchronous `transfer_abandon(operation_token, 0)`. It removes an
+owned blob-read or blob-write operation, cancels any pending producer, and
+discards an uncollected result, including completed read bytes. It allocates
+no operation slot and returns 1 on success or 0 for invalid, foreign-store,
+non-transfer tokens or nonzero reserved arguments. Repeated abandonment is
+safe but returns 0. Explicit `operation_cancel` is unchanged: its terminal
+result remains available to poll. Public transfer guards use abandonment on
+drop. This additive opcode requires a matching guest-capable host release;
+the exact pre-1.0 client pin must not pair these guards with an older host.

@@ -1972,6 +1972,15 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
                 0
             });
         }
+        if kind == crate::operations::OP_TRANSFER_ABANDON {
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_transfer_wire(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+        }
         let Some(runtime) = self.runtime.clone() else {
             return Ok(0);
         };

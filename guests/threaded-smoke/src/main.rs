@@ -145,12 +145,16 @@ pub extern "C" fn kernal_api_run() -> u32 {
     while clock.poll().expect("poll kernel clock").is_none() {
         clock.yield_now().expect("suspend on kernel clock");
     }
-    let blob = kernal_api_v1_bindings::BlobHandle::from_create_payload(
-        complete_operation(
-            kernal_api_v1_bindings::BlobHandle::create().expect("submit blob create"),
-        )
-        .expect("generated blob create"),
-    );
+    use kernal_api::guest::{self as guest, Blob, OperationError, OutputFile};
+    let blob = guest::run(Blob::create()).expect("public blob create");
+    // More than the host's 64 operation slots: Drop must reclaim each slot,
+    // not merely leave an uncollected Cancelled result until root teardown.
+    for _ in 0..128 {
+        drop(
+            blob.read_chunk(1)
+                .expect("abandoned read releases its slot"),
+        );
+    }
     const CHUNK_BYTES: usize = 64 * 1024;
     assert!(blob.read_chunk(0).is_err(), "zero-length read is rejected");
     assert!(
@@ -165,32 +169,29 @@ pub extern "C" fn kernal_api_run() -> u32 {
     for _ in 0..16 {
         assert!(blob.write_chunk(&sent).unwrap().poll().unwrap().is_some());
     }
-    let blocked = blob.write_chunk(&sent).expect("capacity-awaited write");
+    let mut blocked = blob.write_chunk(&sent).expect("capacity-awaited write");
     assert!(blocked.poll().unwrap().is_none());
     complete_operation(kernal_api_v1_bindings::synthetic_yield().unwrap()).unwrap();
     assert!(
         blocked.poll().unwrap().is_none(),
         "producer must wait for consumption"
     );
-    let first = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
-    let cancelled_write = blob.write_chunk(&sent).unwrap();
+    let mut first = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+    let mut cancelled_write = blob.write_chunk(&sent).unwrap();
     assert!(cancelled_write.poll().unwrap().is_none());
     cancelled_write.cancel();
-    assert_eq!(
-        cancelled_write.poll(),
-        Err(kernal_api_v1_bindings::OperationError::Cancelled)
-    );
+    assert_eq!(cancelled_write.poll(), Err(OperationError::Cancelled));
     assert_eq!(first.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
     assert!(
         blocked.poll().unwrap().is_some(),
         "bounded pull releases write capacity"
     );
     for _ in 0..16 {
-        let read = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+        let mut read = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
         assert_eq!(read.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
         assert_eq!(received, sent);
     }
-    let cancelled_read = blob.read_chunk(1).unwrap();
+    let mut cancelled_read = blob.read_chunk(1).unwrap();
     assert!(cancelled_read
         .poll_into(&mut received[..1])
         .unwrap()
@@ -198,18 +199,18 @@ pub extern "C" fn kernal_api_run() -> u32 {
     cancelled_read.cancel();
     assert_eq!(
         cancelled_read.poll_into(&mut received[..1]),
-        Err(kernal_api_v1_bindings::OperationError::Cancelled)
+        Err(OperationError::Cancelled)
     );
     for chunk in 0..CHUNKS {
         for (index, byte) in sent.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_add(chunk as u8);
         }
-        let write = blob.write_chunk(&sent).expect("submit bounded blob write");
+        let mut write = blob.write_chunk(&sent).expect("submit bounded blob write");
         if write.poll().expect("poll blob write").is_none() {
             write.yield_now().expect("yield pending blob write");
             assert!(write.poll().expect("poll completed blob write").is_some());
         }
-        let read = blob
+        let mut read = blob
             .read_chunk(CHUNK_BYTES as u32)
             .expect("submit bounded blob read");
         let count = loop {
@@ -221,31 +222,23 @@ pub extern "C" fn kernal_api_run() -> u32 {
         assert_eq!(count, CHUNK_BYTES);
         assert_eq!(received, sent);
     }
-    let eof = blob.read_chunk(1).expect("submit EOF observation");
+    let mut eof = blob.read_chunk(1).expect("submit EOF observation");
     assert!(eof
         .poll_into(&mut received[..1])
         .expect("empty live blob")
         .is_none());
-    let seal = blob.seal().expect("submit EOF");
-    assert!(seal.poll().expect("completed seal").is_some());
+    guest::run(blob.seal()).expect("public seal");
     assert_eq!(
         eof.poll_into(&mut received[..1]).expect("sealed EOF"),
         Some(0)
     );
-    complete_operation(blob.close().expect("submit blob close")).expect("generated blob close");
-    if let Some(output) =
-        kernal_api_v1_bindings::OutputFile::granted().expect("initial output grant")
-    {
-        let image = kernal_api_v1_bindings::BlobHandle::from_create_payload(
-            complete_operation(kernal_api_v1_bindings::BlobHandle::create().unwrap()).unwrap(),
-        );
-        let write = image.write_chunk(b"guest exact output").unwrap();
+    guest::run(blob.close()).expect("public blob close");
+    if let Some(output) = OutputFile::granted().expect("initial output grant") {
+        let image = guest::run(Blob::create()).unwrap();
+        let mut write = image.write_chunk(b"guest exact output").unwrap();
         assert!(write.poll().unwrap().is_some());
-        assert!(image.seal().unwrap().poll().unwrap().is_some());
-        let commit = output.write_blob(&image).expect("submit exact output");
-        while commit.poll().expect("commit result").is_none() {
-            commit.yield_now().expect("wait for output commit");
-        }
+        guest::run(image.seal()).unwrap();
+        guest::run(output.write_blob(&image)).expect("public exact output");
     }
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));

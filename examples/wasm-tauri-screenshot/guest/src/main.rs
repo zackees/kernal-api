@@ -1,7 +1,7 @@
 //! The screenshot application lives here, inside the actual Wasm module.
 //! No URL, native path, image bytes, host runtime, or platform API enters it.
 
-use kernal_api_v1_bindings::{self as kernel, OperationError, OutputFile, WebviewUrl};
+use kernal_api::guest::{self as kernel, OperationError, OutputFile, WebviewUrl};
 #[allow(dead_code)]
 #[path = "../../status.rs"]
 mod status;
@@ -18,7 +18,7 @@ async fn screenshot(step: &mut Step) -> Result<(), OperationError> {
     // Submitted only after the matching top-level load completion. The host
     // monotonic timer owns the wait; there is no guest clock import.
     *step = Step::Sleep;
-    kernel::clock_sleep(5_000)?.wait().await?;
+    kernel::sleep(5_000).await?;
     *step = Step::Capture;
     let snapshot = view.capture_visible_png().await?;
     // Acceptance-only fault in the real guest, after the native result has
@@ -38,7 +38,7 @@ async fn screenshot(step: &mut Step) -> Result<(), OperationError> {
         }
     }
     *step = Step::Write;
-    output.write_blob(&snapshot)?.wait().await?;
+    output.write_blob(&snapshot).await?;
     // Successful exact-output commit consumes the snapshot and output grants.
     *step = Step::Close;
     view.close().await?;

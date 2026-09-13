@@ -36,6 +36,7 @@ pub(crate) const OP_WEBVIEW_OPEN: u32 = 14;
 pub(crate) const OP_WEBVIEW_LOAD: u32 = 15;
 pub(crate) const OP_WEBVIEW_CAPTURE: u32 = 16;
 pub(crate) const OP_WEBVIEW_CLOSE: u32 = 17;
+pub(crate) const OP_TRANSFER_ABANDON: u32 = 18;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
@@ -252,6 +253,7 @@ struct OperationSlot {
     pending_blob_write: Option<Vec<u8>>,
     pending_blob_read: Option<usize>,
     is_blob_read: bool,
+    is_blob_write: bool,
     blob_read_result: Option<Vec<u8>>,
     producer_cancel: Option<crate::async_engine::CancellationSource>,
 }
@@ -1019,6 +1021,33 @@ impl OperationHub {
         )
     }
 
+    /// A dropped transfer has no future consumer for its terminal result.
+    /// Unlike cancellation, abandonment removes the operation and its retained
+    /// bytes atomically, including a read which completed before guest Drop.
+    pub(crate) fn abandon_transfer_wire(&self, store: u64, token: u64) -> Result<(), HubError> {
+        let token = OpaqueToken(token);
+        let operation = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let operation = state.operations.get(&token).ok_or(HubError::Invalid)?;
+            if operation.owner.store != store {
+                return Err(HubError::Stale);
+            }
+            if !operation.is_blob_read && !operation.is_blob_write {
+                return Err(HubError::WrongKind);
+            }
+            state.operations.remove(&token).ok_or(HubError::Invalid)?
+        };
+        // Never cancel or notify while holding the authority mutex. Dropping
+        // the removed slot releases pending-write and completed-read buffers.
+        if let Some(cancel) = &operation.producer_cancel {
+            cancel.cancel();
+        }
+        operation.notify.notify_one();
+        drop(operation);
+        self.drive_blob_writes()?;
+        self.drive_blob_reads()
+    }
+
     fn validate_close(&self, store: u64, resource: OpaqueToken) -> Result<(), HubError> {
         let state = self.state.lock().map_err(|_| HubError::Closed)?;
         let slot = state.resources.get(&resource).ok_or(HubError::Invalid)?;
@@ -1310,6 +1339,7 @@ impl OperationHub {
                 .operations
                 .get_mut(&operation)
                 .ok_or(HubError::Invalid)?;
+            slot.is_blob_write = true;
             if slot.terminal.is_none() {
                 // Copy only after authority and capacity checks, without
                 // retaining the producer or guest-memory view in the hub.
@@ -2151,6 +2181,7 @@ impl OperationHub {
                 pending_blob_write: None,
                 pending_blob_read: None,
                 is_blob_read: false,
+                is_blob_write: false,
                 blob_read_result: None,
                 producer_cancel: None,
             },
@@ -4014,6 +4045,38 @@ mod tests {
         assert_eq!(hub.snapshot().pending_blob_reads, 0);
         assert_eq!(hub.snapshot().pending_blob_writes, 0);
         assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    }
+
+    #[test]
+    fn abandoned_transfers_reclaim_operation_quota_and_completed_read_bytes() {
+        let hub = OperationHub::with_blob_limits(1, 2, BlobLimits::new(4, 4, 8).unwrap()).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        let (ordinary, _) = hub.submit(1, None, 0, 0).unwrap();
+        assert_eq!(
+            hub.abandon_transfer_wire(1, ordinary.0),
+            Err(HubError::WrongKind)
+        );
+        hub.cancel_wire(1, ordinary.0).unwrap();
+        assert_eq!(hub.poll_wire(1, ordinary.0) as u8, STATUS_CANCELLED);
+        for _ in 0..32 {
+            let pending = hub.submit_blob_read(1, blob, 4).unwrap();
+            assert_eq!(hub.abandon_transfer_wire(2, pending.0), Err(HubError::Stale));
+            hub.abandon_transfer_wire(1, pending.0).unwrap();
+            assert_eq!(hub.abandon_transfer_wire(1, pending.0), Err(HubError::Invalid));
+
+            hub.blob_write(1, blob, b"data").unwrap();
+            let completed = hub.submit_blob_read(1, blob, 4).unwrap();
+            hub.abandon_transfer_wire(1, completed.0).unwrap();
+            assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+
+            hub.blob_write(1, blob, b"full").unwrap();
+            let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+            hub.abandon_transfer_wire(1, write.0).unwrap();
+            assert_eq!(hub.blob_read(1, blob, 4).unwrap(), b"full");
+            assert_eq!(hub.state.lock().unwrap().operations.len(), 0);
+        }
+        hub.close_resource(blob).unwrap();
+        assert_eq!(hub.snapshot().live_blobs, 0);
     }
 
     #[test]

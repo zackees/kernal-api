@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Prove the feature graph has the dependency boundaries measured for #3.
 
 The first command in every pair is the RED state: it must *not* find the
@@ -12,7 +11,6 @@ from __future__ import annotations
 import subprocess
 import sys
 
-
 CASES = (
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
@@ -20,6 +18,9 @@ CASES = (
     ("allocator", "mimalloc-pprof"),
     ("fs-watch", "notify"),
     ("hash-sha256", "sha2"),
+    ("archive", "zip"),
+    ("archive", "tar"),
+    ("archive", "zstd"),
     ("tauri-webview", "tauri"),
     ("tauri-webview", "tauri-runtime-wry"),
     ("tauri-webview", "wry"),

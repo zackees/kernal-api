@@ -30,6 +30,10 @@ mod process_adapter;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Bounded extraction into caller-exclusive staging directories.
+#[cfg(feature = "archive")]
+pub mod archive;
+
 /// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an
 /// existing daemon endpoint.
 ///

@@ -7,6 +7,96 @@ const ARCHIVE_KIND: u8 = 6;
 const EXTRACT_RIGHT: u8 = 1;
 
 impl OperationHub {
+    fn begin_archive_authentication(
+        &self,
+        store: u64,
+        key: &[u8; 16],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        expected: u64,
+    ) -> Result<OpaqueToken, HubError> {
+        // Reserve operation authority before touching crypto or storage.
+        let (operation, _) = self.submit(store, None, 0, 0)?;
+        let pending = Authentication::begin(key, nonce, aad, expected, &self.staging_budget);
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let active = state
+            .operations
+            .get(&operation)
+            .is_some_and(|slot| slot.terminal.is_none());
+        match pending {
+            Ok(pending) if active => {
+                state
+                    .operations
+                    .get_mut(&operation)
+                    .ok_or(HubError::Closed)?
+                    .pending_authentication = Some(pending);
+                Ok(operation)
+            }
+            result => {
+                // The token has not escaped, so there is no terminal consumer.
+                state.operations.remove(&operation);
+                drop(result);
+                Err(if active {
+                    HubError::Invalid
+                } else {
+                    HubError::Closed
+                })
+            }
+        }
+    }
+
+    fn update_archive_authentication(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+        ciphertext: &[u8],
+    ) -> Result<(), HubError> {
+        let mut pending = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state
+                .operations
+                .get_mut(&operation)
+                .ok_or(HubError::Invalid)?;
+            if slot.owner.store != store {
+                return Err(HubError::WrongRights);
+            }
+            if slot.terminal.is_some() {
+                return Err(HubError::Closed);
+            }
+            slot.pending_authentication
+                .take()
+                .ok_or(HubError::Invalid)?
+        };
+        // A concurrent terminal event can run without waiting for this write.
+        // Until it returns, the local owner retains the staging reservation.
+        let result = pending.update(ciphertext);
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let slot = state
+            .operations
+            .get_mut(&operation)
+            .ok_or(HubError::Closed)?;
+        if slot.terminal.is_some() {
+            return Err(HubError::Closed);
+        }
+        if result.is_ok() {
+            slot.pending_authentication = Some(pending);
+            return Ok(());
+        }
+        let notify = Self::terminal_locked(
+            &mut state,
+            operation,
+            TerminalResult {
+                terminal: Terminal::Rejected,
+                resource: None,
+            },
+        )?;
+        drop(state);
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+        Err(HubError::Invalid)
+    }
+
     fn register_authenticated_archive(
         &self,
         store: u64,
@@ -262,4 +352,84 @@ fn authenticated_archive_registry_extracts_large_zip_with_bounded_transfers() {
         assert_eq!(hub.snapshot().live_resources, 0);
         assert_eq!(hub.staging_budget.used(), 0);
     }
+}
+
+#[test]
+fn authenticated_archive_pending_operation_cancellation_reclaims_staging() {
+    let hub = OperationHub::new(2, 2).unwrap();
+    let operation = hub
+        .begin_archive_authentication(1, &[0; 16], &[0; 12], &[], 16)
+        .unwrap();
+    hub.update_archive_authentication(1, operation, &[0; 7])
+        .unwrap();
+    assert_eq!(hub.staging_budget.used(), 16);
+    assert_eq!(hub.snapshot().live_resources, 0);
+    assert_eq!(hub.snapshot().pending_operations, 1);
+    assert_eq!(
+        hub.update_archive_authentication(2, operation, &[]),
+        Err(HubError::WrongRights)
+    );
+    assert!(hub.cancel_wire(2, operation.wire()).is_err());
+    assert_eq!(hub.staging_budget.used(), 16);
+    hub.cancel_wire(1, operation.wire()).unwrap();
+    assert_eq!(hub.staging_budget.used(), 0);
+    assert_eq!(
+        hub.update_archive_authentication(1, operation, &[]),
+        Err(HubError::Closed)
+    );
+    assert_eq!(
+        hub.observe_terminal(1, operation)
+            .unwrap()
+            .unwrap()
+            .terminal,
+        Terminal::Cancelled
+    );
+    assert_eq!(hub.snapshot().pending_operations, 0);
+    assert_eq!(hub.snapshot().live_resources, 0);
+}
+
+#[test]
+fn authenticated_archive_pending_errors_and_teardown_reclaim_staging() {
+    for terminal in [Terminal::Trapped, Terminal::OwnerExited, Terminal::TimedOut] {
+        let hub = OperationHub::new(1, 1).unwrap();
+        let operation = hub
+            .begin_archive_authentication(1, &[0; 16], &[0; 12], &[], 16)
+            .unwrap();
+        hub.update_archive_authentication(1, operation, &[0; 7])
+            .unwrap();
+        hub.close_all(terminal);
+        assert_eq!(hub.staging_budget.used(), 0);
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(
+            hub.observe_terminal(1, operation)
+                .unwrap()
+                .unwrap()
+                .terminal,
+            terminal
+        );
+        assert_eq!(
+            hub.begin_archive_authentication(1, &[0; 16], &[0; 12], &[], 16),
+            Err(HubError::Closed)
+        );
+        assert_eq!(hub.staging_budget.used(), 0);
+    }
+    let hub = OperationHub::new(1, 1).unwrap();
+    assert!(hub
+        .begin_archive_authentication(1, &[0; 16], &[0; 12], &[], u64::MAX)
+        .is_err());
+    assert_eq!(hub.snapshot().pending_operations, 0);
+    let operation = hub
+        .begin_archive_authentication(1, &[0; 16], &[0; 12], &[], 16)
+        .unwrap();
+    assert!(hub
+        .update_archive_authentication(1, operation, &[0; 17])
+        .is_err());
+    assert_eq!(hub.staging_budget.used(), 0);
+    assert_eq!(
+        hub.observe_terminal(1, operation)
+            .unwrap()
+            .unwrap()
+            .terminal,
+        Terminal::Rejected
+    );
 }

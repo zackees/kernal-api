@@ -162,10 +162,10 @@ Accounting uses a private shared `StagingBudget`
 whose maximum is fixed at construction, rather than accepting a separate
 counter and caller-selected limit on every authentication. Budget clones
 share the same ceiling and reservations keep that budget alive through file
-drop. It is not yet a production sketch quota. Cancellation of pending
-authentication is
-currently owner drop; guest cancellation/worker teardown and progress deadlines
-are still unimplemented. OS file cache/RSS and secure physical erasure of
+drop. It is not yet a production sketch quota. The operation-table experiment
+below adds cleanup of idle pending authentication on native cancellation;
+guest execution, worker teardown, and progress deadlines remain unimplemented.
+OS file cache/RSS and secure physical erasure of
 temporary plaintext are not proven by byte accounting. No claim is made that
 enabling the test-support feature implements the production archive contract.
 
@@ -248,9 +248,8 @@ not a guest-authorized output capability.
 soldr cargo test --locked --features wasm-sketch-host,archive-auth-test-support --lib authenticated_archive_registry
 ```
 
-This integration is compiled only in tests. Pending authentication is still
-owned by its native caller, not by a cancellable hub operation, and in-flight
-extraction is not interrupted by hub teardown. The small NIST fixture exercises
+This integration is compiled only in tests. In-flight extraction is not
+interrupted by hub teardown. The small NIST fixture exercises
 ownership and extraction failure. The additional
 `authenticated_archive_registry_extracts_large_zip_with_bounded_transfers`
 fixture creates a stored ZIP with a 17 MiB entry, streams encryption and
@@ -268,3 +267,26 @@ Removing the budget-identity guard caused the rejection regression to return
 a live token instead of `WrongRights` for a foreign-budget file. The guard
 was restored before final validation. The six-native CI step now enables the
 host feature and filters `authenticated_` to include both native test modules.
+
+## Pending authentication operation ownership
+
+The test-gated hub now reserves an ordinary operation slot before constructing
+pending authentication, and stores that state in the existing operation table.
+Failed construction removes the unpublished operation. A chunk update takes
+exclusive ownership of pending state, performs crypto/file I/O outside the
+hub mutex, and returns state only if the operation is still active. No readable
+archive resource is created by beginning or updating authentication.
+
+Native cancellation and terminal transitions drop idle pending state before
+notifying the waiter. Hub trap, owner-exit, and timeout teardown do the same.
+The focused tests check foreign-owner rejection, cancellation after a partial
+update, failed update/construction cleanup, zero storage/resource counts, and
+terminal collection. Omitting cancellation cleanup made its regression retain
+sixteen bytes instead of zero; restoring cleanup fixes that failure.
+
+This is not yet an end-to-end async guest capability. The operation path still
+needs final-tag verification and atomic authenticated-resource publication;
+the large ZIP tests currently use the earlier direct native authentication
+path. An in-flight native write keeps its reservation until I/O returns, even
+if cancellation wins meanwhile. No interruption of uninterruptible filesystem
+work, worker-process cleanup, or progress-deadline execution is claimed.

@@ -245,6 +245,8 @@ enum ResourceValue {
 }
 
 struct OperationSlot {
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    pending_authentication: Option<crate::archive::authenticated_staging::Authentication>,
     owner: Owner,
     resource: Option<OpaqueToken>,
     required_rights: u8,
@@ -2202,6 +2204,8 @@ impl OperationHub {
         state.operations.insert(
             token,
             OperationSlot {
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                pending_authentication: None,
                 owner: Owner { store },
                 resource,
                 required_rights,
@@ -2365,6 +2369,8 @@ impl OperationHub {
                 return Ok(None);
             }
             operation.terminal = Some(result);
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            drop(operation.pending_authentication.take());
             if let Some(cancel) = operation.producer_cancel.take() {
                 cancel.cancel();
             }
@@ -2490,6 +2496,8 @@ impl OperationHub {
         state.free_resource_slots.clear();
         let mut notifications = Vec::new();
         for operation in state.operations.values_mut() {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            drop(operation.pending_authentication.take());
             if let Some(cancel) = operation.producer_cancel.take() {
                 cancel.cancel();
             }

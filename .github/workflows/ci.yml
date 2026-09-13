@@ -329,6 +329,14 @@ jobs:
           ./examples/wasm-tauri-screenshot/build-guest.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -TrapAfterCapture
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -BlockAfterCapture
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Run actual streaming archive guest on the native host
+        shell: pwsh
+        run: |
+          & uv run --no-project -m unittest ci.test_run_extension2_guest
+          if ($LASTEXITCODE -ne 0) { throw 'Archive proof runner checks failed' }
+          & uv run --no-project ci/run_extension2_guest.py --native-target $env:NATIVE_TARGET --target-dir $env:CARGO_TARGET_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Actual streaming archive guest proof failed' }
       - name: Run offline native Wasm screenshot and admission proofs
         if: runner.os != 'Windows'
         shell: bash

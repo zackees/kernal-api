@@ -129,6 +129,20 @@ The prior full contract was RED at `ArchiveEntry::open` (E0599, Soldr log
 
 ## Streaming guest proof
 
+The six-native-host CI matrix now invokes the same build-and-execute runner:
+
+```sh
+uv run --no-project -m unittest ci.test_run_extension2_guest
+uv run --no-project ci/run_extension2_guest.py \
+  --native-target x86_64-unknown-linux-gnu --target-dir "$PWD/target"
+```
+
+Install `wasm32-wasip1-threads` in the pinned toolchain first. Substitute the
+actual native Rust host triple on other hosts. The runner rejects a cross-target,
+selects one Cargo-reported executable per build, copies fresh guest code before
+embedding metadata, and rejects a missing or zero-test proof. Adding this gate
+is not evidence that all six hosts have passed; inspect the matrix results.
+
 Build with `--features guest-proof` and target directory
 `target/extension2-stream-proof`, copy and embed metadata as above, then run:
 

@@ -5,7 +5,10 @@
 //! the private transport implementation.
 
 use super::{Request, Response};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
 use hyper::header;
 use hyper_util::rt::TokioIo;
 use std::{future::Future, io};
@@ -82,6 +85,18 @@ pub struct WebSocket {
     limits: WebSocketLimits,
 }
 
+/// Write half of an upgraded connection. It retains the connection's bounded
+/// outbound-message policy after [`WebSocket::split`].
+pub struct WebSocketSender {
+    inner: SplitSink<WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>, tungstenite::Message>,
+    limits: WebSocketLimits,
+}
+
+/// Read half of an upgraded connection, returned by [`WebSocket::split`].
+pub struct WebSocketReceiver {
+    inner: SplitStream<WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>>,
+}
+
 impl WebSocket {
     /// Receive one message. `Ok(None)` means the peer closed cleanly.
     pub async fn receive(&mut self) -> io::Result<Option<Message>> {
@@ -94,25 +109,65 @@ impl WebSocket {
 
     /// Send one message, flushing it to the connection.
     pub async fn send(&mut self, message: Message) -> io::Result<()> {
-        let bytes = match &message {
-            Message::Text(text) => text.len(),
-            Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
-            Message::Close => 0,
-        };
-        if bytes > self.limits.max_message_bytes
-            || bytes > self.limits.max_frame_bytes
-            || (matches!(message, Message::Ping(_) | Message::Pong(_)) && bytes > 125)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "WebSocket outgoing message exceeds configured limits",
-            ));
-        }
+        validate_outgoing(self.limits, &message)?;
         self.inner
             .send(into_transport(message))
             .await
             .map_err(io::Error::other)
     }
+
+    /// Split this connection into independently owned read and write halves.
+    /// Both halves are cancelled when their owning tasks are dropped.
+    pub fn split(self) -> (WebSocketSender, WebSocketReceiver) {
+        let (inner, receiver) = self.inner.split();
+        (
+            WebSocketSender {
+                inner,
+                limits: self.limits,
+            },
+            WebSocketReceiver { inner: receiver },
+        )
+    }
+}
+
+impl WebSocketSender {
+    /// Send one bounded message and flush it to the peer.
+    pub async fn send(&mut self, message: Message) -> io::Result<()> {
+        validate_outgoing(self.limits, &message)?;
+        self.inner
+            .send(into_transport(message))
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
+impl WebSocketReceiver {
+    /// Receive one message. `Ok(None)` means the peer closed cleanly.
+    pub async fn receive(&mut self) -> io::Result<Option<Message>> {
+        match self.inner.next().await {
+            Some(Ok(message)) => Ok(Some(from_transport(message))),
+            Some(Err(error)) => Err(io::Error::other(error)),
+            None => Ok(None),
+        }
+    }
+}
+
+fn validate_outgoing(limits: WebSocketLimits, message: &Message) -> io::Result<()> {
+    let bytes = match message {
+        Message::Text(text) => text.len(),
+        Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
+        Message::Close => 0,
+    };
+    if bytes > limits.max_message_bytes
+        || bytes > limits.max_frame_bytes
+        || (matches!(message, Message::Ping(_) | Message::Pong(_)) && bytes > 125)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WebSocket outgoing message exceeds configured limits",
+        ));
+    }
+    Ok(())
 }
 
 /// A validated, one-shot WebSocket upgrade.

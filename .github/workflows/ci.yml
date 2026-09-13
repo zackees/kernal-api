@@ -63,6 +63,12 @@ jobs:
         run: >-
           soldr cargo run --locked --all-features
           --bin kernal-tauri-smoke -- bootstrap
+      - name: Verify native Windows interactive window lifetime
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        run: >-
+          soldr cargo run --locked --all-features
+          --bin kernal-tauri-smoke -- window-close
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.

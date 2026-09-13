@@ -645,6 +645,9 @@ pub enum WebviewError {
     WindowClosed,
     #[error("the webview host failed: {0}")]
     HostFailure(String),
+    /// Another timed or untimed terminal wait is currently pending.
+    #[error("a terminal webview wait is already active")]
+    TerminalWaitInProgress,
 }
 
 /// Semantic permissions for one external webview.
@@ -807,6 +810,17 @@ pub struct WebviewHandle {
     store: u64,
     resource: OpaqueToken,
     terminal_operation: OpaqueToken,
+    terminal_wait_active: AtomicBool,
+}
+
+// The hub terminal operation is single-consumer. Admission belongs to the
+// borrowed future so cancellation releases it without revoking the window.
+struct TerminalWaitGuard<'a>(&'a AtomicBool);
+
+impl Drop for TerminalWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Acceptance-only semantic counters for the process-main-thread smoke test.
@@ -990,6 +1004,7 @@ impl ExternalWebviewClient {
                     store: self.store,
                     resource,
                     terminal_operation,
+                    terminal_wait_active: AtomicBool::new(false),
                 })
             }
             Ok(Some(result)) => Err(map_terminal(result.terminal)),
@@ -1101,7 +1116,31 @@ impl WebviewHandle {
     /// This is useful when an allowed top-level document finishes and then
     /// attempts a prohibited redirect or popup. It is itself a hub-owned
     /// operation, so callback completion never needs to retain a Store.
+    /// Only one terminal wait may be active; overlapping timed or untimed
+    /// waits return [`WebviewError::TerminalWaitInProgress`] without expiring
+    /// the window. Dropping the future releases that admission.
     pub async fn wait_until_terminal(&self, timeout: Duration) -> Result<(), WebviewError> {
+        self.wait_terminal(Some(timeout)).await
+    }
+
+    /// Await user closure, cancellation, or a terminal host/security event
+    /// without imposing a lifetime deadline on an interactive window.
+    ///
+    /// Owns no timer and does not poll periodically. Dropping this borrowed
+    /// future leaves the window alive; a subsequent wait observes retained
+    /// terminal state, including an event that arrived between waits. Dropping
+    /// or cancelling the handle still revokes the window. As with the timed
+    /// variant, normal user closure is reported as [`WebviewError::WindowClosed`].
+    /// Overlapping terminal waits return [`WebviewError::TerminalWaitInProgress`].
+    pub async fn wait_for_terminal(&self) -> Result<(), WebviewError> {
+        self.wait_terminal(None).await
+    }
+
+    async fn wait_terminal(&self, timeout: Option<Duration>) -> Result<(), WebviewError> {
+        self.terminal_wait_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| WebviewError::TerminalWaitInProgress)?;
+        let _admission = TerminalWaitGuard(&self.terminal_wait_active);
         // A cancellation or window callback may have completed this operation
         // before the caller first awaits it. Poll first; if completion wins
         // the short race before suspension, consume that typed terminal below
@@ -1120,12 +1159,16 @@ impl WebviewHandle {
             .wait_external_operation(self.store, self.terminal_operation)
         {
             Ok(wake) => {
-                if async_engine::timeout(timeout, wake.notified())
-                    .await
-                    .is_err()
-                {
-                    self.service
-                        .revoke_with_terminal(self.resource, Terminal::TimedOut);
+                if let Some(timeout) = timeout {
+                    if async_engine::timeout(timeout, wake.notified())
+                        .await
+                        .is_err()
+                    {
+                        self.service
+                            .revoke_with_terminal(self.resource, Terminal::TimedOut);
+                    }
+                } else {
+                    wake.notified().await;
                 }
             }
             // Completion can race the poll above; the final observe below

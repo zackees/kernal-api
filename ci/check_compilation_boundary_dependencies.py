@@ -20,6 +20,7 @@ CASES = (
     ("hash-sha256", "sha2"),
     ("http-client", "reqwest"),
     ("http-client", "hyper"),
+    ("event-stream", "tokio-stream"),
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),

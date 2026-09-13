@@ -15,6 +15,10 @@ const PROCESS_RIGHT: u8 = 1;
 const MAX_PROCESS_JOBS: usize = 4;
 const MAX_PROCESS_OUTPUT_CHUNK: usize = 64 * 1024;
 const MAX_PROCESS_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+// Pinned substrate: one shared queue slot, two scratch buffers, two pending
+// sends, and two Windows blocking-read buffers. Payload allowance, not RSS;
+// facade events, allocator overhead, OS pipes and child memory are separate.
+const NATIVE_PROCESS_OUTPUT_ALLOWANCE: usize = 7 * MAX_PROCESS_OUTPUT_CHUNK;
 
 #[path = "process_output.rs"]
 mod output;
@@ -23,6 +27,19 @@ mod output;
 pub(super) struct SpawnCheckpoint {
     started: crate::async_engine::OneshotSender<Arc<ProcessSession>>,
     resume: crate::async_engine::OneshotReceiver<()>,
+}
+
+#[cfg(test)]
+pub(super) struct CleanupCheckpoint {
+    started: crate::async_engine::OneshotSender<()>,
+    resume: crate::async_engine::OneshotReceiver<CleanupFault>,
+}
+
+#[cfg(test)]
+pub(super) enum CleanupFault {
+    None,
+    Error,
+    Panic,
 }
 
 pub(super) struct CompilerGrant {
@@ -115,6 +132,11 @@ impl OperationHub {
         let ResourceValue::CompilerGrant(CompilerGrant { spec: Some(_), .. }) = &slot.value else {
             return Err(HubError::Closed);
         };
+        if Self::transfer_capacity(&state).saturating_add(NATIVE_PROCESS_OUTPUT_ALLOWANCE)
+            > self.blob_limits.maximum_sketch_bytes
+        {
+            return Err(HubError::Quota);
+        }
         let (operation, _) =
             self.submit_locked(&mut state, store, Some(grant), GRANT_KIND, PROCESS_RIGHT)?;
         let cancel = CancellationSource::new();
@@ -149,6 +171,8 @@ impl OperationHub {
             .get_mut(&operation)
             .ok_or(HubError::Closed)?
             .is_compiler_spawn = true;
+        state.reserved_native_process_output_bytes += NATIVE_PROCESS_OUTPUT_ALLOWANCE;
+        Self::record_transfer_capacity(&mut state);
         let ResourceValue::CompilerGrant(grant) = &mut state
             .resources
             .get_mut(&grant)
@@ -164,8 +188,15 @@ impl OperationHub {
         let admitted = Instant::now();
         let hub = Arc::clone(self);
         let job = runtime.launch(async move {
-            hub.supervise_compiler(spec, operation, process, cancellation, admitted, deadline)
-                .await
+            let result = Arc::clone(&hub)
+                .supervise_compiler(spec, operation, process, cancellation, admitted, deadline)
+                .await;
+            // No Drop-based refund: panic, dropped tasks, and uncertain native
+            // cleanup must not make their allowance reusable by another job.
+            if result.is_ok() {
+                hub.release_native_process_output()?;
+            }
+            result
         });
         state.process_jobs.push(job);
         Ok(operation)
@@ -216,7 +247,10 @@ impl OperationHub {
                         resource: None,
                     },
                 );
-                return Ok(());
+                // A failed start has no reader-cleanup acknowledgement. Keep
+                // the allowance charged and fail closed rather than assuming
+                // every substrate error happened before native creation.
+                return Err(HubError::Closed);
             }
         };
         #[cfg(test)]
@@ -253,8 +287,46 @@ impl OperationHub {
         }
         // Revocation, failed publication, and deadline all use the same reaper.
         // This is direct-child cleanup, never a descendant-tree guarantee.
-        session.kill().await.map_err(|_| HubError::Closed)?;
-        session.wait().await.map_err(|_| HubError::Closed)?;
+        let (output, lifecycle) =
+            crate::async_engine::join(self.cleanup_compiler_output(&session), async {
+                let killed = session.kill().await;
+                let reaped = session.wait().await;
+                killed.and(reaped.map(|_| ()))
+            })
+            .await;
+        output.and(lifecycle).map_err(|_| HubError::Closed)
+    }
+
+    async fn cleanup_compiler_output(&self, session: &ProcessSession) -> std::io::Result<()> {
+        #[cfg(test)]
+        let fault = {
+            let checkpoint = self.process_cleanup_checkpoint.lock().unwrap().take();
+            if let Some(checkpoint) = checkpoint {
+                let _ = checkpoint.started.send(());
+                checkpoint.resume.await.unwrap_or(CleanupFault::None)
+            } else {
+                CleanupFault::None
+            }
+        };
+        let result = session.shutdown_output().await;
+        #[cfg(test)]
+        match fault {
+            CleanupFault::None => {}
+            CleanupFault::Error => return Err(std::io::Error::other("injected cleanup failure")),
+            CleanupFault::Panic => panic!("injected cleanup panic"),
+        }
+        result
+    }
+
+    fn release_native_process_output(&self) -> Result<(), HubError> {
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        state.reserved_native_process_output_bytes = state
+            .reserved_native_process_output_bytes
+            .checked_sub(NATIVE_PROCESS_OUTPUT_ALLOWANCE)
+            .ok_or(HubError::Closed)?;
+        drop(state);
+        let _ = self.drive_blob_writes();
+        let _ = self.drive_blob_reads();
         Ok(())
     }
 

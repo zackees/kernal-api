@@ -291,7 +291,7 @@ cancellation-after-receive regression was RED before collection and delivery
 were made atomic. Pending-read Drop, uncollected-result Drop, callback unwind,
 owner/budget rejection, and cumulative counting are covered.
 
-This event reservation does **not** account for all native process buffers.
+This initial event reservation did **not** account for all native process buffers.
 Source inspection of `running-process` 4.10.10 `process_runtime.rs` finds one
 shared queue, two pump scratch buffers, and two blocked-send payloads. Tokio
 1.53.1's Windows process pipes additionally use two blocking-read buffers.
@@ -304,9 +304,9 @@ separate. These are source-derived allowances, not measured peak allocation.
 channel exhaustion is stronger for pump/queue storage, but Windows blocking
 reads can outlive post-exit abandonment. The substrate needs an explicit,
 tracked output-shutdown acknowledgement (including outstanding platform I/O)
-before native reservations can be safely recycled. No such acknowledgement,
-native-buffer ledger, guest ABI, or cache hit/miss integration is claimed by
-this internal output step; they remain required before guest exposure.
+before native reservations can be safely recycled. That initial internal
+output step did not supply the acknowledgement or native ledger. The following
+prerequisites add them; guest ABI and cache hit/miss integration remain absent.
 
 This experiment does not replace the Component Model comparison, ten-edit
 latency measurements, sealed extension2 archive proof, or six native target
@@ -334,5 +334,42 @@ the shutdown request behind mutex acquisition produces a five-second deadline
 failure (Soldr log `20260913T124130Z`); requesting first passes. A separate case
 drops a pending shutdown observer and retries with two callers. These are native
 facade tests, not proof of guest exposure, native-buffer admission accounting,
-or the complete compiler/cache workflow. The compiler supervisor and its ledger
-still need integration before the audited native allowance can be recycled.
+or the complete compiler/cache workflow.
+
+## Native compiler payload admission and cleanup
+
+The supervisor now reserves seven 64-KiB chunks (448 KiB) under the hub lock
+before consuming a compiler grant or scheduling native creation. This covers
+the pinned substrate's queue, scratch, pending-send and Windows blocking-read
+payloads. The existing facade-event lease adds a separate 64 KiB when a receive
+is admitted. Neither figure measures allocator overhead, metadata, diagnostic
+strings, OS pipe buffers, child memory, guest memory, or additional host copies.
+The native allowance participates in transfer-capacity admission and snapshots.
+
+The tracked supervisor owns the reservation; resource revocation, operation
+collection, and direct-child exit cannot refund it. It concurrently attempts
+acknowledged output shutdown and direct kill/reap, including wait after a kill
+error. Refund requires successful cleanup. Pre-spawn cancellation/deadline
+returns the unused reservation. A failed spawn, cleanup error, panic, or dropped
+supervisor does not refund uncertain native storage; failed jobs poison further
+compiler admission. This deliberately favors retained accounting over pretending
+that an unknown failure reclaimed native resources. Scope destruction is not a
+claim that surviving native I/O was reclaimed.
+
+Linux operation tests cover rejection without consuming/scheduling, charging
+before first supervisor poll, a caller-held event outliving native cleanup,
+and pre-spawn refunds. A private per-hub checkpoint pauses before output cleanup:
+even after direct reaping and spawn-result collection, the allowance cannot be
+reused until acknowledgement. Injected errors and panics occur after real output
+cleanup, testing conservative accounting without leaking actual child pipes.
+The checkpoint releases on sender Drop during assertion unwind. An unconditional
+refund mutation fails the error-retention test (Soldr log `20260913T124854Z`).
+These parent tests prove ledger ordering; actual platform blocking-read cleanup
+requires the upstream native tests. Six-host proof and guest compiler/cache
+integration remain required and are not inferred from these Linux results.
+
+Local validation: 104 operation tests pass, strict Clippy passes with
+`--no-default-features --features wasm-sketch-host --lib --tests`, and the
+actual ABI-revision-6 Core-Wasm parser/hash guest still passes its 64-MiB public
+facade proof against the updated host. That reused guest artifact tests ABI
+compatibility; no compiler guest operation was added or exercised by it.

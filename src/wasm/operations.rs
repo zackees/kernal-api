@@ -172,6 +172,8 @@ pub(crate) struct HubSnapshot {
     pub(crate) native_transfer_capacity: usize,
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) reserved_process_output_bytes: usize,
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(crate) reserved_native_process_output_bytes: usize,
     pub(crate) active_output_jobs: usize,
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) retained_process_jobs: usize,
@@ -353,6 +355,8 @@ struct DeferredCompletion {
 
 struct State {
     #[cfg(feature = "wasm-sketch-host")]
+    reserved_native_process_output_bytes: usize,
+    #[cfg(feature = "wasm-sketch-host")]
     reserved_process_output_bytes: usize,
     #[cfg(feature = "wasm-sketch-host")]
     process_jobs: Vec<crate::async_engine::Task<Result<(), HubError>>>,
@@ -450,6 +454,8 @@ pub(crate) struct OperationHub {
     #[cfg(all(test, feature = "wasm-sketch-host"))]
     process_spawn_checkpoint: Mutex<Option<process_resource::SpawnCheckpoint>>,
     #[cfg(all(test, feature = "wasm-sketch-host"))]
+    process_cleanup_checkpoint: Mutex<Option<process_resource::CleanupCheckpoint>>,
+    #[cfg(all(test, feature = "wasm-sketch-host"))]
     process_spawn_attempts: AtomicU64,
     #[cfg(all(
         test,
@@ -534,6 +540,8 @@ impl OperationHub {
             #[cfg(all(test, feature = "wasm-sketch-host"))]
             process_spawn_checkpoint: Mutex::new(None),
             #[cfg(all(test, feature = "wasm-sketch-host"))]
+            process_cleanup_checkpoint: Mutex::new(None),
+            #[cfg(all(test, feature = "wasm-sketch-host"))]
             process_spawn_attempts: AtomicU64::new(0),
             #[cfg(all(
                 test,
@@ -558,6 +566,8 @@ impl OperationHub {
             maximum_resources,
             blob_limits,
             state: Mutex::new(State {
+                #[cfg(feature = "wasm-sketch-host")]
+                reserved_native_process_output_bytes: 0,
                 #[cfg(feature = "wasm-sketch-host")]
                 reserved_process_output_bytes: 0,
                 #[cfg(feature = "wasm-sketch-host")]
@@ -2684,7 +2694,9 @@ impl OperationHub {
     fn transfer_capacity(state: &State) -> usize {
         let native_capacity = state.native_transfer_capacity;
         #[cfg(feature = "wasm-sketch-host")]
-        let native_capacity = native_capacity.saturating_add(state.reserved_process_output_bytes);
+        let native_capacity = native_capacity
+            .saturating_add(state.reserved_process_output_bytes)
+            .saturating_add(state.reserved_native_process_output_bytes);
         state
             .resources
             .values()
@@ -2766,6 +2778,8 @@ impl OperationHub {
             native_transfer_capacity: state.native_transfer_capacity,
             #[cfg(feature = "wasm-sketch-host")]
             reserved_process_output_bytes: state.reserved_process_output_bytes,
+            #[cfg(feature = "wasm-sketch-host")]
+            reserved_native_process_output_bytes: state.reserved_native_process_output_bytes,
             active_output_jobs: self.output_job_count.load(Ordering::Acquire) as usize,
             #[cfg(feature = "wasm-sketch-host")]
             retained_process_jobs: state.process_jobs.len(),

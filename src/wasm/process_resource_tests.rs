@@ -143,6 +143,7 @@ fn revoked_grant_before_scheduling_never_publishes_or_spawns() {
     runtime.run(hub.join_process_jobs()).unwrap();
     assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
     assert_eq!(hub.snapshot().retained_process_jobs, 0);
+    assert_eq!(hub.snapshot().reserved_native_process_output_bytes, 0);
     assert_eq!(hub.snapshot().live_resources, 0);
     assert_eq!(hub.snapshot().pending_operations, 0);
 }
@@ -438,6 +439,7 @@ fn expired_queued_command_is_rejected_without_native_spawn() {
         hub.close_all(Terminal::Closed);
         hub.join_process_jobs().await.unwrap();
         assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(hub.snapshot().reserved_native_process_output_bytes, 0);
     });
 }
 
@@ -456,5 +458,152 @@ fn compiler_grants_require_spawner_owned_lifetimes() {
             grant.spec.as_ref().unwrap().lifetime_owner,
             Some(crate::platform::process::LifetimeOwner::Spawner)
         );
+    }
+}
+
+#[test]
+fn native_output_budget_rejects_before_consuming_or_scheduling() {
+    let runtime = runtime();
+    let budget = 7 * MAX_PROCESS_OUTPUT_CHUNK - 1;
+    let hub = OperationHub::with_blob_limits(
+        4,
+        4,
+        BlobLimits::new(MAX_PROCESS_OUTPUT_CHUNK, budget, budget).unwrap(),
+    )
+    .unwrap();
+    let grant = hub
+        .grant_compiler(7, spec("exit"), Duration::from_secs(10))
+        .unwrap();
+    assert_eq!(
+        hub.submit_compiler_spawn(runtime.handle(), 7, grant),
+        Err(HubError::Quota)
+    );
+    let state = hub.state.lock().unwrap();
+    assert!(matches!(
+        &state.resources[&grant].value,
+        ResourceValue::CompilerGrant(CompilerGrant { spec: Some(_), .. })
+    ));
+    assert!(state.operations.is_empty());
+    assert!(state.process_jobs.is_empty());
+    assert_eq!(hub.process_spawn_attempts.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn native_output_is_charged_before_scheduling_and_released_after_cleanup() {
+    let runtime = runtime();
+    let hub = OperationHub::new(4, 4).unwrap();
+    let grant = hub
+        .grant_compiler(7, spec("silent"), Duration::from_secs(10))
+        .unwrap();
+    let operation = hub
+        .submit_compiler_spawn(runtime.handle(), 7, grant)
+        .unwrap();
+    assert_eq!(
+        hub.snapshot().retained_transfer_capacity,
+        7 * MAX_PROCESS_OUTPUT_CHUNK
+    );
+    runtime.run(async {
+        let (process, session) = published(&hub, operation).await;
+        let output = hub
+            .begin_compiler_output(7, process)
+            .unwrap()
+            .receive()
+            .await
+            .unwrap();
+        assert_eq!(
+            hub.snapshot().retained_transfer_capacity,
+            8 * MAX_PROCESS_OUTPUT_CHUNK
+        );
+        hub.close_all(Terminal::Closed);
+        hub.join_process_jobs().await.unwrap();
+        // Native acknowledgement does not reclaim a caller-owned event.
+        assert_eq!(
+            hub.snapshot().retained_transfer_capacity,
+            MAX_PROCESS_OUTPUT_CHUNK
+        );
+        assert!(session.poll().await.unwrap().is_some());
+        drop(output);
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    });
+}
+
+#[test]
+fn native_output_credit_waits_for_ack_and_is_poisoned_on_failure() {
+    for fault in [CleanupFault::None, CleanupFault::Error, CleanupFault::Panic] {
+        let fails = !matches!(fault, CleanupFault::None);
+        let runtime = runtime();
+        runtime.run(async {
+            let budget = NATIVE_PROCESS_OUTPUT_ALLOWANCE;
+            let hub = OperationHub::with_blob_limits(
+                4,
+                4,
+                BlobLimits::new(MAX_PROCESS_OUTPUT_CHUNK, budget, budget).unwrap(),
+            )
+            .unwrap();
+            let (started, ready) = crate::async_engine::oneshot_channel();
+            let (resume, resumed) = crate::async_engine::oneshot_channel();
+            *hub.process_cleanup_checkpoint.lock().unwrap() = Some(CleanupCheckpoint {
+                started,
+                resume: resumed,
+            });
+            // Sender Drop releases the checkpoint even if an assertion unwinds.
+            let grant = hub
+                .grant_compiler(7, spec("silent"), Duration::from_secs(10))
+                .unwrap();
+            let operation = hub
+                .submit_compiler_spawn(runtime.handle(), 7, grant)
+                .unwrap();
+            let (process, session) = published(&hub, operation).await;
+            hub.take_terminal(operation, 7).unwrap().unwrap();
+            hub.close_resource(process).unwrap();
+            crate::async_engine::timeout(Duration::from_secs(5), ready)
+                .await
+                .unwrap()
+                .unwrap();
+            crate::async_engine::timeout(Duration::from_secs(5), session.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(hub.snapshot().reserved_native_process_output_bytes, budget);
+            assert_eq!(hub.snapshot().pending_operations, 0);
+            let next = hub
+                .grant_compiler(7, spec("exit"), Duration::from_secs(10))
+                .unwrap();
+            assert_eq!(
+                hub.submit_compiler_spawn(runtime.handle(), 7, next),
+                Err(HubError::Quota)
+            );
+            resume.send(fault).ok().unwrap();
+            crate::async_engine::timeout(
+                Duration::from_secs(5),
+                std::future::poll_fn(|cx| {
+                    let mut state = hub.state.lock().unwrap();
+                    OperationHub::poll_process_jobs(&mut state, cx);
+                    if state.process_jobs.is_empty() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+            if fails {
+                assert_eq!(hub.snapshot().reserved_native_process_output_bytes, budget);
+                assert_eq!(
+                    hub.submit_compiler_spawn(runtime.handle(), 7, next),
+                    Err(HubError::Closed)
+                );
+            } else {
+                assert_eq!(hub.snapshot().reserved_native_process_output_bytes, 0);
+                hub.submit_compiler_spawn(runtime.handle(), 7, next)
+                    .unwrap();
+                assert_eq!(hub.snapshot().reserved_native_process_output_bytes, budget);
+            }
+            hub.close_all(Terminal::Closed);
+            let expected = if fails { Err(HubError::Closed) } else { Ok(()) };
+            assert_eq!(hub.join_process_jobs().await, expected);
+            assert_eq!(hub.join_process_jobs().await, expected);
+        });
     }
 }

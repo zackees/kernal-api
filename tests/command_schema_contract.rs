@@ -1,0 +1,114 @@
+use kernal_api::command::{
+    Command, CommandError, OptionSpec, ValueKind, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES,
+};
+
+#[test]
+fn parses_nested_commands_defaults_repeated_values_and_constraints() {
+    let schema = Command::new("fastled")
+        .option(OptionSpec::flag("quick"))
+        .option(
+            OptionSpec::value("link", ValueKind::enumeration(["static", "dynamic"]))
+                .default("static"),
+        )
+        .subcommand(
+            Command::new("source").subcommand(
+                Command::new("update")
+                    .option(OptionSpec::value("ref", ValueKind::string()).default("master")),
+            ),
+        );
+    let parsed = schema
+        .parse(["fastled", "--quick", "source", "update", "--ref", "main"])
+        .unwrap();
+    assert_eq!(parsed.command_path(), ["fastled", "source", "update"]);
+    assert_eq!(parsed.flag("quick"), Some(true));
+    assert_eq!(parsed.value("link"), Some("static"));
+    assert_eq!(parsed.value("ref"), Some("main"));
+}
+
+#[test]
+fn rejects_invalid_enumerations_and_bounds_before_backend_parsing() {
+    let schema = Command::new("fastled").option(OptionSpec::value(
+        "link",
+        ValueKind::enumeration(["static", "dynamic"]),
+    ));
+    assert_eq!(
+        schema.parse(["fastled", "--link", "unsupported"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--link", &"x".repeat(MAX_ARGUMENT_BYTES + 1)]),
+        Err(CommandError::ArgumentTooLarge)
+    );
+    let too_many = std::iter::once("fastled").chain(std::iter::repeat_n("arg", MAX_ARGUMENTS));
+    assert_eq!(schema.parse(too_many), Err(CommandError::TooManyArguments));
+    let too_large = std::iter::once("fastled".to_owned())
+        .chain(std::iter::repeat_n("x".repeat(MAX_ARGUMENT_BYTES), 17))
+        .collect::<Vec<_>>();
+    assert_eq!(schema.parse(&too_large), Err(CommandError::InputTooLarge));
+}
+
+#[test]
+fn invalid_schema_never_exposes_a_backend_error() {
+    let invalid = Command::new("fastled").option(OptionSpec::value(
+        "mode",
+        ValueKind::enumeration(Vec::<String>::new()),
+    ));
+    assert_eq!(invalid.parse(["fastled"]), Err(CommandError::InvalidSchema));
+    assert_eq!(
+        Command::new("fastled")
+            .option(OptionSpec::flag("bad\0name"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
+            .option(OptionSpec::flag("help"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
+            .option(OptionSpec::flag("-bad"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
+            .option(OptionSpec::flag("same"))
+            .subcommand(Command::new("child").option(OptionSpec::flag("same")))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+}
+
+#[test]
+fn root_and_sibling_subcommands_only_collect_selected_schema_values() {
+    let schema = Command::new("fastled")
+        .option(OptionSpec::flag("quick"))
+        .subcommand(Command::new("one").option(OptionSpec::value("first", ValueKind::string())))
+        .subcommand(Command::new("two").option(OptionSpec::value("second", ValueKind::string())));
+    let root = schema.parse(["fastled", "--quick"]).unwrap();
+    assert_eq!(root.flag("quick"), Some(true));
+    assert_eq!(root.value("first"), None);
+    let selected = schema
+        .parse(["fastled", "two", "--second", "value"])
+        .unwrap();
+    assert_eq!(selected.command_path(), ["fastled", "two"]);
+    assert_eq!(selected.value("second"), Some("value"));
+    assert_eq!(selected.value("first"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let schema = Command::new("fastled");
+    assert_eq!(
+        schema.parse([
+            std::ffi::OsString::from("fastled"),
+            std::ffi::OsString::from_vec(vec![0xff])
+        ]),
+        Err(CommandError::InvalidUtf8)
+    );
+}

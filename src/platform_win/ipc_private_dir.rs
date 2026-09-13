@@ -105,8 +105,17 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     // current user.
     let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
     let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
+    // Windows preserves the parent OI|CI inheritance flags on some inherited
+    // file ACEs (notably on the hosted Windows runners), in addition to ID.
+    // It is the same two-principal full-control policy, not a broader ACL.
+    let inherited_with_propagation =
+        LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
     let actual = actual.dacl()?.bytes()?;
-    Ok(actual == direct.dacl()?.bytes()? || actual == inherited.dacl()?.bytes()?)
+    Ok(
+        actual == direct.dacl()?.bytes()?
+            || actual == inherited.dacl()?.bytes()?
+            || actual == inherited_with_propagation.dacl()?.bytes()?,
+    )
 }
 
 #[cfg(feature = "fs")]

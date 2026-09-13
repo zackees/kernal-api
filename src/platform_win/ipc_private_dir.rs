@@ -103,12 +103,19 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     // SAFETY: owner was returned from `actual` and current_sid contains the
     // valid SID bytes copied from the current process token.
     if unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } == 0 {
+        #[cfg(test)]
+        eprintln!("private file owner does not match the current process user");
         return Ok(false);
     }
-    Ok(dacl_is_exact_user_system_file_policy(
+    let is_private = dacl_is_exact_user_system_file_policy(
         &actual.dacl()?.bytes()?,
         &current_sid,
-    ))
+    );
+    #[cfg(test)]
+    if !is_private {
+        eprintln!("private file DACL does not match the current-user/SYSTEM policy");
+    }
+    Ok(is_private)
 }
 
 #[cfg(feature = "fs")]

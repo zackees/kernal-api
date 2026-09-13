@@ -403,8 +403,9 @@ fn accept_http_request(
     accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
     deadline: std::time::Instant,
 ) -> std::io::Result<(std::net::TcpStream, String)> {
-    // Browser speculative connections are not documents. Bound both discarded
-    // connections and total time; never turn a missing report into success.
+    // Browser speculative connections and automatic favicon requests are not
+    // proof messages. Bound both discarded connections and total time; never
+    // turn a missing report into success or discard arbitrary unexpected paths.
     for _ in 0..16 {
         if std::time::Instant::now() >= deadline {
             break;
@@ -415,6 +416,13 @@ fn accept_http_request(
         if let Some(request) = read_http_request(&mut stream, read_deadline)? {
             stream.set_nonblocking(false)?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            if matches!(
+                request.lines().next(),
+                Some("GET /favicon.ico HTTP/1.0" | "GET /favicon.ico HTTP/1.1")
+            ) {
+                stream.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+                continue;
+            }
             return Ok((stream, request));
         }
     }
@@ -482,6 +490,31 @@ fn read_http_request(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser_favicon_is_answered_before_required_proof_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut icon = std::net::TcpStream::connect(address).unwrap();
+        icon.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        icon.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut frame = std::net::TcpStream::connect(address).unwrap();
+        frame
+            .write_all(b"GET /frame HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let (_, request) = super::accept_http_request(
+            &|| listener.accept(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(request.starts_with("GET /frame HTTP/1.1\r\n"));
+        let mut response = String::new();
+        icon.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.0 204 No Content\r\n"));
+    }
+
     #[test]
     fn speculative_connection_is_skipped_before_real_document() {
         use std::io::Write;

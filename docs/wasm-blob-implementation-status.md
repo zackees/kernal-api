@@ -252,8 +252,30 @@ initial wakeup fix; the nonblocking refinement passes ten epoch-focused tests
 and strict combined-feature Clippy; its native cancellation rerun passes in
 4.54 seconds. A broader worker-feature library run passes
 345 tests and fails the pre-existing GNU build-ID assertion: `readelf -n` confirms
-this Soldr-produced test executable lacks a GNU build-ID note. This is not a
-fully green library-suite claim, and that failure remains unresolved.
+this Soldr-produced test executable lacks a GNU build-ID note. An explicit
+Linux test link, `soldr cargo rustc --locked --features wasm-sketch-worker --lib
+--profile test -j 1 -- -C link-arg=-Wl,--build-id=sha1`, produces a GNU build-ID
+note verified by `readelf -n`; running that test executable passes all 346 tests
+in 4.10 seconds, without changing or skipping any assertion. The ordinary local
+link configuration still lacks the note, so this does not claim the unmodified
+`cargo test` command is green in that configuration.
+
+The default-contained CLI success proof now omits `--module` and does not
+require an artifact environment variable. Its first run exposed strict Soldr
+reentry rejection when the harness was launched by a still-running
+`soldr cargo test`. CI now builds the harness through Soldr with Cargo JSON,
+requires exactly one matching test executable, then launches that executable
+after Soldr exits. No guard variables are removed or disabled. The README also
+launches the built CLI directly rather than nesting `soldr cargo run` around
+the CLI's own Soldr guest build. The real build/admission/contained-capture proof
+passes in 9.88 seconds, including PNG/timing/zero-counter/output assertions.
+It has a separate five-minute build-and-execution proof bound; prebuilt native
+failure cases retain their 90-second bound. This is Linux x86-64 evidence, not
+the missing five native target proofs or the #13 comparative timing experiment.
+Strict focused Clippy, formatting, diff checks, and workflow actionlint pass.
+Actionlint also caught invalid job-level `runner.temp` references; the screenshot
+job now exports its storage paths from a runner setup step. The existing popup
+fixture explicitly documents its intentional child-shell variable expansion.
 
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning

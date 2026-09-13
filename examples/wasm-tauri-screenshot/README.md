@@ -96,13 +96,17 @@ generated lifecycle (or the legacy kernel-yield boundary). No new import or
 ambient authority was allowed by this change.
 
 To run the real offline native CLI regression, supply the same artifact and
-enable both capabilities on a host with a working native display:
+enable both capabilities on a host with a working native display. This Bash
+example uses `jq` to resolve the test executable after Soldr exits:
 
 ```sh
+set -o pipefail
+test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
+  jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
 KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
 KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
 KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-wasm-tauri-guest-block/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm" \
-  soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
+  "$test_executable" --ignored --nocapture --test-threads=1
 ```
 
 The native CLI tests launch the executable as a separate process, serve the checked-in
@@ -186,7 +190,7 @@ Run the native executable from this source checkout:
 
 ```sh
 soldr cargo build --locked --features wasm-sketch-worker,tauri-webview --bins
-soldr cargo run --locked --features wasm-sketch-worker,tauri-webview --bin kernal-api-wasm-tauri -- --url http://127.0.0.1:8000/ --output screenshot.png
+./target/debug/kernal-api-wasm-tauri --url http://127.0.0.1:8000/ --output screenshot.png
 ```
 
 Without `--module`, the CLI builds the checked-in guest through Soldr and
@@ -194,9 +198,14 @@ embeds its generated metadata. `--module <artifact>` selects an already-built
 diagnostic artifact; either path validates imports before instantiation.
 The native-enabled `kernal-wasm-worker` must be beside the CLI executable, or
 selected explicitly with `--worker <path>`. Build both with the same features;
-the worker independently validates the module and grants. The earlier
-in-process build-and-run proof produced the same 800×600 red/blue viewport;
-the contained CLI proof currently supplies the built artifact explicitly.
+the worker independently validates the module and grants. Adjust the executable
+path if `CARGO_TARGET_DIR` is set (Windows also uses the `.exe` suffix).
+Launch the built executable directly: wrapping the no-`--module` path in
+`soldr cargo run` nests Soldr front doors and is rejected by its strict reentry
+guard. The contained success proof likewise builds the test harness through
+Soldr and runs it after Soldr exits; it omits `--module` to exercise the full
+guest build/admission/contained-capture path. CI obtains the exact executable
+from Cargo JSON rather than guessing its hashed filename.
 URL and exact-output grants are installed before module start. The UI service
 gets the root's existing hub and the same runtime, never copied tokens from a
 different client hub. Native jobs are bounded and joined; cancelled native

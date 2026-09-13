@@ -418,7 +418,9 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     } else {
         "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
     };
-    let artifact = std::env::var_os(artifact_variable).expect("actual guest artifact required");
+    let builds_guest = scenario == NativeScenario::ContainedCapture;
+    let artifact = (!builds_guest)
+        .then(|| std::env::var_os(artifact_variable).expect("actual guest artifact required"));
     // Diagnostic logs remain outside the exact-output directory.
     let retained = std::env::var_os("KERNAL_API_SCREENSHOT_PROOF_DIR").map(|root| {
         std::fs::create_dir_all(&root).unwrap();
@@ -527,14 +529,18 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     if scenario == NativeScenario::MissingWorker {
         command.arg("--worker").arg(proof.join("missing-worker"));
     }
+    if let Some(artifact) = artifact {
+        command.arg("--module").arg(artifact);
+    }
+    // The ordinary user entry point must build and admit the real guest,
+    // then execute it in containment. Keep a separate bounded build allowance.
+    let proof_bound = Duration::from_secs(if builds_guest { 300 } else { 90 });
     let mut child = Child(
         command
             .arg("--url")
             .arg(format!("http://{address}/"))
             .arg("--output")
             .arg(&output)
-            .arg("--module")
-            .arg(artifact)
             .stdout(std::fs::File::create(proof.join("runner.stdout.log")).unwrap())
             .stderr(std::fs::File::create(proof.join("runner.stderr.log")).unwrap())
             .spawn()
@@ -544,7 +550,7 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() >= Duration::from_secs(90) {
+        if start.elapsed() >= proof_bound {
             std::fs::write(proof.join("process.json"), "{\"outcome\":\"timeout\"}\n").unwrap();
             panic!(
                 "screenshot runner exceeded its proof bound; diagnostics: {}",

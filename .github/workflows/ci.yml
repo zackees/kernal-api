@@ -194,6 +194,8 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          # Expand fixture variables inside the child Bash, not this step shell.
+          # shellcheck disable=SC2016
           dbus-run-session -- xvfb-run -a bash -c '
             soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
@@ -213,8 +215,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-screenshot-build
-      KERNAL_API_SCREENSHOT_PROOF_DIR: ${{ runner.temp }}/kernal-api-screenshot-proof
       GDK_BACKEND: x11
       LIBGL_ALWAYS_SOFTWARE: "1"
       NO_AT_BRIDGE: "1"
@@ -224,7 +224,11 @@ jobs:
       - name: Install native WebKitGTK 4.1 and virtual display
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+          dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+      - name: Configure screenshot build and proof storage
+        run: |
+          echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/kernal-api-screenshot-build" >> "${GITHUB_ENV}"
+          echo "KERNAL_API_SCREENSHOT_PROOF_DIR=${RUNNER_TEMP}/kernal-api-screenshot-proof" >> "${GITHUB_ENV}"
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0
@@ -237,13 +241,18 @@ jobs:
           bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture
           bash examples/wasm-tauri-screenshot/build-guest.sh --block-after-capture
       - name: Run offline native Wasm screenshot and admission proofs
+        shell: bash
         env:
           KERNAL_API_SCREENSHOT_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
           KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest-trap/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
           KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM: ${{ runner.temp }}/kernal-api-screenshot-build/kernal-api-wasm-tauri-guest-block/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm
         run: |
           soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot
-          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot -- --ignored --nocapture --test-threads=1
+          # The build-and-run CLI starts Soldr itself. Finish the outer Soldr
+          # invocation before running the harness; never disable its reentry guard.
+          test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
+            jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
+          dbus-run-session -- xvfb-run -a "$test_executable" --ignored --nocapture --test-threads=1
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

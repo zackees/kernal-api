@@ -88,6 +88,162 @@ pub use crate::{
 #[cfg(feature = "fs")]
 pub const MAX_PRIVATE_REGULAR_FILE_BYTES: usize = 64 * 1024 * 1024;
 
+/// Largest byte limit accepted by [`read_context_regular_file_bounded`].
+///
+/// Context collection returns one allocation, so this is a hard facade cap as
+/// well as a caller-selected bound.
+#[cfg(feature = "fs")]
+pub const MAX_CONTEXT_REGULAR_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The final path component's kind, observed without following a link.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextPathKind {
+    /// An ordinary regular file.
+    RegularFile,
+    /// A directory.
+    Directory,
+    /// A symbolic link or Windows reparse point.
+    Symlink,
+    /// A FIFO, device, socket, or another non-regular native object.
+    Other,
+}
+
+/// Portable metadata for a context path or a coherently-read regular file.
+///
+/// `identity` is absent for a standalone non-following path observation:
+/// obtaining a portable identity there would require opening the path and can
+/// change its meaning. A successful bounded read always supplies the identity
+/// of its final open handle.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPathMetadata {
+    /// The final component's observed kind.
+    pub kind: ContextPathKind,
+    /// Length for a regular file; absent for all other kinds.
+    pub len: Option<u64>,
+    /// Last modification time when the filesystem reports one.
+    pub modified: Option<SystemTime>,
+    /// Stable identity when observed from an open regular-file handle.
+    pub identity: Option<FileIdentity>,
+}
+
+/// A bounded regular-file read together with its final-handle observation.
+///
+/// The native implementation compares identity, length, and modification time
+/// before and after reading, then re-identifies the final path without
+/// following links. It rejects changes it can observe. This is not an atomic
+/// filesystem-tree snapshot: trusted ancestors remain the caller's
+/// responsibility, and filesystems with coarse or mutable timestamps can hide
+/// an in-place content change. Native open/read calls are synchronous and
+/// cannot be forcibly interrupted by this facade.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextFileObservation {
+    /// The bytes, bounded by the caller's limit.
+    pub bytes: Vec<u8>,
+    /// Metadata derived from the final open handle after the read.
+    pub metadata: ContextPathMetadata,
+}
+
+#[cfg(feature = "fs")]
+fn context_path_kind(metadata: &std::fs::Metadata) -> ContextPathKind {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return ContextPathKind::Symlink;
+        }
+    }
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        ContextPathKind::Symlink
+    } else if file_type.is_file() {
+        ContextPathKind::RegularFile
+    } else if file_type.is_dir() {
+        ContextPathKind::Directory
+    } else {
+        ContextPathKind::Other
+    }
+}
+
+#[cfg(feature = "fs")]
+pub(crate) fn context_regular_file_metadata(
+    metadata: &std::fs::Metadata,
+    identity: FileIdentity,
+) -> io::Result<ContextPathMetadata> {
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input is not a regular file",
+        ));
+    }
+    Ok(ContextPathMetadata {
+        kind: ContextPathKind::RegularFile,
+        len: Some(metadata.len()),
+        modified: Some(metadata.modified()?),
+        identity: Some(identity),
+    })
+}
+
+/// Observe the final path component without following a symbolic link.
+///
+/// This is a point-in-time classification only. It does not open the path,
+/// establish a sandbox boundary, or make a later operation race-free.
+#[cfg(feature = "fs")]
+pub fn context_path_metadata_no_follow(path: &Path) -> io::Result<ContextPathMetadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = context_path_kind(&metadata);
+    Ok(ContextPathMetadata {
+        kind,
+        len: (kind == ContextPathKind::RegularFile).then_some(metadata.len()),
+        modified: metadata.modified().ok(),
+        identity: None,
+    })
+}
+
+/// Return a symbolic link's raw target without resolving it.
+///
+/// The returned path is inert text. It may be relative, dangling, or outside
+/// a caller's selected root; the caller owns any policy before following it.
+#[cfg(feature = "fs")]
+pub fn read_context_link(path: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(path)
+}
+
+/// Resolve a path using the host's canonicalization rules.
+///
+/// This follows links and therefore is separate from
+/// [`context_path_metadata_no_follow`] and bounded regular-file reading.
+#[cfg(feature = "fs")]
+pub fn canonical_context_path(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+/// Read an ordinary user-authorized regular file with a bounded allocation.
+///
+/// The final component is opened without following a link. Unix also opens
+/// nonblocking so a FIFO can be rejected from handle metadata without waiting.
+/// Ancestors are not protected from replacement or link traversal: callers
+/// must trust them. At most `max_bytes + 1` bytes are allocated/read, and a
+/// successful result includes a coherent final-handle observation.
+#[cfg(feature = "fs")]
+pub fn read_context_regular_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<ContextFileObservation> {
+    if max_bytes > MAX_CONTEXT_REGULAR_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "context regular-file limit {max_bytes} exceeds the {} byte facade cap",
+                MAX_CONTEXT_REGULAR_FILE_BYTES
+            ),
+        ));
+    }
+    crate::fs_read_context_regular_file_bounded(path, max_bytes)
+}
+
 /// Read a current-user-private regular file, rejecting links and oversized
 /// input.
 ///

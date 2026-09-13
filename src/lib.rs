@@ -248,6 +248,9 @@ pub use platform_imp::{
 #[cfg(feature = "fs")]
 pub(crate) use platform_imp::fs_read_private_regular_file_bounded;
 
+#[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_read_context_regular_file_bounded;
+
 #[cfg(feature = "fs-watch")]
 pub use platform_imp::FsWatchWatcher;
 

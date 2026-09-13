@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use wasmparser::{Encoding, Parser, Payload, Validator, WasmFeatures};
 
 const MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
+mod fault;
 
 #[cfg(feature = "execution-probe")]
 mod host;
@@ -39,7 +40,9 @@ fn validate_component(bytes: &[u8]) -> Result<()> {
                     ensure!(
                         matches!(
                             import.name.name,
-                            "kernal:probe/blobs@0.1.0" | "kernal:hash-experiment/hashes@0.1.0"
+                            "kernal:probe/blobs@0.1.0"
+                                | "kernal:hash-experiment/hashes@0.1.0"
+                                | "kernal:compiler-experiment/compilers@0.1.0"
                         ),
                         "non-kernel component import: {}",
                         import.name.name
@@ -58,8 +61,8 @@ fn validate_component(bytes: &[u8]) -> Result<()> {
         }
     }
     ensure!(
-        imports.len() == 2,
-        "expected exactly the blob and hash kernel interfaces"
+        imports.len() == 2 && imports.contains("kernal:hash-experiment/hashes@0.1.0"),
+        "expected exactly hash plus either blob or compiler kernel interfaces"
     );
     Ok(())
 }
@@ -68,13 +71,20 @@ fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let input = args.next().context("expected core Wasm input path")?;
     let output = args.next().context("expected new component output path")?;
-    ensure!(args.next().is_none(), "expected exactly two paths");
+    let fault = args.next();
+    ensure!(
+        fault.as_deref().is_none_or(|arg| arg == "--trap-realloc") && args.next().is_none(),
+        "expected two paths and optional --trap-realloc"
+    );
     let mut module = Vec::new();
     std::fs::File::open(input)?
         .take(MAX_MODULE_BYTES + 1)
         .read_to_end(&mut module)?;
     if module.len() as u64 > MAX_MODULE_BYTES {
         bail!("core Wasm exceeds the 32 MiB input limit");
+    }
+    if fault.is_some() {
+        fault::trap_realloc(&mut module)?;
     }
     let component = wit_component::ComponentEncoder::default()
         .module(&module)?

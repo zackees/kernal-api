@@ -4944,6 +4944,8 @@ fn capture_threaded_smoke_report(
 }
 
 mod compiler_dispatch;
+#[cfg(feature = "wasm-component-compiler-experiment")]
+mod component_compiler;
 mod hash_dispatch;
 
 #[cfg(test)]

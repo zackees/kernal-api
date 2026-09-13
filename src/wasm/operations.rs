@@ -24,6 +24,18 @@ mod hash_resource;
 mod process_resource;
 
 #[cfg(all(
+    feature = "wasm-sketch-host",
+    feature = "wasm-component-compiler-experiment"
+))]
+#[path = "component_transfer.rs"]
+mod component_transfer;
+#[cfg(all(
+    feature = "wasm-sketch-host",
+    feature = "wasm-component-compiler-experiment"
+))]
+pub(crate) use component_transfer::{ComponentResourceBudget, ComponentResourceLease};
+
+#[cfg(all(
     test,
     feature = "archive-auth-test-support",
     feature = "wasm-sketch-host"

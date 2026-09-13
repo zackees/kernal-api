@@ -482,3 +482,85 @@ Component compiler adaptation, actual zccache artifact key/cache hit/miss logic,
 the six-host parent proof, matched candidate measurements, and final runtime
 selection remain unfinished. Existing revision-6 archive/screenshot evidence
 is historical; those guests must also be rebuilt for the revision-7 host.
+
+## Component compiler candidate
+
+The opt-in `wasm-component-compiler-experiment` now implements the same public
+`CompilerGrant` / `CompilerProcess` guest API and runs the identical shared
+compiler policy. Host spawn, output, hashing, exit observation, cancellation,
+and close use the existing operation hub and process supervisor. The WIT
+interface passes typed capabilities and bounded output, never command strings.
+This is compile-time candidate selection, not a runtime fallback. Selecting the
+candidate alone does not enable the native Wasmtime dependency; the host proof
+also selects `wasm-sketch-host`.
+
+Component output needs an extra copy that the Core adapter does not make.
+Before submitting a native read, the adapter admits a typed-resource slot and
+an additional 64-KiB lowering allowance from the same aggregate byte budget.
+The ready output resource owns the native operation. Its synchronous `copy`
+method consumes that event once into a bounded host `Vec`; repeated copies
+reject without allocation. The resource keeps its extra allowance until its
+destructor, after canonical lowering returns. The guest briefly holds the
+canonical list and its public API destination, unlike Core's direct copy.
+Uncopied resource destruction abandons the read and revokes an uncertain stream.
+Pending async returns consume resource slots too.
+
+Teardown first closes adapter admission, then closes the hub, destroys the whole
+Wasmtime Store, joins native producers, and only then refunds deferred lowering
+credits. Resource-field destruction alone does not prove canonical lowering has
+released its return value. The budget refuses finalization with live resources.
+Focused tests cover one-shot copy, slot reuse, and this deferred refund. An
+actual encoded guest with its `cabi_realloc` body replaced by `unreachable`
+traps after the first host output copy; the test checks that the lowering credit
+remains charged after Store destruction until explicit finalization. Fault
+encoding preserves all other core-module bytes and is opt-in only.
+
+A second actual-guest test cancels the outer execution while a real async host
+read holds an admitted operation and lowering permit but has not published its
+output resource. The test verifies zero output copies and full cleanup after
+Store destruction; it does not claim guest-issued cancellation/reuse coverage.
+Disabling the budget's deferred-refund branch is RED (`20260913T142420Z`):
+resource destruction prematurely reduces the expected 64-KiB charge to zero.
+Restoring the branch makes the focused test GREEN.
+
+Linux x86-64 execution passes both the shared 2-MiB-per-stream compiler workflow
+and the allocator-trap case. The success path observes zero resources, operations,
+tracked process jobs, and transfer bytes after cleanup. To reproduce, use a fresh
+output directory because the encoder intentionally refuses to overwrite files:
+
+```sh
+SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/component-guest/Cargo.toml \
+  --features compiler-proof --target wasm32-unknown-unknown --release \
+  --target-dir benchmarks/wasm-sketch/component-guest/target -j1
+soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/component-tools/Cargo.toml -j1
+component_proof_dir=$(mktemp -d /tmp/kernal-component-compiler-XXXXXX)
+benchmarks/wasm-sketch/component-tools/target/debug/kernal-component-tools \
+  benchmarks/wasm-sketch/component-guest/target/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
+  "$component_proof_dir/compiler.wasm"
+benchmarks/wasm-sketch/component-tools/target/debug/kernal-component-tools \
+  benchmarks/wasm-sketch/component-guest/target/wasm32-unknown-unknown/release/kernal_component_probe.wasm \
+  "$component_proof_dir/compiler-trap.wasm" --trap-realloc
+KERNAL_COMPONENT_COMPILER_WASM="$component_proof_dir/compiler.wasm" \
+KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
+  soldr --no-cache cargo test --locked --no-default-features \
+  --features wasm-sketch-host,wasm-component-compiler-experiment --lib -j1 \
+  wasm::component_compiler::tests -- --include-ignored --nocapture
+```
+
+The candidate remains incomplete for #13: hostile incoming hash lists are still
+canonically allocated before the host length check; cancellation coverage and
+public blob parity are not complete. This proof is not the zccache artifact-key
+and cache hit/miss workflow, six-host parent acceptance, a total-RSS bound, or
+the matched measurements needed to choose the final runtime. Fixture source
+pins remain migration-only, not published-dependency acceptance.
+
+Local regression gates also pass: 116 operation tests, four native semantic
+guest-adapter tests, the revision-7 Core compiler and 64-MiB hash artifacts,
+and the legacy Component execution probe (hash, bounded transfer, traps,
+pending-call teardown, cancellation/reuse, and backpressure). Strict Clippy
+passes for the native Component host with tests, the default native library,
+the Component compiler guest, and the encoder's default targets. The default
+native graph and native candidate-only graph contain neither Wasmtime nor
+wit-bindgen. The sole local pre-push review found no remaining findings.

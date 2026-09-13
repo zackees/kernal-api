@@ -10,6 +10,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+compiler-proof = ["kernal-api/wasm-component-compiler-experiment"]
+
 [dependencies]
 zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }
 # Exact source-only migration fixture; not published-pin acceptance.

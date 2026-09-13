@@ -45,6 +45,12 @@ required-features = ["wasm-sketch-worker", "tauri-webview"]
 default = []
 # Temporary private candidate selection for #13; not a supported second runtime.
 wasm-component-hash-experiment = ["dep:wit-bindgen"]
+wasm-component-compiler-experiment = [
+  "wasm-component-hash-experiment",
+  "wit-bindgen?/async",
+  "wasmtime?/component-model",
+  "wasmtime?/component-model-async",
+]
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the

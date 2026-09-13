@@ -3,6 +3,19 @@
 use super::*;
 
 impl OperationHub {
+    #[cfg(feature = "wasm-component-compiler-experiment")]
+    pub(crate) fn collect_compiler_output_component(
+        &self,
+        store: u64,
+        token: OpaqueToken,
+        allowance: &crate::operations::ComponentResourceLease,
+        copy: impl FnOnce(Option<&ProcessOutputEvent>) -> u64,
+    ) -> Result<u64, HubError> {
+        if !allowance.covers(self, MAX_PROCESS_OUTPUT_CHUNK) {
+            return Err(HubError::Quota);
+        }
+        self.collect_compiler_output_wire(store, token, MAX_PROCESS_OUTPUT_CHUNK, copy)
+    }
     pub(crate) fn submit_compiler_output(
         self: &Arc<Self>,
         runtime: RuntimeHandle,
@@ -60,8 +73,9 @@ impl OperationHub {
     }
 
     /// Destination validation must precede this call. The bounded callback
-    /// runs under the authority mutex and must neither reenter nor retain a
-    /// copied payload; Core writes directly to shared atomic memory cells.
+    /// runs under the authority mutex and must not reenter. Core writes
+    /// directly to shared cells; only collect_compiler_output_component may
+    /// retain a copy, backed by its separately owned lowering allowance.
     pub(crate) fn collect_compiler_output_wire(
         &self,
         store: u64,

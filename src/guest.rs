@@ -8,12 +8,21 @@
 mod bindings;
 
 std::cfg_select! {
-    feature = "wasm-component-hash-experiment" => {
+    all(target_family = "wasm", feature = "wasm-component-hash-experiment") => {
         #[path = "guest_component_hash.rs"]
         mod component_hash;
         use component_hash::Blake3Hasher as HashBackend;
     }
     _ => { use bindings::Blake3Hasher as HashBackend; }
+}
+
+std::cfg_select! {
+    all(target_family = "wasm", feature = "wasm-component-compiler-experiment") => {
+        #[path = "guest_component_compiler.rs"]
+        mod component_compiler;
+        use component_compiler::{CompilerGrant as CompilerGrantBackend, CompilerProcess as CompilerProcessBackend};
+    }
+    _ => { use bindings::{CompilerGrant as CompilerGrantBackend, CompilerProcess as CompilerProcessBackend}; }
 }
 
 /// A kernel operation's terminal failure.
@@ -93,10 +102,10 @@ impl Blake3Hasher {
 /// One exact executable/argument/environment/deadline grant chosen by the host.
 /// The guest cannot substitute a command, working directory, or environment.
 pub struct CompilerGrant {
-    inner: bindings::CompilerGrant,
+    inner: CompilerGrantBackend,
 }
 pub struct CompilerProcess {
-    inner: bindings::CompilerProcess,
+    inner: CompilerProcessBackend,
 }
 
 /// A tagged event; only chunk variants refer to bytes in the read destination.
@@ -122,7 +131,7 @@ pub struct CompilerExit {
 
 impl CompilerGrant {
     pub fn granted() -> Result<Option<Self>, OperationError> {
-        Ok(bindings::CompilerGrant::granted()?.map(|inner| Self { inner }))
+        Ok(CompilerGrantBackend::granted()?.map(|inner| Self { inner }))
     }
     pub async fn spawn(self) -> Result<CompilerProcess, OperationError> {
         Ok(CompilerProcess {

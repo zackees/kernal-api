@@ -519,3 +519,17 @@ completed locally in 2m46s; its Cargo-JSON-selected harness then passed
 under Xvfb in 9.27s (one passed, 17 filtered out). This is focused Linux x86-64
 evidence, not a full-suite or other-platform result. The six native execution
 requirements are unchanged.
+
+Full Linux x86-64 revalidation at `28204bf` subsequently passed all 18
+`wasm_tauri_screenshot` tests with `--include-ignored --nocapture
+--test-threads=1` in 148.53s. The native harness was selected from Soldr's
+Cargo JSON output and executed under Xvfb after Soldr exited. This includes
+the CLI's real guest build, capture/PNG validation, real load timeout,
+redirect rejection, capture quota rejection, cancellation, forced blocked
+worker teardown, trap cleanup, output publication failure, and negative
+controls. Diagnostics are retained locally at
+`/tmp/kernal-full-native-proof.h8OJfe`: nine CLI process reports and five
+direct containment reports with completed validation markers. All five
+direct reports record zero live workers, protocol tasks, and pending root
+leases. Forced termination still does not claim a final child-owned trace.
+This is local Linux evidence only, not a hosted CI run or completion of #22.

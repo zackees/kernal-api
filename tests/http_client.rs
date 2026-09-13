@@ -3,6 +3,93 @@
 use kernal_api::http::{Client, Limits, Method, Request};
 use std::io::{Read, Write};
 
+#[test]
+fn blocking_adapter_streams_on_the_callers_runtime_and_rejects_nested_use() {
+    use kernal_api::async_engine::RuntimeBuilder;
+    use kernal_api::http::BlockingClient;
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = BlockingClient::new(&runtime, Limits::default()).unwrap();
+    let (url, worker) =
+        fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef");
+    let mut response = client.get(&url).unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.header("Content-Length"), Some(b"6".as_slice()));
+    let mut prefix = [0; 2];
+    runtime.run(async {
+        assert_eq!(
+            response.read(&mut prefix).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    });
+    response.read_exact(&mut prefix).unwrap();
+    assert_eq!(&prefix, b"ab");
+    assert_eq!(response.into_bytes().unwrap(), b"cdef");
+    worker.join().unwrap();
+    runtime.run(async {
+        assert!(BlockingClient::new(&runtime, Limits::default()).is_err());
+        assert!(client.get("http://127.0.0.1:1/").is_err());
+    });
+}
+
+#[test]
+fn blocking_stream_preserves_overflow_and_timeout_errors() {
+    use kernal_api::async_engine::RuntimeBuilder;
+    use kernal_api::http::BlockingClient;
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = BlockingClient::new(
+        &runtime,
+        Limits {
+            max_body_bytes: 3,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let (url, worker) = fixture(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nabcdef");
+    let mut response = client.get(&url).unwrap();
+    assert_eq!(
+        std::io::copy(&mut response, &mut std::io::sink())
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    worker.join().unwrap();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = [0; 4096];
+        let _ = socket.read(&mut request).unwrap();
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+            .unwrap();
+        let _ = held.recv_timeout(std::time::Duration::from_secs(2));
+    });
+    let client = BlockingClient::new(
+        &runtime,
+        Limits {
+            read_timeout: std::time::Duration::from_millis(50),
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let response = client.get(&url).unwrap();
+    let result = response.into_bytes();
+    let _ = release.send(());
+    worker.join().unwrap();
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+}
+
 fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());

@@ -142,6 +142,7 @@ jobs:
           - fs
           - fs-watch
           - hash-sha256
+          - http-client
           - ipc
           - ipc-async
           - profile

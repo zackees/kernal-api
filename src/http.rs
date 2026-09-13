@@ -101,6 +101,85 @@ fn transport(error: reqwest::Error) -> io::Error {
     io::Error::new(kind, error.without_url())
 }
 
+fn require_blocking_context() -> io::Result<()> {
+    if crate::async_engine::RuntimeHandle::current().is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "blocking HTTP cannot run inside an async runtime; use the async client",
+        ));
+    }
+    Ok(())
+}
+
+/// Blocking view of the same HTTP transport, driven by a caller-owned runtime.
+/// Does not create a runtime or a background worker. Calls from an entered
+/// async runtime return `WouldBlock`, rather than attempting nested execution.
+pub struct BlockingClient<'runtime> {
+    client: Client,
+    runtime: &'runtime crate::async_engine::Runtime,
+}
+
+impl<'runtime> BlockingClient<'runtime> {
+    /// Bind the client to an existing kernel runtime.
+    pub fn new(
+        runtime: &'runtime crate::async_engine::Runtime,
+        limits: Limits,
+    ) -> io::Result<Self> {
+        require_blocking_context()?;
+        Ok(Self {
+            client: Client::new(limits)?,
+            runtime,
+        })
+    }
+
+    /// Issue a GET without collecting its body.
+    pub fn get(&self, url: &str) -> io::Result<BlockingResponse<'runtime>> {
+        self.execute(Request::get(url))
+    }
+
+    /// Execute on the supplied runtime; all async request limits also apply.
+    pub fn execute(&self, request: Request<'_>) -> io::Result<BlockingResponse<'runtime>> {
+        require_blocking_context()?;
+        Ok(BlockingResponse {
+            response: self.runtime.run(self.client.execute(request))?,
+            runtime: self.runtime,
+        })
+    }
+}
+
+/// Streaming blocking response tied to its caller-owned runtime.
+/// Implements `Read` without collecting the full body. Drop releases the
+/// response; the borrowed runtime remains owned by the caller.
+pub struct BlockingResponse<'runtime> {
+    response: Response,
+    runtime: &'runtime crate::async_engine::Runtime,
+}
+
+impl BlockingResponse<'_> {
+    /// Numeric status; non-success statuses are not transport errors.
+    pub fn status(&self) -> u16 {
+        self.response.status()
+    }
+
+    /// First header value, looked up case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&[u8]> {
+        self.response.header(name)
+    }
+
+    /// Collect only unread bytes, under the same cumulative body limit.
+    pub fn into_bytes(self) -> io::Result<Vec<u8>> {
+        require_blocking_context()?;
+        self.runtime.run(self.response.into_bytes())
+    }
+}
+
+impl io::Read for BlockingResponse<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        require_blocking_context()?;
+        self.runtime.run(self.response.read(buffer))
+    }
+}
+
 impl Client {
     /// Build a transport with finite, nonzero timeouts and verified TLS.
     pub fn new(limits: Limits) -> io::Result<Self> {

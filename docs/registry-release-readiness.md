@@ -18,6 +18,17 @@ graph. In addition, registry Wry 0.57.0 unconditionally injects the Linux IPC
 script; the checkout's Wry patch makes that injection conditional on a native
 handler. Compilation alone is not proof of external-page isolation.
 
+The follow-up implementation removes all Git patches and aligns direct Wry
+with published Tauri runtime's Wry 0.55.1, explicitly enabling `os-webview`.
+The existing native Linux isolation smoke first failed on this registry graph:
+the page reported `ipc=1&tauri=0&platform=1`. Construction now precedes
+navigation, and the Linux adapter removes initialization scripts and unregisters
+the IPC endpoint before loading the external URL. The same native smoke then
+passed with all three bridge probes absent. Native redirect denial, timeout,
+cancellation and window-close scenarios also passed. Cross-platform,
+popup-interaction and extracted-package validation of this fix remain required;
+these local results are not a release.
+
 The release workflow now verifies the extracted package with all features,
 and installs the same Linux webview development prerequisites used by native
 CI. Its focused configuration regression was RED before the workflow change

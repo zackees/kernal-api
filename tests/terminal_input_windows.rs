@@ -25,6 +25,8 @@ fn native_console_session_restores_mode_and_excludes_overlap() {
             "{}",
             io::Error::last_os_error()
         );
+        #[cfg(feature = "terminal-style")]
+        verify_stderr_style_preparation();
         let name: Vec<u16> = "CONIN$\0".encode_utf16().collect();
         // SAFETY: name is terminated; null security/template request defaults.
         let input = unsafe {
@@ -95,5 +97,56 @@ fn native_console_session_restores_mode_and_excludes_overlap() {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(feature = "terminal-style")]
+fn verify_stderr_style_preparation() {
+    use winapi::um::consoleapi::GetConsoleMode;
+    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
+    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+    use winapi::um::processenv::{GetStdHandle, SetStdHandle};
+    use winapi::um::winbase::STD_ERROR_HANDLE;
+    use winapi::um::wincon::{ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING};
+    use winapi::um::winnt::{FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_READ, GENERIC_WRITE};
+
+    let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+    // SAFETY: terminated name, default optional pointers, owned child console.
+    let output = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(output, INVALID_HANDLE_VALUE);
+    // SAFETY: retrieves the child process's current stderr handle without ownership.
+    let previous = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    // SAFETY: output remains live until after previous stderr is restored.
+    assert_ne!(unsafe { SetStdHandle(STD_ERROR_HANDLE, output) }, 0);
+    let mut before = 0;
+    let mut after = 0;
+    // SAFETY: valid live output handle and writable mode output.
+    let queried_before = unsafe { GetConsoleMode(output, &mut before) };
+    let first = kernal_api::terminal_style::prepare_stderr_ansi();
+    let second = kernal_api::terminal_style::prepare_stderr_ansi();
+    // SAFETY: same live console output handle and writable output.
+    let queried_after = unsafe { GetConsoleMode(output, &mut after) };
+    // Restore captured diagnostic output before any subsequent assertions.
+    // SAFETY: previous is still owned by the child process runtime.
+    assert_ne!(unsafe { SetStdHandle(STD_ERROR_HANDLE, previous) }, 0);
+    // SAFETY: no operation retains output after restoration.
+    assert_ne!(unsafe { CloseHandle(output) }, 0);
+    assert_ne!(queried_before, 0);
+    assert_ne!(queried_after, 0);
+    assert!(first.unwrap());
+    assert!(second.unwrap());
+    assert_eq!(
+        after,
+        before | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
     );
 }

@@ -63,6 +63,24 @@ may consume at most 64 KiB including its introducer and terminator, without
 buffering the body. Invalid UTF-8, malformed or oversized sequences poison the
 decoder: no trailing spaces are reinterpreted as keys after an error.
 
-Issue #178 still requires decoded-key native validation, styling, FastLED policy
+## Diagnostic formatting
+
+The independent `terminal-style` feature adds no dependency. It provides a
+borrowed `StyledText` formatter with a facade-owned 16-color foreground palette.
+The caller chooses the color and whether it is enabled. The formatter neither
+reads environment variables nor detects terminals. Disabled output preserves
+plain text; enabled output wraps it in ANSI foreground selection and default
+foreground reset. It preserves embedded escapes and is not a sanitizer. Writer
+errors propagate; a reset cannot be guaranteed after an output failure.
+
+`prepare_stderr_ansi` enables Windows console ANSI processing while preserving
+other mode flags. It returns false for redirected/non-console stderr or consoles
+that reject VT support, and errors for other native failures. Preparation is
+idempotent but persistent: writers sharing the console buffer can observe the
+mode change. On Unix it needs no native action and returns true, which is not
+a TTY or terminal-capability assertion. Applications own `NO_COLOR`, `TERM`,
+redirection, fallback and diagnostic-message policy.
+
+Issue #178 still requires decoded-key/style native validation, FastLED policy
 adoption, release and exact published-version consumption. This does not yet
 complete the Crossterm migration.

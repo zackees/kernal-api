@@ -34,6 +34,10 @@ pub mod text;
 #[cfg(feature = "pty")]
 pub mod keys;
 
+/// Allocation-free diagnostic styling and native ANSI output preparation.
+#[cfg(feature = "terminal-style")]
+pub mod terminal_style;
+
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]
 pub mod archive;

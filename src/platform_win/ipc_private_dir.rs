@@ -102,25 +102,36 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     // `OW` is the Owner Rights SID rather than a literal account SID: it is
     // exactly what the protected parent policy inherits into a child. The
     // owner equality above independently proves this object belongs to the
-    // current user.
-    let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
-    // NTFS preserves, strips, or narrows the parent inheritance flags when
-    // materializing a regular-file ACE. All forms below grant exactly the
-    // same owner/SYSTEM full-control policy, and are distinct from a
-    // caller-supplied direct or permissive ACE.
-    let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
-    let inherited_object =
-        LocalSecurityDescriptor::from_sddl("D:(A;OIID;FA;;;OW)(A;OIID;FA;;;SY)")?;
-    let inherited_container =
-        LocalSecurityDescriptor::from_sddl("D:(A;CIID;FA;;;OW)(A;CIID;FA;;;SY)")?;
-    let inherited_with_flags =
-        LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
-    let actual = actual.dacl()?.bytes()?;
-    Ok(actual == direct.dacl()?.bytes()?
-        || actual == inherited.dacl()?.bytes()?
-        || actual == inherited_object.dacl()?.bytes()?
-        || actual == inherited_container.dacl()?.bytes()?
-        || actual == inherited_with_flags.dacl()?.bytes()?)
+    // current user. Compare the ACL's exact binary forms instead of asking
+    // the local SDDL parser to round-trip the special Owner Rights SID: NTFS
+    // materializes it as S-1-3-4 and preserves only the inherited ACE flags.
+    Ok(owner_system_private_file_dacl(&actual.dacl()?.bytes()?))
+}
+
+#[cfg(feature = "fs")]
+fn owner_system_private_file_dacl(actual: &[u8]) -> bool {
+    // ACL revision 2, exactly two ACCESS_ALLOWED full-control ACEs. The first
+    // principal is Owner Rights (S-1-3-4); the second is LocalSystem
+    // (S-1-5-18). These are the only direct or inherited forms produced from
+    // PRIVATE_DIR_SDDL for a regular file. Inheritance flags do not grant an
+    // additional principal, and every mask, SID, order, ACE type, or payload
+    // remains byte-for-byte constrained.
+    const HEADER: [u8; 8] = [2, 0, 48, 0, 2, 0, 0, 0];
+    const OWNER_RIGHTS: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 3, 4, 0, 0, 0];
+    const LOCAL_SYSTEM: [u8; 12] = [1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0];
+    const FULL_CONTROL: [u8; 4] = [0xff, 0x01, 0x1f, 0x00];
+
+    [0, 0x10, 0x11, 0x12, 0x13].into_iter().any(|inheritance| {
+        let mut expected = Vec::with_capacity(48);
+        expected.extend(HEADER);
+        expected.extend([0, inheritance, 20, 0]);
+        expected.extend(FULL_CONTROL);
+        expected.extend(OWNER_RIGHTS);
+        expected.extend([0, inheritance, 20, 0]);
+        expected.extend(FULL_CONTROL);
+        expected.extend(LOCAL_SYSTEM);
+        actual == expected
+    })
 }
 
 #[cfg(feature = "fs")]
@@ -506,6 +517,7 @@ mod tests {
         fs::write(&child, b"marker").unwrap();
 
         let child_dacl = file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap();
+        assert!(owner_system_private_file_dacl(&child_dacl));
         assert_eq!(
             crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap_or_else(
                 |error| panic!("private inherited child DACL {child_dacl:02x?}: {error}"),

@@ -145,7 +145,21 @@ mod tests {
         // host-selected system variables and Cargo's DLL loader search path
         // even for an otherwise empty fixture environment.
         #[cfg(windows)]
-        let spec = ["SYSTEMROOT", "TEMP", "TMP", "PATH"]
+        let spec = [
+            "APPDATA",
+            "COMSPEC",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "PATH",
+            "PATHEXT",
+            "SYSTEMDRIVE",
+            "SYSTEMROOT",
+            "TEMP",
+            "TMP",
+            "USERPROFILE",
+            "WINDIR",
+        ]
             .into_iter()
             .fold(spec, |spec, key| match std::env::var_os(key) {
                 Some(value) => spec.env(key, value),

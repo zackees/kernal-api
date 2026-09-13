@@ -48,6 +48,9 @@ adapter privately uses `running-process` 4.10.10 without exposing backend
 types; that dependency is mandatory, not feature-gated. Optional features keep
 consumers from linking tooling they do not use:
 
+- `sqlite` for synchronous, bounded SQLite connection/transaction/query and
+  backup mechanics; applications retain schema and SQL. See [SQLite facade](docs/sqlite.md).
+
 - `fs`, `ipc`, `ipc-async`, `session-relay`, `pty`, `conpty-sidecar`
 - `fs` also enables `hash::blake3_tree`: content-authoritative fingerprints of
   glob-selected directory trees, with bounded parallel streaming reads and a

@@ -1,0 +1,71 @@
+//! Executable RED contract for #13. The encrypted archive guest capability is
+//! deliberately not implemented yet. Native policy tests are not guest GREEN.
+use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
+use kernal_extension2_guest_proof::policy;
+
+async fn proof() -> Result<(), OperationError> {
+    let encrypted = EncryptedArchive::granted()?.ok_or(OperationError::Rejected)?;
+    let mut header = [0; policy::MAX_HEADER];
+    let count = encrypted.read_header(&mut header).await?;
+    if !policy::validate_header(&header[..count]) {
+        return Err(OperationError::Rejected);
+    }
+    // The host retains its key and exact original AAD. No plaintext archive
+    // authority may exist until this asynchronous operation succeeds.
+    let mut archive = encrypted.authenticate().await?;
+    let mut inventory = policy::Inventory::default();
+    let mut payloads = 0;
+    while let Some(entry) = archive.next_entry().await? {
+        if !inventory.accept(entry.name(), entry.uncompressed_bytes())
+            || entry.name() != "payload"
+            || entry.uncompressed_bytes() != policy::PAYLOAD_BYTES
+        {
+            return Err(OperationError::Rejected);
+        }
+        let stream = entry.open().await?;
+        let mut chunk = [0; 64 * 1024];
+        let mut total = 0_u64;
+        loop {
+            let count = stream
+                .read_chunk(chunk.len() as u32)?
+                .read_into(&mut chunk)
+                .await?;
+            if count == 0 {
+                break;
+            }
+            if chunk[..count].iter().any(|byte| *byte != 0x5a) {
+                return Err(OperationError::Failed);
+            }
+            total = total
+                .checked_add(count as u64)
+                .ok_or(OperationError::Rejected)?;
+            if total > policy::PAYLOAD_BYTES {
+                return Err(OperationError::Rejected);
+            }
+        }
+        stream.close().await?;
+        if total != policy::PAYLOAD_BYTES {
+            return Err(OperationError::Failed);
+        }
+        payloads += 1;
+    }
+    archive.close().await?;
+    if payloads != 1 {
+        return Err(OperationError::Rejected);
+    }
+    Ok(())
+}
+
+#[export_name = "kernal-api-run"]
+pub extern "C" fn kernal_api_run() -> u32 {
+    match kernel::run(proof()) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn main() {
+    if kernal_api_run() != 0 {
+        std::process::exit(1);
+    }
+}

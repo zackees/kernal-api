@@ -37,6 +37,16 @@ soldr cargo clippy --locked --features archive --lib --test archive_facade -- -D
 
 ## Still required
 
+The next guest boundary is now an executable [RED contract](../benchmarks/wasm-sketch/extension2-guest/README.md).
+Its explicit `guest-proof` Wasm build fails with E0432 because
+`kernal_api::guest::EncryptedArchive` is absent (Soldr log
+`20260913T060627Z-home-niteris-dev-kernal-api.xml`). The source requires
+bounded original-header validation, authentication before archive authority,
+inventory policy, and byte-for-byte 17 MiB entry reads through the public Blob
+facade. Its separate native policy tests are not Wasm execution or unchanged
+upstream-policy equivalence evidence. Generated operations, host dispatch,
+and the encrypted fixture driver must make this same contract GREEN.
+
 This is a reusable native prerequisite, not an extension2/Wasm GREEN claim.
 The experiment still needs a real extension2 policy fixture, authenticated
 AES-GCM staging with no readable plaintext before verification, seekable

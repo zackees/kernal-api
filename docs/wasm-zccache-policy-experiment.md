@@ -400,3 +400,13 @@ including the queued-before-system-call race on Windows x86-64 and ARM64.
 The CI commit `8e8c942` changes no Rust implementation relative to the parent pin
 `1943831`. This proves the dependency shutdown primitive on those hosts, not the
 parent ledger, complete guest workflows, or full #13 six-host acceptance.
+
+The private exit observer validates the process capability before waiting and
+again before returning a status. It neither consumes output nor revokes the
+process when its future is dropped; process revocation wakes a pending observer.
+The test checks a registered counting waker immediately after revocation, before
+any repoll or runtime scheduling, rather than relying only on sticky state.
+The dual-stream test drains output before waiting and checks repeatable exit
+observation. Removing admission-time ownership validation is RED (Soldr log
+`20260913T131658Z`): a foreign owner waits on the native process instead of being
+rejected immediately. This remains a host primitive, not a guest ABI claim.

@@ -48,6 +48,64 @@ fn compiler_helper() {
 #[path = "process_output_tests.rs"]
 mod output;
 
+#[test]
+fn compiler_exit_observer_drop_preserves_authority_and_revocation_wakes_waiters() {
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let runtime = runtime();
+    runtime.run(async {
+        let hub = OperationHub::new(4, 2).unwrap();
+        let grant = hub
+            .grant_compiler(7, spec("silent"), Duration::from_secs(15))
+            .unwrap();
+        let operation = hub
+            .submit_compiler_spawn(runtime.handle(), 7, grant)
+            .unwrap();
+        let (process, session) = published(&hub, operation).await;
+        assert_eq!(
+            crate::async_engine::timeout(Duration::from_secs(1), hub.wait_compiler(8, process))
+                .await
+                .expect("foreign ownership must reject before waiting on native exit"),
+            Err(HubError::WrongRights)
+        );
+        {
+            let mut observer = Box::pin(hub.wait_compiler(7, process));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(observer.as_mut().poll(&mut context).is_pending());
+        }
+        assert!(session.poll().await.unwrap().is_none());
+        // A dropped exit observer must not reserve/consume an output event.
+        let read = hub.begin_compiler_output(7, process).unwrap();
+        let mut observer = Box::pin(hub.wait_compiler(7, process));
+        let wakes = Arc::new(WakeCount::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut context = Context::from_waker(&waker);
+        assert!(observer.as_mut().poll(&mut context).is_pending());
+        wakes.0.store(0, Ordering::SeqCst);
+        let cleanup = hub.close_compiler(7, process).unwrap();
+        // No runtime scheduling or repoll between close and this assertion:
+        // revocation itself must notify the already-registered observer.
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            crate::async_engine::timeout(Duration::from_secs(5), observer)
+                .await
+                .unwrap(),
+            Err(HubError::Closed)
+        );
+        drop(read);
+        cleanup.wait().await.unwrap();
+        assert_eq!(hub.wait_compiler(7, process).await, Err(HubError::Closed));
+        hub.close_all(Terminal::Closed);
+        hub.join_process_jobs().await.unwrap();
+        assert_eq!(hub.snapshot().retained_transfer_capacity, 0);
+    });
+}
+
 async fn published(
     hub: &OperationHub,
     operation: OpaqueToken,

@@ -60,7 +60,10 @@ fn output_is_tagged_bounded_and_one_uncollected_event_per_process() {
             }
         }
         assert_eq!(counts, [2 * 1024 * 1024; 2]);
-        assert_eq!(session.wait().await.unwrap().exit_code(), Some(0));
+        let exit = hub.wait_compiler(7, process).await.unwrap();
+        assert_eq!(exit.exit_code(), Some(0));
+        assert_eq!(hub.wait_compiler(7, process).await.unwrap(), exit);
+        assert_eq!(session.wait().await.unwrap(), exit);
         hub.close_all(Terminal::Closed);
         hub.join_process_jobs().await.unwrap();
         assert_eq!(hub.snapshot().retained_transfer_capacity, 0);

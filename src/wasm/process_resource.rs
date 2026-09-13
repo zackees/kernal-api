@@ -256,6 +256,36 @@ impl OperationHub {
         Ok(operation)
     }
 
+    /// Observe exit without consuming output or transferring process authority.
+    /// Dropping this observer does not cancel the compiler. Resource revocation,
+    /// however, wakes it and must win over a concurrently available exit status.
+    pub(crate) async fn wait_compiler(
+        &self,
+        store: u64,
+        process: OpaqueToken,
+    ) -> Result<crate::ProcessSessionExit, HubError> {
+        let (session, cancellation) = {
+            let state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state.resources.get(&process).ok_or(HubError::Closed)?;
+            Self::validate_resource(slot, store, PROCESS_KIND, PROCESS_RIGHT)?;
+            let ResourceValue::CompilerProcess(value) = &slot.value else {
+                return Err(HubError::WrongKind);
+            };
+            (
+                Arc::clone(value.session.as_ref().ok_or(HubError::Closed)?),
+                value.cancel.token(),
+            )
+        };
+        let result = crate::async_engine::cancellable(&cancellation, session.wait())
+            .await
+            .map_err(|_| HubError::Closed)?
+            .map_err(|_| HubError::Closed)?;
+        let state = self.state.lock().map_err(|_| HubError::Closed)?;
+        let slot = state.resources.get(&process).ok_or(HubError::Closed)?;
+        Self::validate_resource(slot, store, PROCESS_KIND, PROCESS_RIGHT)?;
+        Ok(result)
+    }
+
     pub(crate) fn close_compiler(
         &self,
         store: u64,

@@ -437,6 +437,14 @@ jobs:
           if ($artifacts.Count -ne 1) { throw 'Expected exactly one screenshot test executable' }
           & $artifacts[0].executable --ignored --nocapture --test-threads=1
           if ($LASTEXITCODE -ne 0) { throw 'Native screenshot proof failed' }
+      - name: Prove worker parent-death containment on the native host
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/build-threaded-smoke.sh
+      - name: Prove worker parent-death containment on the native host (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-threaded-smoke.ps1
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

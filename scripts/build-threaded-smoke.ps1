@@ -8,9 +8,9 @@ $guestDirectory = Join-Path $repo 'guests/threaded-smoke'
 $guestManifest = Join-Path $guestDirectory 'Cargo.toml'
 $target = 'wasm32-wasip1-threads'
 $subcommand = -join [char[]](99, 97, 114, 103, 111)
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("kernal-api-threaded-smoke-" + [guid]::NewGuid())
-$targetDirectory = Join-Path $temporaryRoot 'target'
-$artifact = if ($ArtifactPath) { $ArtifactPath } else { Join-Path $temporaryRoot 'threaded-smoke.wasm' }
+$temporaryRoot = if ($env:CARGO_TARGET_DIR) { $null } else { Join-Path ([System.IO.Path]::GetTempPath()) ("kernal-api-threaded-smoke-" + [guid]::NewGuid()) }
+$targetDirectory = if ($env:CARGO_TARGET_DIR) { Join-Path $env:CARGO_TARGET_DIR 'kernal-api-threaded-smoke' } else { Join-Path $temporaryRoot 'target' }
+$artifact = if ($ArtifactPath) { $ArtifactPath } else { Join-Path $targetDirectory "$target/release/kernal-api-threaded-smoke.admitted.wasm" }
 $hadPrevious = Test-Path Env:KERNAL_API_THREADED_ARTIFACT_WASM
 $previous = $env:KERNAL_API_THREADED_ARTIFACT_WASM
 
@@ -101,6 +101,16 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment cargo_built_threaded_guest_forced_output_cleanup -- --ignored
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    # This observes the externally launched worker after its parent exits;
+    # it is deliberately separate from the in-process cancellation proofs.
+    $parentDeathTest = 'failure_proof::d4_parent_death_kills_exact_worker'
+    $listed = @(soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment -- --list)
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (@($listed | Where-Object { $_ -eq "${parentDeathTest}: test" }).Count -ne 1) { throw 'Expected exactly one registered parent-death containment test' }
+    $parentDeathOutput = @(soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment $parentDeathTest -- --exact --test-threads=1 2>&1)
+    $parentDeathOutput | Write-Output
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (@($parentDeathOutput | Where-Object { $_ -match 'test result: ok\. 1 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Parent-death containment did not run exactly one non-ignored test' }
 }
 finally {
     if ($hadPrevious) {
@@ -109,7 +119,7 @@ finally {
     else {
         Remove-Item Env:KERNAL_API_THREADED_ARTIFACT_WASM -ErrorAction SilentlyContinue
     }
-    if (-not $ArtifactPath -and (Test-Path -LiteralPath $temporaryRoot)) {
+    if ($temporaryRoot -and -not $ArtifactPath -and (Test-Path -LiteralPath $temporaryRoot)) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force
     }
 }

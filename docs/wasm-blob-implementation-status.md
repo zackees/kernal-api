@@ -65,6 +65,9 @@ tests and the forced-output-cleanup test on Linux x86-64.
 - Cancellation discards pending write input. Sketch teardown also discards
   completed, unconsumed read buffers and rejects subsequent result retrieval.
 - Exact output grants retain a canonical parent and final filename on the host.
+  The requested destination must already be traversal-free: a `ParentDir`
+  component is rejected before canonicalization, so `approved/../result.png`
+  cannot silently broaden a configured exact-output grant.
   The current synchronous helper requires a sealed blob, writes a sibling
   temporary file, syncs and closes it, and uses the existing atomic replacement.
 - Replacement failure removes the owned temporary file. Failed exclusive

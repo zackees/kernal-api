@@ -156,8 +156,12 @@ Drop, errors, and failed authentication close staging and release accounting;
 successful authentication keeps the reservation charged until file drop.
 
 This is synchronous native prototype work, not an async operation or resource
-registry integration. The accounting is a private shared counter supplied by
-the test harness, not the final authoritative sketch quota. Cancellation is
+registry integration. Accounting now uses a private shared `StagingBudget`
+whose maximum is fixed at construction, rather than accepting a separate
+counter and caller-selected limit on every authentication. Budget clones
+share the same ceiling and reservations keep that budget alive through file
+drop. The test harness still constructs it; it is not yet the final
+authoritative sketch quota. Cancellation is
 currently owner drop; guest cancellation/worker teardown and progress deadlines
 are still unimplemented. OS file cache/RSS and secure physical erasure of
 temporary plaintext are not proven by byte accounting. No claim is made that
@@ -198,7 +202,7 @@ execution, asynchronous cancellation, and worker teardown are still required.
 The existing six-host `wasm-tauri-screenshot-native` CI matrix now runs
 `Run native authenticated archive staging proofs` after verifying that the
 Rust host matches the matrix target. It explicitly enables only
-`archive-auth-test-support` and executes the four staging tests on Linux,
+`archive-auth-test-support` and executes the staging tests on Linux,
 macOS, and Windows, each on x86-64 and ARM64. The independent `each-feature`
 matrix also checks this feature without relying on `--all-features`.
 
@@ -208,3 +212,14 @@ crypto build, anonymous-file lifecycle, and authenticated ZIP extraction
 must succeed on each host; a cross-compilation or screenshot-only result
 does not substitute for this step. These native tests still do not exercise
 the generated guest archive API or complete the extension2 acceptance gate.
+
+`shared_staging_budget_has_one_ceiling_under_contention` holds concurrent
+reservations behind barriers: eight producers each request eight bytes from
+one sixteen-byte budget, and exactly two may retain reservations. It also
+checks reuse after drop and overflow rejection at `u64::MAX`. These are
+accounting-only reservations, not attempts to allocate or stage `u64::MAX`
+bytes. The budget must eventually be owned by the existing logical sketch
+registry; allowing a guest to construct replacement budgets would bypass it.
+Removing the ceiling check made this regression fail with 64 retained bytes
+against a sixteen-byte budget. Restoring the check is required for GREEN;
+the test does not rely on thread scheduling or sleep intervals.

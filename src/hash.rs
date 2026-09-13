@@ -11,6 +11,11 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
 
+#[cfg(feature = "fs")]
+mod tree;
+#[cfg(feature = "fs")]
+pub use tree::{blake3_tree, TreeHashOptions};
+
 /// The number of bytes in a BLAKE3 content digest.
 pub const BLAKE3_DIGEST_LENGTH: usize = 32;
 

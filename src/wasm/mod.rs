@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=5\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=6\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -1958,6 +1958,16 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if let Some(result) = hash_dispatch::dispatch(
+            &self.operations,
+            self.store_owner,
+            &self.controller.memory,
+            kind,
+            arg0,
+            arg1,
+        ) {
+            return Ok(result);
+        }
         if kind == crate::operations::OP_ARCHIVE_NEXT_ENTRY {
             #[cfg(all(test, feature = "archive-auth-test-support"))]
             {
@@ -3950,19 +3960,19 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=5\n",
-            b'6',
+            b"operation_protocol_revision=6\n",
+            b'7',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let mut previous_operations = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut previous_operations,
-            b"operation_protocol_revision=5\n",
-            b'4',
+            b"operation_protocol_revision=6\n",
+            b'5',
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=5\n", "");
+            .replace("operation_protocol_revision=6\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -4911,6 +4921,8 @@ fn capture_threaded_smoke_report(
     }
     Some(report)
 }
+
+mod hash_dispatch;
 
 #[cfg(test)]
 mod validation_report_tests {

@@ -17,7 +17,7 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=5`, independently of the
+The metadata also binds `operation_protocol_revision=6`, independently of the
 scalar import signatures. Revision 1 included opcodes 1–19 and scoped
 transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
 header copy, and abandonment (20–22). Revision 3 adds authentication and scoped
@@ -25,7 +25,12 @@ future/archive abandonment (23–25). Revision 4 adds bounded inventory,
 entry metadata, and entry abandonment (26–28), with opcode 24 also abandoning
 inventory futures. Revision 5 adds entry-to-Blob open (29), whose future also
 uses scoped abandonment (24); native input grants currently exist only
-in the test-support experiment. Rebuild guest code before embedding the new
+in the test-support experiment. Revision 6 adds BLAKE3 create, bounded update,
+finalize, resource abandonment, and operation abandonment (30–34). Updates
+copy at most 64 KiB per import into host-owned memory. Finalize validates the
+complete 32-byte output range before consuming the hash. An abandoned update
+revokes the hash rather than promising rollback of bytes already accepted.
+Rebuild guest code before embedding the new
 metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.
 Unversioned and unknown operation revisions are rejected before compilation;

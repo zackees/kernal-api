@@ -136,6 +136,52 @@ pub fn run<T>(future: impl std::future::Future<Output = Result<T, OperationError
     }
 }
 
+/// Kernel-owned incremental hash authority, never a guest hashing backend.
+pub struct Blake3Hasher { token: u64 }
+struct HashOperation { inner: OperationFuture }
+impl HashOperation {
+    async fn wait(&self) -> Result<u64, OperationError> {
+        loop {
+            if let Some(payload) = self.inner.poll()? { return Ok(payload); }
+            self.inner.yield_now()?;
+        }
+    }
+}
+impl Drop for HashOperation {
+    fn drop(&mut self) { let _ = imports::operation_submit(34, self.inner.operation, 0); }
+}
+impl Blake3Hasher {
+    pub async fn new() -> Result<Self, OperationError> {
+        let operation = HashOperation { inner: OperationFuture::submit(30, 0, 0)? };
+        let token = operation.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(Self { token })
+    }
+    /// One update is at most 64 KiB. Dropping an uncollected update revokes
+    /// this hasher: committed bytes cannot safely be replayed after cancellation.
+    pub async fn update(&mut self, bytes: &[u8]) -> Result<(), OperationError> {
+        if bytes.len() > 65536 { return Err(OperationError::Rejected); }
+        let pointer = u32::try_from(bytes.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let packed = ((bytes.len() as u64) << 32) | u64::from(pointer);
+        let operation = HashOperation { inner: OperationFuture::submit(31, self.token, packed)? };
+        operation.wait().await?;
+        Ok(())
+    }
+    pub async fn finalize(mut self) -> Result<[u8; 32], OperationError> {
+        let mut digest = [0; 32];
+        let pointer = u32::try_from(digest.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let status = imports::operation_submit(32, self.token, (32_u64 << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        if status != 1 { return Err(OperationError::Failed); }
+        self.token = 0;
+        Ok(digest)
+    }
+}
+impl Drop for Blake3Hasher {
+    fn drop(&mut self) {
+        if self.token != 0 { let _ = imports::operation_submit(33, self.token, 0); }
+    }
+}
+
 /// One pre-authorized native URL, never a guest URL string or network grant.
 pub struct WebviewUrl { token: u64 }
 /// Opaque native viewport authority owned by this logical sketch.

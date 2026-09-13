@@ -85,7 +85,9 @@ soldr --no-cache cargo clippy --locked -p zccache-compiler --all-targets -j1 -- 
 ```
 
 This prerequisite is tracked in [zccache #1580](https://github.com/zackees/zccache/pull/1580)
-and is not yet merged. It does not remove the native
+and merged as `348e175aa4be339ebc666bb2be4dc3dd7993af60`. After integrating
+the shared encoder prerequisite, the combined compiler suite again passed
+383 tests and strict all-target compiler Clippy passed. It does not remove the native
 dependency graph or change `NormalizedPath`/lexical path semantics. These
 results are native parser evidence, not an actual Wasm parser/key/miss proof.
 
@@ -113,6 +115,38 @@ PR read confirmed the merge after the command returned a transient API error.
 The sink boundary is ready for a kernel hash adapter, but neither
 that adapter nor portable path normalization or the Wasm dependency graph is
 implemented by this prerequisite. Neither PR changes a release version.
+
+## Bounded public guest hash control
+
+Operation protocol revision 6 adds a facade-owned `guest::Blake3Hasher`, backed
+by the kernel's existing BLAKE3 implementation. Updates are bounded to 64 KiB,
+resources are store-scoped, and operation capacity is reserved before mutation.
+Dropping an uncollected create reclaims its resource; abandoning an update
+revokes uncertain state without replay or rollback. Finalize consumes the hash
+only after validating its complete fixed-size destination.
+
+The `kernal-hash-guest-proof` binary in the extension2 benchmark workspace is
+a separate capability control, not extension2 policy. On Linux x86-64, a freshly
+compiled revision-6 guest checked the empty-input digest and hashed 64 MiB
+of `0x5a` twice, in 65,536-byte and
+4,093-byte chunks, through the public facade. Both digests matched the native
+kernel and independent `b3sum` literal. The actual guest test passed in 4.57 s,
+with zero live resources and pending operations after execution and execution
+limits returned to their defaults after root closure. This is correctness
+evidence, not a benchmark or aggregate-memory measurement.
+
+The operation regression suite passed 79 tests; the independent focused hash
+review run passed 12 tests. Strict host Clippy, generated-ABI drift checking,
+and Astra lifecycle review passed. The hash proof is opt-in: build
+`kernal-hash-guest-proof` with `guest-proof` for `wasm32-wasip1-threads`, copy
+the freshly built module and embed metadata using the ABI generator, then set
+`KERNAL_HASH_GUEST_WASM` to that admitted copy when running the ignored
+`hash_actual_guest_streams_64_mib_through_public_facade` host test.
+
+This control does not yet connect the shared zccache request encoder to the
+guest, remove its native dependency graph, or establish the same-facade
+Component comparison. Revision-5 archive and screenshot runs cannot establish
+revision-6 compatibility; those artifacts must be rebuilt and rerun.
 
 ## Remaining proof
 

@@ -56,6 +56,30 @@ pub async fn sleep(milliseconds: u32) -> Result<(), OperationError> {
     Ok(())
 }
 
+/// Kernel-owned incremental BLAKE3 state. Updates are bounded to 64 KiB.
+pub struct Blake3Hasher {
+    inner: bindings::Blake3Hasher,
+}
+
+impl Blake3Hasher {
+    pub async fn new() -> Result<Self, OperationError> {
+        Ok(Self {
+            inner: bindings::Blake3Hasher::new().await?,
+        })
+    }
+
+    /// Feed one bounded chunk. After an update fails or is abandoned, dispose
+    /// of this hasher: cancellation does not roll back committed bytes.
+    pub async fn update(&mut self, bytes: &[u8]) -> Result<(), OperationError> {
+        self.inner.update(bytes).await.map_err(OperationError::from)
+    }
+
+    /// Consume the hasher and return its canonical 32-byte digest.
+    pub async fn finalize(self) -> Result<[u8; 32], OperationError> {
+        self.inner.finalize().await.map_err(OperationError::from)
+    }
+}
+
 /// Host-granted encrypted input for the archive experiment. Only its bounded
 /// public envelope metadata is readable; no path, key, or plaintext is exposed.
 /// Native input grants currently exist only in the test-support experiment.

@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
-// Revision 5 adds entry-to-Blob streaming (29) and scoped open-future Drop.
+// Revision 6 adds bounded incremental BLAKE3 and scoped abandonment (30-34).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 5;
+const OPERATION_PROTOCOL_REVISION: u32 = 6;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -145,6 +145,52 @@ pub fn run<T>(future: impl std::future::Future<Output = Result<T, OperationError
     match future.as_mut().poll(&mut context) {
         std::task::Poll::Ready(result) => result,
         std::task::Poll::Pending => Err(OperationError::Failed),
+    }
+}
+
+/// Kernel-owned incremental hash authority, never a guest hashing backend.
+pub struct Blake3Hasher { token: u64 }
+struct HashOperation { inner: OperationFuture }
+impl HashOperation {
+    async fn wait(&self) -> Result<u64, OperationError> {
+        loop {
+            if let Some(payload) = self.inner.poll()? { return Ok(payload); }
+            self.inner.yield_now()?;
+        }
+    }
+}
+impl Drop for HashOperation {
+    fn drop(&mut self) { let _ = imports::operation_submit(34, self.inner.operation, 0); }
+}
+impl Blake3Hasher {
+    pub async fn new() -> Result<Self, OperationError> {
+        let operation = HashOperation { inner: OperationFuture::submit(30, 0, 0)? };
+        let token = operation.wait().await?;
+        if token == 0 { return Err(OperationError::Failed); }
+        Ok(Self { token })
+    }
+    /// One update is at most 64 KiB. Dropping an uncollected update revokes
+    /// this hasher: committed bytes cannot safely be replayed after cancellation.
+    pub async fn update(&mut self, bytes: &[u8]) -> Result<(), OperationError> {
+        if bytes.len() > 65536 { return Err(OperationError::Rejected); }
+        let pointer = u32::try_from(bytes.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let packed = ((bytes.len() as u64) << 32) | u64::from(pointer);
+        let operation = HashOperation { inner: OperationFuture::submit(31, self.token, packed)? };
+        operation.wait().await?;
+        Ok(())
+    }
+    pub async fn finalize(mut self) -> Result<[u8; 32], OperationError> {
+        let mut digest = [0; 32];
+        let pointer = u32::try_from(digest.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let status = imports::operation_submit(32, self.token, (32_u64 << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        if status != 1 { return Err(OperationError::Failed); }
+        self.token = 0;
+        Ok(digest)
+    }
+}
+impl Drop for Blake3Hasher {
+    fn drop(&mut self) {
+        if self.token != 0 { let _ = imports::operation_submit(33, self.token, 0); }
     }
 }
 
@@ -677,6 +723,14 @@ mod tests {
         }
     }
     const MANIFEST: &str = include_str!("../../../src/wasm/generated/v1/kernal-api-v1.abi.toml");
+
+    #[test]
+    fn generated_hash_constructor_is_lazy() {
+        SUBMISSION.set((0, 0, 0));
+        let future = generated_guest::Blake3Hasher::new();
+        drop(future);
+        assert_eq!(SUBMISSION.get(), (0, 0, 0));
+    }
     const EMPTY: &[u8] = b"\0asm\x01\0\0\0";
 
     #[test]
@@ -684,7 +738,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=5\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=6\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

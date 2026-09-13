@@ -25,3 +25,8 @@ kernal-api = { version = "=0.1.0", path = "../../..", default-features = false }
 base64 = "=0.22.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
+
+[[bin]]
+name = "kernal-hash-guest-proof"
+path = "src/hash_main.rs"
+required-features = ["guest-proof"]

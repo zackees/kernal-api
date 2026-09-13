@@ -16,6 +16,9 @@ use std::sync::{Arc, Mutex};
 
 static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+#[path = "hash_resource.rs"]
+mod hash_resource;
+
 #[cfg(all(
     test,
     feature = "archive-auth-test-support",
@@ -270,6 +273,7 @@ struct ResourceSlot {
 }
 
 enum ResourceValue {
+    Blake3(Box<crate::hash::Blake3Hasher>),
     #[cfg(all(
         test,
         feature = "archive-auth-test-support",
@@ -302,6 +306,7 @@ enum ResourceValue {
 }
 
 struct OperationSlot {
+    is_hash_operation: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     is_archive_operation: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
@@ -2274,6 +2279,17 @@ impl OperationHub {
         required_rights: u8,
     ) -> Result<(OpaqueToken, Arc<Notify>), HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        self.submit_locked(&mut state, store, resource, kind, required_rights)
+    }
+
+    fn submit_locked(
+        &self,
+        state: &mut State,
+        store: u64,
+        resource: Option<OpaqueToken>,
+        kind: u8,
+        required_rights: u8,
+    ) -> Result<(OpaqueToken, Arc<Notify>), HubError> {
         if state.closed {
             return Err(HubError::Closed);
         }
@@ -2308,6 +2324,7 @@ impl OperationHub {
         state.operations.insert(
             token,
             OperationSlot {
+                is_hash_operation: false,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
                 is_archive_operation: false,
                 #[cfg(all(test, feature = "archive-auth-test-support"))]

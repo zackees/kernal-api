@@ -237,6 +237,20 @@ fn help_is_rendered_without_exposing_the_parser_backend() {
     assert!(!help.contains("clap"));
 }
 
+#[test]
+fn hidden_options_parse_but_are_absent_from_help_and_double_dash_is_literal() {
+    let schema = Command::new("fastled")
+        .option(OptionSpec::flag("internal").hidden())
+        .optional_positional("directory", ValueKind::string());
+
+    let hidden = schema.parse(["fastled", "--internal"]).unwrap();
+    assert_eq!(hidden.flag("internal"), Some(true));
+    assert!(!schema.render_help().contains("internal"));
+
+    let literal = schema.parse(["fastled", "--", "--not-an-option"]).unwrap();
+    assert_eq!(literal.value("directory"), Some("--not-an-option"));
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {

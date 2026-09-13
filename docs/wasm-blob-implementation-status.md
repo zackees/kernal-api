@@ -551,5 +551,23 @@ recorded upstream PNG/X11 isolation gap remains.
 This fixes cleanup after an ancestor rename, not every filesystem race:
 publication and the worker's output grant remain path-based. The backend
 does not promise atomic removal against concurrent directory renames, and
-abrupt parent death does not run Drop. Windows/macOS runtime validation and
-the real contained renamed-parent scenario remain required.
+abrupt parent death does not run Drop. Windows/macOS runtime validation
+remains required.
+
+The actual contained screenshot guest now also passes the renamed-parent
+scenario on Linux x86-64 (9.33s). The fixture renames the destination parent
+upon the first native HTTP request, after staging/grant creation. The guest
+finishes capture and submits output write, reports typed write rejection
+(exit 113), and drains its trace counters. Parent reap/lease counters are zero,
+the original output and neighbor survive in the moved directory, and no
+staging entry remains. This proof is included in the native screenshot matrix;
+it does not claim success on unexecuted targets or successful publication
+through a moved path.
+The follow-up combined-feature screenshot Clippy run did not complete: GTK's
+compiler received SIGTERM (Soldr reported zero cgroup OOM kills). Its build
+record is `20260913T010933Z-home-niteris-dev-kernal-api.xml` under the local
+Soldr build logs. The archived compiler journal confirms signal 15 but does
+not identify its sender. After confirming the failed process was terminal,
+the unchanged focused Clippy command passed on retry in 20.29s; formatting
+and diff checks also passed. The original interruption remains recorded
+rather than being attributed to an unproven OOM cause.

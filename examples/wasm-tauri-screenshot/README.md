@@ -147,6 +147,10 @@ recreated parent or sibling temporary file, unchanged preserved files, and
 zero captured blobs/output jobs/native/Wasm resources. This is a missing-parent
 I/O failure in explicit diagnostic mode, not yet a contained permissions or
 disk-exhaustion proof.
+The direct contained renamed-parent proof now performs the same relocation
+with the real worker. It requires write rejection (guest exit 113), drained
+worker and parent counters, preserved original files, and removal of staging
+from the moved directory through the parent's retained directory handle.
 The default contained publication-failure proof instead preserves the original
 file and places a nonempty directory at its final path after grants are installed.
 The guest completes real capture and staging; the parent reports

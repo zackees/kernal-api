@@ -35,6 +35,14 @@ enum ContainedScenario {
     Block,
     CancelLoad,
     CaptureQuota,
+    RenamedParent,
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn actual_screenshot_guest_renamed_parent_cleans_staging() {
+    run_contained_screenshot(ContainedScenario::RenamedParent);
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
@@ -65,6 +73,7 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         ContainedScenario::Block => "KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM",
         ContainedScenario::Capture
         | ContainedScenario::CancelLoad
+        | ContainedScenario::RenamedParent
         | ContainedScenario::CaptureQuota => "KERNAL_API_SCREENSHOT_ARTIFACT_WASM",
     })
     .expect("built screenshot artifact");
@@ -99,6 +108,9 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
     let stopping = Arc::clone(&stop);
     let requested = Arc::new(AtomicBool::new(false));
     let observed_request = Arc::clone(&requested);
+    let original_directory = directory.clone();
+    let moved_directory = proof.join("moved-output");
+    let server_moved_directory = moved_directory.clone();
     let thread = std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             match listener.accept() {
@@ -111,6 +123,13 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).unwrap_or(0) > 0 {
+                        if scenario == ContainedScenario::RenamedParent
+                            && !observed_request.load(Ordering::Acquire)
+                        {
+                            // A native request proves the parent already
+                            // staged and granted the worker's output path.
+                            std::fs::rename(&original_directory, &server_moved_directory).unwrap();
+                        }
                         observed_request.store(true, Ordering::Release);
                         if scenario == ContainedScenario::CancelLoad {
                             while !stopping.load(Ordering::Acquire) {
@@ -200,6 +219,14 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         &config,
         cancellation.token(),
     ));
+    let directory = if scenario == ContainedScenario::RenamedParent {
+        assert!(!directory.exists());
+        moved_directory
+    } else {
+        directory
+    };
+    let output = directory.join("viewport.png");
+    let sentinel = directory.join("untouched");
     // Persist raw evidence before assertions, including failure outcomes. A
     // killed worker may never send its terminal trace; do not invent one.
     let worker_trace = trace.take();
@@ -227,7 +254,25 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
             "cancellation never observed a native HTTP request"
         );
     }
-    if scenario == ContainedScenario::CancelLoad {
+    if scenario == ContainedScenario::RenamedParent {
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Execution(SketchExecutionError::NonzeroExit { code: 113 })
+        );
+        let trace = worker_trace
+            .as_deref()
+            .expect("renamed-parent cleanup trace");
+        validate_teardown_trace(trace).unwrap();
+        assert!(trace.contains("phase=capture-requested"), "{trace}");
+        assert!(
+            trace.lines().any(
+                |line| line.starts_with("kernal-webview-trace phase=submit ")
+                    && line.ends_with("opcode=10")
+            ),
+            "write was not attempted: {trace}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    } else if scenario == ContainedScenario::CancelLoad {
         assert_eq!(
             terminal,
             SketchWorkerTerminal::Stopped(kernal_api::wasm::SketchWorkerStopReason::Cancelled)

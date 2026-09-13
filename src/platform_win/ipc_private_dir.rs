@@ -104,17 +104,26 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     // owner equality above independently proves this object belongs to the
     // current user.
     let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
+    // NTFS preserves the parent inheritance flags on some Windows versions
+    // and strips them on others when materializing a file ACE. Both forms
+    // grant exactly the same owner/SYSTEM full-control policy, and both are
+    // distinct from a caller-supplied direct or permissive ACE.
     let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
+    let inherited_with_flags =
+        LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
     let actual = actual.dacl()?.bytes()?;
-    Ok(actual == direct.dacl()?.bytes()? || actual == inherited.dacl()?.bytes()?)
+    Ok(actual == direct.dacl()?.bytes()?
+        || actual == inherited.dacl()?.bytes()?
+        || actual == inherited_with_flags.dacl()?.bytes()?)
 }
 
 #[cfg(feature = "fs")]
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows_sys::Win32::Security::TOKEN_QUERY;
 
     let mut token = std::ptr::null_mut();
     // SAFETY: output pointer is valid; returned token is closed before return.

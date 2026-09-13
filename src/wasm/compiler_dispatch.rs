@@ -133,6 +133,26 @@ mod tests {
         0xe9, 0x93,
     ];
 
+    fn compiler_helper_spec() -> crate::SpawnSpec {
+        let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
+            .arg("--nocapture")
+            .current_dir(std::env::current_dir().unwrap())
+            .clear_env(true)
+            .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+        // The Windows loader requires these host-selected system variables
+        // even for an otherwise empty compiler fixture environment.
+        #[cfg(windows)]
+        let spec = ["SystemRoot", "WINDIR"]
+            .into_iter()
+            .fold(spec, |spec, key| match std::env::var_os(key) {
+                Some(value) => spec.env(key, value),
+                None => spec,
+            });
+        spec
+    }
+
     #[test]
     fn compiler_imports_validate_grant_arguments_and_output_ranges_before_consumption() {
         let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
@@ -143,13 +163,7 @@ mod tests {
             .unwrap();
         runtime.run(async {
             let hub = OperationHub::new(4, 2).unwrap();
-            let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-                .arg("--nocapture")
-                .current_dir(std::env::current_dir().unwrap())
-                .clear_env(true)
-                .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+            let spec = compiler_helper_spec();
             let grant = hub
                 .grant_compiler_with_cache(
                     7,
@@ -207,8 +221,14 @@ mod tests {
             imports.store = 7;
             assert_eq!(hub.poll_wire(7, read), 0x80);
             let result = imports.submit(38, read, 65536_u64 << 32).unwrap();
+            // The outer wire adds terminal status below the event payload.
+            // The event tag therefore occupies bits 8..16 and the copied
+            // byte count begins at bit 16.
             assert_eq!(result as u8, 1);
-            assert!(matches!((result >> 8) as u8, 1 | 2));
+            assert!(
+                matches!((result >> 8) as u8, 1 | 2),
+                "unexpected packed output {result:#x}"
+            );
             assert!((1..=65536).contains(&(result >> 16)));
             // SAFETY: read the same pinned shared cell atomically.
             assert_ne!(
@@ -281,13 +301,7 @@ mod tests {
             .current_dir(std::env::current_dir().unwrap())
             .clear_env(true)
         } else {
-            crate::SpawnSpec::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-                .arg("--nocapture")
-                .current_dir(std::env::current_dir().unwrap())
-                .clear_env(true)
-                .env("KERNAL_COMPILER_WIRE_HELPER", "dual")
+            compiler_helper_spec()
         };
         assert_eq!(
             runtime.run(sketch.execute_threaded_root_with_grant(

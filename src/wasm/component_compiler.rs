@@ -23,6 +23,26 @@ mod tests {
         });
     }
 
+    fn compiler_helper_spec() -> crate::SpawnSpec {
+        let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
+            .arg("--nocapture")
+            .current_dir(std::env::current_dir().unwrap())
+            .clear_env(true)
+            .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+        // The Windows loader requires these host-selected system variables
+        // even for an otherwise empty compiler fixture environment.
+        #[cfg(windows)]
+        let spec = ["SystemRoot", "WINDIR"]
+            .into_iter()
+            .fold(spec, |spec, key| match std::env::var_os(key) {
+                Some(value) => spec.env(key, value),
+                None => spec,
+            });
+        spec
+    }
+
     #[test]
     fn output_copy_is_one_shot_and_keeps_lowering_allowance_until_drop() {
         let runtime = crate::async_engine::RuntimeBuilder::current_thread()
@@ -32,13 +52,7 @@ mod tests {
         runtime.run(async {
             let hub = OperationHub::new(64, 64).unwrap();
             let budget = ComponentResourceBudget::new(Arc::clone(&hub));
-            let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-                .arg("--nocapture")
-                .current_dir(std::env::current_dir().unwrap())
-                .clear_env(true)
-                .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
+            let spec = compiler_helper_spec();
             let grant = hub
                 .grant_compiler(0, spec, Duration::from_secs(15))
                 .unwrap();
@@ -50,15 +64,6 @@ mod tests {
                 kind: OperationKind::Spawn,
             };
             let process = OpaqueToken::from_wire(spawn.wait().await.unwrap());
-            let permit = budget.acquire(65536).unwrap();
-            let operation = Operation {
-                hub: Arc::clone(&hub),
-                token: hub
-                    .submit_compiler_output(runtime.handle(), 0, process)
-                    .unwrap(),
-                kind: OperationKind::Read,
-            };
-            operation.ready().await.unwrap();
             let mut state = State {
                 hub: Arc::clone(&hub),
                 budget: Arc::clone(&budget),
@@ -69,19 +74,56 @@ mod tests {
                 output_copies: 0,
                 cancel_read: None,
             };
-            let output = state
-                .table
-                .push(Output {
-                    operation: Some(operation),
-                    _permit: permit,
-                })
-                .unwrap();
-            let before = hub.snapshot().retained_transfer_capacity;
-            let data = compilers::HostOutput::copy(&mut state, Resource::new_borrow(output.rep()))
+            let mut copied = None;
+            // stdout and stderr EOF events may race their buffered chunks.
+            // Consume only a small, fixed number of normal terminal events;
+            // this proof specifically requires a copied payload.
+            for _ in 0..8 {
+                let permit = budget.acquire(65536).unwrap();
+                let operation = Operation {
+                    hub: Arc::clone(&hub),
+                    token: hub
+                        .submit_compiler_output(runtime.handle(), 0, process)
+                        .unwrap(),
+                    kind: OperationKind::Read,
+                };
+                operation.ready().await.unwrap();
+                let output = state
+                    .table
+                    .push(Output {
+                        operation: Some(operation),
+                        _permit: permit,
+                    })
+                    .unwrap();
+                let before = hub.snapshot().retained_transfer_capacity;
+                let data = compilers::HostOutput::copy(
+                    &mut state,
+                    Resource::new_borrow(output.rep()),
+                )
                 .unwrap()
                 .unwrap();
-            assert!(!data.bytes.is_empty());
-            assert!(data.bytes.len() <= 65536);
+                match &data.tag {
+                    OutputTag::Stdout | OutputTag::Stderr => {
+                        assert!(!data.bytes.is_empty());
+                        assert!(data.bytes.len() <= 65536);
+                        copied = Some((output, before, data));
+                        break;
+                    }
+                    OutputTag::StdoutEof | OutputTag::StderrEof | OutputTag::Exhausted => {
+                        assert!(data.bytes.is_empty());
+                        drop(data);
+                        compilers::HostOutput::drop(&mut state, output).unwrap();
+                    }
+                    OutputTag::StdoutAbandoned
+                    | OutputTag::StderrAbandoned
+                    | OutputTag::StdoutError
+                    | OutputTag::StderrError => {
+                        panic!("unexpected output failure: {:?}", data.tag)
+                    }
+                }
+            }
+            let (output, before, data) = copied.expect("fixture produced no output chunk");
+            let output_copies = state.output_copies;
             assert_eq!(hub.snapshot().retained_transfer_capacity, before - 65536);
             assert_eq!(budget.live_resources(), 1);
             assert!(matches!(
@@ -89,7 +131,7 @@ mod tests {
                     .unwrap(),
                 Err(Error::Rejected)
             ));
-            assert_eq!(state.output_copies, 1);
+            assert_eq!(state.output_copies, output_copies);
             assert_eq!(hub.snapshot().retained_transfer_capacity, before - 65536);
             // In real execution the synchronous canonical lowering owns this
             // Vec until it returns; only then may guest code drop the resource.
@@ -171,13 +213,7 @@ mod tests {
             .current_dir(std::env::current_dir().unwrap())
             .clear_env(true)
         } else {
-            crate::SpawnSpec::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-                .arg("--nocapture")
-                .current_dir(std::env::current_dir().unwrap())
-                .clear_env(true)
-                .env("KERNAL_COMPILER_WIRE_HELPER", "dual")
+            compiler_helper_spec()
         };
         let grant = hub
             .grant_compiler_with_cache(

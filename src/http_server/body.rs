@@ -19,9 +19,13 @@ impl ReadBudget {
         Self(Arc::new(tokio::sync::Semaphore::new(capacity)))
     }
 
-    fn spawn<F>(&self, operation: F) -> io::Result<tokio::task::JoinHandle<io::Result<Bytes>>>
+    pub(super) fn spawn<F, T>(
+        &self,
+        operation: F,
+    ) -> io::Result<tokio::task::JoinHandle<io::Result<T>>>
     where
-        F: FnOnce() -> io::Result<Bytes> + Send + 'static,
+        F: FnOnce() -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
     {
         let permit = self.0.clone().try_acquire_owned().map_err(|_| {
             io::Error::new(

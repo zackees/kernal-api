@@ -18,6 +18,74 @@ use diagnostics::increment;
 pub use diagnostics::{Diagnostics, Snapshot};
 pub use target::QueryPairs;
 
+/// Shared bounded native preparation of file responses. Clones share admission;
+/// use one instance for a server's routes, not one instance per request.
+#[derive(Clone, Debug)]
+pub struct FileResponses {
+    budget: body::ReadBudget,
+    timeout: Duration,
+}
+
+impl FileResponses {
+    /// Configure 1..=64 outstanding preparations and a positive deadline up to
+    /// one day. No runtime is constructed.
+    ///
+    /// # Errors
+    /// Invalid limits return `InvalidInput`.
+    pub fn new(max_operations: usize, timeout: Duration) -> io::Result<Self> {
+        if !(1..=64).contains(&max_operations)
+            || timeout.is_zero()
+            || timeout > Duration::from_secs(86400)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid file preparation limits",
+            ));
+        }
+        Ok(Self {
+            budget: body::ReadBudget::new(max_operations),
+            timeout,
+        })
+    }
+
+    /// Inspect and open a caller-authorized regular file, preparing its streamed
+    /// response off the async executor. Prefixes are limited to 1 MiB. Paths may
+    /// follow symlinks; callers still own authorization and directory policy.
+    /// Cancellation/deadlines cannot interrupt an in-flight native call: its
+    /// permit remains held until completion. Saturation fails without queuing.
+    ///
+    /// # Errors
+    /// Reports native failures, non-files/oversize prefixes (`InvalidInput`),
+    /// capacity exhaustion (`WouldBlock`), deadlines (`TimedOut`), and missing
+    /// runtime context. Requires timers enabled on the caller's runtime.
+    pub async fn open(&self, path: std::path::PathBuf, prefix: Vec<u8>) -> io::Result<Response> {
+        crate::async_engine::RuntimeHandle::current().map_err(io::Error::other)?;
+        if prefix.len() > 1024 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file prefix exceeds limit",
+            ));
+        }
+        let task = self.budget.spawn(move || {
+            // Avoid opening known FIFOs/devices. A concurrent path replacement
+            // can still block open, so worker-held admission remains essential.
+            if !std::fs::metadata(&path)?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "response path is not a regular file",
+                ));
+            }
+            Response::file(std::fs::File::open(path)?, prefix)
+        })?;
+        tokio::time::timeout(self.timeout, task)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "file preparation deadline expired")
+            })?
+            .map_err(io::Error::other)?
+    }
+}
+
 /// Per-server resource and time limits. Body limits bound accepted values, not
 /// memory already allocated by application handlers before returning a response.
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +238,17 @@ pub struct Response {
     status: hyper::StatusCode,
     headers: hyper::HeaderMap,
     body: ServerBody,
+}
+
+impl Default for Response {
+    /// An empty 500 response for fallible application response preparation.
+    fn default() -> Self {
+        Self {
+            status: hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            headers: hyper::HeaderMap::new(),
+            body: ServerBody::bytes(Bytes::new()),
+        }
+    }
 }
 
 impl Response {

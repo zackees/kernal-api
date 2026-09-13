@@ -33,6 +33,11 @@ initial transport tests alone.
   with `WouldBlock` (closing a response already started), rather than adding
   another worker. This prevents stalled filesystem work accumulating behind
   repeatedly expired connections.
+- `FileResponses` provides shared, bounded off-executor file inspection/opening
+  and response preparation, with a deadline and permits retained by native work
+  after cancellation. Known non-regular paths are rejected before opening.
+  `Response::default()` supplies an infallible empty 500 fallback for application
+  preparation errors.
 - Pull-driven SSE bodies encode multiline data safely, emit keepalive comments,
   bound individual payloads and frames, and do not prefetch the next event while
   encoded bytes remain pending.
@@ -92,7 +97,7 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 ## Local evidence
 
 The foundation's focused test initially failed to import the missing module.
-Nineteen integration tests cover the draft with `http-server,event-stream` enabled:
+Twenty-two integration tests cover the draft on Linux with `http-server,event-stream` enabled:
 request/response round trip, request rejection, cancellation cleanup,
 invalid limits, connection-capacity waiting, body/handler deadlines,
 header/connection deadlines, response limit/framing validation, a streamed file
@@ -101,7 +106,8 @@ non-reading client releasing its connection slot, duplicate/header-byte limits,
 bodyless-status/connection-header rejection, and diagnostic counters for
 rejections, handler panics, protocol failures and deadlines, and path/query
 decoding, server header overrides/error coverage, merged header budgets, and
-HEAD/OPTIONS behavior. Eight focused unit tests cover
+HEAD/OPTIONS behavior, the default 500 response, bounded file preparation and
+FIFO rejection without blocking the executor. Eight focused unit tests cover
 bounded file reads, growth/truncation, SSE backpressure/encoding/keepalives, and
 write-timeout activation, malformed queries, once-only path decoding, and
 cancelled native read admission (including rejection of another file body).

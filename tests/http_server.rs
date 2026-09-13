@@ -15,6 +15,64 @@ fn loopback() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn file_preparation_is_bounded_and_rejects_non_files() {
+    use kernal_api::http_server::FileResponses;
+    let files = FileResponses::new(2, Duration::from_secs(1)).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    assert!(files
+        .open(root.path().to_path_buf(), Vec::new())
+        .await
+        .is_err());
+    let path = root.path().join("data");
+    std::fs::write(&path, b"hello").unwrap();
+    files.open(path, b"prefix".to_vec()).await.unwrap();
+    assert!(FileResponses::new(0, Duration::from_secs(1)).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn fifo_preparation_does_not_block_executor_progress() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("pipe");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    // A watchdog opens both ends on Linux, unblocking an accidental synchronous
+    // FIFO open so a regression fails rather than hanging runtime teardown.
+    let unblock = path.clone();
+    let watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        let _guard = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(unblock)
+            .unwrap();
+    });
+    let files = kernal_api::http_server::FileResponses::new(1, Duration::from_secs(1)).unwrap();
+    let start = std::time::Instant::now();
+    assert!(files.open(path, Vec::new()).await.is_err());
+    assert!(start.elapsed() < Duration::from_millis(400));
+    watchdog.join().unwrap();
+}
+
+#[tokio::test]
+async fn default_response_is_an_empty_internal_error() {
+    let server = Server::bind(loopback(), Limits::default()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|_| async { Response::default() }));
+    let response = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    assert!(response.ends_with("\r\n\r\n"), "{response}");
+    drop(task);
+}
+
+#[tokio::test]
 async fn server_headers_apply_to_generated_errors_and_override_handler_values() {
     let server = Server::bind(
         loopback(),

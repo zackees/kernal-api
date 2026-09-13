@@ -141,10 +141,11 @@ mod tests {
             .current_dir(std::env::current_dir().unwrap())
             .clear_env(true)
             .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
-        // The Windows loader requires these host-selected system variables
-        // even for an otherwise empty compiler fixture environment.
+        // The Windows process loader and Rust test harness require these
+        // host-selected system variables even for an otherwise empty fixture
+        // environment. The child receives no user-controlled values.
         #[cfg(windows)]
-        let spec = ["SystemRoot", "WINDIR"]
+        let spec = ["SYSTEMROOT", "TEMP", "TMP"]
             .into_iter()
             .fold(spec, |spec, key| match std::env::var_os(key) {
                 Some(value) => spec.env(key, value),
@@ -208,7 +209,7 @@ mod tests {
             })
             .await
             .unwrap();
-            let read = imports.submit(37, process, 0).unwrap();
+            let mut read = imports.submit(37, process, 0).unwrap();
             hub.suspend_wire(7, read).unwrap().notified().await;
             assert_eq!(imports.submit(38, read, 65535_u64 << 32), Some(0x80));
             assert_eq!(imports.submit(38, read, (65536_u64 << 32) | 1), Some(0x80));
@@ -220,15 +221,29 @@ mod tests {
             assert_eq!(imports.submit(38, read, 65536_u64 << 32), Some(0x80));
             imports.store = 7;
             assert_eq!(hub.poll_wire(7, read), 0x80);
-            let result = imports.submit(38, read, 65536_u64 << 32).unwrap();
-            // The outer wire adds terminal status below the event payload.
-            // The event tag therefore occupies bits 8..16 and the copied
-            // byte count begins at bit 16.
-            assert_eq!(result as u8, 1);
-            assert!(
-                matches!((result >> 8) as u8, 1 | 2),
-                "unexpected packed output {result:#x}"
-            );
+            // stdout and stderr EOF events may race their buffered chunks.
+            // The transfer proof requires a copied chunk, so consume only a
+            // small, fixed number of normal EOF events first.
+            let mut chunk = None;
+            for _ in 0..8 {
+                let result = imports.submit(38, read, 65536_u64 << 32).unwrap();
+                // The outer wire adds terminal status below the event payload.
+                // The event tag therefore occupies bits 8..16 and the copied
+                // byte count begins at bit 16.
+                assert_eq!(result as u8, 1);
+                match (result >> 8) as u8 {
+                    1 | 2 => {
+                        chunk = Some(result);
+                        break;
+                    }
+                    3 | 4 => {
+                        read = imports.submit(37, process, 0).unwrap();
+                        hub.suspend_wire(7, read).unwrap().notified().await;
+                    }
+                    tag => panic!("unexpected packed output tag {tag}: {result:#x}"),
+                }
+            }
+            let result = chunk.expect("fixture produced no output chunk");
             assert!((1..=65536).contains(&(result >> 16)));
             // SAFETY: read the same pinned shared cell atomically.
             assert_ne!(

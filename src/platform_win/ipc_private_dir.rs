@@ -104,16 +104,19 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     // owner equality above independently proves this object belongs to the
     // current user.
     let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
-    // NTFS preserves the parent inheritance flags on some Windows versions
-    // and strips them on others when materializing a file ACE. Both forms
-    // grant exactly the same owner/SYSTEM full-control policy, and both are
-    // distinct from a caller-supplied direct or permissive ACE.
+    // NTFS preserves, strips, or narrows the parent inheritance flags when
+    // materializing a regular-file ACE. All forms below grant exactly the
+    // same owner/SYSTEM full-control policy, and are distinct from a
+    // caller-supplied direct or permissive ACE.
     let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
+    let inherited_object =
+        LocalSecurityDescriptor::from_sddl("D:(A;OIID;FA;;;OW)(A;OIID;FA;;;SY)")?;
     let inherited_with_flags =
         LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
     let actual = actual.dacl()?.bytes()?;
     Ok(actual == direct.dacl()?.bytes()?
         || actual == inherited.dacl()?.bytes()?
+        || actual == inherited_object.dacl()?.bytes()?
         || actual == inherited_with_flags.dacl()?.bytes()?)
 }
 

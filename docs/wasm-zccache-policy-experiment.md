@@ -198,6 +198,42 @@ public kernel capabilities with bounded stdout/stderr. Native and Wasm runs
 must compare the same policy outputs. Daemon, watcher, IPC, and artifact
 movement stay native.
 
+### Controlled compiler-miss design constraints
+
+Source inspection identifies `SpawnSpec::spawn_session` and `ProcessSession`
+as the existing native facade seam. `ProcessSessionOptions` bounds queued
+chunks and each chunk's bytes; `next_output` preserves stdout/stderr identity
+and backpressures child pipes. Lifecycle wait/kill remain independent of a
+pending output receive. Reuse this seam rather than adding another process
+backend or executor. This is a proposed integration, not an executed guest
+process proof.
+
+The host must grant one exact command description and working directory,
+with explicit environment and stream policy. A guest should receive only a
+store-scoped opaque grant, not executable paths, arbitrary argv, environment
+mutation, or shell access. Reserve operation/resource capacity before spawn;
+revocation between reservation and attachment must reclaim a spawned session.
+Output delivery needs an aggregate in-flight byte budget in addition to the
+native queue limits. Cache-hit fixtures must prove no spawn occurred, while
+miss fixtures must compare native and guest status and both output streams.
+
+The facade documents that session kill/drop terminates and reaps only the
+direct child. Post-exit drain grace reports abandoned descendant-held pipes;
+it is not process-tree containment. Tests must distinguish direct-child
+cleanup, output completion, and descendant containment, and must not claim
+the last from `kill_on_drop`. Cancellation, trap, grant revocation, and
+uncollected completion each need zero-resource/pending-operation checks in
+both candidate adapters before this workflow can count toward #13.
+
+The host-neutral `tests/process_session_streaming.rs` exercises the native
+seam with a direct child test executable, not a shell: 32 MiB per tagged
+stdout/stderr stream, a one-chunk queue, 4096-byte chunks, exact payload
+counts without whole-output collection, and one EOF per stream. A separate
+test stops receiving output and verifies explicit kill/reap completes without
+draining the queue. Both checks pass on Linux x86-64 alongside all 12 existing
+process-session tests. They do not execute a compiler, measure aggregate RSS,
+prove descendant containment, or provide Windows/macOS execution evidence.
+
 This experiment does not replace the Component Model comparison, ten-edit
 latency measurements, sealed extension2 archive proof, or six native target
 acceptance required by #13.

@@ -111,12 +111,15 @@ pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<boo
     let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
     let inherited_object =
         LocalSecurityDescriptor::from_sddl("D:(A;OIID;FA;;;OW)(A;OIID;FA;;;SY)")?;
+    let inherited_container =
+        LocalSecurityDescriptor::from_sddl("D:(A;CIID;FA;;;OW)(A;CIID;FA;;;SY)")?;
     let inherited_with_flags =
         LocalSecurityDescriptor::from_sddl("D:(A;OICIID;FA;;;OW)(A;OICIID;FA;;;SY)")?;
     let actual = actual.dacl()?.bytes()?;
     Ok(actual == direct.dacl()?.bytes()?
         || actual == inherited.dacl()?.bytes()?
         || actual == inherited_object.dacl()?.bytes()?
+        || actual == inherited_container.dacl()?.bytes()?
         || actual == inherited_with_flags.dacl()?.bytes()?)
 }
 

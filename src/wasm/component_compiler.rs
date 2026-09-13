@@ -32,10 +32,10 @@ mod tests {
             .clear_env(true)
             .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
         // The Windows process loader and Rust test harness require these
-        // host-selected system variables even for an otherwise empty fixture
-        // environment. The child receives no user-controlled values.
+        // host-selected system variables and Cargo's DLL loader search path
+        // even for an otherwise empty fixture environment.
         #[cfg(windows)]
-        let spec = ["SYSTEMROOT", "TEMP", "TMP"]
+        let spec = ["SYSTEMROOT", "TEMP", "TMP", "PATH"]
             .into_iter()
             .fold(spec, |spec, key| match std::env::var_os(key) {
                 Some(value) => spec.env(key, value),

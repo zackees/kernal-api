@@ -28,6 +28,39 @@ fn screenshot_binary(worker: bool) -> std::path::PathBuf {
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+fn configure_fixture_stream(stream: &std::net::TcpStream) -> std::io::Result<()> {
+    // Accepted sockets can inherit listener nonblocking mode. Browser probes
+    // can also disconnect before setup: Darwin rejects setsockopt on a shut
+    // down socket with EINVAL. Callers discard that connection, not the server.
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+fn fixture_stream_uses_bounded_blocking_io() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    server.set_nonblocking(true).unwrap();
+    configure_fixture_stream(&server).unwrap();
+    let timeout = Some(std::time::Duration::from_secs(2));
+    assert_eq!(server.read_timeout().unwrap(), timeout);
+    assert_eq!(server.write_timeout().unwrap(), timeout);
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        client.write_all(b"request").unwrap();
+    });
+    let mut request = [0; 7];
+    let received = server.read_exact(&mut request);
+    writer.join().unwrap();
+    received.unwrap();
+    assert_eq!(&request, b"request");
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
 fn join_fixture_thread(thread: std::thread::JoinHandle<()>) {
     if let Err(failure) = thread.join() {
         // Preserve an assertion already unwinding through fixture cleanup.
@@ -177,12 +210,10 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         while !stopping.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
+                    if let Err(error) = configure_fixture_stream(&stream) {
+                        eprintln!("discarding fixture connection during setup: {error}");
+                        continue;
+                    }
                     let mut request = [0; 4096];
                     if stream.read(&mut request).unwrap_or(0) > 0 {
                         if scenario == ContainedScenario::RenamedParent
@@ -628,15 +659,12 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
         while !stopping.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_nonblocking(false).unwrap();
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
-                    stream
-                        .set_write_timeout(Some(Duration::from_secs(2)))
-                        .unwrap();
+                    if let Err(error) = configure_fixture_stream(&stream) {
+                        eprintln!("discarding fixture connection during setup: {error}");
+                        continue;
+                    }
                     let mut request = [0; 4096];
-                    if stream.read(&mut request).is_ok() {
+                    if stream.read(&mut request).is_ok_and(|count| count > 0) {
                         if scenario == NativeScenario::PublicationFailure && !relocated {
                             // Parent staging already exists. Preserve the original
                             // file and obstruct only final atomic publication;

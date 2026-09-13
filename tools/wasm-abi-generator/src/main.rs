@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
-// Revision 2 adds bounded encrypted-input grant/header/drop operations (20-22).
+// Revision 3 adds authentication and scoped future/archive abandonment (23-25).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 2;
+const OPERATION_PROTOCOL_REVISION: u32 = 3;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -212,6 +212,34 @@ impl EncryptedArchive {
         Ok(copied)
     }
     pub fn abandon(&self) { let _ = imports::operation_submit(22, self.token, 0); }
+    pub fn authenticate(&self, nonce: &[u8; 12]) -> Result<ArchiveAuthentication, OperationError> {
+        let pointer = u32::try_from(nonce.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        Ok(ArchiveAuthentication { inner: OperationFuture::submit(23, self.token, u64::from(pointer))? })
+    }
+}
+pub struct ArchiveAuthentication { inner: OperationFuture }
+impl ArchiveAuthentication {
+    pub async fn wait(self) -> Result<AuthenticatedArchive, OperationError> {
+        loop {
+            if let Some(token) = self.inner.poll()? {
+                if token == 0 { return Err(OperationError::Failed); }
+                return Ok(AuthenticatedArchive { token });
+            }
+            self.inner.yield_now()?;
+        }
+    }
+}
+impl Drop for ArchiveAuthentication {
+    fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
+}
+pub struct AuthenticatedArchive { token: u64 }
+impl AuthenticatedArchive {
+    pub fn close(&self) -> Result<(), OperationError> {
+        if imports::operation_submit(25, self.token, 0).map_err(|_| OperationError::Failed)? == 1 {
+            Ok(())
+        } else { Err(OperationError::Rejected) }
+    }
+    pub fn abandon(&self) { let _ = self.close(); }
 }
 /// One exact destination authorized by the embedding host; never a guest path.
 pub struct OutputFile { token: u64 }
@@ -605,7 +633,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=2\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=3\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

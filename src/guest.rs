@@ -76,6 +76,35 @@ impl EncryptedArchive {
             .read_header(destination)
             .map_err(OperationError::from)
     }
+
+    /// Consume this input and authenticate using the nonce decoded by guest
+    /// policy. The host retains the key and authenticates the original header.
+    /// Dropping this future abandons its operation and any uncollected result.
+    pub async fn authenticate(
+        self,
+        nonce: [u8; 12],
+    ) -> Result<AuthenticatedArchive, OperationError> {
+        let inner = self.inner.authenticate(&nonce)?.wait().await?;
+        Ok(AuthenticatedArchive { inner })
+    }
+}
+
+/// Opaque authenticated storage. No plaintext authority exists before the
+/// final authentication tag succeeds. Inventory/entry APIs remain experimental.
+pub struct AuthenticatedArchive {
+    inner: bindings::AuthenticatedArchive,
+}
+
+impl AuthenticatedArchive {
+    pub async fn close(self) -> Result<(), OperationError> {
+        self.inner.close().map_err(OperationError::from)
+    }
+}
+
+impl Drop for AuthenticatedArchive {
+    fn drop(&mut self) {
+        self.inner.abandon();
+    }
 }
 
 impl Drop for EncryptedArchive {

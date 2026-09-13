@@ -59,6 +59,9 @@ pub(crate) const OP_BLOB_ABANDON: u32 = 19;
 pub(crate) const OP_ENCRYPTED_INPUT_GRANT: u32 = 20;
 pub(crate) const OP_ENCRYPTED_INPUT_HEADER: u32 = 21;
 pub(crate) const OP_ENCRYPTED_INPUT_ABANDON: u32 = 22;
+pub(crate) const OP_ENCRYPTED_INPUT_AUTHENTICATE: u32 = 23;
+pub(crate) const OP_ARCHIVE_AUTHENTICATION_ABANDON: u32 = 24;
+pub(crate) const OP_AUTHENTICATED_ARCHIVE_ABANDON: u32 = 25;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
@@ -123,6 +126,14 @@ pub(crate) enum HubError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HubSnapshot {
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    pub(crate) archive_staging_bytes: u64,
+    #[cfg(all(
+        test,
+        feature = "archive-auth-test-support",
+        feature = "wasm-sketch-host"
+    ))]
+    pub(crate) active_archive_jobs: usize,
     pub(crate) scope: u64,
     pub(crate) pending_operations: usize,
     pub(crate) live_resources: usize,
@@ -268,6 +279,8 @@ enum ResourceValue {
 }
 
 struct OperationSlot {
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    is_archive_authentication: bool,
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     pending_authentication: Option<crate::archive::authenticated_staging::Authentication>,
     owner: Owner,
@@ -2273,6 +2286,8 @@ impl OperationHub {
             token,
             OperationSlot {
                 #[cfg(all(test, feature = "archive-auth-test-support"))]
+                is_archive_authentication: false,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
                 pending_authentication: None,
                 owner: Owner { store },
                 resource,
@@ -2613,6 +2628,18 @@ impl OperationHub {
     pub(crate) fn snapshot(&self) -> HubSnapshot {
         let state = self.state.lock().expect("operation hub mutex poisoned");
         HubSnapshot {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            archive_staging_bytes: self.staging_budget.used(),
+            #[cfg(all(
+                test,
+                feature = "archive-auth-test-support",
+                feature = "wasm-sketch-host"
+            ))]
+            active_archive_jobs: self
+                .archive_jobs
+                .lock()
+                .map(|jobs| jobs.active())
+                .unwrap_or(usize::MAX),
             scope: self.scope,
             pending_operations: state
                 .operations

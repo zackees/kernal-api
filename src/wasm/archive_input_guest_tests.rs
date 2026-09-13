@@ -3,6 +3,63 @@ use crate::operations::archive_input::EncryptedInput;
 use std::io::Write;
 
 #[test]
+#[ignore = "requires Cargo-built auth-proof artifact in KERNAL_EXTENSION2_AUTH_WASM"]
+fn authenticated_input_actual_guest_authenticates_large_zip_and_rejects_bad_tag_or_nonce() {
+    let bytes = std::fs::read(
+        std::env::var_os("KERNAL_EXTENSION2_AUTH_WASM").expect("auth-proof artifact"),
+    )
+    .unwrap();
+    let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
+    let policy =
+        SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES).unwrap();
+    let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    for case in 0..3 {
+        let sketch = compiler.admit(&bytes, policy).unwrap();
+        let header = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#;
+        let (input, length) = crate::operations::archive_input::tests::encrypted_zip_with_header(
+            header,
+            [7; 16],
+            if case == 2 { [8; 12] } else { [0; 12] },
+            case == 1,
+        );
+        assert!(length > 16 * 1024 * 1024);
+        let result = runtime.run(sketch.execute_threaded_root_with_grant(
+            runtime.handle(),
+            crate::async_engine::CancellationSource::new().token(),
+            RootGrants {
+                archive: Some(input),
+                ..RootGrants::default()
+            },
+        ));
+        assert_eq!(
+            result,
+            if case == 0 {
+                Ok(ThreadedRootOutcome::Started)
+            } else {
+                Err(SketchExecutionError::NonzeroExit { code: 1 })
+            }
+        );
+        let snapshot = sketch
+            .root_execution_observation_for_test()
+            .unwrap()
+            .operation_snapshot
+            .unwrap();
+        assert_eq!(snapshot.live_resources, 0);
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(snapshot.archive_staging_bytes, 0);
+        assert_eq!(snapshot.active_archive_jobs, 0);
+        sketch.close_threaded_root().unwrap();
+    }
+    assert_eq!(
+        compiler.execution_limits_snapshot(),
+        SketchExecutionSnapshot::default()
+    );
+}
+
+#[test]
 #[ignore = "requires Cargo-built header-proof artifact in KERNAL_EXTENSION2_HEADER_WASM"]
 fn authenticated_input_actual_guest_validates_header_and_rejects_missing_or_wrong_identity() {
     let artifact =

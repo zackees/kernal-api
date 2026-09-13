@@ -1,19 +1,17 @@
-//! Header-only guest control plus the unfinished full archive contract for #13.
-//! Header validation does not prove authentication or archive streaming.
+//! Header/authentication guest controls plus the unfinished archive contract.
+//! Neither control enumerates or streams entries inside the guest yet.
 use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
 use kernal_extension2_guest_proof::policy;
 
-async fn header() -> Result<EncryptedArchive, OperationError> {
+async fn header() -> Result<(EncryptedArchive, [u8; 12]), OperationError> {
     let encrypted = EncryptedArchive::granted()?.ok_or(OperationError::Rejected)?;
     if EncryptedArchive::granted()?.is_some() {
         return Err(OperationError::Rejected);
     }
     let mut header = [0; policy::MAX_HEADER];
     let count = encrypted.read_header(&mut header).await?;
-    if !policy::validate_header(&header[..count]) {
-        return Err(OperationError::Rejected);
-    }
-    Ok(encrypted)
+    let nonce = policy::validated_nonce(&header[..count]).ok_or(OperationError::Rejected)?;
+    Ok((encrypted, nonce))
 }
 
 #[cfg(feature = "header-proof")]
@@ -28,12 +26,18 @@ async fn proof() -> Result<(), OperationError> {
     Ok(())
 }
 
-#[cfg(not(feature = "header-proof"))]
+#[cfg(all(feature = "auth-proof", not(feature = "header-proof")))]
 async fn proof() -> Result<(), OperationError> {
-    let encrypted = header().await?;
+    let (encrypted, nonce) = header().await?;
+    encrypted.authenticate(nonce).await?.close().await
+}
+
+#[cfg(not(any(feature = "header-proof", feature = "auth-proof")))]
+async fn proof() -> Result<(), OperationError> {
+    let (encrypted, nonce) = header().await?;
     // The host retains its key and exact original AAD. No plaintext archive
     // authority may exist until this asynchronous operation succeeds.
-    let mut archive = encrypted.authenticate().await?;
+    let mut archive = encrypted.authenticate(nonce).await?;
     let mut inventory = policy::Inventory::default();
     let mut payloads = 0;
     while let Some(entry) = archive.next_entry().await? {

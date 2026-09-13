@@ -21,24 +21,30 @@ struct Header {
 /// Validate original prefix/header bytes without reserializing authenticated
 /// data. Ciphertext and the final tag must not be included in this record.
 pub fn validate_header(bytes: &[u8]) -> bool {
+    validated_nonce(bytes).is_some()
+}
+
+/// Decode the explicit crypto nonce only after the complete identity policy.
+pub fn validated_nonce(bytes: &[u8]) -> Option<[u8; 12]> {
     if bytes.len() < 12 || bytes.len() > MAX_HEADER || &bytes[..8] != b"TWPV1AES" {
-        return false;
+        return None;
     }
     let length = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
     if length != bytes.len() - 12 {
-        return false;
+        return None;
     }
     let Ok(header) = serde_json::from_slice::<Header>(&bytes[12..]) else {
-        return false;
+        return None;
     };
-    header.schema_version == 1
+    let valid = header.schema_version == 1
         && header.algorithm == "AES-128-GCM"
         && header.version == "synthetic-1"
         && header.commit == "synthetic-commit"
-        && header.key_id == "synthetic-key"
-        && STANDARD
-            .decode(header.nonce)
-            .is_ok_and(|nonce| nonce.len() == 12)
+        && header.key_id == "synthetic-key";
+    if !valid {
+        return None;
+    }
+    STANDARD.decode(header.nonce).ok()?.try_into().ok()
 }
 
 #[derive(Default)]

@@ -2,7 +2,7 @@
 
 This source-only experiment makes the missing #13 guest capability concrete.
 The `guest-proof` binary currently **does not compile**: the public facade has
-no `EncryptedArchive::authenticate`. The optional binary is an explicit unfinished acceptance
+no `AuthenticatedArchive::next_entry`. The optional binary is an explicit unfinished acceptance
 contract, not a shipped example or a passing Wasm proof. Do not replace its
 kernel calls with host-side orchestration or cite library tests as guest GREEN.
 
@@ -38,7 +38,7 @@ soldr cargo clippy --locked \
 Recorded on Linux x86-64: both policy tests pass (0.03 s), strict library
 Clippy passes, and a `cargo check --lib` using the same Wasm target and lock
 passes (5.31 s). The original guest binary failed on the missing facade import
-with E0432; the full contract now stops at the missing authentication method.
+with E0432; the full contract now stops at the missing inventory method.
 These library checks are not artifact execution evidence.
 
 ## Header-only actual guest control
@@ -67,10 +67,44 @@ KERNAL_EXTENSION2_HEADER_WASM="$PWD/target/extension2-header-proof/wasm32-wasip1
   -j1 -- --ignored
 ```
 
-Operation protocol revision 2 adds grant/header/abandon submissions. Rebuild
-guest code before embedding its metadata; never relabel a revision-1 binary.
+Operation protocol revision 3 adds authentication/future-drop/archive-drop to
+revision 2's grant/header/abandon submissions. Rebuild guest code before
+embedding its metadata; never relabel an older binary.
 The header control also awaits a host timer to exercise the complete admitted
 async lifecycle; the bounded header copy itself finishes synchronously.
+
+## Authentication guest control
+
+`auth-proof` now authenticates a real ZIP containing a 17 MiB payload through
+the public guest facade and closes the resulting opaque archive. Guest policy
+decodes the explicit nonce; the host retains the key and original AAD, performs
+bounded decryption on its tracked blocking lane, and returns archive authority
+only after the final tag succeeds. The input is consumed once. Dropping the
+authentication future abandons pending work or its uncollected result without
+allocating another operation slot; dropping the archive revokes its storage.
+
+```sh
+SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/extension2-guest/Cargo.toml \
+  --features auth-proof --bin kernal-extension2-guest-proof \
+  --target wasm32-wasip1-threads --release --target-dir target/extension2-auth-proof -j1
+cp target/extension2-auth-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.wasm \
+  target/extension2-auth-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm
+soldr cargo build --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
+tools/wasm-abi-generator/target/debug/kernal-api-wasm-abi-generator \
+  --embed-threaded-metadata target/extension2-auth-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm
+KERNAL_EXTENSION2_AUTH_WASM="$PWD/target/extension2-auth-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm" \
+  soldr --no-cache cargo test --locked --features wasm-sketch-host,archive-auth-test-support \
+  --lib authenticated_input_actual_guest_authenticates_large_zip_and_rejects_bad_tag_or_nonce \
+  -j1 -- --ignored
+```
+
+Linux x86-64 execution passes valid authentication, corrupted tag, and wrong
+nonce cases in 11.27 s. Each ends with zero staging bytes, authentication jobs,
+resources, and operations. Native tests separately cover pending-future
+abandonment and abandonment after successful authentication before collection.
+This guest does **not** enumerate or read entries yet. The full build remains
+RED at `next_entry` (Soldr log `20260913T073302Z-home-niteris-dev-kernal-api.xml`).
 
 The executable contract requires a host-granted encrypted input, a bounded
 header read, asynchronous authentication, bounded inventory, and entry-to-Blob
@@ -78,7 +112,7 @@ streaming through `kernal_api::guest`. The guest accepts exactly one `payload`
 entry and verifies every byte of its 17 MiB body with a 64 KiB buffer. The host
 must keep the original header as AAD and expose no archive or entry resource
 before the final tag succeeds. The method names are a proposed semantic
-contract; authentication, inventory, and entry dispatch are still absent.
+contract; inventory and entry dispatch are still absent.
 
 To turn this RED into runtime evidence, add the generated operations and
 host-granted input, construct and encrypt the large synthetic ZIP, build and

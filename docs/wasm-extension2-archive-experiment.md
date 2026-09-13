@@ -48,9 +48,12 @@ upstream-policy equivalence evidence. Generated operations, host dispatch,
 and the encrypted fixture driver must make this same full contract GREEN.
 The header-only control now executes grant, bounded original-header policy,
 and revocation in a real Rust Wasm guest (valid, wrong identity, missing grant).
-The full build still lacks `authenticate`. The control uses an invalid sparse
+The header control uses an invalid sparse
 ciphertext tail, not an encrypted ZIP; it is no authentication evidence.
-Its build and execution commands are in the linked README. Protocol revision 2
+The separate authentication control now executes a genuine encrypted ZIP,
+accepts its valid tag, and rejects corrupted tags and wrong nonces. The full
+build still lacks `next_entry`; no guest entry streaming is claimed.
+Build and execution commands are in the linked README. Protocol revision 3
 requires freshly rebuilt artifacts, not metadata relabeling of old binaries.
 
 This is a reusable native prerequisite, not an extension2/Wasm GREEN claim.
@@ -245,9 +248,9 @@ regression fail because a retry succeeded (Soldr log
 `20260913T061836Z-home-niteris-dev-kernal-api.xml`); the guard was restored.
 
 This is the native entry-streaming seam required by the guest contract, not
-its completed implementation. Generated authentication/inventory/entry
-operations and their real guest execution remain missing; only the header
-boundary now has an actual guest control. The original
+its completed implementation. Generated inventory/entry operations and their
+real guest execution remain missing; header and authentication boundaries now
+have actual guest controls. The original
 synchronous `Write` sink tests do not prove asynchronous backpressure; the
 native Blob bridge below adds that separate proof. Neither proves cancellation
 of blocked filesystem operations.
@@ -314,12 +317,16 @@ The first driver test failed because submission/draining APIs were absent
 cover a real encrypted ZIP containing 17 MiB of byte-verified payload, bad-tag
 rejection, foreign/consumed input rejection, cancellation with worker quota
 retained after terminal collection, and panic reporting after handle pruning.
-The complete authentication-related filter passes 25 tests on Linux x86-64;
-the actual header-only guest control remains a separate explicitly ignored
-artifact test, not evidence that this driver executes from a guest.
+The complete authentication-related filter now passes 26 native tests on Linux
+x86-64. The separate real authentication guest test passes success, bad-tag,
+and wrong-nonce cases with a ZIP exceeding 16 MiB, and asserts zero staging
+bytes, jobs, resources and operations after teardown. It is explicitly ignored
+without a freshly built `auth-proof` artifact; commands are in the guest README.
+Native pending and completed-uncollected abandonment tests cover the new
+scoped authentication-future Drop operation. No plaintext crosses this guest
+proof: it authenticates and closes an opaque archive without reading entries.
 
-Generated authentication/inventory/entry operations, cancellation-safe guest
-future ownership, entry-copy job accounting, progress deadlines, killable
+Generated inventory/entry operations, entry-copy job accounting, progress deadlines, killable
 worker execution, and current six-native runs still remain. This does not
 interrupt blocked filesystem calls or claim process RSS bounds.
 

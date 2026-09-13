@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=2\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=3\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -1958,6 +1958,62 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_AUTHENTICATE {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                let Ok(offset) = i32::try_from(arg1) else {
+                    return Ok(0);
+                };
+                let Some(cells) = shared_range(&self.controller.memory, offset, 12) else {
+                    return Ok(0);
+                };
+                let mut nonce = [0; 12];
+                for (byte, cell) in nonce.iter_mut().zip(cells) {
+                    // SAFETY: the validated shared range owns these byte cells;
+                    // atomic loads avoid racing guest threads during the copy.
+                    *byte = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+                }
+                let Some(runtime) = self.runtime.clone() else {
+                    return Ok(0);
+                };
+                return Ok(self
+                    .operations
+                    .submit_encrypted_authentication(
+                        runtime,
+                        self.store_owner,
+                        crate::operations::OpaqueToken::from_wire(arg0),
+                        nonce,
+                    )
+                    .map(|token| token.wire())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ARCHIVE_AUTHENTICATION_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_archive_authentication(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_AUTHENTICATED_ARCHIVE_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_authenticated_archive(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
         if kind == crate::operations::OP_ENCRYPTED_INPUT_GRANT {
             if arg0 != 0 || arg1 != 0 {
                 return Ok(0);
@@ -3813,13 +3869,19 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=2\n",
-            b'3',
+            b"operation_protocol_revision=3\n",
+            b'4',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
+        let mut previous_operations = ABI_METADATA_VALUE.to_vec();
+        replace_metadata_byte(
+            &mut previous_operations,
+            b"operation_protocol_revision=3\n",
+            b'2',
+        );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=2\n", "");
+            .replace("operation_protocol_revision=3\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -3827,6 +3889,11 @@ mod threaded_root_observation_tests {
         };
 
         let cases = [
+            (
+                "previous operation protocol",
+                threaded_fixture_with_abi_metadata(Some(&previous_operations)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
             (
                 "future operation protocol",
                 threaded_fixture_with_abi_metadata(Some(&operation_skew)),

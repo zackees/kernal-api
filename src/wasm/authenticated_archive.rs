@@ -7,6 +7,69 @@ const ARCHIVE_KIND: u8 = 6;
 const EXTRACT_RIGHT: u8 = 1;
 
 impl OperationHub {
+    pub(crate) fn abandon_archive_authentication(
+        &self,
+        store: u64,
+        token: u64,
+    ) -> Result<(), HubError> {
+        let operation = OpaqueToken(token);
+        let (slot, notifications) = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state.operations.get(&operation).ok_or(HubError::Invalid)?;
+            if slot.owner.store != store {
+                return Err(HubError::WrongRights);
+            }
+            if !slot.is_archive_authentication {
+                return Err(HubError::WrongKind);
+            }
+            let resource = slot.created_resource;
+            let notifications = if let Some(resource) = resource {
+                if state.resources.contains_key(&resource) {
+                    Self::close_resource_with_terminal_locked(
+                        &mut state,
+                        resource,
+                        Terminal::Closed,
+                    )?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            (
+                state
+                    .operations
+                    .remove(&operation)
+                    .ok_or(HubError::Invalid)?,
+                notifications,
+            )
+        };
+        slot.notify.notify_one();
+        drop(slot);
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn abandon_authenticated_archive(
+        &self,
+        store: u64,
+        token: u64,
+    ) -> Result<(), HubError> {
+        let notifications = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let token = OpaqueToken(token);
+            let slot = state.resources.get(&token).ok_or(HubError::Invalid)?;
+            Self::validate_resource(slot, store, ARCHIVE_KIND, EXTRACT_RIGHT)?;
+            Self::close_resource_with_terminal_locked(&mut state, token, Terminal::Closed)?
+        };
+        for notify in notifications {
+            notify.notify_one();
+        }
+        Ok(())
+    }
+
     fn begin_archive_authentication(
         &self,
         store: u64,

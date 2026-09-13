@@ -177,6 +177,7 @@ jobs:
           - secure-random
           - text-similarity
           - command-arguments
+          - config-toml
           - terminal-style
           - terminal-input
           - event-stream

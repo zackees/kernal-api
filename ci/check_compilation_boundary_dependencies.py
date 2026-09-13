@@ -50,7 +50,7 @@ SKETCH_AND_WEBVIEW_PACKAGES = {
 }
 
 
-def tree(features: str) -> set[str]:
+def tree(features: str, *, normal_only: bool = False) -> set[str]:
     command = [
         "soldr",
         "cargo",
@@ -60,6 +60,8 @@ def tree(features: str) -> set[str]:
         "--prefix",
         "none",
     ]
+    if normal_only:
+        command.extend(("--edges", "normal"))
     if features:
         command.extend(("--features", features))
     completed = subprocess.run(command, check=True, text=True, capture_output=True)
@@ -73,6 +75,11 @@ def tree(features: str) -> set[str]:
 def main() -> int:
     default_graph = tree("")
     failures: list[str] = []
+    # TOML already builds the kernel's catalog. Only its runtime edge is opt-in.
+    if "toml" in tree("", normal_only=True):
+        failures.append("default runtime graph unexpectedly contains toml")
+    if "toml" not in tree("config-toml", normal_only=True):
+        failures.append("config-toml runtime graph omits toml")
     for label, graph in (("default", default_graph), ("full", tree("full"))):
         unexpected = sorted(graph & SKETCH_AND_WEBVIEW_PACKAGES)
         if unexpected:

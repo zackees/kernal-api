@@ -7,7 +7,7 @@ use kernal_api::wasm::{
 };
 #[path = "support/threaded_fixture.rs"]
 mod threaded_fixture;
-use threaded_fixture::threaded_root_wasm;
+use threaded_fixture::{abi_metadata, threaded_root_wasm};
 
 #[test]
 fn admitted_threaded_profile_executes_its_start_once_with_a_facade_runtime_handle() {
@@ -325,11 +325,7 @@ fn legacy_threaded_root_wasm(
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
-    let metadata = format!(
-        "capabilities=0\n{}",
-        include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml")
-    );
-    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
+    custom("kernal-api.abi", abi_metadata::METADATA, &mut wasm);
     wasm
 }
 
@@ -360,11 +356,7 @@ fn synthetic_root_wasm() -> Vec<u8> {
     exports.extend([0, 2]);
     section(7, exports, &mut wasm);
     section(10, vec![1, 2, 0, 0x0b], &mut wasm);
-    let metadata = format!(
-        "capabilities=0\n{}",
-        include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml")
-    );
-    custom("kernal-api.abi", metadata.as_bytes(), &mut wasm);
+    custom("kernal-api.abi", abi_metadata::METADATA, &mut wasm);
     custom("kernal-api.profile", b"threaded-core-wasm-v1", &mut wasm);
     wasm
 }

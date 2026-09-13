@@ -39,6 +39,7 @@ secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 command-arguments = ["dep:shell-words"]
 config-toml = ["dep:toml"]
+json = ["dep:serde", "dep:serde_json"]
 source-cpp = ["dep:tree-sitter", "dep:tree-sitter-cpp"]
 terminal-style = []
 # Native terminal capture and key decoding without PTY process spawning.
@@ -390,6 +391,7 @@ toml = "=0.8.23"
 features = [
   "full",
   "config-toml",
+  "json",
   "source-cpp",
   "daemon-identity",
   "daemon-frame-v1",

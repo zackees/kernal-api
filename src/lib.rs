@@ -26,6 +26,9 @@ pub mod arguments;
 /// Bounded configuration decoding with caller-owned schemas and defaults.
 #[cfg(feature = "config-toml")]
 pub mod config;
+/// Bounded JSON values and encoding with caller-owned schemas.
+#[cfg(feature = "json")]
+pub mod json;
 
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.

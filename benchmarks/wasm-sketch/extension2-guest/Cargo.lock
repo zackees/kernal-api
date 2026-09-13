@@ -36,9 +36,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.4.5"
+version = "1.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
+checksum = "a3eb0f42d6c360dc3f8a821f6bf2fdea7f72bfd36b3076eb0e6d1e9e0752fff4"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -148,7 +148,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kernal-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "libc",
@@ -278,8 +278,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.11"
-source = "git+https://github.com/zackees/running-process?rev=1943831d13bf0f4c82eb694bc1f9cf5940d4718a#1943831d13bf0f4c82eb694bc1f9cf5940d4718a"
+version = "4.10.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "492c9f25a9a886d7e4281eae987e2d90732ee07f01a35860899618b3b3484cc3"
 dependencies = [
  "libc",
  "running-process-platform-internal",
@@ -292,8 +293,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.11"
-source = "git+https://github.com/zackees/running-process?rev=1943831d13bf0f4c82eb694bc1f9cf5940d4718a#1943831d13bf0f4c82eb694bc1f9cf5940d4718a"
+version = "4.10.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce466bd3d8c281e4f3f409bf0931011306172fbd74032787958eaf5272505391"
 dependencies = [
  "libc",
  "sysinfo",

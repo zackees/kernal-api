@@ -176,6 +176,9 @@ jobs:
           - event-stream
           - http-server
           - http-client
+          # Canonical scheduler/broker spawn API is public only through this
+          # feature. Keep it isolated from the default process HAL.
+          - independent-spawn
           - ipc
           - ipc-async
           - profile

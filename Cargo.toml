@@ -1,6 +1,6 @@
 [package]
 name = "kernal-api"
-version = "0.1.0"
+version = "0.1.1"
 build = "build.rs"
 edition = "2021"
 rust-version = "1.95.0"
@@ -51,6 +51,10 @@ wasm-component-compiler-experiment = [
   "wasmtime?/component-model",
   "wasmtime?/component-model-async",
 ]
+# Canonical resource-independent launch contract. This stays opt-in: ordinary
+# inherited process operations remain the useful default HAL and do not select
+# scheduler/broker serialization or control code.
+independent-spawn = ["running-process/independent-spawn"]
 # Bounded OS entropy, independent of crash/profiling facilities.
 secure-random = ["dep:getrandom"]
 # Synchronous, bounded SQLite mechanics.  Applications retain schema, SQL,
@@ -103,8 +107,12 @@ http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "de
 # but the feature name is host-independent so a client enables one capability
 # rather than one host.
 #
-# The migration substrate also gates its PNG/X11 dependencies, keeping
-# these GUI facilities out of the default process/host graph.
+# This does not yet remove `png`/`x11rb` from the default *graph*:
+# `running-process-platform-internal` 4.10.12 declares both as non-optional
+# `cfg(target_os = "linux")` dependencies and `running-process` is mandatory
+# here, so they resolve regardless. What this gates is the code and public
+# surface this crate owns; the graph reduction follows when the substrate
+# gates its own copy.
 window-icon = ["dep:png", "dep:x11rb"]
 # Untrusted external web content is an explicit, heavyweight native capability.
 # The private implementation uses tauri-runtime-wry directly because Tauri's
@@ -289,17 +297,16 @@ wit-bindgen = { version = "=0.58.0", default-features = false, features = ["macr
 # The guest uses the generated kernel ABI, not a native runtime or OS substrate.
 # These remain mandatory (not feature-optional) for every native consumer.
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+# Exact first-party pre-1.0 pin. Most substrate APIs remain private behind
+# facade-owned semantic types. The opt-in `independent-spawn` feature is the
+# narrowly scoped exception: its live handles and options cross this boundary
+# unchanged, so callers and the substrate share type identity.
+running-process = { version = "=4.10.12", default-features = false, features = ["kernel-substrate"] }
 # `rayon` backs native parallel memory-mapped hashing; its global pool is lazy.
 # Keep native SIMD enabled: Soldr supplies the clang/SDK needed by BLAKE3's
 # ARM64 NEON C backend, including Linux-hosted Windows ARM64 cross-checks.
 blake3 = { version = "=1.8.7", features = ["rayon"] }
 memmap2 = "=0.9.11"
-# Exact first-party pre-1.0 pin. The substrate remains private behind facade
-# owned semantic types, with only the lightweight async process HAL enabled.
-# Migration-only: PR running-process#1204 supplies acknowledged output cleanup.
-# The unchanged release guard rejects this Git source; replace it with an exact
-# published registry release containing the change before release packaging.
-running-process = { version = "=4.10.11", git = "https://github.com/zackees/running-process", rev = "1943831d13bf0f4c82eb694bc1f9cf5940d4718a", default-features = false, features = ["kernel-substrate"] }
 sysinfo = "=0.30.13"
 tokio = { version = "=1.53.1", default-features = false, features = [
   "fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread",
@@ -421,6 +428,7 @@ toml = "=0.8.23"
 # here explicitly; this is a documentation set, not a supported bundle.
 features = [
   "full",
+  "independent-spawn",
   "daemon-identity",
   "daemon-frame-v1",
   "daemon-registration",

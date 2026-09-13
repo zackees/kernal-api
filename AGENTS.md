@@ -16,6 +16,10 @@
   reverse dependency.
 - Keep backend types private. Public APIs use facade-owned semantic types rather
   than re-exporting `running-process`, Tokio, or another implementation crate.
+  The only approved exception is the canonical independent-spawn contract:
+  re-export its selected `running-process` types and entry point unchanged so
+  live control handles retain type identity. Do not broaden this to general
+  backend, Tokio, runtime, or platform types.
 - Do not add a second allocator, pprof schema, Tokio Console stack, crash
   handler, or OS HAL behind a runtime fallback. This crate is the canonical
   owner.

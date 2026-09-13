@@ -20,6 +20,38 @@ use std::process::ExitStatus;
 
 mod process_adapter;
 
+/// Canonical launch payload and readiness contract for [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
+pub use running_process::independent_spawn::{LaunchSpec, Readiness};
+/// Canonical resource-placement spawn contract selected by this facade.
+///
+/// This is the intentionally narrow exception to the usual facade-owned type
+/// rule: process placement options and their live control handle must retain
+/// identical Rust type identity across `kernal_api` and `running_process`.
+/// The re-export does not expose the substrate's general process, runtime, or
+/// platform API.
+///
+/// [`SpawnMode::Inherited`] is the default and preserves ordinary direct
+/// spawning inside the caller's cgroup or Job Object.  [`SpawnMode::Independent`]
+/// is explicit: it requires a verified native scheduler or a pre-existing
+/// broker already outside the caller's boundary.  It never silently degrades
+/// to inherited placement.  Independent placement remains subject to user,
+/// container, and machine-wide limits; it is neither privilege elevation nor
+/// a container escape.
+///
+/// For a persistent build daemon, provide an absolute program/cwd/logging
+/// [`LaunchSpec`], select `SpawnMode::Independent` with an
+/// [`IndependentBackend`], then retain [`SpawnHandle`] for reuse-safe stop or
+/// wait operations.  [`SpawnLifetime::Detached`] controls only what dropping
+/// that handle does; it is distinct from resource placement.  Readiness,
+/// cancellation, authority, and unsupported-platform failures propagate as
+/// the canonical `std::io::Error` from [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
+pub use running_process::{
+    spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,
+    SpawnOptions,
+};
+
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;

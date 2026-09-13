@@ -2543,7 +2543,7 @@ dependencies = [
 
 [[package]]
 name = "kernal-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "addr2line 0.24.2",
  "blake3",
@@ -4164,9 +4164,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.10"
+version = "4.10.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d49ccdbfa59730688bbbeca9c9f3f4ee4c8976e38e9e5929fee8128bbd046db"
+checksum = "492c9f25a9a886d7e4281eae987e2d90732ee07f01a35860899618b3b3484cc3"
 dependencies = [
  "blake3",
  "getrandom 0.4.3",
@@ -4186,29 +4186,33 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.10"
+version = "4.10.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2c944cf400635eebd05ece53fb38786005602e4f99f8ecbab45f2df0ea17194"
+checksum = "ce466bd3d8c281e4f3f409bf0931011306172fbd74032787958eaf5272505391"
 dependencies = [
  "blake3",
  "dirs 6.0.0",
+ "getrandom 0.4.3",
  "interprocess",
  "libc",
- "png 0.17.16",
+ "prost",
+ "running-process-protocol",
+ "serde",
+ "serde_json",
  "sysinfo",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "widestring",
  "winapi",
  "windows-sys 0.61.2",
- "x11rb",
 ]
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.10"
+version = "4.10.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "effd1ab4c1415bac2e5e854fbb24b13a58e9f17ccba49da4a2ed87ba9d9c58f6"
+checksum = "24283b500a0f98fec340534d7d72a5885a9d0d55aa09555fa144ff3250d16bf5"
 dependencies = [
  "prost",
  "prost-build",

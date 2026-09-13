@@ -1,7 +1,9 @@
 # Native terminal input groundwork
 
-The `pty` feature exposes `TerminalInputSession`, an owned raw-terminal capture
-session. `new` snapshots the input mode and Drop attempts to restore it. Unix
+The dependency-free `terminal-input` feature exposes key decoding and
+`TerminalInputSession`, an owned raw-terminal capture session. The `pty` feature
+includes it and additionally enables PTY process spawning through a private
+backend. `new` snapshots the input mode and Drop attempts to restore it. Unix
 returns `Ok(None)` for non-terminal stdin; Windows currently reports an error
 when stdin is not an attached console. Callers must not assume parity yet.
 

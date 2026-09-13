@@ -123,7 +123,7 @@ impl PtyChild for conpty_passthrough::child::ConPtyChild {
 #[cfg(feature = "pty")]
 pub type Backend = ConPtyBackend;
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 use crate::platform::terminal::PtyInputChunk;
 
 #[cfg(feature = "pty")]
@@ -332,10 +332,10 @@ pub fn resize_pty(
     _size: crate::platform::terminal::PtySize,
 ) -> std::io::Result<()> { Ok(()) }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 pub struct TerminalInputSession(super::terminal_input::TerminalInputCore);
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl TerminalInputSession {
     pub(crate) fn new_for_keys() -> std::io::Result<Option<Self>> {
         let input = super::terminal_input::TerminalInputCore::new();
@@ -360,7 +360,7 @@ impl TerminalInputSession {
     }
 }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl Drop for TerminalInputSession {
     fn drop(&mut self) { let _ = self.0.stop_impl(); }
 }

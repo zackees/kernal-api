@@ -1,4 +1,4 @@
-#![cfg(feature = "pty")]
+#![cfg(feature = "terminal-input")]
 
 use kernal_api::keys::{Key, KeyDecoder, KeyModifiers};
 

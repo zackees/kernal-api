@@ -7,13 +7,13 @@ use std::sync::{Arc, Mutex};
 
 static INPUT_OWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(any(windows, all(test, feature = "pty")))]
+#[cfg(any(windows, all(test, feature = "terminal-input")))]
 pub(crate) struct InputQueue<T> {
     events: std::collections::VecDeque<(T, usize)>,
     bytes: usize,
 }
 
-#[cfg(any(windows, all(test, feature = "pty")))]
+#[cfg(any(windows, all(test, feature = "terminal-input")))]
 impl<T> InputQueue<T> {
     pub(crate) fn new() -> Self {
         Self {
@@ -238,8 +238,11 @@ pub mod input {
 #[cfg(feature = "pty")]
 pub use crate::{
     Backend, ChildProcessInfo, ConPtyBackendKind, OrphanConhostInfo, PtyProcessGuard,
-    PtySpawnContext, TerminalInputSession,
+    PtySpawnContext,
 };
+
+#[cfg(feature = "terminal-input")]
+pub use crate::TerminalInputSession;
 
 #[cfg(feature = "pty")]
 pub use crate::current_backend_kind;
@@ -326,7 +329,7 @@ pub fn find_orphan_conhosts() -> Vec<OrphanConhostInfo> {
     crate::find_orphan_conhosts()
 }
 
-#[cfg(all(test, feature = "pty"))]
+#[cfg(all(test, feature = "terminal-input"))]
 mod ownership_tests {
     #[test]
     fn capture_queue_enforces_event_and_byte_limits() {

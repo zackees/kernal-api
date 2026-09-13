@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "pty"))]
+#![cfg(all(unix, feature = "terminal-input"))]
 
 use std::io;
 use std::io::Write;

@@ -870,7 +870,7 @@ impl TerminalInputCore {
         self.start_with_signal_keys(false)
     }
 
-    #[cfg(feature = "pty")]
+    #[cfg(feature = "terminal-input")]
     pub(crate) fn start_for_keys(&self) -> Result<(), std::io::Error> {
         self.start_with_signal_keys(true)
     }

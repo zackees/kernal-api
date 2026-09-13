@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 CASES = (
+    ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
@@ -74,6 +75,8 @@ def main() -> int:
         unexpected = sorted(graph & SKETCH_AND_WEBVIEW_PACKAGES)
         if unexpected:
             failures.append(f"{label} graph unexpectedly contains {', '.join(unexpected)}")
+    if "portable-pty" in tree("terminal-input"):
+        failures.append("terminal-input unexpectedly enables PTY process spawning")
     enabled_graphs: dict[str, set[str]] = {}
     # getrandom already occurs transitively in the host substrate. Prove this
     # capability activates the backend without importing unrelated facilities;

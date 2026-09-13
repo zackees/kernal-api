@@ -38,6 +38,8 @@ default = []
 secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 terminal-style = []
+# Native terminal capture and key decoding without PTY process spawning.
+terminal-input = []
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the
@@ -71,7 +73,7 @@ daemon-registration = ["running-process/daemon-registration"]
 # separate from v1 records and pulls no broker client, identity, IPC, or
 # runtime policy into applications that dual-write during the v1-to-v2 rollout.
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
-pty = ["dep:portable-pty"]
+pty = ["dep:portable-pty", "terminal-input"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
 http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures-core"]
 # Window-icon and stock-icon mechanics for the host console or a child. This

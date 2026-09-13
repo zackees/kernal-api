@@ -1,4 +1,4 @@
-#![cfg(all(windows, feature = "pty"))]
+#![cfg(all(windows, feature = "terminal-input"))]
 
 use std::io;
 use std::process::{Command, Stdio};

@@ -193,7 +193,7 @@ pub use pty::*;
 
 #[cfg(feature = "pty")]
 use crate::platform::process::UnixSignalKind;
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 use crate::platform::terminal::PtyInputChunk;
 
 #[cfg(feature = "pty")]
@@ -387,14 +387,14 @@ pub fn find_orphan_conhosts() -> Vec<OrphanConhostInfo> {
     Vec::new()
 }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 pub struct TerminalInputSession {
     stdin_fd: i32,
     original_mode: libc::termios,
     _input_lease: crate::platform::terminal::InputLease,
 }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl TerminalInputSession {
     pub fn new() -> std::io::Result<Option<Self>> {
         Self::new_with_mode(true)
@@ -470,7 +470,7 @@ impl TerminalInputSession {
     }
 }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl Drop for TerminalInputSession {
     fn drop(&mut self) {
         unsafe {

@@ -47,6 +47,9 @@ pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDir
 
 pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     let actual = file_security_descriptor(path)?;
+    if !actual.owner_is(&current_user_sid_bytes()?)? {
+        return Ok(false);
+    }
     if !actual.dacl_is_protected()? {
         return Ok(false);
     }
@@ -175,7 +178,6 @@ fn exact_full_control_ace(dacl: &[u8], offset: usize, principal: &[u8]) -> Optio
     Some(end)
 }
 
-#[cfg(any(feature = "fs", feature = "ipc"))]
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
@@ -247,9 +249,15 @@ fn current_user_sid_sddl() -> io::Result<String> {
 
 #[cfg(feature = "ipc")]
 fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-    use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION};
 
-    apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
+    let owner = current_user_sid_bytes()?;
+    apply_dacl_sddl(
+        path,
+        sddl,
+        PROTECTED_DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+        Some(&owner),
+    )
 }
 
 #[cfg(feature = "ipc")]
@@ -257,10 +265,11 @@ fn apply_dacl_sddl(
     path: &Path,
     sddl: &str,
     inheritance_control: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
+    owner: Option<&[u8]>,
 ) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION};
 
     let descriptor = LocalSecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
@@ -277,8 +286,10 @@ fn apply_dacl_sddl(
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | inheritance_control,
-            std::ptr::null_mut(),
+            DACL_SECURITY_INFORMATION
+                | inheritance_control
+                | if owner.is_some() { OWNER_SECURITY_INFORMATION } else { 0 },
+            owner.map_or(std::ptr::null_mut(), |sid| sid.as_ptr().cast_mut().cast()),
             std::ptr::null_mut(),
             dacl.as_ptr(),
             std::ptr::null_mut(),
@@ -308,7 +319,7 @@ fn file_security_descriptor(path: &Path) -> io::Result<LocalSecurityDescriptor> 
         GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            DACL_SECURITY_INFORMATION | windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -373,6 +384,26 @@ impl LocalSecurityDescriptor {
             return Err(io::Error::last_os_error());
         }
         Ok(control & SE_DACL_PROTECTED != 0)
+    }
+
+    fn owner_is(&self, expected: &[u8]) -> io::Result<bool> {
+        use windows_sys::Win32::Security::{EqualSid, GetSecurityDescriptorOwner, PSID};
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `self.0` is a live descriptor owned by `self`; both output
+        // pointers refer to writable locals and `expected` is a validated SID
+        // copied from the current process token.
+        let ok = unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if owner.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: `owner` borrows the live descriptor and `expected` is the
+        // validated current-user SID returned by GetTokenInformation.
+        Ok(unsafe { EqualSid(owner, expected.as_ptr().cast_mut().cast()) } != 0)
     }
 
     fn dacl(&self) -> io::Result<SecurityDescriptorDacl<'_>> {
@@ -546,6 +577,7 @@ mod tests {
             &directory,
             &private_sddl,
             UNPROTECTED_DACL_SECURITY_INFORMATION,
+            None,
         )
         .unwrap();
         let unprotected = file_security_descriptor(&directory).unwrap();

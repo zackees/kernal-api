@@ -209,6 +209,26 @@ fn typed_scalars_keep_their_types_and_reject_invalid_input() {
     );
 }
 
+#[test]
+fn help_is_rendered_without_exposing_the_parser_backend() {
+    let schema = Command::new("fastled")
+        .about("FastLED WASM compilation CLI")
+        .option(OptionSpec::flag("quick").help("Build quickly."))
+        .option(
+            OptionSpec::value("link", ValueKind::enumeration(["static", "dynamic"]))
+                .help("Select static or dynamic linking."),
+        )
+        .subcommand(Command::new("source").about("Manage cached source."));
+
+    let help = schema.render_help();
+    assert!(help.contains("Usage: fastled [OPTIONS] [COMMAND]"));
+    assert!(help.contains("FastLED WASM compilation CLI"));
+    assert!(help.contains("--quick"));
+    assert!(help.contains("Select static or dynamic linking."));
+    assert!(help.contains("source"));
+    assert!(!help.contains("clap"));
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 
 /// Maximum number of command-line words accepted by [`Command::parse`].
 pub const MAX_ARGUMENTS: usize = 1_024;
@@ -60,6 +61,7 @@ pub struct OptionSpec {
     repeated: bool,
     conflicts: Vec<String>,
     requires_any: Vec<String>,
+    help: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +82,7 @@ impl OptionSpec {
             repeated: false,
             conflicts: Vec::new(),
             requires_any: Vec::new(),
+            help: None,
         }
     }
 
@@ -93,6 +96,7 @@ impl OptionSpec {
             repeated: false,
             conflicts: Vec::new(),
             requires_any: Vec::new(),
+            help: None,
         }
     }
 
@@ -129,12 +133,19 @@ impl OptionSpec {
         self.requires_any.extend(names.into_iter().map(Into::into));
         self
     }
+
+    /// Describe this option in facade-rendered help.
+    pub fn help(mut self, text: impl Into<String>) -> Self {
+        self.help = Some(text.into());
+        self
+    }
 }
 
 /// A declarative command and its nested subcommands.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Command {
     name: String,
+    about: Option<String>,
     options: Vec<OptionSpec>,
     positionals: Vec<PositionalSpec>,
     subcommands: Vec<Self>,
@@ -146,6 +157,7 @@ impl Command {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            about: None,
             options: Vec::new(),
             positionals: Vec::new(),
             subcommands: Vec::new(),
@@ -157,6 +169,58 @@ impl Command {
     pub fn option(mut self, option: OptionSpec) -> Self {
         self.options.push(option);
         self
+    }
+
+    /// Describe this command in facade-rendered help.
+    pub fn about(mut self, text: impl Into<String>) -> Self {
+        self.about = Some(text.into());
+        self
+    }
+
+    /// Render deterministic, backend-independent help for this command.
+    pub fn render_help(&self) -> String {
+        let mut output = format!("Usage: {}", self.name);
+        if !self.options.is_empty() {
+            output.push_str(" [OPTIONS]");
+        }
+        if !self.positionals.is_empty() {
+            for positional in &self.positionals {
+                let token = format!("<{}>", positional.name);
+                if positional.optional {
+                    let _ = write!(output, " [{token}]");
+                } else {
+                    let _ = write!(output, " {token}");
+                }
+            }
+        }
+        if !self.subcommands.is_empty() {
+            output.push_str(" [COMMAND]");
+        }
+        output.push('\n');
+        if let Some(about) = &self.about {
+            let _ = write!(output, "\n{about}\n");
+        }
+        if !self.options.is_empty() {
+            output.push_str("\nOptions:\n");
+            for option in &self.options {
+                let suffix = match &option.kind {
+                    None => String::new(),
+                    Some(_) if option.default_missing.is_some() => " [VALUE]".to_owned(),
+                    Some(_) => " <VALUE>".to_owned(),
+                };
+                let repeat = if option.repeated { "..." } else { "" };
+                let help = option.help.as_deref().unwrap_or("");
+                let _ = writeln!(output, "  --{}{suffix}{repeat}\t{help}", option.name);
+            }
+        }
+        if !self.subcommands.is_empty() {
+            output.push_str("\nCommands:\n");
+            for command in &self.subcommands {
+                let about = command.about.as_deref().unwrap_or("");
+                let _ = writeln!(output, "  {}\t{about}", command.name);
+            }
+        }
+        output
     }
 
     /// Add a required positional value in declaration order.

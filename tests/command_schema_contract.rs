@@ -157,6 +157,31 @@ fn optional_and_repeated_values_and_option_relations_are_enforced() {
     );
 }
 
+#[test]
+fn optional_positionals_do_not_hide_subcommands() {
+    let schema = Command::new("fastled")
+        .optional_positional("directory", ValueKind::string())
+        .subcommand(
+            Command::new("toolchain")
+                .subcommand(Command::new("activate").positional("package-id", ValueKind::string())),
+        );
+
+    let directory = schema.parse(["fastled", "sketch"]).unwrap();
+    assert_eq!(directory.value("directory"), Some("sketch"));
+    assert_eq!(directory.command_path(), ["fastled"]);
+
+    let nested = schema
+        .parse(["fastled", "toolchain", "activate", "wasm-3.1"])
+        .unwrap();
+    assert_eq!(nested.command_path(), ["fastled", "toolchain", "activate"]);
+    assert_eq!(nested.value("directory"), None);
+    assert_eq!(nested.value("package-id"), Some("wasm-3.1"));
+    assert_eq!(
+        schema.parse(["fastled", "toolchain", "activate"]),
+        Err(CommandError::InvalidArguments)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {

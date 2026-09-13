@@ -871,6 +871,25 @@ impl<T> Sender<T> {
             .map_err(|error| SendError(error.0))
     }
 
+    /// Send from a synchronous producer, parking this thread until capacity is
+    /// available. No runtime is created, and the bounded queue is unchanged.
+    ///
+    /// There is no independent timeout. The consumer must close or drop the
+    /// receiver to wake waiting producers when cancelling its work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent value if the receiver closes or is dropped, or if
+    /// this thread has entered a runtime. Use [`Self::send`] inside a runtime.
+    pub fn blocking_send(&self, value: T) -> Result<(), BlockingSendError<T>> {
+        if RuntimeHandle::current().is_ok() {
+            return Err(BlockingSendError::AsyncContext(value));
+        }
+        self.inner
+            .blocking_send(value)
+            .map_err(|error| BlockingSendError::Closed(error.0))
+    }
+
     /// Send a value without waiting for capacity.
     ///
     /// # Errors
@@ -1025,6 +1044,17 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("the kernal-api channel receiver has been dropped")]
 pub struct SendError<T>(pub T);
+
+/// A synchronous send failed, retaining the unsent value.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum BlockingSendError<T> {
+    /// The receiving half has been closed or dropped.
+    #[error("the kernal-api channel receiver is closed")]
+    Closed(T),
+    /// Blocking is forbidden on a thread that has entered a runtime.
+    #[error("blocking channel send cannot run inside a runtime")]
+    AsyncContext(T),
+}
 
 /// A value could not be sent through a bounded channel without waiting.
 #[derive(Clone, Copy, Debug, thiserror::Error)]

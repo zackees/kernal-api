@@ -14,6 +14,8 @@ import subprocess
 import sys
 
 CASES = (
+    ("pty", "portable-pty"),
+    ("text-similarity", "strsim"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),
@@ -25,6 +27,7 @@ CASES = (
     ("http-server", "hyper"),
     ("http-server", "http-body-util"),
     ("event-stream", "tokio-stream"),
+    ("sqlite", "rusqlite"),
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),
@@ -78,7 +81,26 @@ def main() -> int:
         unexpected = sorted(graph & SKETCH_AND_WEBVIEW_PACKAGES)
         if unexpected:
             failures.append(f"{label} graph unexpectedly contains {', '.join(unexpected)}")
+    if "portable-pty" in tree("terminal-input"):
+        failures.append("terminal-input unexpectedly enables PTY process spawning")
     enabled_graphs: dict[str, set[str]] = {}
+    # getrandom already occurs transitively in the host substrate. Prove this
+    # capability activates the backend without importing unrelated facilities;
+    # default absence of the package would be a false claim.
+    entropy_graph = tree("secure-random")
+    if "getrandom" not in entropy_graph:
+        failures.append("secure-random graph omits its OS entropy backend")
+    unexpected_entropy = sorted(
+        (entropy_graph - default_graph)
+        & (
+            SKETCH_AND_WEBVIEW_PACKAGES
+            | {"crash-handler", "console-subscriber", "mimalloc-pprof", "framehop"}
+        )
+    )
+    if unexpected_entropy:
+        failures.append(
+            f"secure-random adds unrelated facilities: {', '.join(unexpected_entropy)}"
+        )
     for feature, package in CASES:
         if package in default_graph:
             failures.append(f"RED failed: default graph unexpectedly contains {package}")

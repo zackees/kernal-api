@@ -30,6 +30,28 @@ mod process_adapter;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Synchronous, bounded SQLite storage mechanics.
+///
+/// This facade owns connection safety policy and semantic result values; the
+/// application owns its schema, SQL, migrations, and choice of blocking
+/// worker. Do not call it on an async executor thread.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
+/// Bounded, fallible operating-system entropy without token-format policy.
+#[cfg(feature = "secure-random")]
+pub mod random;
+#[cfg(feature = "text-similarity")]
+pub mod text;
+
+/// Bounded terminal key decoding and owned native polling.
+#[cfg(feature = "terminal-input")]
+pub mod keys;
+
+/// Allocation-free diagnostic styling and native ANSI output preparation.
+#[cfg(feature = "terminal-style")]
+pub mod terminal_style;
+
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]
 pub mod archive;
@@ -113,8 +135,9 @@ pub mod webview {
     #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestTraceEvent;
     pub use crate::tauri::{
-        ExternalWebviewClient, ExternalWebviewHost, ViewportCaptureLimits, WebviewError,
-        WebviewHandle, WebviewPermissions, WebviewSnapshot, WebviewSnapshotChunk, WebviewUrlGrant,
+        ExternalWebviewClient, ExternalWebviewHost, PageBootstrapError, ViewportCaptureLimits,
+        WebviewError, WebviewHandle, WebviewPageBootstrap, WebviewPermissions, WebviewSnapshot,
+        WebviewSnapshotChunk, WebviewUrlGrant, WebviewWindowOptions, WindowOptionsError,
     };
 }
 
@@ -237,6 +260,12 @@ pub use platform_imp::{
     fs_try_lock_shared, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
     fs_user_runtime_dir, fs_user_state_dir, FsFileIdentity,
 };
+
+#[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_read_private_regular_file_bounded;
+
+#[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_read_context_regular_file_bounded;
 
 #[cfg(feature = "fs-watch")]
 pub use platform_imp::FsWatchWatcher;
@@ -395,8 +424,11 @@ pub use platform_imp::terminal::{
     input_payload, is_ignorable_process_control_error, prepare_unmanaged_pty_child,
     query_responses, resize_pty, shell_argv, signal_pty_tree, terminate_pty_child,
     wait_before_pty_close_supported, Backend, ChildProcessInfo, ConPtyBackendKind,
-    OrphanConhostInfo, PtyProcessGuard, PtySpawnContext, TerminalInputSession,
+    OrphanConhostInfo, PtyProcessGuard, PtySpawnContext,
 };
+
+#[cfg(feature = "terminal-input")]
+pub use platform_imp::terminal::TerminalInputSession;
 
 #[cfg(feature = "session-relay")]
 pub use platform_imp::relay_local_socket_session;

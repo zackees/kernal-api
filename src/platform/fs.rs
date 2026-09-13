@@ -18,6 +18,11 @@
 //! a maintained backend privately, because there is no std equivalent and a
 //! hand-rolled reflink ioctl is not something to get wrong silently.
 
+#[cfg(feature = "fs")]
+mod temporary;
+#[cfg(feature = "fs")]
+pub use temporary::{TemporaryDirectory, MAX_TEMP_PREFIX_BYTES};
+
 /// A descriptor the caller already owns and has asked us to write to.
 ///
 /// Deliberately opaque. Callers hold host-specific things -- a `RawFd` on
@@ -122,6 +127,306 @@ pub use crate::{
     FsFileIdentity as FileIdentity,
 };
 
+/// Largest byte limit accepted by [`read_private_regular_file_bounded`].
+///
+/// This is deliberately a hard ceiling as well as a caller-selected limit:
+/// this convenience operation returns one allocation rather than a stream.
+#[cfg(feature = "fs")]
+pub const MAX_PRIVATE_REGULAR_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Largest byte limit accepted by [`read_context_regular_file_bounded`].
+///
+/// Context collection returns one allocation, so this is a hard facade cap as
+/// well as a caller-selected bound.
+#[cfg(feature = "fs")]
+pub const MAX_CONTEXT_REGULAR_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+/// The final path component's kind, observed without following a link.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContextPathKind {
+    /// An ordinary regular file.
+    RegularFile,
+    /// A directory.
+    Directory,
+    /// A symbolic link or Windows reparse point.
+    Symlink,
+    /// A FIFO, device, socket, or another non-regular native object.
+    Other,
+}
+
+/// Portable metadata for a context path or a coherently-read regular file.
+///
+/// `identity` is absent for a standalone non-following path observation:
+/// obtaining a portable identity there would require opening the path and can
+/// change its meaning. A successful bounded read always supplies the identity
+/// of its final open handle.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextPathMetadata {
+    /// The final component's observed kind.
+    pub kind: ContextPathKind,
+    /// Length for a regular file; absent for all other kinds.
+    pub len: Option<u64>,
+    /// Last modification time when the filesystem reports one.
+    pub modified: Option<SystemTime>,
+    /// Stable identity when observed from an open regular-file handle.
+    pub identity: Option<FileIdentity>,
+}
+
+/// A bounded regular-file read together with its final-handle observation.
+///
+/// The native implementation compares identity, length, and modification time
+/// before and after reading, then re-identifies the final path without
+/// following links. It rejects changes it can observe. This is not an atomic
+/// filesystem-tree snapshot: trusted ancestors remain the caller's
+/// responsibility, and filesystems with coarse or mutable timestamps can hide
+/// an in-place content change. Native open/read calls are synchronous and
+/// cannot be forcibly interrupted by this facade.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextFileObservation {
+    /// The bytes, bounded by the caller's limit.
+    pub bytes: Vec<u8>,
+    /// Metadata derived from the final open handle after the read.
+    pub metadata: ContextPathMetadata,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) fn context_path_kind(metadata: &std::fs::Metadata) -> ContextPathKind {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return ContextPathKind::Symlink;
+        }
+    }
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        ContextPathKind::Symlink
+    } else if file_type.is_file() {
+        ContextPathKind::RegularFile
+    } else if file_type.is_dir() {
+        ContextPathKind::Directory
+    } else {
+        ContextPathKind::Other
+    }
+}
+
+#[cfg(feature = "fs")]
+pub(crate) fn context_regular_file_metadata(
+    metadata: &std::fs::Metadata,
+    identity: FileIdentity,
+) -> io::Result<ContextPathMetadata> {
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input is not a regular file",
+        ));
+    }
+    Ok(ContextPathMetadata {
+        kind: ContextPathKind::RegularFile,
+        len: Some(metadata.len()),
+        modified: Some(metadata.modified()?),
+        identity: Some(identity),
+    })
+}
+
+/// Observe the final path component without following a symbolic link.
+///
+/// This is a point-in-time classification only. It does not open the path,
+/// establish a sandbox boundary, or make a later operation race-free.
+#[cfg(feature = "fs")]
+pub fn context_path_metadata_no_follow(path: &Path) -> io::Result<ContextPathMetadata> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    let kind = context_path_kind(&metadata);
+    Ok(ContextPathMetadata {
+        kind,
+        len: (kind == ContextPathKind::RegularFile).then_some(metadata.len()),
+        modified: metadata.modified().ok(),
+        identity: None,
+    })
+}
+
+/// Return a symbolic link's raw target without resolving it.
+///
+/// The returned path is inert text. It may be relative, dangling, or outside
+/// a caller's selected root; the caller owns any policy before following it.
+#[cfg(feature = "fs")]
+pub fn read_context_link(path: &Path) -> io::Result<PathBuf> {
+    std::fs::read_link(path)
+}
+
+/// Resolve a path using the host's canonicalization rules.
+///
+/// This follows links and therefore is separate from
+/// [`context_path_metadata_no_follow`] and bounded regular-file reading.
+#[cfg(feature = "fs")]
+pub fn canonical_context_path(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path)
+}
+
+/// Read an ordinary user-authorized regular file with a bounded allocation.
+///
+/// The final component is opened without following a link. Unix also opens
+/// nonblocking so a FIFO can be rejected from handle metadata without waiting.
+/// Ancestors are not protected from replacement or link traversal: callers
+/// must trust them. At most `max_bytes + 1` bytes are allocated/read, and a
+/// successful result includes a coherent final-handle observation.
+#[cfg(feature = "fs")]
+pub fn read_context_regular_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<ContextFileObservation> {
+    if max_bytes > MAX_CONTEXT_REGULAR_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "context regular-file limit {max_bytes} exceeds the {} byte facade cap",
+                MAX_CONTEXT_REGULAR_FILE_BYTES
+            ),
+        ));
+    }
+    crate::fs_read_context_regular_file_bounded(path, max_bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Demand-driven directory cursor
+// ---------------------------------------------------------------------------
+
+/// One owned entry observed by a [`DirectoryCursor`].
+///
+/// `kind` is a point-in-time, non-following classification of the entry's
+/// final component. It is not a handle observation and does not make a later
+/// open race-free.
+#[cfg(feature = "fs")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCursorEntry {
+    path: PathBuf,
+    file_name: OsString,
+    kind: ContextPathKind,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryCursorEntry {
+    /// The entry path formed from the cursor's supplied directory path and
+    /// this entry's name. It is owned but is not canonicalized or guaranteed
+    /// to be absolute.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The entry's final component, owned independently of the native handle.
+    pub fn file_name(&self) -> &OsStr {
+        &self.file_name
+    }
+
+    /// The entry's observed final-component kind without following a link.
+    pub fn kind(&self) -> ContextPathKind {
+        self.kind
+    }
+}
+
+/// A synchronous, demand-driven, nonrecursive directory enumeration.
+///
+/// The cursor owns one native directory-enumeration handle. Each
+/// [`next_entry`](Self::next_entry) call asks the host for at most the next
+/// entry; it neither descends into child directories nor collects, sorts, or
+/// prefetches the rest of the directory. Native APIs can still buffer entries
+/// internally, so this is not a claim that the operating system reads exactly
+/// one directory record per call.
+///
+/// Dropping the cursor deterministically releases its native handle, which
+/// lets a bounded consumer stop without enumerating the remainder. Calls are
+/// synchronous native operations and may block. Opening a directory by path
+/// follows the final link where the host does so. This cursor is not a hostile
+/// path sandbox or an atomic directory snapshot: callers must trust and police
+/// the root and its ancestors, and make separate observations before any
+/// security-sensitive operation.
+#[cfg(feature = "fs")]
+pub struct DirectoryCursor {
+    // Kept private so callers cannot retain a native entry/handle. `ReadDir`
+    // is the kernel's native directory cursor on every supported host.
+    native: std::fs::ReadDir,
+}
+
+#[cfg(feature = "fs")]
+impl DirectoryCursor {
+    /// Open `directory` for demand-driven, nonrecursive enumeration.
+    ///
+    /// Missing paths, non-directories, and inaccessible directories return the
+    /// host error. The supplied spelling is retained in each entry path; it is
+    /// not canonicalized.
+    pub fn open(directory: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self {
+            native: std::fs::read_dir(directory)?,
+        })
+    }
+
+    /// Yield the next entry, or `None` after the directory is exhausted.
+    ///
+    /// An error from native enumeration or entry classification is returned to
+    /// the caller; it is not hidden or converted into end-of-directory.
+    pub fn next_entry(&mut self) -> io::Result<Option<DirectoryCursorEntry>> {
+        let Some(entry) = self.native.next() else {
+            return Ok(None);
+        };
+        let entry = entry?;
+        // Copy every facade value before `DirEntry` is dropped. On Unix a
+        // retained `DirEntry` can retain the directory descriptor.
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let kind = context_path_kind(&std::fs::symlink_metadata(&path)?);
+        Ok(Some(DirectoryCursorEntry {
+            path,
+            file_name,
+            kind,
+        }))
+    }
+}
+
+/// Read a current-user-private regular file, rejecting links and oversized
+/// input.
+///
+/// The final path component is opened without following a link, and all file
+/// security checks are made from that same open handle before its contents are
+/// read. The immediate parent must also be a current-user-private directory.
+/// The path is re-identified after reading where the host can do so, so a
+/// replacement of that final component during the operation is rejected rather
+/// than silently read. This is not a filesystem sandbox: callers must supply a
+/// trusted parent and ancestor path, and must prevent races that could replace
+/// or redirect those path components while this operation runs.
+///
+/// `max_bytes` is both the returned-data limit and the allocation/read bound:
+/// at most `max_bytes + 1` bytes are read in order to distinguish an exact
+/// limit from an oversized file. Limits above
+/// [`MAX_PRIVATE_REGULAR_FILE_BYTES`] are rejected.
+///
+/// On Unix, private means owned by the effective uid with no group or other
+/// permission bits. On Windows, the trusted parent must have the protected
+/// owner-and-SYSTEM DACL, and the opened file must be owned by the current user
+/// with exactly the private owner-rights-and-SYSTEM full-control DACL, either
+/// direct or inherited. The final component's reparse point is rejected; no
+/// claim is made about reparse points in ancestors.
+/// Callers that create staging files must still create them under an
+/// owner-private directory (for example the runtime-directory helper's
+/// result); this operation does not repair insecure paths.
+#[cfg(feature = "fs")]
+pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    if max_bytes > MAX_PRIVATE_REGULAR_FILE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "private regular-file limit {max_bytes} exceeds the {} byte facade cap",
+                MAX_PRIVATE_REGULAR_FILE_BYTES
+            ),
+        ));
+    }
+    crate::fs_read_private_regular_file_bounded(path, max_bytes)
+}
+
+#[cfg(feature = "fs")]
+use std::ffi::{OsStr, OsString};
 #[cfg(feature = "fs")]
 use std::fs::File;
 #[cfg(feature = "fs")]

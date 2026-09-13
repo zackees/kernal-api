@@ -153,9 +153,40 @@ impl std::error::Error for TaskError {}
 /// Owned asynchronous runtime.
 pub struct Runtime {
     inner: tokio::runtime::Runtime,
+    drivers_enabled: bool,
 }
 
 impl Runtime {
+    /// Register for native Ctrl+C notifications before returning.
+    ///
+    /// Requires a runtime built with `enable_all`; otherwise returns
+    /// `Unsupported` without installing a signal handler. Registration failures
+    /// propagate. The listener borrows this runtime and uses its existing driver.
+    ///
+    /// Registration changes process-wide handling: dropping listeners does not
+    /// restore the default handler. Applications must own graceful exit policy.
+    pub fn interrupt_signal(&self) -> std::io::Result<InterruptSignal<'_>> {
+        if !self.drivers_enabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "interrupt notifications require enabled runtime drivers",
+            ));
+        }
+        let _entered = self.inner.enter();
+        Ok(InterruptSignal {
+            inner: crate::platform_imp::interrupt::InterruptReceiver::new()?,
+            _runtime: self,
+        })
+    }
+
+    /// Register and wait for one Ctrl+C notification when first polled.
+    ///
+    /// For registration before polling, use [`Self::interrupt_signal`] instead.
+    /// The same driver requirements and process-wide handler effects apply.
+    pub async fn wait_for_interrupt(&self) -> std::io::Result<()> {
+        self.interrupt_signal()?.wait().await
+    }
+
     /// Run one future to completion on this runtime.
     pub fn run<F: Future>(&self, future: F) -> F::Output {
         self.inner.block_on(future)
@@ -172,6 +203,7 @@ impl Runtime {
 /// Builder for an owned asynchronous runtime.
 pub struct RuntimeBuilder {
     inner: tokio::runtime::Builder,
+    drivers_enabled: bool,
 }
 
 impl RuntimeBuilder {
@@ -179,6 +211,7 @@ impl RuntimeBuilder {
     pub fn current_thread() -> Self {
         Self {
             inner: tokio::runtime::Builder::new_current_thread(),
+            drivers_enabled: false,
         }
     }
 
@@ -186,12 +219,14 @@ impl RuntimeBuilder {
     pub fn multi_thread() -> Self {
         Self {
             inner: tokio::runtime::Builder::new_multi_thread(),
+            drivers_enabled: false,
         }
     }
 
     /// Enable the engine's I/O, time, and signal drivers.
     pub fn enable_all(mut self) -> Self {
         self.inner.enable_all();
+        self.drivers_enabled = true;
         self
     }
 
@@ -209,7 +244,48 @@ impl RuntimeBuilder {
 
     /// Create the configured runtime.
     pub fn build(mut self) -> std::io::Result<Runtime> {
-        self.inner.build().map(|inner| Runtime { inner })
+        self.inner.build().map(|inner| Runtime {
+            inner,
+            drivers_enabled: self.drivers_enabled,
+        })
+    }
+}
+
+/// Owned subscription to native Ctrl+C notifications.
+///
+/// Created by [`Runtime::interrupt_signal`], not an ambient or second runtime.
+/// Unix observes SIGINT; Windows observes console CTRL_C, not CTRL_BREAK,
+/// close, logoff or shutdown. Notifications may coalesce and every registered
+/// listener is notified; this is not an exact interrupt counter.
+///
+/// The borrowed runtime must be driven to deliver notifications. No timeout is
+/// imposed on an intentional wait for user input; callers may use [`timeout`]
+/// or cancel the wait. Dropping this subscription does not restore process-wide
+/// signal handlers. It does not cancel work or select an exit code.
+///
+/// A listener cannot outlive the runtime that drives it:
+///
+/// ```compile_fail
+/// let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
+///     .enable_all().build().unwrap();
+/// let listener = runtime.interrupt_signal().unwrap();
+/// drop(runtime);
+/// drop(listener);
+/// ```
+pub struct InterruptSignal<'runtime> {
+    inner: crate::platform_imp::interrupt::InterruptReceiver,
+    _runtime: &'runtime Runtime,
+}
+
+impl InterruptSignal<'_> {
+    /// Wait for one notification, or report a closed native receiver.
+    ///
+    /// Cancellation-safe: dropping a pending wait does not consume a later
+    /// notification. A subsequent wait can observe it. Signals may coalesce.
+    pub async fn wait(&mut self) -> std::io::Result<()> {
+        self.inner.recv().await.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "interrupt receiver closed")
+        })
     }
 }
 

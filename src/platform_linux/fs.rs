@@ -1,7 +1,7 @@
 //! Linux per-user directory placement for product runtime artifacts.
 
 use std::fs::File;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Directory for `product`'s ephemeral runtime artifacts (sockets, pid files).
@@ -288,4 +288,149 @@ pub fn create_private_file(path: &Path) -> io::Result<File> {
         .create_new(true)
         .mode(0o600)
         .open(path)
+}
+
+/// Secure, bounded private-file read for the facade.
+pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file path has no parent")
+    })?;
+    let parent_metadata = parent.metadata()?;
+    if !parent_metadata.is_dir()
+        // SAFETY: `geteuid` has no preconditions and only reads this process's credentials.
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private file parent is not current-user private",
+        ));
+    }
+
+    // O_NONBLOCK makes opening a FIFO harmless long enough to reject it from
+    // the handle metadata; O_NOFOLLOW keeps the final component honest.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private input is not a regular file",
+        ));
+    }
+    // SAFETY: `geteuid` has no preconditions and only reads this process's credentials.
+    if metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "private input is not current-user private",
+        ));
+    }
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "private file limit overflows")
+    })?;
+    if metadata.len() > max_bytes as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file)
+        .take(bound_plus_one as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "private input exceeds limit"));
+    }
+    let opened = file_identity(&file)?;
+    if path_identity(path)? != opened {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private input path changed while it was read",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Bounded ordinary regular-file observation for the public context facade.
+pub fn read_context_regular_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<crate::platform::fs::ContextFileObservation> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "context file limit overflows")
+    })?;
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input final component is a symbolic link",
+        ));
+    }
+    // O_NONBLOCK makes opening a FIFO harmless long enough to reject it from
+    // the handle metadata; O_NOFOLLOW applies solely to the final component.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input is not a regular file",
+        ));
+    }
+    let identity = file_identity(&file)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable")
+    })?;
+    let before_modified = before.modified()?;
+    if before.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input exceeds limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file)
+        .take(bound_plus_one as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input exceeds limit",
+        ));
+    }
+    let after = file.metadata()?;
+    let after_identity = file_identity(&file)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable")
+    })?;
+    if after_identity != identity
+        || after.len() != before.len()
+        || after.modified()? != before_modified
+        || bytes.len() as u64 != after.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input changed while it was read",
+        ));
+    }
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.is_file()
+        || (FileIdentity {
+            device: path_metadata.dev(),
+            file: path_metadata.ino(),
+        }) != identity
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input path changed while it was read",
+        ));
+    }
+    Ok(crate::platform::fs::ContextFileObservation {
+        bytes,
+        metadata: crate::platform::fs::context_regular_file_metadata(&after, identity)?,
+    })
 }

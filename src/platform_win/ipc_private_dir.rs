@@ -1,8 +1,12 @@
+#[cfg(feature = "ipc")]
 use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
+#[cfg(feature = "fs")]
+use std::{fs::File, os::windows::io::AsRawHandle as _};
 
+#[cfg(feature = "ipc")]
 use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 
 /// Protected, inheritable owner-and-SYSTEM DACL for private IPC directories.
@@ -13,6 +17,7 @@ use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 /// the directory. Reapplying this policy repairs that legacy state.
 const PRIVATE_DIR_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)";
 
+#[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
     fs::create_dir_all(path)?;
     // Avoid an expensive recursive DACL propagation on every warm manifest
@@ -45,12 +50,112 @@ pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     Ok(actual.dacl()?.bytes()? == expected.dacl()?.bytes()?)
 }
 
+/// Validate the confidentiality policy of an already-open regular file.
+///
+/// This uses `GetSecurityInfo` on the handle rather than reopening the path:
+/// a rename or reparse-point swap cannot change the object whose owner and
+/// DACL are checked. We accept only the two exact owner/SYSTEM full-control
+/// ACL forms Windows creates directly or by inheriting `PRIVATE_DIR_SDDL`.
+/// Every other ACE kind, principal, mask, order, or callback payload differs
+/// byte-for-byte and fails closed.
+#[cfg(feature = "fs")]
+pub(super) fn opened_file_is_current_user_private(file: &File) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let current_sid = current_user_sid_bytes()?;
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `file` owns a live handle; all output pointers refer to writable
+    // locals. On success the descriptor is a LocalFree allocation adopted
+    // immediately below, so no native allocation escapes this function.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file security descriptor is incomplete"));
+    }
+    let actual = LocalSecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file security descriptor has no owner"));
+    }
+    // SAFETY: owner was returned from `actual` and current_sid contains the
+    // valid SID bytes copied from the current process token.
+    if unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } == 0 {
+        return Ok(false);
+    }
+    // `OW` is the Owner Rights SID rather than a literal account SID: it is
+    // exactly what the protected parent policy inherits into a child. The
+    // owner equality above independently proves this object belongs to the
+    // current user.
+    let direct = LocalSecurityDescriptor::from_sddl("D:P(A;;FA;;;OW)(A;;FA;;;SY)")?;
+    let inherited = LocalSecurityDescriptor::from_sddl("D:(A;ID;FA;;;OW)(A;ID;FA;;;SY)")?;
+    let actual = actual.dacl()?.bytes()?;
+    Ok(actual == direct.dacl()?.bytes()? || actual == inherited.dacl()?.bytes()?)
+}
+
+#[cfg(feature = "fs")]
+fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+
+    let mut token = std::ptr::null_mut();
+    // SAFETY: output pointer is valid; returned token is closed before return.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    struct Token(windows_sys::Win32::Foundation::HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            // SAFETY: this is the unique successful OpenProcessToken handle.
+            unsafe { CloseHandle(self.0); }
+        }
+    }
+    let _token = Token(token);
+    let mut needed = 0;
+    // SAFETY: documented size query with null buffer.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    if needed == 0 { return Err(io::Error::last_os_error()); }
+    let mut buffer = vec![0_u8; needed as usize];
+    // SAFETY: buffer has exactly the requested capacity and token remains live.
+    if unsafe { GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), needed, &mut needed) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: TOKEN_USER may be only byte-aligned in the Vec; read_unaligned
+    // copies its pointer field without creating an aligned reference.
+    let sid = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) }.User.Sid;
+    if sid.is_null() || unsafe { IsValidSid(sid) } == 0 { return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid current-user SID")); }
+    let length = unsafe { GetLengthSid(sid) } as usize;
+    if length == 0 || length > 1024 { return Err(io::Error::new(io::ErrorKind::InvalidData, "implausible current-user SID length")); }
+    // SAFETY: IsValidSid and GetLengthSid above validated this live token SID.
+    Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length).to_vec() })
+}
+
+#[cfg(feature = "ipc")]
 fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
 
     apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
 }
 
+#[cfg(feature = "ipc")]
 fn apply_dacl_sddl(
     path: &Path,
     sddl: &str,
@@ -258,7 +363,7 @@ impl Drop for LocalSecurityDescriptor {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ipc"))]
 mod tests {
     use std::fs::{self, File};
 
@@ -374,5 +479,28 @@ mod tests {
             OwnerPrivateDirectoryOutcome::Hardened
         );
         File::open(&file).unwrap();
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn inherited_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        ensure_owner_private_directory(&directory).unwrap();
+        let child = directory.join("marker");
+        fs::write(&child, b"marker").unwrap();
+
+        assert_eq!(
+            crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap(),
+            b"marker"
+        );
+
+        apply_protected_dacl_sddl(&child, "D:P(A;;GR;;;WD)").unwrap();
+        assert_eq!(
+            crate::platform::fs::read_private_regular_file_bounded(&child, 6)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
     }
 }

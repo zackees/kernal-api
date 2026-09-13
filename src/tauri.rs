@@ -123,6 +123,8 @@ pub(crate) enum NativeWebviewError {
 pub(crate) struct NativeWebviewRequest {
     url: Url,
     permissions: WebviewPermissions,
+    window: Option<WebviewWindowOptions>,
+    bootstrap: Option<WebviewPageBootstrap>,
 }
 
 impl NativeWebviewRequest {
@@ -142,7 +144,12 @@ impl NativeWebviewRequest {
         }
         let url = Url::parse(url).map_err(|_| NativeWebviewError::InvalidUrl)?;
         if is_allowed_url(&url) {
-            Ok(Self { url, permissions })
+            Ok(Self {
+                url,
+                permissions,
+                window: None,
+                bootstrap: None,
+            })
         } else {
             Err(NativeWebviewError::InvalidUrl)
         }
@@ -235,10 +242,13 @@ impl NativeWebviewBackend {
         let created_sender = Arc::new(Mutex::new(Some(created_sender)));
         let native_id = NEXT_LABEL.fetch_add(1, Ordering::Relaxed);
         let label = format!("kernal-api-webview-{native_id}");
-        let pending_window = match PendingWindow::<(), Wry<()>>::new(
-            WindowBuilderWrapper::new().title("kernal-api external-content proof"),
-            label,
-        ) {
+        let window_builder = match request.window.as_ref() {
+            Some(options) => WindowBuilderWrapper::new()
+                .title(options.title())
+                .inner_size(f64::from(options.width), f64::from(options.height)),
+            None => WindowBuilderWrapper::new().title("kernal-api external-content proof"),
+        };
+        let pending_window = match PendingWindow::<(), Wry<()>>::new(window_builder, label) {
             Ok(window) => window,
             Err(error) => {
                 let _ = created_sender
@@ -296,6 +306,7 @@ impl NativeWebviewBackend {
                 &window_for_ui,
                 request.url,
                 request.permissions,
+                request.bootstrap,
                 completion_for_ui,
                 terminal_for_ui,
             );
@@ -517,6 +528,7 @@ fn build_isolated_webview(
     dispatcher: &WryWindowDispatcher<()>,
     target: Url,
     permissions: WebviewPermissions,
+    bootstrap: Option<WebviewPageBootstrap>,
     completion: Arc<LoadCompletion>,
     terminal: Arc<TerminalCompletion>,
 ) -> Result<WebView, NativeWebviewError> {
@@ -527,6 +539,8 @@ fn build_isolated_webview(
     let completion_for_popup = Arc::clone(&completion);
     let terminal_for_popup = Arc::clone(&terminal);
     let completion_for_load = Arc::clone(&completion);
+    let bootstrap_origin = bootstrap.as_ref().map(|_| target.origin());
+    let bootstrap_source = bootstrap.as_ref().map(|script| script.for_origin(&target));
     let builder = WebViewBuilder::new()
         // Deliberately do not call `with_ipc_handler`: Wry documents that it
         // exposes `window.ipc.postMessage` to page JavaScript.
@@ -537,9 +551,14 @@ fn build_isolated_webview(
         .with_devtools(false)
         .with_general_autofill_enabled(false)
         .with_navigation_handler(move |url| match Url::parse(&url) {
-            Ok(url) if is_allowed_url(&url) => true,
+            Ok(url) if navigation_allowed(&url, bootstrap_origin.as_ref()) => true,
             Ok(url) => {
-                let error = NativeWebviewError::RejectedNavigation(url.scheme().to_owned());
+                let reason = if is_allowed_url(&url) {
+                    "cross-origin bootstrap navigation"
+                } else {
+                    url.scheme()
+                };
+                let error = NativeWebviewError::RejectedNavigation(reason.to_owned());
                 completion_for_navigation.finish(Err(error.clone()));
                 terminal_for_navigation.finish(Err(error));
                 false
@@ -572,6 +591,14 @@ fn build_isolated_webview(
         })
         .with_download_started_handler(|_, _| false);
 
+    // Linux must add the caller script AFTER removing backend scripts/IPC.
+    #[cfg(not(target_os = "linux"))]
+    let builder = if let Some(source) = bootstrap_source.as_ref() {
+        builder.with_initialization_script_for_main_only(source.clone(), true)
+    } else {
+        builder
+    };
+
     #[cfg(any(
         target_os = "linux",
         target_os = "dragonfly",
@@ -585,6 +612,9 @@ fn build_isolated_webview(
             .build_gtk(&dispatcher.default_vbox().map_err(host_failure)?)
             .map_err(host_failure)?;
         linux_webkitgtk::remove_host_bridge(&webview.webview())?;
+        if let Some(source) = bootstrap_source.as_ref() {
+            linux_webkitgtk::install_page_bootstrap(&webview.webview(), source)?;
+        }
         linux_webkitgtk::configure_permissions(&webview.webview(), permissions);
         webview.load_url(target.as_str()).map_err(host_failure)?;
         Ok(webview)
@@ -669,6 +699,112 @@ impl WebviewPermissions {
     pub const fn allow_user_media(mut self) -> Self {
         self.allow_user_media = true;
         self
+    }
+}
+
+fn navigation_allowed(url: &Url, required_origin: Option<&url::Origin>) -> bool {
+    is_allowed_url(url) && required_origin.is_none_or(|origin| *origin == url.origin())
+}
+
+/// Invalid caller-supplied bootstrap source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PageBootstrapError {
+    #[error("page bootstrap exceeds 65536 UTF-8 bytes")]
+    SourceTooLarge,
+    #[error("page bootstrap contains a NUL character")]
+    ContainsNul,
+}
+
+/// Explicit native-caller opt-in to document-start page JavaScript.
+///
+/// The trusted caller owns source correctness and effects. Source executes in
+/// a block in the main frame's ordinary page world, not an isolated privileged
+/// world. No native IPC or guest ABI capability is installed. Runtime syntax
+/// errors follow normal page error reporting; they are not host-open errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebviewPageBootstrap {
+    source: String,
+}
+
+impl WebviewPageBootstrap {
+    /// Validate the 64 KiB byte limit and absence of NUL before copying.
+    /// This bounds source storage, not execution time or page-side allocations.
+    pub fn new(source: &str) -> Result<Self, PageBootstrapError> {
+        if source.len() > 65536 {
+            return Err(PageBootstrapError::SourceTooLarge);
+        }
+        if source.contains('\0') {
+            return Err(PageBootstrapError::ContainsNul);
+        }
+        Ok(Self {
+            source: source.to_owned(),
+        })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    fn for_origin(&self, target: &Url) -> String {
+        // WebView2 injects into subframes regardless of Wry's main-only flag.
+        // Guard in page code too, including against initial about:blank.
+        // The origin is URL-canonicalized and JS-string escaped; source is
+        // deliberately trusted caller code, never a remote page's input.
+        format!(
+            "if (window === window.top && location.origin === \"{}\") {{\n{}\n}}\n",
+            target.origin().ascii_serialization().escape_default(),
+            self.source
+        )
+    }
+}
+
+/// Invalid presentation options, rejected before allocating native resources.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WindowOptionsError {
+    #[error("webview title exceeds 1024 UTF-8 bytes or contains a control character")]
+    InvalidTitle,
+    #[error("webview logical width and height must each be between 1 and 16384")]
+    InvalidSize,
+}
+
+/// Validated initial window presentation, independent of page permissions.
+///
+/// Dimensions are logical client-area pixels, not physical screen pixels or
+/// a guarantee of the page's CSS viewport. Desktop window managers may constrain
+/// the requested size. This supplies no script execution or native IPC authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WebviewWindowOptions {
+    title: String,
+    width: u32,
+    height: u32,
+}
+
+impl WebviewWindowOptions {
+    /// Validate before copying: title is at most 1024 UTF-8 bytes, with no
+    /// Unicode control characters; each logical dimension is 1 through 16384.
+    /// An empty title is allowed. These are input bounds, not GPU-memory quotas.
+    pub fn new(title: &str, width: u32, height: u32) -> Result<Self, WindowOptionsError> {
+        if title.len() > 1024 || title.chars().any(char::is_control) {
+            return Err(WindowOptionsError::InvalidTitle);
+        }
+        if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
+            return Err(WindowOptionsError::InvalidSize);
+        }
+        Ok(Self {
+            title: title.to_owned(),
+            width,
+            height,
+        })
+    }
+
+    /// Requested initial native-window title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Requested initial client-area width and height in logical pixels.
+    pub const fn logical_size(&self) -> (u32, u32) {
+        (self.width, self.height)
     }
 }
 
@@ -896,6 +1032,56 @@ impl ExternalWebviewClient {
         grant: &WebviewUrlGrant,
         permissions: WebviewPermissions,
     ) -> Result<WebviewHandle, WebviewError> {
+        self.open_granted_with_request(grant, permissions, None, None)
+            .await
+    }
+
+    /// Open an isolated external page with validated window presentation.
+    ///
+    /// Reuses the same permission, navigation, lifetime, and no-IPC policy as
+    /// [`Self::open_webview_with_permissions`]. URL validation still precedes
+    /// native effects. The options constructor performs presentation validation.
+    pub async fn open_webview_with_options(
+        &self,
+        url: &str,
+        window: WebviewWindowOptions,
+        permissions: WebviewPermissions,
+    ) -> Result<WebviewHandle, WebviewError> {
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_request(&grant, permissions, Some(window), None)
+            .await
+    }
+
+    /// Open with explicit caller-owned main-frame document-start JavaScript.
+    ///
+    /// Re-runs on same-origin reloads. All native navigation is restricted to
+    /// the original HTTP(S) origin (scheme, host, port); crossing it revokes the
+    /// view. Existing open methods remain script-free. Script correctness,
+    /// product protocols, and permission choices belong to the caller.
+    /// Bootstrap origins are limited to 4096 UTF-8 bytes before script wrapping.
+    pub async fn open_webview_with_bootstrap(
+        &self,
+        url: &str,
+        window: WebviewWindowOptions,
+        permissions: WebviewPermissions,
+        bootstrap: WebviewPageBootstrap,
+    ) -> Result<WebviewHandle, WebviewError> {
+        let preview = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
+        if preview.url.origin().ascii_serialization().len() > 4096 {
+            return Err(WebviewError::InvalidUrl);
+        }
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_request(&grant, permissions, Some(window), Some(bootstrap))
+            .await
+    }
+
+    async fn open_granted_with_request(
+        &self,
+        grant: &WebviewUrlGrant,
+        permissions: WebviewPermissions,
+        window: Option<WebviewWindowOptions>,
+        bootstrap: Option<WebviewPageBootstrap>,
+    ) -> Result<WebviewHandle, WebviewError> {
         let grant = PendingUrlGrant {
             hub: Arc::clone(&self.service.hub),
             resource: grant.bind(&self.service.hub, self.store).map_err(map_hub)?,
@@ -912,7 +1098,9 @@ impl ExternalWebviewClient {
             operation,
             transferred: false,
         };
-        let request = NativeWebviewRequest::parse(&url, permissions).map_err(map_native)?;
+        let mut request = NativeWebviewRequest::parse(&url, permissions).map_err(map_native)?;
+        request.window = window;
+        request.bootstrap = bootstrap;
         let lease = self.service.hub.acquire_native_open().map_err(map_hub)?;
         let mut native = match self.service.backend.open(request, lease).await {
             Ok(native) => native,
@@ -998,6 +1186,42 @@ impl ExternalWebviewClient {
 }
 
 impl WebviewHandle {
+    /// Acceptance-only check of the native title and logical client-area size.
+    /// Allows one logical pixel of native rounding. Intended for controlled
+    /// desktops: a window manager may legitimately constrain production sizes.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn verify_window_options_for_test(
+        &self,
+        expected: &WebviewWindowOptions,
+    ) -> Result<(), WebviewError> {
+        // Clone the dispatcher before native synchronous queries: never hold
+        // the backing-table lock while waiting for the UI thread.
+        let window = self
+            .service
+            .native
+            .lock()
+            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
+            .get(&self.resource)
+            .ok_or(WebviewError::WindowClosed)?
+            .window
+            .clone();
+        let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
+        let title = window.title().map_err(host_error)?;
+        let size = window.inner_size().map_err(host_error)?;
+        let scale = window.scale_factor().map_err(host_error)?;
+        if !scale.is_finite()
+            || scale <= 0.0
+            || title != expected.title
+            || (f64::from(size.width) / scale - f64::from(expected.width)).abs() > 1.0
+            || (f64::from(size.height) / scale - f64::from(expected.height)).abs() > 1.0
+        {
+            return Err(WebviewError::HostFailure(format!(
+                "window presentation mismatch: title={title:?}, physical_size={size:?}, scale={scale}, expected={expected:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Await the requested top-level page's matching `Finished` event.
     /// A timeout revokes this handle and closes the backing native window.
     pub async fn wait_until_loaded(&self, timeout: Duration) -> Result<(), WebviewError> {
@@ -1298,6 +1522,39 @@ mod tests {
         assert_eq!(&*url, "https://example.test/exact?q=1");
         hub.close_all(Terminal::Cancelled);
         assert_eq!(hub.snapshot().live_resources, 0);
+    }
+
+    #[test]
+    fn bootstrap_navigation_is_origin_scoped_without_changing_default_route() {
+        let target = Url::parse("http://127.0.0.1:8080/start").unwrap();
+        for allowed in [
+            "http://127.0.0.1:8080/reload",
+            "http://127.0.0.1:8080/start#fragment",
+        ] {
+            assert!(navigation_allowed(
+                &Url::parse(allowed).unwrap(),
+                Some(&target.origin())
+            ));
+        }
+        for rejected in [
+            "http://localhost:8080/",
+            "http://127.0.0.1:8081/",
+            "https://127.0.0.1:8080/",
+        ] {
+            let url = Url::parse(rejected).unwrap();
+            assert!(!navigation_allowed(&url, Some(&target.origin())));
+            assert!(navigation_allowed(&url, None));
+        }
+        assert!(!navigation_allowed(
+            &Url::parse("file:///tmp/test").unwrap(),
+            None
+        ));
+        let bootstrap = WebviewPageBootstrap::new("window.marker = 1; // comment").unwrap();
+        let wrapped = bootstrap.for_origin(&target);
+        assert!(wrapped.starts_with(
+            "if (window === window.top && location.origin === \"http://127.0.0.1:8080\") {\n"
+        ));
+        assert!(wrapped.ends_with("// comment\n}\n"));
     }
 
     #[test]

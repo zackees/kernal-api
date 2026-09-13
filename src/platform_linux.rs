@@ -85,6 +85,8 @@ pub use fs::{
     unlock as fs_unlock,
     user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
+    read_context_regular_file_bounded as fs_read_context_regular_file_bounded,
+    read_private_regular_file_bounded as fs_read_private_regular_file_bounded,
 };
 
 #[cfg(feature = "fs-watch")]
@@ -1011,3 +1013,5 @@ pub fn process_replace_current_image(command: &mut std::process::Command) -> std
 pub const fn process_can_replace_current_image() -> bool {
     true
 }
+#[path = "platform_linux/interrupt.rs"]
+pub(crate) mod interrupt;

@@ -11,7 +11,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use kernal_api::async_engine;
-use kernal_api::webview::{ExternalWebviewClient, ExternalWebviewHost, WebviewError};
+use kernal_api::webview::{
+    ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPageBootstrap,
+    WebviewPermissions, WebviewWindowOptions,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = SmokeScenario::from_args()?;
@@ -39,54 +42,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => return Err(error),
             }
         };
-        let (mut stream, _) = accept()?;
-        // Accepted sockets inherit the listener's nonblocking mode on the
-        // supported Unix CI hosts.  The proof uses a bounded blocking read so
-        // an in-flight navigation cannot race the harness into WouldBlock.
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut request = [0_u8; 4096];
-        match stream.read(&mut request) {
-            Ok(_) => {}
-            // A real WebKit navigation may establish its loopback connection
-            // just as the semantic timeout tears down the native backing,
-            // before it writes HTTP bytes. That is a successful timeout
-            // proof, not a server failure.
-            Err(error)
-                if scenario == SmokeScenario::Timeout
-                    && matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error),
+        if scenario == SmokeScenario::Bootstrap {
+            return bootstrap_server(&accept, deadline, address.port());
         }
         if scenario == SmokeScenario::Timeout {
-            // Keep the top-level navigation pending past the facade timeout.
-            // The client has already sent a real loopback request, so this
-            // proves teardown of an actual native backing rather than a mock.
+            let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
+            // Accepted sockets inherit the listener's nonblocking mode on the
+            // supported Unix CI hosts.  The proof uses a bounded blocking read so
+            // an in-flight navigation cannot race the harness into WouldBlock.
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let mut request = [0_u8; 4096];
+            match stream.read(&mut request) {
+                Ok(_) => {}
+                // A real WebKit navigation may establish its loopback connection
+                // just as the semantic timeout tears down the native backing,
+                // before it writes HTTP bytes. That is a successful timeout
+                // proof, not a server failure.
+                Err(error)
+                    if scenario == SmokeScenario::Timeout
+                        && matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(socket_stage("read document request")(error)),
+            }
             std::thread::sleep(Duration::from_secs(1));
             return Ok(());
+        }
+        let (mut stream, request) = accept_http_request(&accept, deadline)
+            .map_err(socket_stage("read document request"))?;
+        if !request.starts_with("GET /finished HTTP/1.") {
+            return Err(std::io::Error::other(format!(
+                "unexpected document request: {request:?}"
+            )));
         }
         write!(
             stream,
             "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
             page.len()
-        )?;
-        let (mut report, _) = accept()?;
-        report.set_nonblocking(false)?;
-        report.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut report_request = [0_u8; 4096];
-        let read = report.read(&mut report_request)?;
-        let report_request = String::from_utf8_lossy(&report_request[..read]);
+        )
+        .map_err(socket_stage("write document response"))?;
+        let (mut report, report_request) = accept_http_request(&accept, deadline)
+            .map_err(socket_stage("read isolation request"))?;
         if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
             return Err(std::io::Error::other(format!(
                 "page observed a prohibited host bridge: {report_request:?}"
             )));
         }
-        report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+        report
+            .write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")
+            .map_err(socket_stage("write isolation response"))?;
         Ok(())
     });
 
@@ -134,7 +143,34 @@ async fn lifecycle(
     url: &str,
     scenario: SmokeScenario,
 ) -> Result<(), WebviewError> {
-    let webview = client.open_webview(url).await?;
+    if scenario == SmokeScenario::Bootstrap {
+        let window = WebviewWindowOptions::new("kernal-api bootstrap proof", 800, 600)
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        let bootstrap = WebviewPageBootstrap::new("window.__kernal_bootstrap = 17;")
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        let outcome = match client
+            .open_webview_with_bootstrap(url, window, WebviewPermissions::deny_all(), bootstrap)
+            .await
+        {
+            Ok(webview) => webview.wait_until_terminal(Duration::from_secs(30)).await,
+            Err(error) => Err(error),
+        };
+        return match outcome {
+            Err(WebviewError::RejectedNavigation(_)) => assert_clean(client),
+            other => Err(WebviewError::HostFailure(format!(
+                "bootstrap must reject cross-origin navigation, got {other:?}"
+            ))),
+        };
+    }
+    let webview = if scenario == SmokeScenario::Close {
+        let window = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
+            .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+        client
+            .open_webview_with_options(url, window, WebviewPermissions::deny_all())
+            .await?
+    } else {
+        client.open_webview(url).await?
+    };
     if scenario == SmokeScenario::Timeout {
         let timed_out = webview.wait_until_loaded(Duration::from_millis(50)).await;
         if timed_out != Err(WebviewError::TimedOut) {
@@ -285,7 +321,12 @@ async fn lifecycle(
             webview.close().await?;
             assert_clean(client)
         }
-        (SmokeScenario::Close, Ok(())) => webview.close().await,
+        (SmokeScenario::Close, Ok(())) => {
+            let expected = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
+                .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+            webview.verify_window_options_for_test(&expected)?;
+            webview.close().await
+        }
         (SmokeScenario::Cancel, Ok(())) => {
             webview.cancel();
             if webview.wait_until_terminal(Duration::ZERO).await != Err(WebviewError::Cancelled) {
@@ -351,6 +392,7 @@ enum SmokeScenario {
     OpenCancel,
     CaptureCancel,
     Capture,
+    Bootstrap,
     Close,
     Popup,
     ProhibitedRedirect,
@@ -362,6 +404,7 @@ enum SmokeScenario {
 impl SmokeScenario {
     fn from_args() -> Result<Self, Box<dyn std::error::Error>> {
         match std::env::args().nth(1).as_deref() {
+            Some("bootstrap") => Ok(Self::Bootstrap),
             None | Some("close") => Ok(Self::Close),
             Some("capture") => Ok(Self::Capture),
             Some("capture-cancel") => Ok(Self::CaptureCancel),
@@ -372,7 +415,7 @@ impl SmokeScenario {
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use bootstrap, capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, or window-close"
             )
             .into()),
         }
@@ -380,7 +423,11 @@ impl SmokeScenario {
 
     fn page(self, address: &str) -> String {
         let action = match self {
-            Self::Close | Self::Capture | Self::CaptureCancel | Self::OpenCancel => "",
+            Self::Close
+            | Self::Bootstrap
+            | Self::Capture
+            | Self::CaptureCancel
+            | Self::OpenCancel => "",
             Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with
@@ -400,6 +447,74 @@ impl SmokeScenario {
              {action}</script>"
         )
     }
+}
+
+fn bootstrap_server(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+    port: u16,
+) -> std::io::Result<()> {
+    // Every stage must report bootstrap-before-page execution, no subframe
+    // execution, and absence of host IPC. The second document is a real reload
+    // into a fresh global, followed by a prohibited same-port/different-host URL.
+    for stage in 1..=2 {
+        let (mut document, request) = accept_http_request(accept, deadline)
+            .map_err(socket_stage("read bootstrap document"))?;
+        let path = if stage == 1 { "/finished" } else { "/reload" };
+        if !request.starts_with(&format!("GET {path} HTTP/1.")) {
+            return Err(std::io::Error::other(format!(
+                "unexpected bootstrap document: {request:?}"
+            )));
+        }
+        let next = if stage == 1 {
+            "/reload".to_owned()
+        } else {
+            format!("http://localhost:{port}/rejected")
+        };
+        let page = format!(
+            r#"<!doctype html><body><script>
+const beforePage = window.__kernal_bootstrap === 17;
+const noIpc = typeof window.ipc === 'undefined' && typeof window.__TAURI_INTERNALS__ === 'undefined' && !window.webkit?.messageHandlers?.ipc;
+const frame = document.createElement('iframe');
+window.addEventListener('message', (event) => {{
+  if (event.source !== frame.contentWindow) return;
+  const ok = Number(beforePage && noIpc && event.data === 'undefined');
+  const request = new XMLHttpRequest();
+  request.open('GET', '/_bootstrap?stage={stage}&ok=' + ok, false);
+  request.send();
+  location.href = '{next}';
+}}, {{ once: true }});
+frame.src = '/frame';
+document.body.append(frame);
+</script>"#
+        );
+        write!(
+            document,
+            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
+            page.len()
+        )?;
+        drop(document);
+        let (mut frame, frame_request) = accept_http_request(accept, deadline)
+            .map_err(socket_stage("read bootstrap subframe"))?;
+        if !frame_request.starts_with("GET /frame HTTP/1.") {
+            return Err(std::io::Error::other(format!(
+                "unexpected bootstrap frame: {frame_request:?}"
+            )));
+        }
+        let frame_page =
+            "<script>parent.postMessage(typeof window.__kernal_bootstrap, '*')</script>";
+        write!(frame, "HTTP/1.0 200 OK\r\nCache-Control: no-store\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{frame_page}", frame_page.len())?;
+        drop(frame);
+        let (mut report, request) =
+            accept_http_request(accept, deadline).map_err(socket_stage("read bootstrap report"))?;
+        if !request.starts_with(&format!("GET /_bootstrap?stage={stage}&ok=1 HTTP/1.")) {
+            return Err(std::io::Error::other(format!(
+                "bootstrap ordering/frame/isolation proof failed: {request:?}"
+            )));
+        }
+        report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+    }
+    Ok(())
 }
 
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
@@ -422,4 +537,202 @@ fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {
 
 fn host_error(error: WebviewError) -> std::io::Error {
     std::io::Error::other(error.to_string())
+}
+
+fn socket_stage(stage: &'static str) -> impl FnOnce(std::io::Error) -> std::io::Error {
+    move |error| std::io::Error::new(error.kind(), format!("{stage}: {error}"))
+}
+
+fn accept_http_request(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+) -> std::io::Result<(std::net::TcpStream, String)> {
+    // Browser speculative connections and automatic favicon requests are not
+    // proof messages. Bound both discarded connections and total time; never
+    // turn a missing report into success or discard arbitrary unexpected paths.
+    for _ in 0..16 {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        let (mut stream, _) = accept()?;
+        stream.set_nonblocking(true)?;
+        let read_deadline = deadline.min(std::time::Instant::now() + Duration::from_secs(5));
+        if let Some(request) = read_http_request(&mut stream, read_deadline)? {
+            stream.set_nonblocking(false)?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            if matches!(
+                request.lines().next(),
+                Some("GET /favicon.ico HTTP/1.0" | "GET /favicon.ico HTTP/1.1")
+            ) {
+                stream.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
+                continue;
+            }
+            return Ok((stream, request));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "no complete HTTP request within proof limits",
+    ))
+}
+
+// The real socket must be nonblocking so this deadline bounds all partial reads.
+fn read_http_request(
+    reader: &mut impl Read,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = [0_u8; 4096];
+    let mut used = 0;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return if used == 0 {
+                Ok(None)
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "incomplete HTTP request",
+                ))
+            };
+        }
+        match reader.read(&mut bytes[used..]) {
+            Ok(0) if used == 0 => return Ok(None),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "truncated HTTP request",
+                ))
+            }
+            Ok(count) => used += count,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            Err(error)
+                if used == 0
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        }
+        if bytes[..used].windows(4).any(|part| part == b"\r\n\r\n") {
+            return String::from_utf8(bytes[..used].to_vec())
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+        if used == bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP request exceeds proof header limit",
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn browser_favicon_is_answered_before_required_proof_request() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut icon = std::net::TcpStream::connect(address).unwrap();
+        icon.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        icon.write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut frame = std::net::TcpStream::connect(address).unwrap();
+        frame
+            .write_all(b"GET /frame HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let (_, request) = super::accept_http_request(
+            &|| listener.accept(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(request.starts_with("GET /frame HTTP/1.1\r\n"));
+        let mut response = String::new();
+        icon.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.0 204 No Content\r\n"));
+    }
+
+    #[test]
+    fn speculative_connection_is_skipped_before_real_document() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(std::net::TcpStream::connect(address).unwrap());
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET /finished HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let (_, request) = super::accept_http_request(
+            &|| listener.accept(),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(request.starts_with("GET /finished HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn fragmented_headers_are_complete_and_oversize_is_rejected() {
+        struct OneByte(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for OneByte {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.0, &mut buffer[..1])
+            }
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let expected = b"GET /_isolation?ipc=0&tauri=0&platform=0 HTTP/1.1\r\n\r\n";
+        let actual = super::read_http_request(
+            &mut OneByte(std::io::Cursor::new(expected.to_vec())),
+            deadline,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(actual.as_bytes(), expected);
+        let error = super::read_http_request(&mut std::io::Cursor::new(vec![b'x'; 4097]), deadline)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn empty_connection_is_not_an_http_request() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        assert!(
+            super::read_http_request(&mut std::io::Cursor::new(b""), deadline)
+                .unwrap()
+                .is_none()
+        );
+        assert!(super::read_http_request(
+            &mut std::io::Cursor::new(b"GET /finished HTTP/1.1\r\n"),
+            deadline
+        )
+        .is_err());
+        assert_eq!(
+            super::read_http_request(
+                &mut std::io::Cursor::new(b"GET /finished HTTP/1.1\r\n\r\n"),
+                deadline
+            )
+            .unwrap()
+            .as_deref(),
+            Some("GET /finished HTTP/1.1\r\n\r\n")
+        );
+    }
+
+    #[test]
+    fn socket_diagnostic_preserves_failure_kind_and_stage() {
+        let error = super::socket_stage("read isolation request")(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "native socket failure",
+        ));
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            error.to_string(),
+            "read isolation request: native socket failure"
+        );
+    }
 }

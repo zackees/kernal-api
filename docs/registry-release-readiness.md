@@ -46,8 +46,32 @@ and GREEN afterward. This gate detects the problem; it does not fix the
 underlying registry viewer graph. Resolve the patched dependencies and rerun
 package verification plus native isolation checks before publishing.
 
-Publication credentials also need configuration. Repository Actions secrets
-and environments were empty when inspected; no token was present in the
-current environment or default Cargo credentials file. The existing workflow
-expects `CARGO_REGISTRY_TOKEN` and `PYPI_API_TOKEN`. Never put tokens in source,
-issue comments, logs, or chat.
+## Autonomous releases
+
+`.github/workflows/auto-release.yml` follows the Soldr/zccache version-bump
+pattern. A push to `main` that changes the Cargo package version starts the
+existing package and six-target symbolizer verification pipeline. Unchanged
+versions and existing GitHub releases do not automatically publish again.
+Manual dispatch on `main` defaults to `dry_run: true`: verification and Actions
+artifacts only, with no tag, GitHub release, or registry writes. Set it to false
+to release the current version without another version bump. Existing tags must
+resolve to the exact workflow commit; tags and release assets are never replaced.
+GitHub release creation happens directly in the same workflow, not through a
+second workflow triggered by a bot-created release event.
+
+Registry publishing is deferred by owner request. GitHub packages, sidecars and
+workers can release without registry credentials. To enable crates.io later,
+configure `CARGO_REGISTRY_TOKEN` and set the repository Actions variable `PUBLISH_CRATES_IO`
+to `true`. PyPI independently uses `PYPI_API_TOKEN` and `PUBLISH_PYPI=true`.
+The publishing jobs use the `release` environment; secrets can be configured
+there or at repository scope. Opt-in variables must be repository-level because
+job conditions are evaluated before entering the environment. Neither variable
+is set by this change.
+Skipping an opted-out registry is not evidence that its package is published.
+Manual non-dry-run dispatch can recover registry publication for an existing
+GitHub release only from the same tagged commit and with identical rebuilt
+GitHub assets. A mismatch fails rather than overwriting an immutable release.
+After `main` advances, dispatch on the existing tag instead:
+`gh workflow run auto-release.yml --ref v0.1.0 -f dry_run=false`.
+Registry jobs wait for successful GitHub asset comparison before publishing.
+Never put tokens in source, issue comments, logs, or chat.

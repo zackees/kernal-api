@@ -123,7 +123,7 @@ impl PtyChild for conpty_passthrough::child::ConPtyChild {
 #[cfg(feature = "pty")]
 pub type Backend = ConPtyBackend;
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 use crate::platform::terminal::PtyInputChunk;
 
 #[cfg(feature = "pty")]
@@ -332,11 +332,17 @@ pub fn resize_pty(
     _size: crate::platform::terminal::PtySize,
 ) -> std::io::Result<()> { Ok(()) }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 pub struct TerminalInputSession(super::terminal_input::TerminalInputCore);
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl TerminalInputSession {
+    pub(crate) fn new_for_keys() -> std::io::Result<Option<Self>> {
+        let input = super::terminal_input::TerminalInputCore::new();
+        input.start_for_keys()?;
+        Ok(Some(Self(input)))
+    }
+
     pub fn new() -> std::io::Result<Option<Self>> {
         let input = super::terminal_input::TerminalInputCore::new();
         input.start_impl()?;
@@ -346,6 +352,7 @@ impl TerminalInputSession {
     pub fn read_chunk(&self, timeout: std::time::Duration) -> std::io::Result<Option<PtyInputChunk>> {
         use super::terminal_input::{TerminalInputWaitOutcome, wait_for_terminal_input_event};
         match wait_for_terminal_input_event(&self.0.state, &self.0.condvar, Some(timeout)) {
+            TerminalInputWaitOutcome::Failed(error) => Err(std::io::Error::other(error)),
             TerminalInputWaitOutcome::Event(event) => Ok(Some(PtyInputChunk { data: event.data, submit: event.submit })),
             TerminalInputWaitOutcome::Timeout => Ok(None),
             TerminalInputWaitOutcome::Closed => Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "native terminal input closed")),
@@ -353,7 +360,7 @@ impl TerminalInputSession {
     }
 }
 
-#[cfg(feature = "pty")]
+#[cfg(feature = "terminal-input")]
 impl Drop for TerminalInputSession {
     fn drop(&mut self) { let _ = self.0.stop_impl(); }
 }

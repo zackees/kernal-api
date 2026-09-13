@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use crate::platform::terminal::InputQueue;
 #[cfg(windows)]
 use std::fs::OpenOptions;
 #[cfg(windows)]
@@ -19,6 +19,8 @@ pub const NATIVE_TERMINAL_INPUT_TRACE_PATH_ENV: &str =
 /// Errors returned by native terminal input capture.
 #[derive(Debug, Error)]
 pub enum TerminalInputError {
+    #[error("terminal capture failed: {0}")]
+    Capture(#[from] TerminalCaptureFailure),
     /// Terminal input capture has already closed.
     #[error("terminal input is closed")]
     Closed,
@@ -57,14 +59,25 @@ pub struct TerminalInputEventRecord {
 /// Shared queue state for captured terminal input events.
 pub struct TerminalInputState {
     /// Queued translated terminal input events.
-    pub events: VecDeque<TerminalInputEventRecord>,
+    events: InputQueue<TerminalInputEventRecord>,
+    failure: Option<TerminalCaptureFailure>,
     /// Whether the capture stream has been closed.
     pub closed: bool,
+}
+
+/// Capture stops and reports failure instead of silently dropping excess input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum TerminalCaptureFailure {
+    #[error("terminal input exceeded queue or repeat limits")]
+    Overflow,
+    #[error("native terminal input failed")]
+    Native,
 }
 
 #[cfg(windows)]
 /// Windows console state saved while native input capture is active.
 pub struct ActiveTerminalInputCapture {
+    _input_lease: crate::platform::terminal::InputLease,
     /// Raw Windows console input handle as an integer.
     pub input_handle: usize,
     /// Console mode to restore when capture stops.
@@ -77,6 +90,7 @@ pub struct ActiveTerminalInputCapture {
 /// Result of waiting for a Windows terminal input event.
 #[derive(Debug, PartialEq)]
 pub enum TerminalInputWaitOutcome {
+    Failed(TerminalCaptureFailure),
     /// A translated input event was received.
     Event(TerminalInputEventRecord),
     /// Terminal input capture closed before an event arrived.
@@ -499,6 +513,21 @@ pub(crate) fn translate_console_key_event(
 // ── Worker thread ──
 
 #[cfg(windows)]
+fn translate_captured_key_event(
+    record: &winapi::um::wincon::KEY_EVENT_RECORD,
+) -> Result<Option<TerminalInputEventRecord>, TerminalCaptureFailure> {
+    // Releases carry no text. Ignore them before inspecting the repeat field.
+    if record.bKeyDown == 0 {
+        return Ok(None);
+    }
+    // Bound expansion before translation allocates repeated bytes.
+    if record.wRepeatCount > 1024 {
+        return Err(TerminalCaptureFailure::Overflow);
+    }
+    Ok(translate_console_key_event(record))
+}
+
+#[cfg(windows)]
 /// Runs the Windows console input worker that queues translated key events.
 pub fn native_terminal_input_worker(
     input_handle: usize,
@@ -522,7 +551,7 @@ pub fn native_terminal_input_worker(
         unix_now_seconds(),
     ));
 
-    while !stop.load(Ordering::Acquire) {
+    'capture: while !stop.load(Ordering::Acquire) {
         let wait_result = unsafe { WaitForSingleObject(handle, 50) };
         match wait_result {
             WAIT_OBJECT_0 => {
@@ -536,31 +565,44 @@ pub fn native_terminal_input_worker(
                     )
                 };
                 if ok == 0 {
+                    state.lock().expect("terminal input mutex poisoned").failure =
+                        Some(TerminalCaptureFailure::Native);
                     append_native_terminal_input_trace_line(&format!(
                         "[{:.6}] native_terminal_input read_console_input_failed handle={input_handle}",
                         unix_now_seconds(),
                     ));
                     break;
                 }
-                let mut batch = Vec::new();
                 for record in records.iter().take(read_count as usize) {
                     if record.EventType != KEY_EVENT {
                         continue;
                     }
                     let key_event = unsafe { record.Event.KeyEvent() };
-                    if let Some(event) = translate_console_key_event(key_event) {
-                        batch.push(event);
-                    }
-                }
-                if !batch.is_empty() {
+                    // Translation can write the optional diagnostic trace. Never
+                    // hold the input-state mutex across that external I/O.
+                    let translated = translate_captured_key_event(key_event);
                     let mut guard = state.lock().expect("terminal input mutex poisoned");
-                    guard.events.extend(batch);
-                    drop(guard);
-                    condvar.notify_all();
+                    match translated {
+                        Err(failure) => {
+                            guard.failure = Some(failure);
+                            break 'capture;
+                        }
+                        Ok(Some(event)) => {
+                            let bytes = event.data.len();
+                            if !guard.events.push(event, bytes) {
+                                guard.failure = Some(TerminalCaptureFailure::Overflow);
+                                break 'capture;
+                            }
+                            condvar.notify_all();
+                        }
+                        Ok(None) => {}
+                    }
                 }
             }
             WAIT_TIMEOUT => continue,
             _ => {
+                state.lock().expect("terminal input mutex poisoned").failure =
+                    Some(TerminalCaptureFailure::Native);
                 append_native_terminal_input_trace_line(&format!(
                     "[{:.6}] native_terminal_input wait_result={wait_result} handle={input_handle}",
                     unix_now_seconds(),
@@ -573,6 +615,9 @@ pub fn native_terminal_input_worker(
     capturing.store(false, Ordering::Release);
     let mut guard = state.lock().expect("terminal input mutex poisoned");
     guard.closed = true;
+    if guard.failure.is_some() {
+        guard.events.clear();
+    }
     condvar.notify_all();
     drop(guard);
     append_native_terminal_input_trace_line(&format!(
@@ -593,6 +638,9 @@ pub fn wait_for_terminal_input_event(
     let deadline = timeout.map(|limit| Instant::now() + limit);
     let mut guard = state.lock().expect("terminal input mutex poisoned");
     loop {
+        if let Some(failure) = guard.failure {
+            return TerminalInputWaitOutcome::Failed(failure);
+        }
         if let Some(event) = guard.events.pop_front() {
             return TerminalInputWaitOutcome::Event(event);
         }
@@ -652,7 +700,8 @@ impl TerminalInputCore {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(TerminalInputState {
-                events: VecDeque::new(),
+                events: InputQueue::new(),
+                failure: None,
                 closed: true,
             })),
             condvar: Arc::new(Condvar::new()),
@@ -734,6 +783,9 @@ impl TerminalInputCore {
         let deadline = timeout.map(|secs| Instant::now() + Duration::from_secs_f64(secs));
         let mut guard = state.lock().expect("terminal input mutex poisoned");
         loop {
+            if let Some(failure) = guard.failure {
+                return Err(TerminalInputError::Capture(failure));
+            }
             if let Some(event) = guard.events.pop_front() {
                 return Ok(event);
             }
@@ -762,23 +814,23 @@ impl TerminalInputCore {
     /// Drains all queued terminal input events.
     pub fn drain_events(&self) -> Vec<TerminalInputEventRecord> {
         let mut guard = self.state.lock().expect("terminal input mutex poisoned");
-        guard.events.drain(..).collect()
+        guard.events.drain().collect()
     }
 
     /// Stops native terminal input capture and restores console state.
     pub fn stop_impl(&self) -> Result<(), std::io::Error> {
-        self.stop.store(true, Ordering::Release);
         #[cfg(windows)]
         append_native_terminal_input_trace_line(&format!(
             "[{:.6}] native_terminal_input stop_requested",
             unix_now_seconds(),
         ));
-        if let Some(worker) = self
+        let mut worker_guard = self
             .worker
             .lock()
-            .expect("terminal input worker mutex poisoned")
-            .take()
-        {
+            .expect("terminal input worker mutex poisoned");
+        self.stop.store(true, Ordering::Release);
+        // Serialize restart until the old worker exits and its mode is restored.
+        if let Some(worker) = worker_guard.take() {
             let _ = worker.join();
         }
         self.capturing.store(false, Ordering::Release);
@@ -815,6 +867,15 @@ impl TerminalInputCore {
     #[cfg(windows)]
     /// Starts native terminal input capture for the attached Windows console.
     pub fn start_impl(&self) -> Result<(), std::io::Error> {
+        self.start_with_signal_keys(false)
+    }
+
+    #[cfg(feature = "terminal-input")]
+    pub(crate) fn start_for_keys(&self) -> Result<(), std::io::Error> {
+        self.start_with_signal_keys(true)
+    }
+
+    fn start_with_signal_keys(&self, preserve_signal_keys: bool) -> Result<(), std::io::Error> {
         use winapi::um::consoleapi::{GetConsoleMode, SetConsoleMode};
         use winapi::um::handleapi::INVALID_HANDLE_VALUE;
         use winapi::um::processenv::GetStdHandle;
@@ -833,6 +894,7 @@ impl TerminalInputCore {
             return Err(std::io::Error::last_os_error());
         }
 
+        let input_lease = crate::platform::terminal::InputLease::acquire()?;
         let mut original_mode = 0u32;
         let got_mode = unsafe { GetConsoleMode(input_handle, &mut original_mode) };
         if got_mode == 0 {
@@ -842,7 +904,10 @@ impl TerminalInputCore {
             ));
         }
 
-        let active_mode = native_terminal_input_mode(original_mode);
+        let mut active_mode = native_terminal_input_mode(original_mode);
+        if preserve_signal_keys {
+            active_mode |= original_mode & winapi::um::wincon::ENABLE_PROCESSED_INPUT;
+        }
         let set_mode = unsafe { SetConsoleMode(input_handle, active_mode) };
         if set_mode == 0 {
             return Err(std::io::Error::last_os_error());
@@ -860,12 +925,14 @@ impl TerminalInputCore {
         {
             let mut state = self.state.lock().expect("terminal input mutex poisoned");
             state.events.clear();
+            state.failure = None;
             state.closed = false;
         }
         *self
             .console
             .lock()
             .expect("terminal input console mutex poisoned") = Some(ActiveTerminalInputCapture {
+            _input_lease: input_lease,
             input_handle: input_handle as usize,
             original_mode,
             active_mode,
@@ -946,6 +1013,39 @@ pub(crate) fn key_event(
         *event.uChar.UnicodeChar_mut() = unicode;
     }
     event
+}
+
+#[test]
+fn capture_repeat_limit_precedes_translation_but_ignores_releases() {
+    let mut record = key_event(0, b' ' as u16, 0, 1025);
+    record.bKeyDown = 0;
+    assert_eq!(translate_captured_key_event(&record), Ok(None));
+    record.bKeyDown = 1;
+    assert_eq!(translate_captured_key_event(&record), Err(TerminalCaptureFailure::Overflow));
+    record.wRepeatCount = 1024;
+    assert_eq!(translate_captured_key_event(&record).unwrap().unwrap().data, vec![b' '; 1024]);
+}
+
+#[test]
+fn capture_queue_overflow_is_reported_before_queued_input() {
+    let core = TerminalInputCore::new();
+    {
+        let mut state = core.state.lock().unwrap();
+        let record = key_event(0, b' ' as u16, 0, 1);
+        for _ in 0..256 {
+            let event = translate_captured_key_event(&record).unwrap().unwrap();
+            assert!(state.events.push(event, 1));
+        }
+        let event = translate_captured_key_event(&record).unwrap().unwrap();
+        assert!(!state.events.push(event, 1));
+        state.failure = Some(TerminalCaptureFailure::Overflow);
+        assert_eq!(state.failure, Some(TerminalCaptureFailure::Overflow));
+    }
+    assert_eq!(
+        wait_for_terminal_input_event(&core.state, &core.condvar, Some(Duration::ZERO)),
+        TerminalInputWaitOutcome::Failed(TerminalCaptureFailure::Overflow)
+    );
+    assert!(matches!(core.wait_for_event(Some(0.0)), Err(TerminalInputError::Capture(TerminalCaptureFailure::Overflow))));
 }
 
 #[test]

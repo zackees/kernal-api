@@ -56,6 +56,13 @@ jobs:
         run: >-
           soldr cargo run --locked --all-features
           --bin kernal-tauri-smoke -- close
+      - name: Verify native Windows page bootstrap
+        # WebView2 needs the explicit main-frame guard even with Wry main-only.
+        if: runner.os == 'Windows'
+        timeout-minutes: 15
+        run: >-
+          soldr cargo run --locked --all-features
+          --bin kernal-tauri-smoke -- bootstrap
       - name: Verify HTTP wire semantics under backend feature unification
         # Run after locked checks: this deliberately resolves a backend feature
         # outside our manifest's production graph and may update the lockfile.
@@ -162,6 +169,10 @@ jobs:
           - fs
           - fs-watch
           - hash-sha256
+          - secure-random
+          - text-similarity
+          - terminal-style
+          - terminal-input
           - event-stream
           - http-server
           - http-client
@@ -219,6 +230,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- bootstrap
           # Expand fixture variables inside the child Bash, not this step shell.
           # shellcheck disable=SC2016
           dbus-run-session -- xvfb-run -a bash -c '
@@ -515,6 +527,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - run: uv run --no-project ci/check_compilation_boundary_dependencies.py
       - run: uv run --no-project ci/test_release_package_features.py
+      - run: uv run --no-project --python 3.13 ci/test_auto_release.py
 
   supported-targets:
     strategy:

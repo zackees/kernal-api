@@ -20,6 +20,31 @@ pub use crate::{
 
 pub use crate::host_login_environment_block as login_environment_block;
 
+/// Compile target of this executing binary, not the physical host hardware.
+///
+/// Names follow Rust's target vocabulary (for example `windows`, `macos`,
+/// `linux`, `x86_64`, and `aarch64`). Package registry aliases and supported
+/// artifact selection are caller policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct ProcessTarget {
+    /// Operating system the binary was compiled for.
+    pub os: &'static str,
+    /// Architecture the binary was compiled for.
+    pub architecture: &'static str,
+}
+
+/// Report the executing binary's compile target without probing the host.
+///
+/// An x86-64 binary running under emulation on ARM64 still reports `x86_64`.
+/// This does not detect Rosetta, CPU features, the host's native architecture,
+/// or ABI details such as libc. No subprocess or environment lookup is used.
+pub const fn process_target() -> ProcessTarget {
+    ProcessTarget {
+        os: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+    }
+}
+
 /// Logical concurrency this host exposes to this process.
 ///
 /// A thin, host-neutral restatement of [`std::thread::available_parallelism`]

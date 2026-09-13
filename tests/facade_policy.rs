@@ -59,6 +59,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use interprocess",
         "pub use jwalk",
         "pub use libc",
+        "pub use libsqlite3_sys",
         "pub use mach2",
         "pub use memmap2",
         "pub use mimalloc_pprof",
@@ -66,6 +67,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use pdb_addr2line",
         "pub use portable_pty",
         "pub use reflink_copy",
+        "pub use rusqlite",
         "pub use running_process",
         "pub use sysinfo",
         "pub use tokio",
@@ -116,7 +118,7 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     }
     assert!(
         workflow_job(&release_workflow, "publish-crates")
-            .contains("needs: [release-guard, validate-and-package]"),
+            .contains("needs: [release-guard, validate-and-package, release-assets]"),
         "publish-crates must directly depend on release-guard before cargo publish"
     );
 
@@ -155,6 +157,34 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
             }
         }
     }
+}
+
+#[test]
+fn sqlite_is_opt_in_bundled_and_backend_private() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains("sqlite = [\"dep:rusqlite\", \"dep:tempfile\"]"),
+        "SQLite must remain an opt-in capability"
+    );
+    assert!(
+        manifest.contains("rusqlite = { version = \"=0.40.2\", default-features = false, features = [\"bundled\", \"backup\"], optional = true }"),
+        "SQLite must use the audited bundled backend only behind its feature"
+    );
+    let full = manifest
+        .split("full = [")
+        .nth(1)
+        .and_then(|tail| tail.split(']').next())
+        .expect("locate full feature");
+    assert!(
+        !full.contains("sqlite"),
+        "full must not enable application storage"
+    );
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        lib.contains("#[cfg(feature = \"sqlite\")]\npub mod sqlite;"),
+        "the facade module must be feature-gated"
+    );
 }
 
 #[test]
@@ -522,7 +552,7 @@ fn process_session_surface_keeps_backend_and_native_status_types_private() {
 /// Owned-crate spellings that name a backend type wherever they appear in a
 /// type position. Mirrors `OWNED_IMPLEMENTATION_CRATES` in
 /// `dylints/kernal_api_boundary`.
-const OWNED_BACKEND_PATHS: [&str; 23] = [
+const OWNED_BACKEND_PATHS: [&str; 25] = [
     "addr2line::",
     "blake3::",
     "console_api::",
@@ -533,6 +563,7 @@ const OWNED_BACKEND_PATHS: [&str; 23] = [
     "interprocess::",
     "jwalk::",
     "libc::",
+    "libsqlite3_sys::",
     "mach2::",
     "memmap2::",
     "mimalloc_pprof::",
@@ -541,6 +572,7 @@ const OWNED_BACKEND_PATHS: [&str; 23] = [
     "portable_pty::",
     "reflink_copy::",
     "running_process::",
+    "rusqlite::",
     "sysinfo::",
     "tokio::",
     "widestring::",

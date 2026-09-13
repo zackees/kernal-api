@@ -1,26 +1,40 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      source_sha:
+        required: true
+        type: string
+      tag:
+        required: true
+        type: string
+      dry_run:
+        required: true
+        type: boolean
 
 permissions:
   contents: write
-  actions: write
+  actions: read
 
 env:
   SOURCE_DATE_EPOCH: "0"
 
 jobs:
   release-guard:
-    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.source_sha }}
           lfs: true
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify immutable release source and tag
+        env:
+          RELEASE_SHA: ${{ inputs.source_sha }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: uv run --no-project --python 3.13 ci/auto_release.py --verify-source
       - name: Reject migration-only running-process paths
         run: >-
           uv run --no-project --with tomli==2.2.1 python
@@ -28,13 +42,12 @@ jobs:
 
   validate-and-package:
     needs: release-guard
-    if: startsWith(github.event.release.tag_name, 'v')
     runs-on: ubuntu-latest
     environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.source_sha }}
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
@@ -49,7 +62,7 @@ jobs:
         shell: bash
         run: |
           manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
-          test "v${manifest_version}" = "${{ github.event.release.tag_name }}"
+          test "v${manifest_version}" = "${{ inputs.tag }}"
           test "${manifest_version}" != "0.0.0"
           grep -q "version = \"${manifest_version}\"" pyproject.toml
           grep -q "__version__ = \"${manifest_version}\"" python/kernal_api/__init__.py
@@ -67,12 +80,16 @@ jobs:
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*
+      - name: Stage flat registry artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir registry-packages
+          cp target/package/kernal-api-*.crate dist/* registry-packages/
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: registry-packages
-          path: |
-            target/package/kernal-api-*.crate
-            dist/*
+          path: registry-packages/*
           if-no-files-found: error
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -82,7 +99,6 @@ jobs:
 
   symbolizer-workers:
     needs: release-guard
-    if: startsWith(github.event.release.tag_name, 'v')
     strategy:
       fail-fast: false
       matrix:
@@ -115,7 +131,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.source_sha }}
       - if: ${{ !matrix.cross }}
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - if: ${{ matrix.cross }}
@@ -142,13 +158,14 @@ jobs:
           if-no-files-found: error
 
   publish-crates:
-    needs: [release-guard, validate-and-package]
+    if: ${{ !inputs.dry_run && vars.PUBLISH_CRATES_IO == 'true' }}
+    needs: [release-guard, validate-and-package, release-assets]
     runs-on: ubuntu-latest
     environment: release
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.release.tag_name }}
+          ref: ${{ inputs.source_sha }}
           lfs: true
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -160,7 +177,7 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          version="${{ github.event.release.tag_name }}"
+          version="${{ inputs.tag }}"
           version="${version#v}"
           crate_file="$(find release-packages -name "kernal-api-${version}.crate" -print -quit)"
           local_sha="$(sha256sum "${crate_file}" | awk '{print $1}')"
@@ -178,7 +195,8 @@ jobs:
           fi
 
   publish-pypi:
-    needs: validate-and-package
+    if: ${{ !inputs.dry_run && vars.PUBLISH_PYPI == 'true' }}
+    needs: [validate-and-package, release-assets]
     runs-on: ubuntu-latest
     environment: release
     steps:
@@ -193,7 +211,7 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         run: |
-          version="${{ github.event.release.tag_name }}"
+          version="${{ inputs.tag }}"
           version="${version#v}"
           status="$(curl -sS -o pypi.json -w '%{http_code}' \
             "https://pypi.org/pypi/kernal-api/${version}/json")"
@@ -212,6 +230,7 @@ jobs:
           fi
 
   release-assets:
+    if: ${{ !inputs.dry_run }}
     needs: [validate-and-package, symbolizer-workers]
     runs-on: ubuntu-latest
     steps:
@@ -219,11 +238,25 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
-      - name: Attach verified sidecars and isolated workers
+      - name: Create or verify GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release upload "${{ github.event.release.tag_name }}"
-          release-assets/conpty-sidecar-*.tar.zst
-          release-assets/kernal-symbolize-*
-          --repo "${{ github.repository }}" --clobber
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_SHA: ${{ inputs.source_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --slurp > releases.json
+          existing="$(jq --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)] | length' releases.json)"
+          if [[ "$existing" == 0 ]]; then
+            gh release create "$RELEASE_TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" --target "$RELEASE_SHA" --generate-notes
+          else
+            # Manual registry recovery must not overwrite published GitHub assets.
+            jq -e --arg tag "$RELEASE_TAG" '.[][] | select(.tag_name == $tag) | .draft == false' releases.json
+            download_dir="$(mktemp -d)"
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$download_dir"
+            for asset in release-assets/*; do
+              cmp "$asset" "$download_dir/$(basename "$asset")"
+            done
+          fi

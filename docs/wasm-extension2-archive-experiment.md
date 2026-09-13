@@ -155,13 +155,15 @@ reservation. An update error permanently invalidates the pending state.
 Drop, errors, and failed authentication close staging and release accounting;
 successful authentication keeps the reservation charged until file drop.
 
-This is synchronous native prototype work, not an async operation or resource
-registry integration. Accounting now uses a private shared `StagingBudget`
+This is synchronous native prototype work, not an async guest operation.
+The initial staging tests construct their own accounting; the separate
+test-gated registry integration below adds hub-owned accounting.
+Accounting uses a private shared `StagingBudget`
 whose maximum is fixed at construction, rather than accepting a separate
 counter and caller-selected limit on every authentication. Budget clones
 share the same ceiling and reservations keep that budget alive through file
-drop. The test harness still constructs it; it is not yet the final
-authoritative sketch quota. Cancellation is
+drop. It is not yet a production sketch quota. Cancellation of pending
+authentication is
 currently owner drop; guest cancellation/worker teardown and progress deadlines
 are still unimplemented. OS file cache/RSS and secure physical erasure of
 temporary plaintext are not proven by byte accounting. No claim is made that
@@ -201,8 +203,9 @@ execution, asynchronous cancellation, and worker teardown are still required.
 
 The existing six-host `wasm-tauri-screenshot-native` CI matrix now runs
 `Run native authenticated archive staging proofs` after verifying that the
-Rust host matches the matrix target. It explicitly enables only
-`archive-auth-test-support` and executes the staging tests on Linux,
+Rust host matches the matrix target. It explicitly enables
+`wasm-sketch-host,archive-auth-test-support` and executes the staging and
+authenticated resource registry tests on Linux,
 macOS, and Windows, each on x86-64 and ARM64. The independent `each-feature`
 matrix also checks this feature without relying on `--all-features`.
 
@@ -218,8 +221,41 @@ reservations behind barriers: eight producers each request eight bytes from
 one sixteen-byte budget, and exactly two may retain reservations. It also
 checks reuse after drop and overflow rejection at `u64::MAX`. These are
 accounting-only reservations, not attempts to allocate or stage `u64::MAX`
-bytes. The budget must eventually be owned by the existing logical sketch
-registry; allowing a guest to construct replacement budgets would bypass it.
+bytes. A guest must never be allowed to construct replacement budgets, which
+would bypass the registry's ceiling.
 Removing the ceiling check made this regression fail with 64 retained bytes
 against a sixteen-byte budget. Restoring the check is required for GREEN;
 the test does not rely on thread scheduling or sleep intervals.
+
+## Test-gated authenticated resource ownership
+
+With `wasm-sketch-host,archive-auth-test-support`, the existing `OperationHub`
+owns a staging budget and accepts authenticated files into its existing
+generation-safe resource table. Registration accepts only the consuming
+authentication result, rejects files charged to another budget, applies the
+ordinary resource-count ceiling, and does not share the token between stores.
+This adds no second registry and no production ABI opcode.
+
+The focused registry tests check foreign-store/foreign-hub rejection, stale
+tokens after slot reuse, foreign-budget and full/closed-hub rejection, and
+storage release on close, extraction failure, and hub cancellation/trap/owner
+teardown. Extraction consumes the resource under the hub lock and runs the
+existing extractor after releasing that lock; the owned file keeps its charge
+until extraction returns. Its destination is still a trusted native test path,
+not a guest-authorized output capability.
+
+```sh
+soldr cargo test --locked --features wasm-sketch-host,archive-auth-test-support --lib authenticated_archive_registry
+```
+
+This integration is compiled only in tests. Pending authentication is still
+owned by its native caller, not by a cancellable hub operation, and in-flight
+extraction is not interrupted by hub teardown. The registry fixture uses the
+small NIST plaintext to exercise ownership and extraction failure; the existing
+large encrypted ZIP proof does not yet run through this registry. Successful
+large-archive registry extraction, async cancellation, generated guest calls,
+real extension2 policy, and six-native-target execution remain required.
+Removing the budget-identity guard caused the rejection regression to return
+a live token instead of `WrongRights` for a foreign-budget file. The guard
+was restored before final validation. The six-native CI step now enables the
+host feature and filters `authenticated_` to include both native test modules.

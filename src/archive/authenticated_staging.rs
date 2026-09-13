@@ -11,7 +11,7 @@ use openssl::symm::{Cipher, Crypter, Mode};
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
-struct StagingBudget(Arc<StagingBudgetState>);
+pub(crate) struct StagingBudget(Arc<StagingBudgetState>);
 
 #[derive(Debug)]
 struct StagingBudgetState {
@@ -20,14 +20,14 @@ struct StagingBudgetState {
 }
 
 impl StagingBudget {
-    fn new(maximum: u64) -> Self {
+    pub(crate) fn new(maximum: u64) -> Self {
         Self(Arc::new(StagingBudgetState {
             maximum,
             used: AtomicU64::new(0),
         }))
     }
 
-    fn used(&self) -> u64 {
+    pub(crate) fn used(&self) -> u64 {
         self.0.used.load(Ordering::SeqCst)
     }
 
@@ -193,13 +193,18 @@ impl Drop for Reservation {
     }
 }
 #[derive(Debug)]
-struct Authenticated {
+pub(crate) struct Authenticated {
     file: File,
     _reservation: Reservation,
 }
 
 impl Authenticated {
-    fn extract(
+    #[cfg(any(feature = "wasm-sketch-host", feature = "tauri-webview"))]
+    pub(crate) fn belongs_to(&self, budget: &StagingBudget) -> bool {
+        Arc::ptr_eq(&self._reservation.budget.0, &budget.0)
+    }
+
+    pub(crate) fn extract(
         self,
         destination: &std::path::Path,
         limits: super::ExtractionLimits,
@@ -225,12 +230,12 @@ struct Pending {
 }
 
 // There is intentionally no read, seek, path, or file accessor on this type.
-struct Authentication {
+pub(crate) struct Authentication {
     pending: Option<Pending>,
 }
 
 impl Authentication {
-    fn begin(
+    pub(crate) fn begin(
         key: &[u8; 16],
         nonce: &[u8; 12],
         aad: &[u8],
@@ -255,7 +260,7 @@ impl Authentication {
         })
     }
 
-    fn update(&mut self, ciphertext: &[u8]) -> io::Result<()> {
+    pub(crate) fn update(&mut self, ciphertext: &[u8]) -> io::Result<()> {
         // Taking ownership poisons the operation on any error, closing its
         // private staging even when the caller retains this failed wrapper.
         let mut state = self.pending.take().ok_or(io::ErrorKind::BrokenPipe)?;
@@ -276,7 +281,7 @@ impl Authentication {
         Ok(())
     }
 
-    fn authenticate(mut self, tag: &[u8; 16]) -> io::Result<Authenticated> {
+    pub(crate) fn authenticate(mut self, tag: &[u8; 16]) -> io::Result<Authenticated> {
         let mut state = self.pending.take().ok_or(io::ErrorKind::BrokenPipe)?;
         if state.written != state.expected {
             return Err(io::ErrorKind::UnexpectedEof.into());

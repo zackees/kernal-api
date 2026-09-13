@@ -15,7 +15,7 @@ use std::rc::Rc;
 mod tar_format;
 
 #[cfg(all(test, feature = "archive-auth-test-support"))]
-mod authenticated_staging;
+pub(crate) mod authenticated_staging;
 
 #[cfg(test)]
 mod owned_source_tests {

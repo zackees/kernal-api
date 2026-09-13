@@ -15,6 +15,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+#[path = "authenticated_archive.rs"]
+mod authenticated_archive;
 static NEXT_LOGICAL_SCOPE: AtomicU64 = AtomicU64::new(1);
 const MAX_CLOSED_TOMBSTONES: usize = 128;
 const MAX_WIRE_TOKEN: u64 = (1_u64 << 56) - 1;
@@ -227,6 +231,8 @@ struct ResourceSlot {
 }
 
 enum ResourceValue {
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    AuthenticatedArchive(crate::archive::authenticated_staging::Authenticated),
     Synthetic,
     ExternalWebview,
     WebviewUrl(Arc<str>),
@@ -353,6 +359,8 @@ impl Drop for NativeCaptureLease {
 
 /// Private logical authority shared only by explicitly authorized instances.
 pub(crate) struct OperationHub {
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    staging_budget: crate::archive::authenticated_staging::StagingBudget,
     #[cfg(all(test, feature = "wasm-sketch-host"))]
     output_fault: Mutex<Option<OutputFault>>,
     output_job_failed: AtomicBool,
@@ -423,6 +431,8 @@ impl OperationHub {
     ) -> Result<Arc<Self>, HubError> {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            staging_budget: crate::archive::authenticated_staging::StagingBudget::new(512 * 1024 * 1024),
             #[cfg(all(test, feature = "wasm-sketch-host"))]
             output_fault: Mutex::new(None),
             output_job_failed: AtomicBool::new(false),

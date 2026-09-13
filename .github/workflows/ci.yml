@@ -298,7 +298,7 @@ jobs:
         run: |
           # Native execution on all six hosts, not an emulator/cross-build.
           # This remains a prerequisite, not the extension2 guest ABI proof.
-          & soldr cargo test --locked --no-default-features --features archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_staging
+          & soldr cargo test --locked --no-default-features --features wasm-sketch-host,archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_
           if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
       - name: Build actual Rust screenshot guest
         if: runner.os != 'Windows'

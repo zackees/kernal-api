@@ -4,6 +4,7 @@
 //! by the caller throughout extraction. Failure may leave partial output.
 
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -77,6 +78,8 @@ pub struct ExtractionLimits {
     pub max_metadata_bytes: u64,
     /// Maximum entry or link path encoding length.
     pub max_path_bytes: usize,
+    /// Maximum component visits while resolving the complete link graph.
+    pub max_link_steps: u64,
 }
 
 impl Default for ExtractionLimits {
@@ -87,6 +90,7 @@ impl Default for ExtractionLimits {
             max_entries: 1_000_000,
             max_metadata_bytes: 64 * 1024 * 1024,
             max_path_bytes: 4096,
+            max_link_steps: 1_000_000,
         }
     }
 }
@@ -131,6 +135,80 @@ fn prepare_destination(dest: &Path) -> io::Result<PathBuf> {
     fs::canonicalize(dest)
 }
 
+// Resolve the virtual link graph before placing any link on disk. In
+// particular, `alias/..` must expand alias before interpreting the parent.
+fn resolve_link_path(
+    path: &Path,
+    links: &BTreeMap<PathBuf, PathBuf>,
+    depth: usize,
+    steps: &mut u64,
+) -> io::Result<PathBuf> {
+    if depth > 64 {
+        return Err(invalid("archive link cycle or excessive depth"));
+    }
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        *steps = steps
+            .checked_sub(1)
+            .ok_or_else(|| invalid("archive link work limit exceeded"))?;
+        match component {
+            Component::CurDir => (),
+            Component::ParentDir => {
+                if !resolved.pop() {
+                    return Err(invalid("archive link escapes destination"));
+                }
+            }
+            Component::Normal(name) => {
+                resolved.push(name);
+                if let Some(target) = links.get(&resolved) {
+                    let parent = resolved.parent().unwrap_or(Path::new(""));
+                    resolved = resolve_link_path(&parent.join(target), links, depth + 1, steps)?;
+                }
+            }
+            _ => return Err(invalid("absolute archive link target")),
+        }
+    }
+    Ok(resolved)
+}
+
+fn install_links(root: &Path, links: BTreeMap<PathBuf, PathBuf>, mut steps: u64) -> io::Result<()> {
+    // Parent creation happens before link creation, so none can redirect it.
+    for path in links.keys() {
+        if let Some(parent) = root.join(path).parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut validated = Vec::with_capacity(links.len());
+    for (path, target) in &links {
+        let output = root.join(path);
+        match fs::symlink_metadata(&output) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error),
+            Ok(_) => return Err(invalid("archive link collides with another entry")),
+        }
+        let resolved = resolve_link_path(path, &links, 0, &mut steps)?;
+        let canonical = fs::canonicalize(root.join(resolved))?;
+        if !canonical.starts_with(root) {
+            return Err(invalid("archive link escapes destination"));
+        }
+        validated.push((output, target, canonical.is_dir()));
+    }
+    for (output, target, is_dir) in validated {
+        #[cfg(unix)]
+        {
+            let _ = is_dir;
+            std::os::unix::fs::symlink(target, output)?;
+        }
+        #[cfg(windows)]
+        if is_dir {
+            std::os::windows::fs::symlink_dir(target, output)?;
+        } else {
+            std::os::windows::fs::symlink_file(target, output)?;
+        }
+    }
+    Ok(())
+}
+
 /// Extract an archive under explicit ceilings. Does not promote wrapper dirs.
 pub fn extract(
     archive: &Path,
@@ -166,24 +244,52 @@ fn preflight_zip(file: &mut File, limits: ExtractionLimits) -> io::Result<()> {
         return Err(invalid("multi-disk ZIP is unsupported"));
     }
     let mut count = u16::from_le_bytes([end[10], end[11]]) as u64;
+    let disk_count = u16::from_le_bytes([end[8], end[9]]) as u64;
+    if disk_count != count {
+        return Err(invalid("inconsistent ZIP directory counts"));
+    }
     let mut metadata_size = u32::from_le_bytes(end[12..16].try_into().unwrap()) as u64;
-    if count == u16::MAX as u64 || metadata_size == u32::MAX as u64 {
-        let position = length - tail_length as u64 + offset as u64;
-        if position < 20 {
-            return Err(invalid("missing ZIP64 locator"));
-        }
+    let directory_offset = u32::from_le_bytes(end[16..20].try_into().unwrap());
+    let position = length - tail_length as u64 + offset as u64;
+    let mut locator = [0; 20];
+    if position >= 20 {
         file.seek(SeekFrom::Start(position - 20))?;
-        let mut locator = [0; 20];
         file.read_exact(&mut locator)?;
-        if !locator.starts_with(b"PK\x06\x07") {
-            return Err(invalid("bad ZIP64 locator"));
+    }
+    let has_zip64 = locator.starts_with(b"PK\x06\x07");
+    if !has_zip64
+        && (count == u16::MAX as u64
+            || metadata_size == u32::MAX as u64
+            || directory_offset == u32::MAX)
+    {
+        return Err(invalid("missing ZIP64 locator"));
+    }
+    if has_zip64 {
+        if locator[4..8] != [0; 4] || locator[16..20] != 1_u32.to_le_bytes() {
+            return Err(invalid("multi-disk ZIP64 is unsupported"));
         }
         let record = u64::from_le_bytes(locator[8..16].try_into().unwrap());
+        if record.checked_add(56).is_none_or(|end| end > position - 20) {
+            return Err(invalid("ZIP64 record outside archive"));
+        }
         file.seek(SeekFrom::Start(record))?;
         let mut header = [0; 56];
         file.read_exact(&mut header)?;
         if !header.starts_with(b"PK\x06\x06") {
             return Err(invalid("bad ZIP64 directory"));
+        }
+        let record_size = u64::from_le_bytes(header[4..12].try_into().unwrap());
+        if record_size < 44
+            || record_size > limits.max_metadata_bytes
+            || record
+                .checked_add(record_size)
+                .and_then(|end| end.checked_add(12))
+                != Some(position - 20)
+        {
+            return Err(invalid("invalid or oversized ZIP64 metadata record"));
+        }
+        if header[16..24] != [0; 8] || header[24..32] != header[32..40] {
+            return Err(invalid("inconsistent ZIP64 disks or counts"));
         }
         count = u64::from_le_bytes(header[32..40].try_into().unwrap());
         metadata_size = u64::from_le_bytes(header[40..48].try_into().unwrap());
@@ -201,7 +307,10 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
         file,
         remaining: Rc::clone(&budget),
     };
-    let mut archive = zip::ZipArchive::new(reader).map_err(io::Error::other)?;
+    let config = zip::read::Config {
+        archive_offset: zip::read::ArchiveOffset::Known(0),
+    };
+    let mut archive = zip::ZipArchive::with_config(config, reader).map_err(io::Error::other)?;
     // Metadata parsing is complete. File data is bounded by compressed file
     // size and the independent decompressed-output counter below.
     budget.set(u64::MAX);
@@ -210,12 +319,30 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
     }
     let root = prepare_destination(dest)?;
     let mut remaining = limits.max_output_bytes;
+    let mut link_bytes = limits.max_metadata_bytes;
+    let mut links = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).map_err(io::Error::other)?;
         let relative = relative_path(entry.name(), limits.max_path_bytes)?;
-        let output = root.join(relative);
+        let output = root.join(&relative);
         if entry.is_symlink() {
-            return Err(invalid("ZIP symlink extraction is not yet implemented"));
+            let mut bytes = Vec::new();
+            let mut allowed = (limits.max_path_bytes as u64)
+                .min(link_bytes)
+                .min(remaining);
+            let before = allowed;
+            copy_bounded(&mut entry, &mut bytes, &mut allowed)?;
+            link_bytes -= before - allowed;
+            remaining -= before - allowed;
+            let target =
+                String::from_utf8(bytes).map_err(|_| invalid("non-UTF-8 archive link target"))?;
+            if target.is_empty() || target.contains(['\\', ':', '\0']) {
+                return Err(invalid("unsafe archive link target"));
+            }
+            if links.insert(relative, PathBuf::from(target)).is_some() {
+                return Err(invalid("duplicate archive link"));
+            }
+            continue;
         }
         if entry.is_dir() {
             fs::create_dir_all(output)?;
@@ -239,5 +366,5 @@ fn extract_zip(mut file: File, dest: &Path, limits: ExtractionLimits) -> io::Res
             fs::set_permissions(&output, fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
-    Ok(())
+    install_links(&root, links, limits.max_link_steps)
 }

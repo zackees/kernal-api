@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "../../tests/support/readiness_marker.rs"]
+mod readiness_marker;
+
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, TRUE};
 use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
 use winapi::um::handleapi::{CloseHandle, DuplicateHandle, INVALID_HANDLE_VALUE};
@@ -1430,7 +1434,8 @@ mod daemon_flag_tests {
                 }
                 Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
             };
-            std::fs::write(breakaway_marker, outcome).expect("publish breakaway result");
+            super::readiness_marker::publish(std::path::Path::new(&breakaway_marker), &outcome)
+                .expect("publish breakaway result");
         }
         let mut descendant = Command::new(std::env::current_exe().expect("test executable"));
         descendant
@@ -1444,7 +1449,8 @@ mod daemon_flag_tests {
             Ok(descendant) => format!("ready:{}", descendant.id()),
             Err(error) => format!("denied:{}", error.raw_os_error().unwrap_or_default()),
         };
-        std::fs::write(marker, outcome).expect("publish descendant result");
+        super::readiness_marker::publish(std::path::Path::new(&marker), &outcome)
+            .expect("publish descendant result");
         std::thread::park();
     }
 
@@ -1455,7 +1461,8 @@ mod daemon_flag_tests {
     #[ignore]
     fn ordinary_post_spawn_red_helper() {
         if let Some(marker) = std::env::var_os("KERNAL_API_ORDINARY_SPAWN_MARKER") {
-            std::fs::write(marker, "ready").expect("publish ordinary entry marker");
+            super::readiness_marker::publish(std::path::Path::new(&marker), "ready")
+                .expect("publish ordinary entry marker");
             std::thread::park();
         }
     }

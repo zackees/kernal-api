@@ -150,6 +150,7 @@ jobs:
           - fs-watch
           - hash-sha256
           - event-stream
+          - http-server
           - http-client
           - ipc
           - ipc-async

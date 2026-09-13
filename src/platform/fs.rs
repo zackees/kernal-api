@@ -93,6 +93,11 @@ impl Drop for OwnedScratchDirectory {
     }
 }
 
+#[cfg(feature = "fs")]
+mod async_io;
+#[cfg(feature = "fs")]
+pub use async_io::AsyncFileIo;
+
 /// Resolve the current user's home directory using native account conventions.
 ///
 /// On Unix, a nonempty `HOME` overrides the account database; missing or empty

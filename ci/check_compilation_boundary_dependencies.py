@@ -22,6 +22,8 @@ CASES = (
     ("hash-sha256", "sha2"),
     ("http-client", "reqwest"),
     ("http-client", "hyper"),
+    ("http-server", "hyper"),
+    ("http-server", "http-body-util"),
     ("event-stream", "tokio-stream"),
     ("archive", "zip"),
     ("archive", "tar"),

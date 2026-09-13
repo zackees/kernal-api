@@ -35,6 +35,8 @@ pub mod hash;
 pub mod archive;
 #[cfg(feature = "http-client")]
 pub mod http;
+#[cfg(feature = "http-server")]
+pub mod http_server;
 
 /// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an
 /// existing daemon endpoint.

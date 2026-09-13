@@ -234,6 +234,61 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
 
+  # Archive and screenshot builds need independent cold-build deadlines.
+  # Both matrices execute real guests; neither is a cross-build substitute.
+  wasm-archive-native:
+    name: Native archive (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      NATIVE_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Configure archive build storage
+        shell: pwsh
+        run: |
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'kernal-api-archive-build')" >> $env:GITHUB_ENV
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          toolchain: 1.95.0
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify native host and install guest target
+        shell: pwsh
+        run: |
+          $version = & soldr rustc -vV
+          if ($LASTEXITCODE -ne 0) { throw 'Rust host probe failed' }
+          if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
+          ./tests/screenshot-target-repair.ps1
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
+      - name: Run native authenticated archive staging proofs
+        shell: pwsh
+        run: |
+          & soldr cargo test --locked --no-default-features --features wasm-sketch-host,archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
+      - name: Run actual streaming archive guest on the native host
+        shell: pwsh
+        run: |
+          & uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs
+          if ($LASTEXITCODE -ne 0) { throw 'Archive proof runner checks failed' }
+          & uv run --no-project ci/run_extension2_guest.py --native-target $env:NATIVE_TARGET --target-dir $env:CARGO_TARGET_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Actual streaming archive guest proof failed' }
+
   # Each #22 platform/architecture requires its own successful native run.
   # Matrix configuration alone is not acceptance evidence.
   wasm-tauri-screenshot-native:
@@ -315,13 +370,6 @@ jobs:
           $version = & soldr rustc -vV
           if ($LASTEXITCODE -ne 0) { throw 'Rust host probe failed' }
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
-      - name: Run native authenticated archive staging proofs
-        shell: pwsh
-        run: |
-          # Native execution on all six hosts, not an emulator/cross-build.
-          # This remains a prerequisite, not the extension2 guest ABI proof.
-          & soldr cargo test --locked --no-default-features --features wasm-sketch-host,archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_
-          if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
       - name: Build actual Rust screenshot guest
         if: runner.os != 'Windows'
         shell: bash
@@ -342,14 +390,6 @@ jobs:
           ./examples/wasm-tauri-screenshot/build-guest.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -TrapAfterCapture
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -BlockAfterCapture
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - name: Run actual streaming archive guest on the native host
-        shell: pwsh
-        run: |
-          & uv run --no-project -m unittest ci.test_run_extension2_guest
-          if ($LASTEXITCODE -ne 0) { throw 'Archive proof runner checks failed' }
-          & uv run --no-project ci/run_extension2_guest.py --native-target $env:NATIVE_TARGET --target-dir $env:CARGO_TARGET_DIR
-          if ($LASTEXITCODE -ne 0) { throw 'Actual streaming archive guest proof failed' }
       - name: Run offline native Wasm screenshot and admission proofs
         if: runner.os != 'Windows'
         shell: bash

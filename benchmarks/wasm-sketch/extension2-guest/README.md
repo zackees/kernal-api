@@ -129,10 +129,11 @@ The prior full contract was RED at `ArchiveEntry::open` (E0599, Soldr log
 
 ## Streaming guest proof
 
-The six-native-host CI matrix now invokes the same build-and-execute runner:
+The independent `wasm-archive-native` six-host CI matrix invokes the same
+build-and-execute runner:
 
 ```sh
-uv run --no-project -m unittest ci.test_run_extension2_guest
+uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs
 uv run --no-project ci/run_extension2_guest.py \
   --native-target x86_64-unknown-linux-gnu --target-dir "$PWD/target"
 ```
@@ -142,6 +143,15 @@ actual native Rust host triple on other hosts. The runner rejects a cross-target
 selects one Cargo-reported executable per build, copies fresh guest code before
 embedding metadata, and rejects a missing or zero-test proof. Adding this gate
 is not evidence that all six hosts have passed; inspect the matrix results.
+
+Archive staging and actual guest execution have a separate 30-minute job
+deadline from the six screenshot jobs. The previous combined macOS x86-64
+job passed the archive guest, then timed out building the screenshot harness
+(run `34748066733`). Separating the jobs retains both native matrices without
+making their cold builds compete for one deadline. Workflow regression tests
+check both host sets and the archive job's independent guest setup.
+The archive job uses the screenshot builder's `-PrepareTargetOnly` mode to
+reuse verified core/std target repair without building any screenshot artifact.
 
 Build with `--features guest-proof` and target directory
 `target/extension2-stream-proof`, copy and embed metadata as above, then run:

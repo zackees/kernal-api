@@ -1,5 +1,5 @@
 # PowerShell 7 counterpart of build-guest.sh. The caller owns build storage.
-param([switch]$TrapAfterCapture, [switch]$BlockAfterCapture)
+param([switch]$TrapAfterCapture, [switch]$BlockAfterCapture, [switch]$PrepareTargetOnly)
 $ErrorActionPreference = 'Stop'
 $repoDirectory = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $guestDirectory = Join-Path $PSScriptRoot 'guest'
@@ -52,6 +52,9 @@ try {
             if (-not (Test-ScreenshotTargetLibraries)) { throw 'Guest target still lacks core/std libraries after reinstall' }
         }
     }
+    # Reuse the exact target repair for other guests without building a screenshot.
+    # Returning through finally restores the caller's directory and linker setting.
+    if ($PrepareTargetOnly) { return }
     & soldr --no-cache cargo build --locked --manifest-path Cargo.toml --target $target --release --target-dir $guestTargetDirectory @guestFeatures
     if ($LASTEXITCODE -ne 0) { throw "guest build failed with exit code $LASTEXITCODE" }
 }

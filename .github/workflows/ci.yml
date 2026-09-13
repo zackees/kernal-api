@@ -128,6 +128,7 @@ jobs:
         feature:
           - allocator
           - archive
+          - archive-auth-test-support
           - conpty-sidecar
           - crash
           # The four daemon lanes are the frozen running-process substrates.
@@ -292,6 +293,13 @@ jobs:
           $version = & soldr rustc -vV
           if ($LASTEXITCODE -ne 0) { throw 'Rust host probe failed' }
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
+      - name: Run native authenticated archive staging proofs
+        shell: pwsh
+        run: |
+          # Native execution on all six hosts, not an emulator/cross-build.
+          # This remains a prerequisite, not the extension2 guest ABI proof.
+          & soldr cargo test --locked --no-default-features --features archive-auth-test-support --target $env:NATIVE_TARGET --lib authenticated_staging
+          if ($LASTEXITCODE -ne 0) { throw 'Authenticated archive staging proof failed' }
       - name: Build actual Rust screenshot guest
         if: runner.os != 'Windows'
         shell: bash

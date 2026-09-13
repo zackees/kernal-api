@@ -192,3 +192,19 @@ the storage counter returns to zero in every case. The four native staging
 tests pass together in 0.56 seconds on Linux x86-64. This remains a synthetic
 native fixture: real extension2 envelope parsing/identity policy, guest ABI
 execution, asynchronous cancellation, and worker teardown are still required.
+
+## Native portability gate
+
+The existing six-host `wasm-tauri-screenshot-native` CI matrix now runs
+`Run native authenticated archive staging proofs` after verifying that the
+Rust host matches the matrix target. It explicitly enables only
+`archive-auth-test-support` and executes the four staging tests on Linux,
+macOS, and Windows, each on x86-64 and ARM64. The independent `each-feature`
+matrix also checks this feature without relying on `--all-features`.
+
+This adds a gate, not six-platform success evidence. Record the successful
+run and per-target steps before claiming portability. The native vendored
+crypto build, anonymous-file lifecycle, and authenticated ZIP extraction
+must succeed on each host; a cross-compilation or screenshot-only result
+does not substitute for this step. These native tests still do not exercise
+the generated guest archive API or complete the extension2 acceptance gate.

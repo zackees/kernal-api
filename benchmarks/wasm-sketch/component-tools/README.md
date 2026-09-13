@@ -2,7 +2,7 @@
 
 This standalone, unpublished workspace encodes the sibling guest's core Wasm
 using pinned `wit-component = 0.251.0`, matching wit-bindgen 0.58's metadata
-format. It does not instantiate a component, add a runtime, or grant effects.
+format. By default it does not instantiate a component or grant effects.
 
 The optional `engine-probe` feature additionally compiles the encoded component
 with the production runtime's pinned Wasmtime 45.0.0, enabling Component Model
@@ -15,6 +15,49 @@ explicitly when engine compilation has also passed.
 This experimental tool has its own lockfile and does not change the parent
 crate's features or dependencies. Wasmtime is optional here and no second
 production runtime fallback is introduced.
+
+## Opt-in stream execution
+
+`--features execution-probe` additionally links the exact generated private
+world and executes two isolated instances: a 64 MiB stream, and a producer trap
+after exactly one 64 KiB chunk. It grants one synthetic blob and permits one
+stream, with no filesystem/network/WASI host imports. The host produces at most
+the reader's capacity and 64 KiB per call; no whole-payload vector is created.
+Normal return requires an empty blob table and matching host/guest byte counts.
+Both normal and trapped runs require zero live blob and producer objects after
+store teardown. The probe uses the kernel runtime builder and timeout wrapper,
+not a direct Tokio dependency or a second executor implementation. Each run has
+a 30-second async timeout, 100 million fuel units, and an 8 MiB per-memory limit.
+These bounds are not a complete hostile-component admission policy.
+
+Build the guest, then add `--features execution-probe` to the encoder command
+below, using a new output path. Run the actual-artifact regression explicitly:
+
+```sh
+KERNAL_COMPONENT_PROBE=/absolute/path/to/probe.component.wasm \
+  soldr --no-cache cargo test --locked \
+  --manifest-path benchmarks/wasm-sketch/component-tools/Cargo.toml \
+  --features execution-probe --target-dir benchmarks/wasm-sketch/component-tools/target \
+  -j1 -- --include-ignored
+```
+
+The artifact test is explicitly ignored without this command, because Cargo
+does not rebuild the independent Wasm guest. The local path dependency on the
+exact `kernal-api = 0.1.0` source is experimental/migration-only and must be
+replaced by a matching published pin before release.
+
+The first instantiation rejected synchronous WIT methods paired with concurrent
+host bindings (`[method]blob.read` async type mismatch). Making the private WIT
+methods explicitly async and awaiting them in the guest made exact-world
+instantiation pass, without weakening linker type checks. The rebuilt component
+is 60,841 bytes; the two-scenario output is retained at
+`/tmp/kernal-component-execution-probe-2.wasm`, SHA-256
+`4d762703cb75c1c5f684443fdcec6bf111964ac45b660c75446995218cedc141`.
+This is Linux x86-64 fixture evidence, not a public-facade comparison, pending
+read/write cancellation proof, slow-consumer test, six-target validation, or
+go/no-go selection.
+
+## Encoding-only commands and earlier evidence
 
 From the repository root:
 

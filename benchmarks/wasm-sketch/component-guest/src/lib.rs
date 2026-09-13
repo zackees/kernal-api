@@ -9,8 +9,8 @@ struct Sketch;
 
 impl bindings::Guest for Sketch {
     async fn run() -> Result<u64, ()> {
-        let blob = bindings::kernal::probe::blobs::granted().ok_or(())?;
-        let mut stream = blob.read();
+        let blob = bindings::kernal::probe::blobs::granted().await.ok_or(())?;
+        let mut stream = blob.read().await;
         let mut buffer = Vec::with_capacity(64 * 1024);
         let mut total = 0_u64;
         loop {

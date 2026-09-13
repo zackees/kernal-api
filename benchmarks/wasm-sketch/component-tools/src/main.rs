@@ -1,9 +1,12 @@
-//! Private component encoding/admission probe; never executes a component.
+//! Private component encoding probe with opt-in compilation and execution checks.
 use anyhow::{bail, ensure, Context, Result};
 use std::io::{Read, Write};
 use wasmparser::{Encoding, Parser, Payload, Validator, WasmFeatures};
 
 const MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[cfg(feature = "execution-probe")]
+mod host;
 
 #[cfg(feature = "engine-probe")]
 fn compile_component(bytes: &[u8]) -> wasmtime::Result<()> {
@@ -68,16 +71,19 @@ fn main() -> Result<()> {
     validate_component(&component)?;
     #[cfg(feature = "engine-probe")]
     compile_component(&component).map_err(|error| anyhow::anyhow!("{error:#}"))?;
+    #[cfg(feature = "execution-probe")]
+    host::execute(&component).map_err(|error| anyhow::anyhow!("{error:#}"))?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(output)?;
     file.write_all(&component)?;
+    #[cfg(not(feature = "execution-probe"))]
     println!(
         "validated component: {} bytes; one kernel import; not executed",
         component.len()
     );
-    #[cfg(feature = "engine-probe")]
+    #[cfg(all(feature = "engine-probe", not(feature = "execution-probe")))]
     println!("Wasmtime 45 component compilation passed; not instantiated or executed");
     Ok(())
 }

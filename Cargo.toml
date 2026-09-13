@@ -69,6 +69,7 @@ daemon-registration = ["running-process/daemon-registration"]
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
 pty = ["dep:portable-pty"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
+http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes"]
 # Window-icon and stock-icon mechanics for the host console or a child. This
 # is GUI hosting: on Linux it decodes PNG and speaks the X11 client protocol,
 # so it is gated like every peer capability rather than sitting in the
@@ -190,6 +191,8 @@ reqwest = { version = "=0.12.28", default-features = false, features = ["default
 # Constrain reqwest's private parser for published consumers, not just this
 # repository's lockfile. Its metadata bounds are audited in docs/http-client.md.
 hyper = { version = "=1.11.0", default-features = false, optional = true }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"], optional = true }
+http-body-util = { version = "=0.1.5", optional = true }
 bytes = { version = "=1.12.1", optional = true }
 # `rayon` backs the parallel memory-mapped hashing path; its global pool is
 # constructed lazily, so a consumer that never hashes a large file never builds

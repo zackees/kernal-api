@@ -20,6 +20,7 @@ path = "src/main.rs"
 required-features = ["guest-proof"]
 
 [dependencies]
+zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }
 # Exact source-only migration fixture; not published-pin acceptance.
 zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
 # Migration-only source proof, not release-pin acceptance.

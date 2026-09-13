@@ -3,6 +3,10 @@
 `hash_policy.rs` contains the async public-facade correctness policy, separate
 from runtime-specific entrypoint glue. It checks empty input, two chunkings of
 64 MiB, and resource Drop using only `kernal_api::guest` semantic types.
+It also runs actual upstream request-key encoding and includes `rustc_policy.rs`
+for the pinned upstream compiler parser. The latter is compiled unchanged into
+the native test and both guests. Current scope and evidence are recorded in
+[the policy experiment](../../../docs/wasm-zccache-policy-experiment.md).
 
 Both candidate guests include this exact source. The Component generated async
 export awaits the function directly; the Core wrapper uses its suspending

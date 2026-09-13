@@ -1,5 +1,7 @@
 //! Public hash control and actual zccache key encoding; not full policy acceptance.
 use kernal_api::guest::{Blake3Hasher, OperationError};
+#[path = "rustc_policy.rs"]
+mod rustc_policy;
 
 const EXPECTED: [u8; 32] = [
     0x35, 0x70, 0x71, 0xd5, 0x54, 0xb8, 0x55, 0x45, 0xe7, 0xab, 0xc6, 0x4c, 0x4d, 0x5b, 0xfe, 0x68,
@@ -7,6 +9,9 @@ const EXPECTED: [u8; 32] = [
 ];
 
 pub async fn proof() -> Result<(), OperationError> {
+    if !rustc_policy::proof() {
+        return Err(OperationError::Failed);
+    }
     request_key_proof().await?;
     let empty = Blake3Hasher::new().await?.finalize().await?;
     if empty

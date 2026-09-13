@@ -173,6 +173,24 @@ compatibility results, not six-target evidence for this revision.
 
 ## Remaining proof
 
+The actual Rustc parser is now exercised by the shared `rustc_policy.rs`
+fixture, pinned to source commit `c6ddfa974a4920a127eac81773db6a5c56cd30a7`
+from [zccache #1583](https://github.com/zackees/zccache/pull/1583). Native
+execution and freshly built Core/Component guests pass the same source.
+Coverage includes compiler detection, proc-macro host naming despite a Wasm
+target, independent Unix/Windows lexical syntax, test-cache opt-in, complete
+metadata output plans with unknown flags, nested Dylint cdylib policy, and
+malformed nested-driver rejection. The expanded actual Core run passed in
+8.35 s and Component in 7.56 s on Linux x86-64. These concurrent correctness
+runs are not comparative performance evidence. The Component artifact is
+148700 bytes and retains exactly two kernel import instances.
+
+This uses the upstream policy implementation without native compiler/runtime
+dependencies; only its lexical `typed-path` dependency is present. It does not
+prove native Windows path equivalence, actual process execution, or a complete
+cache hit/miss workflow. The source pin is migration-only, not a published
+front-door dependency.
+
 No complete compiler-policy or cache-workflow GREEN result is claimed yet. The next
 implementation must reuse representative parser/key fixtures, supply host
 facts explicitly, and route hashing and the controlled compiler miss through

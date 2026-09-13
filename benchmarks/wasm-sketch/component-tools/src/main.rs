@@ -141,3 +141,11 @@ mod tests {
         assert!(validate_component(b"\0asm\x0d\0\x01\0").is_err());
     }
 }
+#[cfg(test)]
+#[path = "../../shared/rustc_policy.rs"]
+mod rustc_policy;
+
+#[test]
+fn native_shared_rustc_policy() {
+    assert!(rustc_policy::proof());
+}

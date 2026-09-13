@@ -251,6 +251,7 @@ version = "0.1.0"
 dependencies = [
  "kernal-api",
  "wit-bindgen",
+ "zccache-compiler",
  "zccache-hash",
 ]
 
@@ -675,6 +676,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -966,6 +973,14 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "zccache-compiler"
+version = "1.13.22"
+source = "git+https://github.com/zackees/zccache?rev=c6ddfa974a4920a127eac81773db6a5c56cd30a7#c6ddfa974a4920a127eac81773db6a5c56cd30a7"
+dependencies = [
+ "typed-path",
+]
 
 [[package]]
 name = "zccache-hash"

@@ -165,8 +165,28 @@ These observations do not establish the remaining failure matrix.
 Run under Xvfb on headless
 Linux, using the environment in `docs/tauri-external-content-isolation.md`.
 
-The dedicated `wasm-tauri-screenshot-linux` CI job builds this actual guest
-and runs both proofs with WebKitGTK 4.1 under Xvfb. Set
+The dedicated `wasm-tauri-screenshot-native` CI matrix builds the actual guest
+and runs the native proofs on six explicitly matched Rust hosts. Linux uses
+WebKitGTK 4.1 under Xvfb; macOS uses WKWebView; Windows checks/installs the
+Evergreen WebView2 Runtime. The configured runner/target pairs are:
+
+| Runner | Native Rust target |
+| --- | --- |
+| `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `macos-15-intel` | `x86_64-apple-darwin` |
+| `macos-15` | `aarch64-apple-darwin` |
+| `windows-2025` | `x86_64-pc-windows-msvc` |
+| `windows-11-arm` | `aarch64-pc-windows-msvc` |
+
+These labels follow the [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Windows setup follows [Microsoft's Runtime detection/deployment procedure](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution),
+verifies the downloaded installer's signature, and records the installed version.
+The matrix fails a Rust-host mismatch instead of counting emulation or a
+cross-build as native proof. Native harness builds omit `--target` so native
+GUI libraries use the host build setup rather than an explicit-target sysroot.
+**The five additional native runs are not yet
+verified; configured jobs are not acceptance evidence.** Set
 `KERNAL_API_SCREENSHOT_PROOF_DIR` to retain a unique diagnostic directory
 containing runner stdout/stderr, process outcome/timing JSON, and the exact
 output directory even if an assertion fails. CI uploads these artifacts on
@@ -184,8 +204,8 @@ delivered it; `output/` retains the final file and neighbor. A `validation.txt`
 marker is written only after all assertions pass. In particular, forced
 termination records a missing trace rather than fabricated zero worker counters.
 Hard termination can prevent the bounded trace from being emitted,
-so failure-path/containment diagnostics remain incomplete. This Linux x86-64 lane does not
-establish native execution on the other five supported host targets.
+so failure-path/containment diagnostics remain incomplete. Existing local Linux
+x86-64 evidence does not establish native execution on the other five targets.
 
 Focused formatting and lint checks:
 

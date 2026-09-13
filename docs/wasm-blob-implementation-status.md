@@ -487,3 +487,35 @@ on Linux x86-64. The admitted artifact was reused and the host rebuilt.
 
 The wider goal also retains #13, #19–#22, #28, and fp-bindgen#1. Completion of
 these native hub tests does not close those deliverables.
+
+## Native CI matrix rollout (not execution evidence)
+
+The dedicated screenshot job is now `wasm-tauri-screenshot-native`, with six
+explicit runner/target pairs documented in the example README. Each checks
+the Rust host triple and builds the test executable with native Cargo defaults;
+neither cross-compilation nor an emulated host is counted as native execution.
+Linux restores its actual architecture's pkg-config path and uses WebKitGTK
+4.1/Xvfb. macOS runs its native harness directly. Windows uses PowerShell guest
+builds and Cargo JSON executable selection, verifies or installs the signed
+Microsoft Evergreen WebView2 Runtime, and records its version. All Rust tools
+still run through Soldr, and harness execution follows the outer Soldr exit.
+Each target gets distinct always-upload proof artifacts and fail-fast is off.
+
+Workflow actionlint and syntax parsing of all five PowerShell steps pass
+locally. This configuration has not yet run on the five additional native
+targets. Runner, toolchain, GUI-session, or native-adapter failures must remain
+visible and be resolved or recorded as infrastructure blockers; this matrix
+does not close #22 or replace required runtime evidence.
+
+The local explicit-target Linux build failed at linking before native test
+execution. Soldr selected its GNU sysroot linker, which reported unresolved
+transitive Nix WebKitGTK libraries (including libffi and libepoxy). A repeat
+reproduced the link failure. The native-host guard passes, but this build is
+not a passing matrix proof. The workflow now omits `--target` for the native
+harness while retaining its exact Rust host-triple guard, avoiding an explicit
+target's sysroot selection for native GUI libraries. The revised Soldr build
+completed locally in 2m46s; its Cargo-JSON-selected harness then passed
+`actual_screenshot_guest_native_capture_quota_failure_drains_containment`
+under Xvfb in 9.27s (one passed, 17 filtered out). This is focused Linux x86-64
+evidence, not a full-suite or other-platform result. The six native execution
+requirements are unchanged.

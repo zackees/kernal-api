@@ -23,6 +23,7 @@ CASES = (
     ("http-server", "hyper"),
     ("http-server", "http-body-util"),
     ("event-stream", "tokio-stream"),
+    ("sqlite", "rusqlite"),
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),

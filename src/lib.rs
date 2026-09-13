@@ -24,6 +24,14 @@ mod process_adapter;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Synchronous, bounded SQLite storage mechanics.
+///
+/// This facade owns connection safety policy and semantic result values; the
+/// application owns its schema, SQL, migrations, and choice of blocking
+/// worker. Do not call it on an async executor thread.
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
 pub mod random;

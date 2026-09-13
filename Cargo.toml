@@ -36,6 +36,9 @@ required-features = ["tauri-webview-test-support"]
 default = []
 # Bounded OS entropy, independent of crash/profiling facilities.
 secure-random = ["dep:getrandom"]
+# Synchronous, bounded SQLite mechanics.  Applications retain schema, SQL,
+# migrations, and scheduling policy; run this facade on a kernel blocking worker.
+sqlite = ["dep:rusqlite", "dep:tempfile"]
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the
@@ -190,6 +193,7 @@ full = [
 
 [dependencies]
 reqwest = { version = "=0.12.28", default-features = false, features = ["default-tls"], optional = true }
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled", "backup"], optional = true }
 # Constrain reqwest's private parser for published consumers, not just this
 # repository's lockfile. Its metadata bounds are audited in docs/http-client.md.
 hyper = { version = "=1.11.0", default-features = false, optional = true }

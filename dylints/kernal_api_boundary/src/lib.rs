@@ -57,6 +57,7 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "interprocess",
     "jwalk",
     "libc",
+    "libsqlite3_sys",
     "mach2",
     "memmap2",
     "mimalloc_pprof",
@@ -65,6 +66,7 @@ const OWNED_IMPLEMENTATION_CRATES: &[&str] = &[
     "portable_pty",
     "reflink_copy",
     "running_process",
+    "rusqlite",
     "sysinfo",
     "tokio",
     "widestring",
@@ -502,9 +504,11 @@ fn manifest_scan_finds_normal_aliased_target_and_test_dependencies() {
         tokio = "1"
         async_backend = { package = "console-subscriber", version = "0.5" }
         process_backend = { package = "running-process", version = "4" }
+        rusqlite = "0.40"
 
         [target.'cfg(windows)'.dev-dependencies]
         portable-pty = "0.9"
+        sqlite_sys = { package = "libsqlite3-sys", version = "0.35" }
     "#;
     toml::from_str::<toml::Value>(manifest)
         .expect("the client manifest fixture must be valid TOML");
@@ -512,8 +516,10 @@ fn manifest_scan_finds_normal_aliased_target_and_test_dependencies() {
         direct_owned_dependencies_in(manifest),
         [
             "console-subscriber",
+            "libsqlite3-sys",
             "portable-pty",
             "running-process",
+            "rusqlite",
             "tokio"
         ]
     );

@@ -120,6 +120,8 @@ fn implementation_crates_are_not_publicly_reexported() {
                                 | "pub use running_process::SpawnLifetime;"
                                 | "pub use running_process::SpawnMode;"
                                 | "pub use running_process::SpawnOptions;"
+                                | "pub use running_process::SpawnExit;"
+                                | "pub use running_process::SpawnHandle;"
                                 | "pub use running_process::daemon_frame_v1;"
                                 | "pub use running_process::register_daemon_frame_payload_protocol;"
                                 | "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;"
@@ -140,6 +142,8 @@ fn implementation_crates_are_not_publicly_reexported() {
                     "pub use running_process::SpawnLifetime;",
                     "pub use running_process::SpawnMode;",
                     "pub use running_process::SpawnOptions;",
+                    "pub use running_process::SpawnExit;",
+                    "pub use running_process::SpawnHandle;",
                     "pub use running_process::daemon_frame_v1;",
                     "pub use running_process::register_daemon_frame_payload_protocol;",
                     "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;",

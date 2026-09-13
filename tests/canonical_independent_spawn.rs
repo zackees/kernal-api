@@ -1,8 +1,8 @@
 //! Compile-time identity contract for issue #189.
 
 use kernal_api::{
-    IndependentBackend, IndependentChild, LaunchSpec, Readiness, SpawnLifetime, SpawnMode,
-    SpawnOptions,
+    IndependentBackend, IndependentChild, LaunchSpec, Readiness, SpawnHandle, SpawnLifetime,
+    SpawnMode, SpawnOptions,
 };
 
 fn backend_to_facade_mode(value: running_process::SpawnMode) -> SpawnMode {
@@ -40,8 +40,9 @@ fn module_namespace_preserves_canonical_signatures() {
         &running_process::independent_spawn::LaunchSpec,
         &running_process::SpawnOptions,
         &std::sync::atomic::AtomicBool,
-    ) -> std::io::Result<running_process::independent_spawn::IndependentChild> =
-        kernal_api::spawn_independent;
+    ) -> std::io::Result<running_process::SpawnHandle> = kernal_api::spawn_independent;
+
+    let _: Option<SpawnHandle> = None;
 
     let _: fn(
         &running_process::independent_spawn::LaunchSpec,

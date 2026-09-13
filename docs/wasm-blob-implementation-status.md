@@ -101,6 +101,17 @@ not facade-owned public `kernal_api` guest operations. These unpublished fixture
 prove ABI/runtime behavior only; they do not satisfy #13's public guest API or
 exact pre-1.0 consumer-pin acceptance criteria.
 
+Compiler RED evidence at `b95b1c6`: `soldr cargo check --locked
+--no-default-features --lib --target wasm32-wasip1-threads -j 1` exits 101.
+After compiling Mio 1.2.2, Tokio 1.53.1 rejects its enabled native features:
+`Only features sync,macros,io-util,rt,time are supported on wasm.` The diagnostic
+is at Tokio's `src/lib.rs:479`; this is a dependency-feature failure, not a
+missing Wasm standard library. The check stops before compiling this facade,
+so it does not establish what additional source errors remain. Turning off
+default features alone is demonstrably insufficient. Target-scoping the native
+dependency graph must accompany the source/API split; merely gating native
+modules cannot prevent this earlier dependency failure.
+
 The native package currently selects only Linux/macOS/Windows implementations
 in `src/lib.rs` and has an unconditional mandatory `running-process` dependency.
 Simply renaming the generated dependency to `kernal-api` would conceal rather

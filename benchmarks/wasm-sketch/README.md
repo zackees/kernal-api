@@ -58,6 +58,25 @@ That is the build time of the native measurement executable and its dependencies
 not a guest cold-build or edit-loop sample. The optimized-host edit run is
 recorded separately from the debug diagnostic below.
 
+### Optional build-memory measurement
+
+Pass `--gnu-time /usr/bin/time` (or the installed GNU time path) to retain
+`<sample>-build.rss-kib` alongside each build log. The runner verifies GNU time,
+uses its `%M` measurement, converts KiB to bytes, and rejects absent, malformed,
+or zero readings. BSD time and shell builtins are not supported by this option;
+without it, the runner remains usable without this additional dependency.
+
+`build_peak_rss_bytes` and `build_memory.peak_rss_bytes` describe GNU time's
+build-command high-water mark, not a sum of concurrently resident processes,
+an isolated rustc allocation profile, or native admission-engine memory.
+Detached daemon processes are outside GNU time's accounting; in particular,
+do not infer that the number captures all Soldr broker/daemon memory.
+The compiler-specific field remains null: this command-level diagnostic does
+not by itself discharge the peak-compiler-memory acceptance requirement.
+The timing wrapper is included in end-to-end wall time, so keep instrumented
+results separate from the original uninstrumented diagnostics. Caching remains
+explicitly disabled; no cache-hit percentage is inferred or fabricated.
+
 ## Isolated core edit runner
 
 ```sh
@@ -103,3 +122,10 @@ sample was 17.198s and the no-op 0.608s. The measured edit p50 is below 2s,
 but this remains diagnostic evidence on a shared development host, with caching
 disabled and compiler RSS unmeasured. It does not establish the full #13 gate,
 the Component Model comparison, fixture correctness, or a go/no-go selection.
+
+The separate instrumented run is retained in
+[results/core-release-rss-diagnostic.json](results/core-release-rss-diagnostic.json).
+Ten distinct edits passed admission, with p50 1.372s and p95 1.391s.
+The largest GNU time build-command reading was 264,003,584 bytes (251.77 MiB),
+on the fresh-target sample. This is the scoped diagnostic described above,
+not complete compiler/process-tree memory accounting or binding selection.

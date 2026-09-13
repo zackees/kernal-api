@@ -57,10 +57,22 @@ def validate_admission(record: object, module_bytes: int) -> dict[str, object]:
     return record
 
 
-def run(command: list[str], cwd: Path, log: Path) -> tuple[int, str]:
+def build_rss(raw: str) -> int:
+    value = raw.strip()
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise ValueError("GNU time must report one positive peak RSS value in KiB")
+    return int(value) * 1024
+
+
+def run(command: list[str], cwd: Path, log: Path, *,
+        gnu_time: Path | None = None, rss_log: Path | None = None) -> tuple[int, str]:
+    if (gnu_time is None) != (rss_log is None):
+        raise ValueError("GNU time and its RSS output path must be supplied together")
+    if gnu_time is not None:
+        command = [str(gnu_time), "-f", "%M", "-o", str(rss_log), "--", *command]
     start = time.monotonic_ns()
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True,
-                            env={**os.environ, "SOLDR_LINKER": "default"})
+                            env={**os.environ, "SOLDR_LINKER": "default", "LC_ALL": "C"})
     elapsed = time.monotonic_ns() - start
     log.write_text(result.stdout + "\n--- stderr ---\n" + result.stderr, encoding="utf-8")
     if result.returncode:
@@ -74,6 +86,8 @@ def main() -> None:
     parser.add_argument("--admission", required=True, type=Path)
     parser.add_argument("--embedder", required=True, type=Path)
     parser.add_argument("--edits", default=10, type=int)
+    parser.add_argument("--gnu-time", type=Path,
+                        help="optional GNU time executable; collect build command peak RSS")
     args = parser.parse_args()
     if args.edits < 10:
         parser.error("--edits must be at least 10")
@@ -81,6 +95,14 @@ def main() -> None:
     admission, embedder = args.admission.resolve(), args.embedder.resolve()
     if not admission.is_file() or not embedder.is_file():
         parser.error("build the admission and metadata executables first")
+    gnu_time = args.gnu_time.resolve() if args.gnu_time else None
+    time_version = None
+    if gnu_time is not None:
+        version = subprocess.run([str(gnu_time), "--version"], capture_output=True,
+                                 text=True, check=True, env={**os.environ, "LC_ALL": "C"})
+        if "GNU Time" not in version.stdout:
+            parser.error("--gnu-time must name GNU time (not BSD time or a shell builtin)")
+        time_version = version.stdout.splitlines()[0]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     source = output / "source"
@@ -101,7 +123,13 @@ def main() -> None:
                 "admission_sha256": hashlib.sha256(admission.read_bytes()).hexdigest(),
                 "embedder_sha256": hashlib.sha256(embedder.read_bytes()).hexdigest(),
                 "cache_hit_rate": None, "peak_compiler_rss_bytes": None,
-                "limitations": ["cache and compiler RSS are not collected",
+                "cache_mode": "soldr-disabled",
+                "build_memory": {"method": "gnu-time-%M" if gnu_time else None,
+                                 "tool_version": time_version,
+                                 "scope": "build command peak RSS; not aggregate concurrent RSS",
+                                 "peak_rss_bytes": None},
+                "limitations": ["cache hit rate and compiler-specific RSS are not collected",
+                                "GNU time does not account for detached daemon processes",
                                 "no Component Model or execution comparison"]}
     previous = 10
     for index in range(args.edits + 2):
@@ -112,9 +140,12 @@ def main() -> None:
                                                 previous, following), encoding="utf-8")
             previous = following
         started = time.monotonic_ns()
+        rss_log = output / f"{label}-build.rss-kib" if gnu_time else None
         build_ns, _ = run(["soldr", "--no-cache", "cargo", "build", "--locked", "--release",
                            "--target", "wasm32-wasip1-threads", "--target-dir", str(target),
-                           "-j", "1"], guest, output / f"{label}-build.log")
+                           "-j", "1"], guest, output / f"{label}-build.log",
+                          gnu_time=gnu_time, rss_log=rss_log)
+        peak_rss = build_rss(rss_log.read_text(encoding="utf-8")) if rss_log else None
         shutil.copyfile(artifact, admitted)
         embed_ns, _ = run([str(embedder), "--embed-threaded-metadata", str(admitted)],
                           source, output / f"{label}-metadata.log")
@@ -124,12 +155,16 @@ def main() -> None:
         elapsed = time.monotonic_ns() - started
         records.append({"label": label, "wall_ns": elapsed, "build_ns": build_ns,
                         "metadata_ns": embed_ns, "admission_command_ns": admit_ns,
+                        "build_peak_rss_bytes": peak_rss,
                         "admission": measurement,
                         "source_sha256": hashlib.sha256(guest_source.read_bytes()).hexdigest(),
                         "module_sha256": hashlib.sha256(admitted.read_bytes()).hexdigest()})
         (output / "result.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         print(f"{label}: {elapsed / 1_000_000_000:.3f}s", flush=True)
     document["edit_summary"] = edit_summary(records[2:])
+    if gnu_time:
+        document["build_memory"]["peak_rss_bytes"] = max(
+            sample["build_peak_rss_bytes"] for sample in records)
     document["status"] = "complete-diagnostic-only"
     (output / "result.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 

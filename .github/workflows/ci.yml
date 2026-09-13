@@ -157,6 +157,7 @@ jobs:
           - fs
           - fs-watch
           - hash-sha256
+          - secure-random
           - event-stream
           - http-server
           - http-client

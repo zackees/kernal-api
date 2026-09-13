@@ -24,6 +24,10 @@ mod process_adapter;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Bounded, fallible operating-system entropy without token-format policy.
+#[cfg(feature = "secure-random")]
+pub mod random;
+
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]
 pub mod archive;

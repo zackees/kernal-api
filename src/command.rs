@@ -321,6 +321,7 @@ impl Command {
             }
             words.push(value.to_owned());
         }
+        let explicit_options = explicit_option_names(&words);
         self.validate()?;
         let command = self.clap_command();
         let matches = command
@@ -348,7 +349,7 @@ impl Command {
             .iter()
             .map(|(command, _)| *command)
             .collect::<Vec<_>>();
-        Self::validate_selected_relations(&selected_schemas, &values)?;
+        Self::validate_selected_relations(&selected_schemas, &explicit_options)?;
         Ok(ParsedCommand { path, values })
     }
 
@@ -600,24 +601,24 @@ impl Command {
 
     fn validate_selected_relations(
         selected: &[&Self],
-        values: &BTreeMap<String, ParsedValue>,
+        explicit_options: &std::collections::BTreeSet<String>,
     ) -> Result<(), CommandError> {
         for command in selected {
             for option in &command.options {
-                if is_present(values.get(&option.name))
+                if explicit_options.contains(&option.name)
                     && option
                         .conflicts
                         .iter()
-                        .any(|name| is_present(values.get(name)))
+                        .any(|name| explicit_options.contains(name))
                 {
                     return Err(CommandError::InvalidArguments);
                 }
-                if is_present(values.get(&option.name))
+                if explicit_options.contains(&option.name)
                     && !option.requires_any.is_empty()
                     && !option
                         .requires_any
                         .iter()
-                        .any(|name| is_present(values.get(name)))
+                        .any(|name| explicit_options.contains(name))
                 {
                     return Err(CommandError::InvalidArguments);
                 }
@@ -625,7 +626,7 @@ impl Command {
             for (_, options) in &command.exclusive_groups {
                 if options
                     .iter()
-                    .filter(|name| is_present(values.get(*name)))
+                    .filter(|name| explicit_options.contains(*name))
                     .take(2)
                     .count()
                     > 1
@@ -638,14 +639,20 @@ impl Command {
     }
 }
 
-fn is_present(value: Option<&ParsedValue>) -> bool {
-    match value {
-        Some(ParsedValue::Flag(value)) => *value,
-        Some(ParsedValue::String(_)) => true,
-        Some(ParsedValue::Strings(values)) => !values.is_empty(),
-        Some(ParsedValue::F64(_)) | Some(ParsedValue::U32(_)) => true,
-        Some(ParsedValue::Absent) | None => false,
+fn explicit_option_names(words: &[String]) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut options_enabled = true;
+    for word in words.iter().skip(1) {
+        if options_enabled && word == "--" {
+            options_enabled = false;
+        } else if options_enabled {
+            if let Some(name) = word.strip_prefix("--") {
+                let name = name.split_once('=').map_or(name, |(name, _)| name);
+                names.insert(name.to_owned());
+            }
+        }
     }
+    names
 }
 
 fn valid_name(name: &str) -> bool {

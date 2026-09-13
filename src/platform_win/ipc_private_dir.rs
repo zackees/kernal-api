@@ -15,7 +15,7 @@ use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
 /// ACEs through existing descendants. The earlier non-inheritable policy could
 /// leave descendants with an empty DACL, including files with hardlinks outside
 /// the directory. Reapplying this policy repairs that legacy state.
-#[cfg(feature = "ipc")]
+#[cfg(any(feature = "ipc", feature = "fs"))]
 fn private_dir_sddl() -> io::Result<String> {
     Ok(format!(
         "D:P(A;OICI;FA;;;{})(A;OICI;FA;;;SY)",

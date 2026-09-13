@@ -120,13 +120,14 @@ async fn contained(
     runtime: RuntimeHandle,
     config: &SketchWorkerConfig,
     cancellation: Option<CancellationSource>,
+    outer_bound: Duration,
 ) -> SketchWorkerTerminal {
     let token = cancellation
         .as_ref()
         .map(CancellationSource::token)
         .unwrap_or_else(|| CancellationSource::new().token());
     async_engine::timeout(
-        OUTER_BOUND,
+        outer_bound,
         sketch.execute_threaded_root_contained_cancellable(runtime, config, token),
     )
     .await
@@ -163,6 +164,17 @@ fn run_case(
     cancel: bool,
     expected: SketchWorkerTerminal,
 ) {
+    run_case_with_outer_bound(bytes, deadline, fuel, cancel, expected, OUTER_BOUND);
+}
+
+fn run_case_with_outer_bound(
+    bytes: Vec<u8>,
+    deadline: Duration,
+    fuel: SketchFuelLimits,
+    cancel: bool,
+    expected: SketchWorkerTerminal,
+    outer_bound: Duration,
+) {
     let compiler = compiler(deadline, fuel);
     let sketch = admit(&compiler, bytes);
     let config = worker_config();
@@ -177,7 +189,7 @@ fn run_case(
             let config = config.clone();
             let source = source.clone();
             let handle = runtime.handle();
-            async move { contained(&sketch, handle, &config, Some(source)).await }
+            async move { contained(&sketch, handle, &config, Some(source), outer_bound).await }
         });
         if cancel {
             // Let the parent finish the bounded upload and the child enter
@@ -197,12 +209,17 @@ fn cargo_built_threaded_guest_runs_inside_killable_worker() {
     let path = std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM")
         .expect("explicit artifact proof must supply its Cargo-built Wasm");
     let bytes = std::fs::read(path).expect("read real threaded guest");
-    run_case(
+    // Intel macOS completes the real artifact in about 13 seconds under the
+    // native screenshot job. Keep this real-worker smoke bounded, but leave
+    // enough room for that supported host rather than misclassifying normal
+    // execution as containment expiry.
+    run_case_with_outer_bound(
         bytes,
-        Duration::from_secs(8),
+        Duration::from_secs(20),
         long_fuel(),
         false,
         SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+        Duration::from_secs(30),
     );
 }
 
@@ -569,8 +586,8 @@ mod failure_proof {
             .enable_all()
             .build()
             .expect("runtime");
-        let actual =
-            runtime.run(async { contained(&sketch, runtime.handle(), &config, None).await });
+        let actual = runtime
+            .run(async { contained(&sketch, runtime.handle(), &config, None, OUTER_BOUND).await });
         fs::write(std::env::var_os(RESULT).expect("result"), actual.code()).expect("result");
         runtime.run(async { assert_clean(&compiler, &sketch).await });
     }

@@ -369,21 +369,43 @@ pub(crate) mod tests {
         nonce: [u8; 12],
         corrupt_tag: bool,
     ) -> (EncryptedInput, u64) {
+        encrypted_zip_entry(
+            header,
+            key,
+            nonce,
+            corrupt_tag,
+            "payload",
+            17 * 1024 * 1024,
+            0x5a,
+        )
+    }
+
+    pub(crate) fn encrypted_zip_entry(
+        header: &[u8],
+        key: [u8; 16],
+        nonce: [u8; 12],
+        corrupt_tag: bool,
+        name: &str,
+        bytes: u64,
+        value: u8,
+    ) -> (EncryptedInput, u64) {
         use openssl::symm::{Cipher, Crypter, Mode};
         let mut zip = zip::ZipWriter::new(tempfile::tempfile().unwrap());
         zip.start_file(
-            "payload",
+            name,
             zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored),
         )
         .unwrap();
-        let mut chunk = [0x5a; 64 * 1024];
-        for _ in 0..272 {
-            zip.write_all(&chunk).unwrap();
+        let mut chunk = [value; 64 * 1024];
+        let mut remaining = bytes;
+        while remaining != 0 {
+            let count = remaining.min(chunk.len() as u64) as usize;
+            zip.write_all(&chunk[..count]).unwrap();
+            remaining -= count as u64;
         }
         let mut zip = zip.finish().unwrap();
         let length = zip.metadata().unwrap().len();
-        assert!(length > 16 * 1024 * 1024);
         zip.rewind().unwrap();
         let mut source = source(header, 0);
         source.rewind().unwrap();

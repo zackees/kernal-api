@@ -163,6 +163,12 @@ default correctly exhausted during the first full-payload execution.
 The freshly built revision-5 Wasm passes valid ZIP, corrupted-tag, and
 wrong-nonce cases on Linux x86-64 in 12.73 s, including these peak and teardown
 assertions. This does not replace six-target execution or upstream policy proof.
+The same full-guest test now additionally rejects an authenticated unexpected
+name, traversal path, oversized entry (32 MiB + 1), and incorrect payload bytes.
+The seven-case Linux run passes in 31.31 s. Policy/size/path failures expose no
+Blob payload; the incorrect-content case reaches guest byte validation, then
+reclaims its producer and storage on nonzero guest exit. Native path/size
+rejection and guest product-name/content rejection are distinct evidence.
 
 The reader is sequential: drain or drop the open Blob before advancing
 inventory or opening another entry. Entry handles independently retain storage,

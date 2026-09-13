@@ -38,14 +38,25 @@ fn authenticated_guest_control(artifact_variable: &str) {
         .enable_all()
         .build()
         .unwrap();
-    for case in 0..3 {
+    let stream_proof = artifact_variable == "KERNAL_EXTENSION2_STREAM_WASM";
+    for case in 0..if stream_proof { 7 } else { 3 } {
         let sketch = compiler.admit(&bytes, policy).unwrap();
         let header = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#;
-        let (input, length) = crate::operations::archive_input::tests::encrypted_zip_with_header(
+        let (name, payload_bytes, value) = match case {
+            3 => ("other", 17 * 1024 * 1024, 0x5a),
+            4 => ("../payload", 17 * 1024 * 1024, 0x5a),
+            5 => ("payload", 32 * 1024 * 1024 + 1, 0x5a),
+            6 => ("payload", 17 * 1024 * 1024, 0),
+            _ => ("payload", 17 * 1024 * 1024, 0x5a),
+        };
+        let (input, length) = crate::operations::archive_input::tests::encrypted_zip_entry(
             header,
             [7; 16],
             if case == 2 { [8; 12] } else { [0; 12] },
             case == 1,
+            name,
+            payload_bytes,
+            value,
         );
         assert!(length > 16 * 1024 * 1024);
         let result = runtime.run(sketch.execute_threaded_root_with_grant(
@@ -62,7 +73,8 @@ fn authenticated_guest_control(artifact_variable: &str) {
                 Ok(ThreadedRootOutcome::Started)
             } else {
                 Err(SketchExecutionError::NonzeroExit { code: 1 })
-            }
+            },
+            "authenticated guest case {case}"
         );
         let snapshot = sketch
             .root_execution_observation_for_test()
@@ -76,8 +88,10 @@ fn authenticated_guest_control(artifact_variable: &str) {
         assert_eq!(snapshot.retained_transfer_capacity, 0);
         assert!(snapshot.peak_retained_transfer_capacity <= blobs.maximum_transfer_bytes());
         assert!(snapshot.peak_buffered_blob_bytes <= blobs.maximum_blob_bytes());
-        if case == 0 && artifact_variable == "KERNAL_EXTENSION2_STREAM_WASM" {
+        if stream_proof && matches!(case, 0 | 6) {
             assert!(snapshot.peak_buffered_blob_bytes > 0);
+        } else if stream_proof {
+            assert_eq!(snapshot.peak_buffered_blob_bytes, 0);
         }
         sketch.close_threaded_root().unwrap();
     }

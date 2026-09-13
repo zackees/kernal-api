@@ -21,6 +21,7 @@ CASES = (
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),
+    ("archive-auth-test-support", "openssl"),
     ("tauri-webview", "tauri"),
     ("tauri-webview", "tauri-runtime-wry"),
     ("tauri-webview", "wry"),

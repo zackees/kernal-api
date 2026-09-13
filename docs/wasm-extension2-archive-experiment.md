@@ -130,7 +130,9 @@ The required lifecycle is:
 The distinction between update output and authenticated output is explicit
 in the maintained [OpenSSL authenticated-decryption example](https://github.com/openssl/openssl/blob/master/demos/cipher/aesgcm.c)
 and [Rust OpenSSL Crypter API](https://docs.rs/openssl/0.10.81/openssl/symm/struct.Crypter.html).
-These are implementation references, not a selected or added dependency.
+The test-gated native prototype uses exact OpenSSL 0.10.81 with a vendored
+backend under `archive-auth-test-support`; this does not select a Wasm binding
+candidate or expose a production guest capability.
 Do not hand-roll AES/GHASH to avoid a dependency, or use per-chunk AEAD records
 that are incompatible with the existing single-message envelope.
 
@@ -141,3 +143,36 @@ key fixture must exceed 16 MiB, preserve bytes through bounded reads and
 central-directory seeks, and report peak memory, staged bytes, and zero live
 resources after close/cancel/teardown. A native crypto-only test is not a
 substitute for running that sequence through the actual guest ABI.
+
+## Native authenticated-staging prototype
+
+`src/archive/authenticated_staging.rs` is compiled only for tests with
+`archive-auth-test-support`. Its pending type has no read/seek/path accessor.
+Updates are capped at 64 KiB and write only to an anonymous temporary file.
+Authentication consumes the pending state, verifies the expected length and
+the single final GCM tag, then returns the seekable file with its storage
+reservation. An update error permanently invalidates the pending state.
+Drop, errors, and failed authentication close staging and release accounting;
+successful authentication keeps the reservation charged until file drop.
+
+This is synchronous native prototype work, not an async operation or resource
+registry integration. The accounting is a private shared counter supplied by
+the test harness, not the final authoritative sketch quota. Cancellation is
+currently owner drop; guest cancellation/worker teardown and progress deadlines
+are still unimplemented. OS file cache/RSS and secure physical erasure of
+temporary plaintext are not proven by byte accounting. No claim is made that
+enabling the test-support feature implements the production archive contract.
+
+```sh
+soldr cargo test --locked --features archive-auth-test-support --lib authenticated_staging
+```
+
+On Linux x86-64 the initial vendored build took 223.30 seconds; all three
+native tests passed in 0.06 seconds. Tests cover the standard zero-key GCM
+vector, a 17 MiB single message with separate AAD/ciphertext/tag mutations,
+incomplete input, per-update rejection, aggregate reservation denial, and
+reservation release after success/failure/drop. The large case checks a seek
+to the final chunk; it is not an encrypted ZIP or a guest execution test.
+A temporary mutation that ignored failed final authentication caused the
+known-vector regression to fail by returning an authenticated file for a bad
+tag. Restoring error propagation returned all three tests to GREEN.

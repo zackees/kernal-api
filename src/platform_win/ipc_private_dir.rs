@@ -190,21 +190,90 @@ fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
 }
 
-/// Open a directory once for the owner and DACL updates that harden it.
+/// Open a directory for DACL inspection and update without demanding an owner
+/// change that ordinary owners are not entitled to make.
 ///
-/// The handle pins the target across the two required `SetSecurityInfo` calls:
-/// a rename or reparse-point replacement cannot make the owner update affect
-/// one directory and the DACL update another.
+/// Windows grants an object owner `READ_CONTROL` and `WRITE_DAC` implicitly,
+/// but not `WRITE_OWNER`. Request only the former two rights on the normal
+/// path; ownership correction reopens with `WRITE_OWNER` below only when the
+/// live object actually needs it.
 #[cfg(feature = "ipc")]
-fn open_directory_for_security_update(path: &Path) -> io::Result<File> {
+fn open_directory_for_dacl_update(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
-    use winapi::um::winnt::{WRITE_DAC, WRITE_OWNER};
+    use winapi::um::winnt::{READ_CONTROL, WRITE_DAC};
 
     std::fs::OpenOptions::new()
-        .access_mode(WRITE_OWNER | WRITE_DAC)
+        .access_mode(READ_CONTROL | WRITE_DAC)
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
+}
+
+/// Reopen only after inspection showed that assigning TokenUser is necessary.
+/// Both mutating calls then target this one handle, so a pathname race cannot
+/// split the owner and DACL updates across different directories.
+#[cfg(feature = "ipc")]
+fn open_directory_for_owner_and_dacl_update(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+    use winapi::um::winnt::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+
+    std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// Compare the owner of this live handle to the caller's TokenUser SID.
+///
+/// This deliberately requests no pathname metadata. The caller may use the
+/// answer to decide whether `WRITE_OWNER` is required, and it must recheck
+/// after opening the stronger handle before mutating a mismatched object.
+#[cfg(feature = "ipc")]
+fn opened_owner_is_current_user(file: &File) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `file` owns a live handle with READ_CONTROL; every output
+    // pointer is a writable local. On success the descriptor is adopted below
+    // and freed by `LocalSecurityDescriptor` before this function returns.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory security query returned a null descriptor",
+        ));
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory security descriptor has no owner",
+        ));
+    }
+    let current_sid = current_user_sid_bytes()?;
+    // SAFETY: `owner` is borrowed from `_descriptor`, which remains live, and
+    // `current_sid` is the valid SID copied from the live process token.
+    Ok(unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } != 0)
 }
 
 /// Assign the current token user as an open file's owner without accepting
@@ -251,15 +320,27 @@ fn apply_dacl_sddl(
     use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
-    let file = open_directory_for_security_update(path)?;
-    apply_current_user_owner(&file)?;
+    let file = open_directory_for_dacl_update(path)?;
+    let file = if opened_owner_is_current_user(&file)? {
+        file
+    } else {
+        drop(file);
+        let file = open_directory_for_owner_and_dacl_update(path)?;
+        // The first inspection intentionally carries no authority across this
+        // reopen. Recheck the stronger handle, then bind both mutating calls
+        // to exactly that live object.
+        if !opened_owner_is_current_user(&file)? {
+            apply_current_user_owner(&file)?;
+        }
+        file
+    };
     let descriptor = LocalSecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
     // SAFETY: `file` pins the object updated above and has WRITE_DAC access;
     // `dacl` borrows the live descriptor for this call. All unused
-    // owner/group/SACL pointers are null. The owner was assigned to TokenUser
-    // on this same handle first, so `OW` is a single-user principal even for
-    // an elevated token whose default owner is a local group.
+    // owner/group/SACL pointers are null. When ownership differed, TokenUser
+    // was assigned on this same handle first, so `OW` is a single-user
+    // principal even for an elevated token whose default owner is a group.
     let status = unsafe {
         SetSecurityInfo(
             file.as_raw_handle() as _,
@@ -483,6 +564,22 @@ mod tests {
     use std::fs::{self, File};
 
     use super::*;
+
+    #[test]
+    fn dacl_update_handle_opens_and_reads_a_new_directory_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        fs::create_dir(&directory).unwrap();
+
+        // Regression for GitHub-hosted Windows: an owner gets WRITE_DAC, not
+        // implicit WRITE_OWNER. DACL hardening must therefore inspect the
+        // ordinary handle before asking for an owner-changing handle. An
+        // elevated token may create the directory with a group default owner,
+        // so both owner answers are valid here; successful inspection is the
+        // invariant this path needs before conditionally escalating access.
+        let handle = open_directory_for_dacl_update(&directory).unwrap();
+        let _is_current_user_owner = opened_owner_is_current_user(&handle).unwrap();
+    }
 
     #[test]
     fn ensure_private_dir_is_a_noop_for_an_already_private_populated_tree() {

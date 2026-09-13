@@ -164,6 +164,11 @@ staging gate rejects zero executed tests, and the actual guest gate still
 requires exactly one passing execution. No native target, test gate, or timeout
 was removed. Runner regression tests first failed on the missing staging call
 and duplicate workflow build, then passed after this change.
+The combined helper passed locally on Linux x86-64 at `eb612e2`, with freshly
+built revision-6 guest metadata: 29 staging tests passed (four existing ignored)
+in 0.57 s, followed by the one actual guest test in 37.41 s. The native harness
+was built once (416.25 s). This validates the revised runner locally; it does
+not establish completion of the Intel macOS job or six-host revision-6 parity.
 The archive job uses the screenshot builder's `-PrepareTargetOnly` mode to
 reuse verified core/std target repair without building any screenshot artifact.
 

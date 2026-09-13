@@ -314,6 +314,38 @@ async fn redirects_drop_cross_origin_headers_and_convert_post_to_get() {
 }
 
 #[tokio::test]
+async fn cross_origin_redirects_never_replay_post_payloads() {
+    for status in [307, 308] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/next", listener.local_addr().unwrap());
+        let (url, first) = fixture(format!("HTTP/1.1 {status} Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+        let result = Client::new(Limits {
+            max_redirects: 1,
+            total_timeout: std::time::Duration::from_millis(200),
+            ..Limits::default()
+        })
+        .unwrap()
+        .execute(Request {
+            method: Method::Post,
+            body: b"secret=private",
+            ..Request::get(&url)
+        })
+        .await;
+        first.join().unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "cross-origin POST replay must be rejected before connecting"
+        );
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+}
+
+#[tokio::test]
 async fn redirect_hops_reject_unsafe_urls_and_oversized_metadata() {
     for target in ["file:///secret", "http://user:secret@127.0.0.1:1/"] {
         let (url, worker) = fixture(format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());

@@ -12,7 +12,8 @@ use std::time::Duration;
 pub struct Limits {
     /// Redirect hops allowed (at most 32). Zero returns 3xx without following.
     /// Cross-origin hops discard all application headers; HTTPS downgrade is
-    /// rejected. POST becomes GET for 301/302/303, but is replayed for 307/308.
+    /// rejected. POST becomes GET for 301/302/303. For 307/308, POST is replayed
+    /// only within the same origin; cross-origin POST replay is rejected.
     pub max_redirects: u8,
     /// Maximum buffered request body.
     pub max_request_bytes: usize,
@@ -271,6 +272,12 @@ impl Client {
                 return Err(invalid("HTTP redirect would downgrade HTTPS"));
             }
             if next.origin() != previous.origin() {
+                // A POST payload can contain credentials even when every
+                // application header has been discarded. Following redirects
+                // does not grant a second origin authority to receive it.
+                if method == Method::Post && matches!(response.status(), 307 | 308) {
+                    return Err(invalid("HTTP redirect would replay POST across origins"));
+                }
                 headers = std::borrow::Cow::Borrowed(&[]);
             }
             if method == Method::Post && matches!(response.status(), 301..=303) {

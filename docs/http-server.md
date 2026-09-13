@@ -41,6 +41,14 @@ initial transport tests alone.
   retaining request contents or allocating an event queue. Snapshots are not
   transactional. Header/write/stream failures share the connection-error count;
   shutdown cancellation is not reported as a task failure.
+- The `fs` feature provides `platform::fs::AsyncFileIo` for bounded screenshot
+  persistence mechanics: shared fail-fast concurrency admission, per-write byte
+  acceptance, parent directory creation, and a deadline. Cancellation signals
+  between native calls; an already-running OS call keeps its permit until it
+  ends. Writes follow trusted caller-selected paths and are not atomic or
+  crash-durable. A timeout can leave partial output or finish an OS effect after
+  return. FastLED still owns PNG validation, authorization, path selection and
+  success/failure events; adoption remains pending.
 
 The body limits are acceptance limits, not precise process-memory guarantees.
 Request collection currently copies the bounded collected body into a vector;
@@ -53,7 +61,8 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 
 ## Required before the server migration can land
 
-- Bounded async filesystem effects needed for screenshot persistence.
+- Adopt bounded filesystem effects for screenshot persistence and retain product
+  error reporting; ensure file-open/read behavior fits the streamed routes.
 - Request path/query handling and application-owned response-header/CORS policy,
   including behavior for transport-generated errors and HEAD/OPTIONS requests.
 - Product route migration and parity checks before removing Axum, Tower HTTP and
@@ -78,3 +87,8 @@ checks pass locally. The suite uses the Linux build-ID flag required by process
 identity tests; an initial Soldr relay failure passed on retry.
 These are draft transport results, not proof of the remaining requirements or
 cross-platform validation of the new streaming paths.
+
+The async file-write addition passes three unit tests: parent creation and
+pre-effect byte rejection, timeout permit retention, and cancellation stop
+signaling with permit retention. The full local suite and strict all-target
+Clippy also pass with `fs,http-server,event-stream` enabled.

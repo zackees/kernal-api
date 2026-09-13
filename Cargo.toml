@@ -34,6 +34,8 @@ required-features = ["tauri-webview-test-support"]
 
 [features]
 default = []
+# Bounded OS entropy, independent of crash/profiling facilities.
+secure-random = ["dep:getrandom"]
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the

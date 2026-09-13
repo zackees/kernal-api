@@ -39,6 +39,7 @@ secure-random = ["dep:getrandom"]
 # Synchronous, bounded SQLite mechanics.  Applications retain schema, SQL,
 # migrations, and scheduling policy; run this facade on a kernel blocking worker.
 sqlite = ["dep:rusqlite", "dep:tempfile"]
+text-similarity = ["dep:strsim"]
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the
@@ -221,6 +222,7 @@ flate2 = { version = "=1.1.9", optional = true }
 framehop = { version = "=0.13.3", optional = true }
 futures-core = { version = "=0.3.34", optional = true }
 getrandom = { version = "=0.4.3", optional = true }
+strsim = { version = "=0.11.1", optional = true }
 globset = { version = "=0.4.18", optional = true }
 interprocess = { version = "=2.4.3", optional = true }
 jwalk = { version = "=0.8.1", optional = true }

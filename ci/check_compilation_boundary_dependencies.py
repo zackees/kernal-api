@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 CASES = (
+    ("text-similarity", "strsim"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),

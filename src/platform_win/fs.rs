@@ -520,3 +520,96 @@ pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::R
     }
     Ok(bytes)
 }
+
+/// Bounded ordinary regular-file observation for the public context facade.
+pub fn read_context_regular_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<crate::platform::fs::ContextFileObservation> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_OPEN_REPARSE_POINT;
+    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "context file limit overflows")
+    })?;
+    // Reject currently-special final components before opening them. The open
+    // below still verifies the handle, so this precheck is not advertised as a
+    // race-free authorization decision.
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input is not a regular file",
+        ));
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let before = file.metadata()?;
+    use std::os::windows::fs::MetadataExt as _;
+    if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input is not a regular file",
+        ));
+    }
+    let identity = file_identity(&file)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable")
+    })?;
+    let before_modified = before.modified()?;
+    if before.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input exceeds limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file)
+        .take(bound_plus_one as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input exceeds limit",
+        ));
+    }
+    let after = file.metadata()?;
+    if after.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "context input final component is a reparse point",
+        ));
+    }
+    let after_identity = file_identity(&file)?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable")
+    })?;
+    if after_identity != identity || after.len() != before.len() || after.modified()? != before_modified || bytes.len() as u64 != after.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input changed while it was read",
+        ));
+    }
+    let path_file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let path_metadata = path_file.metadata()?;
+    if path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !path_metadata.is_file()
+        || file_identity(&path_file)? != Some(identity)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "context input path changed while it was read",
+        ));
+    }
+    Ok(crate::platform::fs::ContextFileObservation {
+        bytes,
+        metadata: crate::platform::fs::context_regular_file_metadata(&after, identity)?,
+    })
+}

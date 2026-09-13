@@ -319,3 +319,41 @@ pub fn read_private_regular_file_bounded(path: &Path, max_bytes: usize) -> io::R
     }
     Ok(bytes)
 }
+
+/// Bounded ordinary regular-file observation for the public context facade.
+pub fn read_context_regular_file_bounded(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<crate::platform::fs::ContextFileObservation> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let bound_plus_one = max_bytes.checked_add(1).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "context file limit overflows"))?;
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "context input final component is a symbolic link"));
+    }
+    let file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "context input is not a regular file"));
+    }
+    let identity = file_identity(&file)?.ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable"))?;
+    let before_modified = before.modified()?;
+    if before.len() > max_bytes as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "context input exceeds limit"));
+    }
+    let mut bytes = Vec::with_capacity(bound_plus_one);
+    (&mut &file).take(bound_plus_one as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "context input exceeds limit"));
+    }
+    let after = file.metadata()?;
+    let after_identity = file_identity(&file)?.ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "context file identity is unavailable"))?;
+    if after_identity != identity || after.len() != before.len() || after.modified()? != before_modified || bytes.len() as u64 != after.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "context input changed while it was read"));
+    }
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.is_file() || FileIdentity { device: path_metadata.dev(), file: path_metadata.ino() } != identity {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "context input path changed while it was read"));
+    }
+    Ok(crate::platform::fs::ContextFileObservation { bytes, metadata: crate::platform::fs::context_regular_file_metadata(&after, identity)? })
+}

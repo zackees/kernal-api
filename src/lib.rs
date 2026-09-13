@@ -105,6 +105,9 @@ pub mod archive;
 pub mod http;
 #[cfg(feature = "http-server")]
 pub mod http_server;
+/// Owned native pseudo-terminal sessions without backend descriptor types.
+#[cfg(feature = "pty")]
+pub mod pty;
 
 /// Facade-owned identity, sidecar, probe, and endpoint-mux semantics for an
 /// existing daemon endpoint.

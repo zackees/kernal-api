@@ -1,6 +1,6 @@
 #![cfg(feature = "http-client")]
 
-use kernal_api::http::{Client, Limits};
+use kernal_api::http::{Client, Limits, Method, Request};
 use std::io::{Read, Write};
 
 fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
@@ -16,6 +16,121 @@ fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
         let _ = socket.write_all(response);
     });
     (url, worker)
+}
+
+#[tokio::test]
+async fn head_preserves_headers_without_treating_entity_length_as_body() {
+    let (url, worker) = fixture(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nX-Test: value\r\nConnection: close\r\n\r\n",
+    );
+    let client = Client::new(Limits {
+        max_body_bytes: 0,
+        ..Limits::default()
+    })
+    .unwrap();
+    let response = client
+        .execute(Request {
+            method: Method::Head,
+            ..Request::get(&url)
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.header("X-Test"), Some(b"value".as_slice()));
+    assert!(response.into_bytes().await.unwrap().is_empty());
+    worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn post_sends_application_headers_and_body() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/debug", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut wire = Vec::new();
+        while !wire.ends_with(b"ping") {
+            let mut bytes = [0; 256];
+            let n = socket.read(&mut bytes).unwrap();
+            assert_ne!(n, 0);
+            wire.extend_from_slice(&bytes[..n]);
+            assert!(wire.len() < 4096);
+        }
+        socket
+            .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        wire
+    });
+    let client = Client::new(Limits::default()).unwrap();
+    let response = client
+        .execute(Request {
+            method: Method::Post,
+            headers: &[
+                ("Content-Type", "application/json"),
+                ("User-Agent", "fixture"),
+            ],
+            body: b"ping",
+            ..Request::get(&url)
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 201);
+    let wire = String::from_utf8(worker.join().unwrap()).unwrap();
+    assert!(wire.starts_with("POST /debug HTTP/1.1\r\n"));
+    assert!(wire
+        .to_lowercase()
+        .contains("content-type: application/json\r\n"));
+    assert!(wire.ends_with("\r\n\r\nping"));
+}
+
+#[tokio::test]
+async fn request_limits_and_invalid_headers_fail_before_connecting() {
+    let client = Client::new(Limits {
+        max_request_bytes: 4,
+        ..Limits::default()
+    })
+    .unwrap();
+    let url = "http://127.0.0.1:1/";
+    for headers in [
+        &[("bad name", "value")][..],
+        &[("X-Test", "value\r\nInjected: yes")][..],
+        &[("Content-Length", "100")][..],
+        &[("Host", "elsewhere")][..],
+    ] {
+        let result = client
+            .execute(Request {
+                headers,
+                ..Request::get(url)
+            })
+            .await;
+        assert_eq!(
+            result.err().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    let result = client
+        .execute(Request {
+            method: Method::Post,
+            body: b"12345",
+            ..Request::get(url)
+        })
+        .await;
+    assert_eq!(
+        result.err().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    let headers = vec![("a", ""); 32769];
+    let result = client
+        .execute(Request {
+            headers: &headers,
+            ..Request::get(url)
+        })
+        .await;
+    assert_eq!(
+        result.err().unwrap().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }
 
 #[tokio::test]

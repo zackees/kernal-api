@@ -17,7 +17,9 @@ interface compilers {
         copy: func() -> result<output-data, error>;
     }
     granted: func() -> result<option<grant>, error>;
-    lookup-cache: func(command: borrow<grant>, key: list<u8>) -> result<cache-status, error>;
+    // A cache identity is exactly 32 bytes. Keep it scalar so canonical list
+    // lowering cannot allocate attacker-controlled input before host checks.
+    lookup-cache: func(command: borrow<grant>, key-0: u64, key-1: u64, key-2: u64, key-3: u64) -> result<cache-status, error>;
     spawn: async func(command: own<grant>) -> result<process, error>;
     read: async func(child: borrow<process>) -> result<output, error>;
     wait: async func(child: borrow<process>) -> result<exit, error>;

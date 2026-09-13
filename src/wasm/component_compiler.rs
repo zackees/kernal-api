@@ -421,12 +421,15 @@ impl compilers::Host for State {
     fn lookup_cache(
         &mut self,
         command: Resource<Grant>,
-        key: Vec<u8>,
+        key_0: u64,
+        key_1: u64,
+        key_2: u64,
+        key_3: u64,
     ) -> wasmtime::Result<Result<compilers::CacheStatus, Error>> {
-        let key: [u8; 32] = match key.try_into() {
-            Ok(key) => key,
-            Err(_) => return Ok(Err(Error::Rejected)),
-        };
+        let mut key = [0; 32];
+        for (index, word) in [key_0, key_1, key_2, key_3].into_iter().enumerate() {
+            key[index * 8..(index + 1) * 8].copy_from_slice(&word.to_le_bytes());
+        }
         let grant = self.table.get(&command)?;
         Ok(self
             .hub

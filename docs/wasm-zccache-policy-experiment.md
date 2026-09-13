@@ -569,9 +569,10 @@ KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
   wasm::component_compiler::tests -- --include-ignored --nocapture
 ```
 
-The candidate remains incomplete for #13: hostile incoming hash and cache-key
-lists are still canonically allocated before the host length check; cancellation
-coverage and public blob parity are not complete. The request-key decision is
+The candidate remains incomplete for #13: hostile incoming hash lists are still
+canonically allocated before the host length check; the fixed 32-byte compiler
+cache key crosses the Component ABI as four scalar words. Cancellation coverage
+and public blob parity are not complete. The request-key decision is
 not a complete artifact cache: it does not persist or move artifacts. Nor is it
 six-host parent acceptance, a total-RSS bound, or the matched measurements needed to
 choose the final runtime. Fixture source pins remain migration-only, not

@@ -35,7 +35,14 @@ impl CompilerGrant {
         })
     }
     pub(super) fn cache_status(&self, key: &[u8; 32]) -> Result<bool, OperationError> {
-        match compilers::lookup_cache(&self.inner, key).map_err(error)? {
+        let words: [u64; 4] = std::array::from_fn(|index| {
+            let mut bytes = [0; 8];
+            bytes.copy_from_slice(&key[index * 8..(index + 1) * 8]);
+            u64::from_le_bytes(bytes)
+        });
+        match compilers::lookup_cache(&self.inner, words[0], words[1], words[2], words[3])
+            .map_err(error)?
+        {
             compilers::CacheStatus::Hit => Ok(true),
             compilers::CacheStatus::Miss => Ok(false),
         }

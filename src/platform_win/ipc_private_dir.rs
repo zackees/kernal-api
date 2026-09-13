@@ -499,9 +499,11 @@ mod tests {
         let child = directory.join("marker");
         fs::write(&child, b"marker").unwrap();
 
-        assert_eq!(
-            crate::platform::fs::read_private_regular_file_bounded(&child, 6).unwrap(),
-            b"marker"
+        let read = crate::platform::fs::read_private_regular_file_bounded(&child, 6);
+        assert!(
+            matches!(read.as_deref(), Ok(bytes) if bytes == b"marker"),
+            "inherited child private-file read failed: {read:?}; child DACL bytes: {:02x?}",
+            file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap(),
         );
 
         apply_protected_dacl_sddl(&child, "D:P(A;;GR;;;WD)").unwrap();

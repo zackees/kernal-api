@@ -4,9 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const CAPABILITIES: u32 = 0;
-// Revision 1 requires the scoped transfer/blob abandonment semantics (18/19).
+// Revision 2 adds bounded encrypted-input grant/header/drop operations (20-22).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 1;
+const OPERATION_PROTOCOL_REVISION: u32 = 2;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -196,6 +196,23 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
+/// Optional host-owned encrypted input. No source path or key crosses the ABI.
+pub struct EncryptedArchive { token: u64 }
+impl EncryptedArchive {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(20, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
+    pub fn read_header(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
+        let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let result = imports::operation_submit(21, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let copied = (result >> 8) as usize;
+        if result as u8 != 1 || copied > destination.len() || copied > 16 * 1024 + 12 { return Err(OperationError::Rejected); }
+        Ok(copied)
+    }
+    pub fn abandon(&self) { let _ = imports::operation_submit(22, self.token, 0); }
+}
 /// One exact destination authorized by the embedding host; never a guest path.
 pub struct OutputFile { token: u64 }
 impl OutputFile {
@@ -489,6 +506,16 @@ mod tests {
     }
 
     #[test]
+    fn generated_encrypted_input_grant_and_abandon_are_scoped_scalar_submissions() {
+        let input = generated_guest::EncryptedArchive::granted()
+            .unwrap()
+            .unwrap();
+        assert_eq!(SUBMISSION.get(), (20, 0, 0));
+        input.abandon();
+        assert_eq!(SUBMISSION.get(), (22, 1, 0));
+    }
+
+    #[test]
     fn generated_poll_preserves_rejected_terminal_status() {
         let operation = generated_guest::synthetic_yield().unwrap();
         POLL_RESPONSE.set(7);
@@ -578,7 +605,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=1\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=2\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

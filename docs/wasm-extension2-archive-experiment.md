@@ -38,14 +38,20 @@ soldr cargo clippy --locked --features archive --lib --test archive_facade -- -D
 ## Still required
 
 The next guest boundary is now an executable [RED contract](../benchmarks/wasm-sketch/extension2-guest/README.md).
-Its explicit `guest-proof` Wasm build fails with E0432 because
-`kernal_api::guest::EncryptedArchive` is absent (Soldr log
+Its original `guest-proof` Wasm build failed with E0432 because
+`kernal_api::guest::EncryptedArchive` was absent (Soldr log
 `20260913T060627Z-home-niteris-dev-kernal-api.xml`). The source requires
 bounded original-header validation, authentication before archive authority,
 inventory policy, and byte-for-byte 17 MiB entry reads through the public Blob
 facade. Its separate native policy tests are not Wasm execution or unchanged
 upstream-policy equivalence evidence. Generated operations, host dispatch,
-and the encrypted fixture driver must make this same contract GREEN.
+and the encrypted fixture driver must make this same full contract GREEN.
+The header-only control now executes grant, bounded original-header policy,
+and revocation in a real Rust Wasm guest (valid, wrong identity, missing grant).
+The full build still lacks `authenticate`. The control uses an invalid sparse
+ciphertext tail, not an encrypted ZIP; it is no authentication evidence.
+Its build and execution commands are in the linked README. Protocol revision 2
+requires freshly rebuilt artifacts, not metadata relabeling of old binaries.
 
 This is a reusable native prerequisite, not an extension2/Wasm GREEN claim.
 The experiment still needs a real extension2 policy fixture, authenticated
@@ -239,8 +245,9 @@ regression fail because a retry succeeded (Soldr log
 `20260913T061836Z-home-niteris-dev-kernal-api.xml`); the guard was restored.
 
 This is the native entry-streaming seam required by the guest contract, not
-its completed implementation. The generated `EncryptedArchive` operations,
-host dispatch and real guest artifact execution remain missing. The original
+its completed implementation. Generated authentication/inventory/entry
+operations and their real guest execution remain missing; only the header
+boundary now has an actual guest control. The original
 synchronous `Write` sink tests do not prove asynchronous backpressure; the
 native Blob bridge below adds that separate proof. Neither proves cancellation
 of blocked filesystem operations.

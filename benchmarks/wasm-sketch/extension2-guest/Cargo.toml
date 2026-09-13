@@ -11,6 +11,7 @@ publish = false
 # Explicit unfinished acceptance contract. This binary is expected to remain
 # RED until the generated guest archive capability is implemented.
 guest-proof = []
+header-proof = ["guest-proof"]
 
 [[bin]]
 name = "kernal-extension2-guest-proof"

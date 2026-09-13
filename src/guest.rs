@@ -56,6 +56,34 @@ pub async fn sleep(milliseconds: u32) -> Result<(), OperationError> {
     Ok(())
 }
 
+/// Host-granted encrypted input for the archive experiment. Only its bounded
+/// public envelope metadata is readable; no path, key, or plaintext is exposed.
+/// Native input grants currently exist only in the test-support experiment.
+pub struct EncryptedArchive {
+    inner: bindings::EncryptedArchive,
+}
+
+impl EncryptedArchive {
+    /// Take the input grant once. Subsequent calls return `None`.
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        Ok(bindings::EncryptedArchive::granted()?.map(|inner| Self { inner }))
+    }
+
+    /// Copy the original bounded prefix/header. An undersized destination is
+    /// rejected without consuming the grant, so the caller may retry.
+    pub async fn read_header(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        self.inner
+            .read_header(destination)
+            .map_err(OperationError::from)
+    }
+}
+
+impl Drop for EncryptedArchive {
+    fn drop(&mut self) {
+        self.inner.abandon();
+    }
+}
+
 /// An opaque host-owned bulk resource, never an image buffer or ABI token.
 /// Drop revokes host authority without suspending or reserving an operation.
 pub struct Blob {

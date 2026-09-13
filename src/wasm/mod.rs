@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=1\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=2\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -790,6 +790,8 @@ impl AdmittedSketch {
             cancellation,
             RootGrants {
                 output: Some(destination),
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                archive: None,
                 #[cfg(feature = "tauri-webview")]
                 webview: None,
             },
@@ -815,6 +817,8 @@ impl AdmittedSketch {
             RootGrants {
                 output: Some(destination),
                 webview: Some((client, url)),
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                archive: None,
             },
         )
         .await
@@ -893,6 +897,16 @@ impl AdmittedSketch {
             .transpose()
             .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        let initial_archive = grants
+            .archive
+            .map(|input| {
+                operations
+                    .grant_encrypted_input(0, input)
+                    .map(|token| token.wire())
+            })
+            .transpose()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
         #[cfg(feature = "tauri-webview")]
         let (webviews, initial_url) = match grants.webview {
             Some((client, url)) => {
@@ -921,6 +935,8 @@ impl AdmittedSketch {
                 operations,
                 store_owner: 0,
                 initial_output,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                initial_archive,
                 #[cfg(feature = "tauri-webview")]
                 webviews,
                 #[cfg(feature = "tauri-webview")]
@@ -1105,6 +1121,8 @@ impl AdmittedSketch {
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
                 store_owner: 0,
                 initial_output: None,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                initial_archive: None,
                 #[cfg(feature = "tauri-webview")]
                 webviews: None,
                 #[cfg(feature = "tauri-webview")]
@@ -1860,6 +1878,8 @@ impl Drop for LogicalRootPermit {
 #[derive(Default)]
 struct RootGrants {
     output: Option<std::path::PathBuf>,
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    archive: Option<crate::operations::archive_input::EncryptedInput>,
     #[cfg(feature = "tauri-webview")]
     webview: Option<(
         crate::webview::ExternalWebviewClient,
@@ -1877,6 +1897,8 @@ struct ThreadStoreState {
     operations: Arc<OperationHub>,
     store_owner: u64,
     initial_output: Option<u64>,
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    initial_archive: Option<u64>,
     #[cfg(feature = "tauri-webview")]
     initial_url: Option<u64>,
     #[cfg(feature = "tauri-webview")]
@@ -1932,6 +1954,52 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_GRANT {
+            if arg0 != 0 || arg1 != 0 {
+                return Ok(0);
+            }
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            let granted = self.initial_archive.take().unwrap_or(0);
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            let granted = 0;
+            return Ok(granted);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_HEADER {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                let offset = arg1 as u32 as i32;
+                let capacity = (arg1 >> 32) as usize;
+                let Some(cells) = shared_range(&self.controller.memory, offset, capacity) else {
+                    return Ok(0x80);
+                };
+                return Ok(self
+                    .operations
+                    .read_encrypted_header(self.store_owner, arg0, capacity, |bytes| {
+                        for (cell, byte) in cells.iter().zip(bytes) {
+                            // SAFETY: shared_range pins the shared byte cells;
+                            // host accesses shared guest memory atomically.
+                            unsafe { AtomicU8::from_ptr(cell.get()) }
+                                .store(*byte, Ordering::Relaxed);
+                        }
+                    })
+                    .map(|count| (count as u64) << 8 | 1)
+                    .unwrap_or(0x80));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0x80);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_encrypted_input(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
         #[cfg(feature = "tauri-webview-test-support")]
         if let Some(webviews) = &self.webviews {
             webviews.trace_abi("submit", Some(kind));
@@ -2878,6 +2946,8 @@ fn define_closed_imports(
                                 operations,
                                 store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
                                 initial_output: None,
+                                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                                initial_archive: None,
                                 #[cfg(feature = "tauri-webview")]
                                 webviews,
                                 #[cfg(feature = "tauri-webview")]
@@ -3048,6 +3118,10 @@ fn define_closed_imports(
         .map_err(|_| SketchExecutionError::PrelinkFailed)?;
     Ok(())
 }
+
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+#[path = "archive_input_guest_tests.rs"]
+mod archive_input_guest_tests;
 
 #[cfg(test)]
 mod threaded_root_observation_tests {
@@ -3735,13 +3809,13 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=1\n",
-            b'2',
+            b"operation_protocol_revision=2\n",
+            b'3',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=1\n", "");
+            .replace("operation_protocol_revision=2\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);

@@ -184,6 +184,23 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
 pub struct BlobHandle { token: u64 }
+/// Optional host-owned encrypted input. No source path or key crosses the ABI.
+pub struct EncryptedArchive { token: u64 }
+impl EncryptedArchive {
+    pub fn granted() -> Result<Option<Self>, OperationError> {
+        let token = imports::operation_submit(20, 0, 0).map_err(|_| OperationError::Failed)?;
+        Ok(if token == 0 { None } else { Some(Self { token }) })
+    }
+    pub fn read_header(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
+        let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
+        let result = imports::operation_submit(21, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let copied = (result >> 8) as usize;
+        if result as u8 != 1 || copied > destination.len() || copied > 16 * 1024 + 12 { return Err(OperationError::Rejected); }
+        Ok(copied)
+    }
+    pub fn abandon(&self) { let _ = imports::operation_submit(22, self.token, 0); }
+}
 /// One exact destination authorized by the embedding host; never a guest path.
 pub struct OutputFile { token: u64 }
 impl OutputFile {

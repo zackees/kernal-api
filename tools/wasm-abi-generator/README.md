@@ -17,9 +17,12 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=1`, independently of the
-scalar import signatures. Revision 1 includes opcodes 1–19 and specifically
-requires scoped transfer/blob abandonment. Bump this revision when operation
+The metadata also binds `operation_protocol_revision=2`, independently of the
+scalar import signatures. Revision 1 included opcodes 1–19 and scoped
+transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
+header copy, and abandonment (20–22); native input grants currently exist only
+in the test-support experiment. Rebuild guest code before embedding the new
+metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.
 Unversioned and unknown operation revisions are rejected before compilation;
 there is no legacy-host fallback. This closes the gap where an older host could

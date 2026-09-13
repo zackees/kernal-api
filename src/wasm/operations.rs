@@ -16,10 +16,21 @@ use std::sync::{Arc, Mutex};
 
 static NEXT_OPAQUE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+#[cfg(all(
+    test,
+    feature = "archive-auth-test-support",
+    feature = "wasm-sketch-host"
+))]
+#[path = "archive_input.rs"]
+pub(crate) mod archive_input;
 #[cfg(all(test, feature = "archive-auth-test-support"))]
 #[path = "authenticated_archive.rs"]
 mod authenticated_archive;
-#[cfg(all(test, feature = "archive-auth-test-support", feature = "wasm-sketch-host"))]
+#[cfg(all(
+    test,
+    feature = "archive-auth-test-support",
+    feature = "wasm-sketch-host"
+))]
 #[path = "authenticated_blob.rs"]
 mod authenticated_blob;
 static NEXT_LOGICAL_SCOPE: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +56,9 @@ pub(crate) const OP_WEBVIEW_CAPTURE: u32 = 16;
 pub(crate) const OP_WEBVIEW_CLOSE: u32 = 17;
 pub(crate) const OP_TRANSFER_ABANDON: u32 = 18;
 pub(crate) const OP_BLOB_ABANDON: u32 = 19;
+pub(crate) const OP_ENCRYPTED_INPUT_GRANT: u32 = 20;
+pub(crate) const OP_ENCRYPTED_INPUT_HEADER: u32 = 21;
+pub(crate) const OP_ENCRYPTED_INPUT_ABANDON: u32 = 22;
 pub(crate) const MAX_WEBVIEW_URL_BYTES: usize = 16 * 1024;
 const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
@@ -234,6 +248,12 @@ struct ResourceSlot {
 }
 
 enum ResourceValue {
+    #[cfg(all(
+        test,
+        feature = "archive-auth-test-support",
+        feature = "wasm-sketch-host"
+    ))]
+    EncryptedInput(archive_input::EncryptedInput),
     #[cfg(all(test, feature = "archive-auth-test-support"))]
     AuthenticatedArchive(crate::archive::authenticated_staging::Authenticated),
     Synthetic,
@@ -437,7 +457,9 @@ impl OperationHub {
         let scope = next(&NEXT_LOGICAL_SCOPE)?;
         Ok(Arc::new(Self {
             #[cfg(all(test, feature = "archive-auth-test-support"))]
-            staging_budget: crate::archive::authenticated_staging::StagingBudget::new(512 * 1024 * 1024),
+            staging_budget: crate::archive::authenticated_staging::StagingBudget::new(
+                512 * 1024 * 1024,
+            ),
             #[cfg(all(test, feature = "wasm-sketch-host"))]
             output_fault: Mutex::new(None),
             output_job_failed: AtomicBool::new(false),
@@ -1356,8 +1378,7 @@ impl OperationHub {
         if length > self.blob_limits.maximum_chunk_bytes {
             return Err(HubError::Quota);
         }
-        let (operation, _) =
-            self.submit(store, Some(blob), BLOB_RESOURCE_KIND, required_rights)?;
+        let (operation, _) = self.submit(store, Some(blob), BLOB_RESOURCE_KIND, required_rights)?;
         {
             let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
             if state

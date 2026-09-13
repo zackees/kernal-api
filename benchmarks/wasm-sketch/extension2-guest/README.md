@@ -2,7 +2,7 @@
 
 This source-only experiment makes the missing #13 guest capability concrete.
 The `guest-proof` binary currently **does not compile**: the public facade has
-no `EncryptedArchive`. The optional binary is an explicit unfinished acceptance
+no `EncryptedArchive::authenticate`. The optional binary is an explicit unfinished acceptance
 contract, not a shipped example or a passing Wasm proof. Do not replace its
 kernel calls with host-side orchestration or cite library tests as guest GREEN.
 
@@ -37,8 +37,40 @@ soldr cargo clippy --locked \
 
 Recorded on Linux x86-64: both policy tests pass (0.03 s), strict library
 Clippy passes, and a `cargo check --lib` using the same Wasm target and lock
-passes (5.31 s). The guest binary instead fails on the missing facade import
-with E0432. These are compile/policy controls, not artifact execution evidence.
+passes (5.31 s). The original guest binary failed on the missing facade import
+with E0432; the full contract now stops at the missing authentication method.
+These library checks are not artifact execution evidence.
+
+## Header-only actual guest control
+
+The separate `header-proof` feature executes the public grant and bounded
+original-header read in a Cargo-built Rust Wasm guest. The host retains the
+file and synthetic key; its native grant is test-only. No plaintext is exposed.
+The Linux x86-64 execution test passes valid identity, wrong identity, and
+missing grant cases, with zero live resources and pending operations after
+each fresh admitted execution. A sparse 17 MiB tail is deliberately **not a
+valid encrypted ZIP**: this proves header policy execution, not authentication.
+
+```sh
+SOLDR_LINKER=default soldr --no-cache cargo build --locked \
+  --manifest-path benchmarks/wasm-sketch/extension2-guest/Cargo.toml \
+  --features header-proof --bin kernal-extension2-guest-proof \
+  --target wasm32-wasip1-threads --release --target-dir target/extension2-header-proof -j1
+cp target/extension2-header-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.wasm \
+  target/extension2-header-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm
+soldr cargo build --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
+tools/wasm-abi-generator/target/debug/kernal-api-wasm-abi-generator \
+  --embed-threaded-metadata target/extension2-header-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm
+KERNAL_EXTENSION2_HEADER_WASM="$PWD/target/extension2-header-proof/wasm32-wasip1-threads/release/kernal-extension2-guest-proof.admitted.wasm" \
+  soldr --no-cache cargo test --locked --features wasm-sketch-host,archive-auth-test-support \
+  --lib authenticated_input_actual_guest_validates_header_and_rejects_missing_or_wrong_identity \
+  -j1 -- --ignored
+```
+
+Operation protocol revision 2 adds grant/header/abandon submissions. Rebuild
+guest code before embedding its metadata; never relabel a revision-1 binary.
+The header control also awaits a host timer to exercise the complete admitted
+async lifecycle; the bounded header copy itself finishes synchronously.
 
 The executable contract requires a host-granted encrypted input, a bounded
 header read, asynchronous authentication, bounded inventory, and entry-to-Blob
@@ -46,7 +78,7 @@ streaming through `kernal_api::guest`. The guest accepts exactly one `payload`
 entry and verifies every byte of its 17 MiB body with a 64 KiB buffer. The host
 must keep the original header as AAD and expose no archive or entry resource
 before the final tag succeeds. The method names are a proposed semantic
-contract; generated bindings and host dispatch are still absent.
+contract; authentication, inventory, and entry dispatch are still absent.
 
 To turn this RED into runtime evidence, add the generated operations and
 host-granted input, construct and encrypt the large synthetic ZIP, build and

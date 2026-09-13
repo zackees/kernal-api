@@ -1,15 +1,36 @@
-//! Executable RED contract for #13. The encrypted archive guest capability is
-//! deliberately not implemented yet. Native policy tests are not guest GREEN.
+//! Header-only guest control plus the unfinished full archive contract for #13.
+//! Header validation does not prove authentication or archive streaming.
 use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
 use kernal_extension2_guest_proof::policy;
 
-async fn proof() -> Result<(), OperationError> {
+async fn header() -> Result<EncryptedArchive, OperationError> {
     let encrypted = EncryptedArchive::granted()?.ok_or(OperationError::Rejected)?;
+    if EncryptedArchive::granted()?.is_some() {
+        return Err(OperationError::Rejected);
+    }
     let mut header = [0; policy::MAX_HEADER];
     let count = encrypted.read_header(&mut header).await?;
     if !policy::validate_header(&header[..count]) {
         return Err(OperationError::Rejected);
     }
+    Ok(encrypted)
+}
+
+#[cfg(feature = "header-proof")]
+async fn proof() -> Result<(), OperationError> {
+    // Exercise the complete admitted async lifecycle even though the bounded
+    // header copy itself completes synchronously.
+    kernel::sleep(1).await?;
+    drop(header().await?);
+    if EncryptedArchive::granted()?.is_some() {
+        return Err(OperationError::Rejected);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "header-proof"))]
+async fn proof() -> Result<(), OperationError> {
+    let encrypted = header().await?;
     // The host retains its key and exact original AAD. No plaintext archive
     // authority may exist until this asynchronous operation succeeds.
     let mut archive = encrypted.authenticate().await?;

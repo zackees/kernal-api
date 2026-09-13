@@ -86,6 +86,12 @@ fn invalid_schema_never_exposes_a_backend_error() {
     );
     assert_eq!(
         Command::new("fastled")
+            .option(OptionSpec::value("timeout", ValueKind::f64()).default("never"))
+            .parse(["fastled"]),
+        Err(CommandError::InvalidSchema)
+    );
+    assert_eq!(
+        Command::new("fastled")
             .option(OptionSpec::flag("same"))
             .subcommand(Command::new("child").option(OptionSpec::flag("same")))
             .parse(["fastled"]),
@@ -178,6 +184,27 @@ fn optional_positionals_do_not_hide_subcommands() {
     assert_eq!(nested.value("package-id"), Some("wasm-3.1"));
     assert_eq!(
         schema.parse(["fastled", "toolchain", "activate"]),
+        Err(CommandError::InvalidArguments)
+    );
+}
+
+#[test]
+fn typed_scalars_keep_their_types_and_reject_invalid_input() {
+    let schema = Command::new("fastled")
+        .option(OptionSpec::value("timeout", ValueKind::f64()).default("120"))
+        .option(OptionSpec::value("count", ValueKind::u32()));
+
+    let parsed = schema
+        .parse(["fastled", "--timeout", "1.5", "--count", "10"])
+        .unwrap();
+    assert_eq!(parsed.f64("timeout"), Some(1.5));
+    assert_eq!(parsed.u32("count"), Some(10));
+    assert_eq!(
+        schema.parse(["fastled", "--timeout", "not-a-float"]),
+        Err(CommandError::InvalidArguments)
+    );
+    assert_eq!(
+        schema.parse(["fastled", "--count", "-1"]),
         Err(CommandError::InvalidArguments)
     );
 }

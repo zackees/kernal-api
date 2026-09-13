@@ -31,6 +31,10 @@ pub mod config;
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;
 
+/// Bounded source analysis; callers own language integration and product policy.
+#[cfg(feature = "source-cpp")]
+pub mod source;
+
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
 pub mod random;

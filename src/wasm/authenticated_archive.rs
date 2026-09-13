@@ -157,3 +157,109 @@ fn authenticated_archive_registry_rejection_and_teardown_release_storage() {
         assert_eq!(hub.staging_budget.used(), 0);
     }
 }
+
+#[test]
+fn authenticated_archive_registry_extracts_large_zip_with_bounded_transfers() {
+    use crate::archive::authenticated_staging::StagingBudget;
+    use openssl::symm::{Cipher, Crypter, Mode};
+    use std::io::{Read, Seek, Write};
+
+    const CHUNK: usize = 64 * 1024;
+    const LENGTH: u64 = 17 * 1024 * 1024;
+    // Successful extraction, failed authentication, and entry-size rejection.
+    for case in 0..3 {
+        let mut writer = zip::ZipWriter::new(tempfile::tempfile().unwrap());
+        writer
+            .start_file(
+                "payload",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        let payload = [0x5a; CHUNK];
+        for _ in 0..LENGTH / CHUNK as u64 {
+            writer.write_all(&payload).unwrap();
+        }
+        let mut source = writer.finish().unwrap();
+        let length = source.metadata().unwrap().len();
+        assert!(length > 16 * 1024 * 1024);
+        source.rewind().unwrap();
+
+        let mut hub = OperationHub::new(8, 2).unwrap();
+        Arc::get_mut(&mut hub).unwrap().staging_budget = StagingBudget::new(length);
+        let key = [19; 16];
+        let nonce = [23; 12];
+        let aad = b"synthetic registered ZIP";
+        let mut pending =
+            Authentication::begin(&key, &nonce, aad, length, &hub.staging_budget).unwrap();
+        let mut encoder =
+            Crypter::new(Cipher::aes_128_gcm(), Mode::Encrypt, &key, Some(&nonce)).unwrap();
+        encoder.aad_update(aad).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let mut input = [0; CHUNK];
+        let mut ciphertext = [0; CHUNK + 16];
+        loop {
+            let count = source.read(&mut input).unwrap();
+            if count == 0 {
+                break;
+            }
+            let encrypted = encoder.update(&input[..count], &mut ciphertext).unwrap();
+            pending.update(&ciphertext[..encrypted]).unwrap();
+            assert_eq!(hub.snapshot().live_resources, 0);
+            assert_eq!(hub.staging_budget.used(), length);
+            assert!(!output.exists());
+        }
+        assert_eq!(encoder.finalize(&mut ciphertext).unwrap(), 0);
+        let mut tag = [0; 16];
+        encoder.get_tag(&mut tag).unwrap();
+        if case == 1 {
+            tag[0] ^= 1;
+        }
+        let authenticated = pending.authenticate(&tag);
+        if case == 1 {
+            assert_eq!(
+                authenticated.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(!output.exists());
+        } else {
+            let token = hub
+                .register_authenticated_archive(1, authenticated.unwrap())
+                .unwrap();
+            assert_eq!(hub.snapshot().live_resources, 1);
+            assert_eq!(hub.staging_budget.used(), length);
+            assert!(Authentication::begin(&key, &nonce, aad, 1, &hub.staging_budget).is_err());
+            let limits = crate::archive::ExtractionLimits {
+                max_input_bytes: length,
+                max_output_bytes: LENGTH,
+                max_entry_bytes: if case == 2 { LENGTH - 1 } else { LENGTH },
+                max_entries: 1,
+                ..crate::archive::ExtractionLimits::default()
+            };
+            let result = hub.extract_authenticated_archive(1, token, &output, limits);
+            if case == 2 {
+                assert!(result.is_err());
+                assert!(!output.join("payload").exists());
+            } else {
+                result.unwrap();
+                let mut file = std::fs::File::open(output.join("payload")).unwrap();
+                let mut total = 0;
+                loop {
+                    let count = file.read(&mut input).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    assert!(input[..count].iter().all(|byte| *byte == 0x5a));
+                    total += count as u64;
+                }
+                assert_eq!(total, LENGTH);
+            }
+            assert!(hub
+                .extract_authenticated_archive(1, token, &output, limits)
+                .is_err());
+        }
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.staging_budget.used(), 0);
+    }
+}

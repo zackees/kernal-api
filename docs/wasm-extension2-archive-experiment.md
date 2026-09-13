@@ -250,11 +250,20 @@ soldr cargo test --locked --features wasm-sketch-host,archive-auth-test-support 
 
 This integration is compiled only in tests. Pending authentication is still
 owned by its native caller, not by a cancellable hub operation, and in-flight
-extraction is not interrupted by hub teardown. The registry fixture uses the
-small NIST plaintext to exercise ownership and extraction failure; the existing
-large encrypted ZIP proof does not yet run through this registry. Successful
-large-archive registry extraction, async cancellation, generated guest calls,
-real extension2 policy, and six-native-target execution remain required.
+extraction is not interrupted by hub teardown. The small NIST fixture exercises
+ownership and extraction failure. The additional
+`authenticated_archive_registry_extracts_large_zip_with_bounded_transfers`
+fixture creates a stored ZIP with a 17 MiB entry, streams encryption and
+authentication with 64 KiB buffers, registers the authenticated resource, and
+extracts through its opaque token. It verifies every output byte, no live
+resource/output before authentication, denial of another staging reservation
+while the registered archive holds the full budget, and rejection of token
+reuse after consumption. Bad-tag and per-entry-limit cases finish with zero
+live resources and zero charged storage as well.
+
+This is a synthetic native registry proof, not guest execution or a measured
+RSS bound. Async cancellation, generated guest calls, real extension2 policy,
+and six-native-target execution remain required.
 Removing the budget-identity guard caused the rejection regression to return
 a live token instead of `WrongRights` for a foreign-budget file. The guard
 was restored before final validation. The six-native CI step now enables the

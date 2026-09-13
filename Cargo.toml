@@ -17,6 +17,10 @@ exclude = ["/.github", "/ci", "/dylints", "/python", "/vendor", "/pyproject.toml
 name = "kernal_api"
 path = "src/lib.rs"
 
+[[example]]
+name = "wasm-admission"
+required-features = ["wasm-sketch-host"]
+
 [[bin]]
 name = "kernal-symbolize"
 path = "src/bin/kernal-symbolize.rs"

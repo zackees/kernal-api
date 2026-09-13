@@ -2,6 +2,7 @@
 //!
 //! Redirects are opt-in; credentials are never inferred.
 //! Response status interpretation and payload schemas belong to the caller.
+//! Bodies preserve content-encoded wire bytes; decoding belongs to the caller.
 
 use std::io;
 use std::time::Duration;
@@ -210,6 +211,12 @@ impl Client {
             }
         }
         let inner = reqwest::Client::builder()
+            // Cargo unifies backend features across the consumer's graph.
+            // Preserve wire bytes even if another user enables auto-decoding.
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
             .connect_timeout(limits.connect_timeout)
             .timeout(limits.total_timeout)
             .read_timeout(limits.read_timeout)

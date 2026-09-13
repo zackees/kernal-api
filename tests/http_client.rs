@@ -4,6 +4,30 @@ use kernal_api::http::{Client, Limits, Method, Request};
 use std::io::{Read, Write};
 
 #[tokio::test]
+async fn encoded_responses_preserve_wire_bytes_and_headers() {
+    // gzip -n of "hello". Also run with reqwest/gzip enabled to exercise
+    // backend features unified by an unrelated downstream dependency.
+    let encoded = [
+        31, 139, 8, 0, 0, 0, 0, 0, 0, 3, 203, 72, 205, 201, 201, 7, 0, 134, 166, 16, 54, 5, 0, 0, 0,
+    ];
+    let mut wire = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 25\r\nConnection: close\r\n\r\n".to_vec();
+    wire.extend_from_slice(&encoded);
+    let (url, worker) = fixture(&wire);
+    let response = Client::new(Limits::default())
+        .unwrap()
+        .get(&url)
+        .await
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(
+        response.header("Content-Encoding"),
+        Some(b"gzip".as_slice())
+    );
+    assert_eq!(response.header("Content-Length"), Some(b"25".as_slice()));
+    assert_eq!(response.into_bytes().await.unwrap(), encoded);
+}
+
+#[tokio::test]
 #[ignore = "requires KERNAL_HTTP_HTTPS_FIXTURE pointing to a trusted public HTTPS resource"]
 async fn trusted_https_fixture_uses_verified_tls_and_bounded_body() {
     let url = std::env::var("KERNAL_HTTP_HTTPS_FIXTURE").expect("HTTPS fixture URL");

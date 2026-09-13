@@ -1,5 +1,9 @@
 //! Linux implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
 #[cfg(feature = "tauri-webview")]
 #[path = "platform_linux/viewport_capture.rs"]
 pub(crate) mod viewport_capture;

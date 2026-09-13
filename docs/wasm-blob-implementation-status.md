@@ -554,6 +554,23 @@ does not promise atomic removal against concurrent directory renames, and
 abrupt parent death does not run Drop. Windows/macOS runtime validation
 remains required.
 
+Hosted Windows runs exposed a separate limitation: the long-lived `cap-std`
+directory handle prevented the destination ancestor from being renamed
+(`AccessDenied`), so both renamed-parent unit regressions and the native
+screenshot scenario failed before exercising cleanup. The Windows candidate
+now keeps a metadata-only, delete-shared handle during execution. Cleanup
+resolves that live handle's current path, acquires a restrictive `cap-std`
+handle, and compares volume plus 128-bit file identity before removal. A
+mismatch fails without deleting the candidate directory. It never passes the
+permissive metadata handle to `cap-std`, whose directory constructor requires
+delete sharing to be disabled. Linux/macOS retain the existing cfg-free
+descriptor backend through their selected platform roots.
+
+The candidate passes Windows x64 cross-compilation and strict Clippy, plus
+the seven Linux staging/publication tests. A Windows-only identity mismatch
+test is added; the existing renamed-parent tests are unchanged. Native
+Windows runtime GREEN is still required before treating this as resolved.
+
 The actual contained screenshot guest now also passes the renamed-parent
 scenario on Linux x86-64 (9.33s). The fixture renames the destination parent
 upon the first native HTTP request, after staging/grant creation. The guest

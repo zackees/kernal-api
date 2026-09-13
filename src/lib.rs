@@ -80,6 +80,9 @@ mod tauri;
 #[cfg(feature = "tauri-webview")]
 pub(crate) use platform_imp::viewport_capture as native_viewport_capture;
 
+#[cfg(feature = "wasm-sketch-worker")]
+pub(crate) use platform_imp::scratch_directory::Anchor as ScratchDirectoryAnchor;
+
 /// Semantic, opt-in external-webview operations.
 ///
 /// This module exposes no Tauri, Wry, Tokio, or platform-window types.  It

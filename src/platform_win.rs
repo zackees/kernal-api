@@ -1,5 +1,9 @@
 //! Windows implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform_win/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
 #[cfg(feature = "tauri-webview")]
 #[path = "platform_win/viewport_capture.rs"]
 pub(crate) mod viewport_capture;

@@ -52,7 +52,7 @@ pub use crate::fs_write_all_to_descriptor as write_all_to_descriptor;
 /// renames during removal are not guaranteed atomic by the private backend.
 #[cfg(feature = "wasm-sketch-worker")]
 pub(crate) struct OwnedScratchDirectory {
-    directory: Option<cap_std::fs::Dir>,
+    directory: Option<crate::ScratchDirectoryAnchor>,
     path: std::path::PathBuf,
 }
 
@@ -62,8 +62,7 @@ impl OwnedScratchDirectory {
         let temporary = tempfile::Builder::new()
             .prefix(".kernal-worker-output-")
             .tempdir_in(parent)?;
-        let directory =
-            cap_std::fs::Dir::open_ambient_dir(temporary.path(), cap_std::ambient_authority())?;
+        let directory = crate::ScratchDirectoryAnchor::open(temporary.path())?;
         // Transfer cleanup ownership only after acquiring the handle. Never
         // let TempDir's pathname-based Drop remove a replacement directory.
         let path = temporary.keep();
@@ -81,7 +80,7 @@ impl OwnedScratchDirectory {
         self.directory
             .take()
             .expect("scratch owner is live")
-            .remove_open_dir_all()
+            .remove()
     }
 }
 
@@ -89,7 +88,7 @@ impl OwnedScratchDirectory {
 impl Drop for OwnedScratchDirectory {
     fn drop(&mut self) {
         if let Some(directory) = self.directory.take() {
-            let _ = directory.remove_open_dir_all();
+            let _ = directory.remove();
         }
     }
 }

@@ -23,6 +23,10 @@ mod process_adapter;
 #[cfg(feature = "command-arguments")]
 pub mod arguments;
 
+/// Bounded configuration decoding with caller-owned schemas and defaults.
+#[cfg(feature = "config-toml")]
+pub mod config;
+
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;

@@ -38,6 +38,7 @@ default = []
 secure-random = ["dep:getrandom"]
 text-similarity = ["dep:strsim"]
 command-arguments = ["dep:shell-words"]
+config-toml = ["dep:toml"]
 terminal-style = []
 # Native terminal capture and key decoding without PTY process spawning.
 terminal-input = []
@@ -223,6 +224,7 @@ framehop = { version = "=0.13.3", optional = true }
 futures-core = { version = "=0.3.34", optional = true }
 getrandom = { version = "=0.4.3", optional = true }
 strsim = { version = "=0.11.1", optional = true }
+toml = { version = "=0.8.23", optional = true }
 shell-words = { version = "=1.1.1", optional = true }
 globset = { version = "=0.4.18", optional = true }
 interprocess = { version = "=2.4.3", optional = true }
@@ -384,6 +386,7 @@ toml = "=0.8.23"
 # here explicitly; this is a documentation set, not a supported bundle.
 features = [
   "full",
+  "config-toml",
   "daemon-identity",
   "daemon-frame-v1",
   "daemon-registration",

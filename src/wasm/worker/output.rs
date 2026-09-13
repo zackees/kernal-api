@@ -10,11 +10,13 @@ pub(super) struct StagedOutput {
     destination: PathBuf,
     #[cfg(test)]
     fail_cleanup: bool,
+    #[cfg(test)]
+    before_publish: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
-pub(super) struct CommittedOutput {
-    // Replacement has already succeeded. A cleanup error must not be reported
-    // as though the original final file were still intact.
+pub(super) struct FinalizedOutput {
+    // None means replacement succeeded; Some means it was stopped before rename.
+    pub(super) stop: Option<super::SketchWorkerStopReason>,
     pub(super) cleanup: io::Result<()>,
 }
 
@@ -35,6 +37,8 @@ impl StagedOutput {
             destination: parent.join(name),
             #[cfg(test)]
             fail_cleanup: false,
+            #[cfg(test)]
+            before_publish: std::sync::Mutex::new(None),
         })
     }
 
@@ -44,7 +48,10 @@ impl StagedOutput {
 
     /// Call only after successful worker completion and reap. Never publish
     /// the directory itself, an unfinished sibling, or a symbolic link.
-    pub(super) fn commit(self) -> io::Result<CommittedOutput> {
+    pub(super) fn commit(
+        self,
+        stop: impl FnOnce() -> Option<super::SketchWorkerStopReason>,
+    ) -> io::Result<FinalizedOutput> {
         let staged = self.worker_destination();
         if !std::fs::symlink_metadata(&staged)?.file_type().is_file() {
             return Err(io::Error::new(
@@ -57,8 +64,21 @@ impl StagedOutput {
             .write(true)
             .open(&staged)?
             .sync_all()?;
+        #[cfg(test)]
+        if let Some(before_publish) = self.before_publish.lock().unwrap().take() {
+            before_publish();
+        }
+        // Flushing may be slow. A stop observed at the publication boundary
+        // must preserve the original destination, not report success.
+        if let Some(reason) = stop() {
+            return Ok(FinalizedOutput {
+                stop: Some(reason),
+                cleanup: self.cleanup(),
+            });
+        }
         crate::fs_replace_file(&staged, &self.destination)?;
-        Ok(CommittedOutput {
+        Ok(FinalizedOutput {
+            stop: None,
             cleanup: self.cleanup(),
         })
     }
@@ -67,6 +87,12 @@ impl StagedOutput {
     /// solely on best-effort Drop. This must also follow worker reap.
     pub(super) fn discard(self) -> io::Result<()> {
         self.cleanup()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_before_publish(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
+        self.before_publish = std::sync::Mutex::new(Some(Box::new(hook)));
+        self
     }
 
     #[cfg(test)]
@@ -98,7 +124,7 @@ mod tests {
         assert_ne!(staged, final_path);
         std::fs::write(&staged, b"completed bytes").unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
-        output.commit().unwrap().cleanup.unwrap();
+        output.commit(|| None).unwrap().cleanup.unwrap();
         assert_eq!(std::fs::read(&final_path).unwrap(), b"completed bytes");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -127,7 +153,7 @@ mod tests {
         std::fs::write(&final_path, b"original").unwrap();
         let output = StagedOutput::new(&final_path).unwrap();
         std::fs::write(output.directory.path().join("partial.tmp"), b"partial").unwrap();
-        assert!(output.commit().is_err());
+        assert!(output.commit(|| None).is_err());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -140,7 +166,7 @@ mod tests {
         std::fs::write(final_path.join("keep"), b"original").unwrap();
         let output = StagedOutput::new(&final_path).unwrap();
         std::fs::write(output.worker_destination(), b"completed").unwrap();
-        assert!(output.commit().is_err());
+        assert!(output.commit(|| None).is_err());
         assert_eq!(std::fs::read(final_path.join("keep")).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -155,7 +181,7 @@ mod tests {
         std::fs::write(&unrelated, b"private").unwrap();
         let output = StagedOutput::new(&final_path).unwrap();
         std::os::unix::fs::symlink(&unrelated, output.worker_destination()).unwrap();
-        assert!(output.commit().is_err());
+        assert!(output.commit(|| None).is_err());
         assert_eq!(std::fs::read(&final_path).unwrap(), b"original");
         assert_eq!(std::fs::read(&unrelated).unwrap(), b"private");
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);

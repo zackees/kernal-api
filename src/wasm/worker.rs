@@ -996,25 +996,30 @@ fn supervise(
         .ownership
         .as_mut()
         .and_then(|owner| owner.output.take());
-    finish_output(output, terminal, selected_stop(&cancellation, deadline))
+    finish_output(output, terminal, || selected_stop(&cancellation, deadline))
 }
 
 fn finish_output(
     output: Option<output::StagedOutput>,
     terminal: SketchWorkerTerminal,
-    stop: Option<SketchWorkerStopReason>,
+    mut stop: impl FnMut() -> Option<SketchWorkerStopReason>,
 ) -> SketchWorkerTerminal {
     let Some(output) = output else {
         return terminal;
     };
     let terminal = if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
-        stop.map_or(terminal, SketchWorkerTerminal::Stopped)
+        stop().map_or(terminal, SketchWorkerTerminal::Stopped)
     } else {
         terminal
     };
     if matches!(terminal, SketchWorkerTerminal::Completed(_)) {
-        match output.commit() {
-            Ok(committed) if committed.cleanup.is_ok() => terminal,
+        match output.commit(stop) {
+            Ok(finalized) if finalized.cleanup.is_ok() => finalized
+                .stop
+                .map_or(terminal, SketchWorkerTerminal::Stopped),
+            Ok(finalized) if finalized.stop.is_some() => {
+                SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCleanup)
+            }
             Ok(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCommittedCleanup),
             Err(_) => SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCommit),
         }
@@ -1457,7 +1462,7 @@ mod tests {
             } else {
                 SketchWorkerTerminal::Execution(SketchExecutionError::Trapped)
             };
-            let result = finish_output(Some(output), terminal, None);
+            let result = finish_output(Some(output), terminal, || None);
             assert_eq!(
                 result.code(),
                 if publish {
@@ -1518,7 +1523,7 @@ mod tests {
             } else {
                 terminal.clone()
             };
-            assert_eq!(finish_output(Some(output), terminal, stop), expected);
+            assert_eq!(finish_output(Some(output), terminal, || stop), expected);
             assert_eq!(
                 std::fs::read(&destination).unwrap(),
                 if publish {
@@ -1532,6 +1537,73 @@ mod tests {
     }
 
     const TEST_WAIT: Duration = Duration::from_secs(2);
+
+    #[test]
+    fn cancellation_after_parent_sync_preserves_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("final");
+        std::fs::write(&destination, b"original").unwrap();
+        let cancellation = crate::async_engine::CancellationSource::new();
+        let cancel_at_publication = cancellation.clone();
+        let output = output::StagedOutput::new(&destination)
+            .unwrap()
+            .with_before_publish(move || cancel_at_publication.cancel());
+        std::fs::write(output.worker_destination(), b"completed").unwrap();
+        let deadline = std::time::Instant::now() + TEST_WAIT;
+        let token = cancellation.token();
+        let terminal = finish_output(
+            Some(output),
+            SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+            || selected_stop(&token, deadline),
+        );
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Stopped(SketchWorkerStopReason::Cancelled)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn deadline_after_parent_sync_preserves_output_and_reports_cleanup_failure() {
+        for cleanup_fails in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("final");
+            std::fs::write(&destination, b"original").unwrap();
+            // Advance the deadline predicate only at the post-sync boundary,
+            // independent of host scheduling and without a timing-based sleep.
+            let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let expire_at_publication = Arc::clone(&expired);
+            let mut output = output::StagedOutput::new(&destination)
+                .unwrap()
+                .with_before_publish(move || {
+                    expire_at_publication.store(true, Ordering::Release);
+                });
+            if cleanup_fails {
+                output = output.with_cleanup_failure();
+            }
+            std::fs::write(output.worker_destination(), b"completed").unwrap();
+            let terminal = finish_output(
+                Some(output),
+                SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+                || select_stop(false, expired.load(Ordering::Acquire)),
+            );
+            assert!(
+                expired.load(Ordering::Acquire),
+                "post-sync boundary not reached"
+            );
+            assert_eq!(
+                terminal,
+                if cleanup_fails {
+                    SketchWorkerTerminal::Failure(SketchWorkerFailure::OutputCleanup)
+                } else {
+                    SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded)
+                }
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
 
     struct DeferredFake {
         calls: Arc<AtomicU64>,

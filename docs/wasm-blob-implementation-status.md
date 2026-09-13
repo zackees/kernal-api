@@ -19,8 +19,11 @@ entry point authorizes the destination before root Store creation. The root
 guest discovers it through `OutputFile::granted`; child Stores do not receive
 an initial grant. The real guest replaces an existing output with the exact
 bytes `guest exact output`, with no sibling temporary remaining afterward.
-This is Linux in-process output evidence only: output-grant delivery through
-the killable worker protocol and its failure cleanup are not implemented.
+The killable worker protocol now delivers the exact-output grant too: parent
+staging is published only after successful execution and reap, with Linux
+success, trap, cancellation, and publication-failure proofs described below.
+These implementations are not full release acceptance: all six native targets,
+renamed-parent cleanup, and kernel-blocked filesystem behavior remain gaps.
 
 Guest `seal` publishes EOF without revoking the readable handle. Pending empty
 reads then complete with zero bytes; an empty unsealed blob stays pending.
@@ -233,6 +236,22 @@ passes, parent counters drain, staging disappears, and the preserved original,
 neighbor, and obstructing directory contents are unchanged. This is a native
 replacement failure, not a permissions/disk-exhaustion or renamed-parent proof.
 
+A full-branch single-agent pre-push review identified a parent publication race:
+the supervisor sampled stop state before flushing staged output, allowing a stop
+during that flush to be ignored. A deterministic post-sync cancellation hook
+reproduced `Completed` instead of `Stopped(Cancelled)`. Publication now checks
+live stop authority again immediately before attempting replacement and
+explicitly discards staging when stopped. Cancellation and simulated deadline
+boundary tests preserve the original; discard failure retains the distinct
+`OutputCleanup` result rather than claiming publication occurred. All 41
+worker/protocol tests and strict worker-feature Clippy pass. This is a boundary
+check, not rollback after replacement starts or a hard bound on parent-owned
+filesystem syscalls. The review's two stale-documentation findings were also
+corrected; all-six-native-target acceptance remains incomplete.
+The four real default-CLI regressions pass after the change in 30.87 seconds:
+missing worker, publication failure, standalone build/capture, and trap output
+preservation. Formatting and diff checks also pass.
+
 A real contained cancellation-during-load proof exposed a cooperative shutdown
 bug: epoch interruption did not wake a guest suspended in the generated async
 `operation_yield` host import, so the parent had to force containment. The epoch
@@ -429,8 +448,8 @@ on Linux x86-64. The admitted artifact was reused and the host rebuilt.
   blocking lane, reserves exclusive blob consumption, and checks the operation
   terminal winner at final replacement under the hub lock. A stalled filesystem
   replacement holds the hub lock; worker containment must bound this case.
-- Deliver the exact output grant through the worker boundary before guest
-  execution, retaining only the semantic handle in guest-visible state.
+- Extend the implemented exact-output worker grant and staging cleanup proofs
+  to all supported native targets, retaining only semantic handles in guests.
 - Extend the 64 MiB generated guest proof with slow-consumer backpressure,
   cancellation, forged/stale/cross-sketch handles, and teardown.
 - Inject write, flush, and rename failures and cancellation at the commit

@@ -1,8 +1,8 @@
 # Native viewport capture ownership (#19)
 
 Status: the Linux, Windows, and macOS callback adapters are implemented and wired
-to the semantic webview operation service. The generated snapshot operation
-remains unimplemented. This note does not establish full native
+to the semantic webview operation service. The generated snapshot operation and
+actual contained screenshot guest pass on Linux x86-64. This does not establish full native
 capture acceptance or close #19.
 The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
 the existing root platform selector and gated only by `tauri-webview` in the
@@ -26,7 +26,8 @@ one hub lock: cancellation or view closure that wins first prevents publication
 and releases the reserved blob. A regression covers all three terminal outcomes
 and verifies zero retained storage after teardown. The callback uses this
 operation-bound publication path. The shared service owns UI dispatch and native
-cancellation handles; an end-to-end generated sketch proof remains required.
+cancellation handles; the Linux end-to-end generated sketch proof now exercises
+this path and validates viewport pixels, timing, and final cleanup counters.
 Capture has a distinct hub permission and submission method; a load or close
 operation cannot publish a snapshot. The checked-in load-as-capture regression
 failed before this separation and passes with it. Additional tests reject
@@ -221,13 +222,14 @@ is actually released, even if the guest already consumed cancellation.
 
 ## Required evidence still missing
 
-- A checked-in RED regression for the absent generated capture operation.
-- Generated capture dispatch within the same Wasm resource context.
-- Decodable viewport PNGs at native scale without window chrome.
-- Pixel/encoded-byte admission, stale and cross-instance rejection, cancellation,
-  late callbacks, and teardown tests with truthful final resource counters.
-- Native Linux WebKitGTK 4.1/Xvfb, macOS, and Windows execution, plus both
-  architecture compile checks for each supported operating system.
+- Extend the implemented generated capture/opaque-blob path and decoded pixel
+  proof from Linux x86-64 to the other five supported native host targets.
+- Complete the native failure matrix across those targets: pixel/encoded-byte
+  admission, stale and cross-instance rejection, cancellation, late callbacks,
+  and teardown with truthful final resource counters. Shared hub unit coverage
+  does not substitute for native callback execution.
+- Complete both-architecture compile and native execution evidence for each
+  supported OS; Linux WebKitGTK 4.1/Xvfb success does not prove macOS or Windows.
 
 All three callbacks use the shared blob protocol from #17. Their existence and
 compile checks do not reduce the requirement for native execution and the

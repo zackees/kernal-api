@@ -675,3 +675,5 @@ pub fn process_replace_current_image(_command: &mut std::process::Command) -> st
 pub const fn process_can_replace_current_image() -> bool {
     false
 }
+#[path = "platform_win/interrupt.rs"]
+pub(crate) mod interrupt;

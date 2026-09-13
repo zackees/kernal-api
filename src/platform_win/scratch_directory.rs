@@ -108,6 +108,60 @@ fn current_path(file: &File) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Native NTFS experiment: opening by object ID rather than a pathname
+    /// may avoid the ancestor pin held by a name-opened directory handle.
+    /// Do not adopt this in production before this entire lifecycle passes.
+    #[test]
+    fn id_opened_directory_survives_ancestor_rename_and_cleans_original() {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FileIdType, OpenFileById, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        };
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        let scratch = parent.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("partial"), b"owned").unwrap();
+        let original = Anchor::open(&scratch).unwrap();
+        let id = super::super::fs::file_identity(&original.0)
+            .unwrap()
+            .unwrap();
+        let descriptor = FILE_ID_DESCRIPTOR {
+            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: FileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 {
+                FileId: id.file as i64,
+            },
+        };
+        // SAFETY: the volume-hint handle remains live and descriptor uses
+        // the matching FileId discriminator. No security pointer is supplied.
+        let raw = unsafe {
+            OpenFileById(
+                original.0.as_raw_handle(),
+                &descriptor,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+        // SAFETY: OpenFileById returned a new owned, valid handle.
+        let by_id = Anchor(unsafe { File::from_raw_handle(raw) });
+        require_same_directory(&original.0, &by_id.0).unwrap();
+        drop(original);
+
+        let moved = root.path().join("moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("keep"), b"unrelated").unwrap();
+        by_id.remove().unwrap();
+        assert!(!moved.join("scratch").exists());
+        assert_eq!(std::fs::read(scratch.join("keep")).unwrap(), b"unrelated");
+    }
+
     #[test]
     fn cleanup_identity_rejects_a_different_directory() {
         let first = tempfile::tempdir().unwrap();

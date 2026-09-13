@@ -1,6 +1,6 @@
 //! Bounded HTTP client operations on the caller's async runtime.
 //!
-//! This initial surface does not follow redirects or infer credentials.
+//! Redirects are opt-in; credentials are never inferred.
 //! Response status interpretation and payload schemas belong to the caller.
 
 use std::io;
@@ -10,6 +10,10 @@ use std::time::Duration;
 /// All timeouts must be nonzero and at most 365 days.
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
+    /// Redirect hops allowed (at most 32). Zero returns 3xx without following.
+    /// Cross-origin hops discard all application headers; HTTPS downgrade is
+    /// rejected. POST becomes GET for 301/302/303, but is replayed for 307/308.
+    pub max_redirects: u8,
     /// Maximum buffered request body.
     pub max_request_bytes: usize,
     /// Maximum encoded URL length before parsing.
@@ -33,6 +37,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            max_redirects: 0,
             max_request_bytes: 4 * 1024 * 1024,
             max_url_bytes: 8192,
             max_body_bytes: 4 * 1024 * 1024,
@@ -183,6 +188,9 @@ impl io::Read for BlockingResponse<'_> {
 impl Client {
     /// Build a transport with finite, nonzero timeouts and verified TLS.
     pub fn new(limits: Limits) -> io::Result<Self> {
+        if limits.max_redirects > 32 {
+            return Err(invalid("HTTP redirect limit cannot exceed 32"));
+        }
         if limits.max_header_count > 1024 {
             return Err(invalid("HTTP header count limit cannot exceed 1024"));
         }
@@ -212,7 +220,7 @@ impl Client {
         Ok(Self { inner, limits })
     }
 
-    /// Issue a GET, returning all statuses without automatically following 3xx.
+    /// Issue a GET, following redirects only when explicitly enabled in limits.
     /// Drop the future or response to release the in-flight operation.
     pub async fn get(&self, url: &str) -> io::Result<Response> {
         self.execute(Request::get(url)).await
@@ -221,6 +229,71 @@ impl Client {
     /// Send a validated request. Status interpretation belongs to the caller.
     /// Request and response headers each have an independent metadata ceiling.
     pub async fn execute(&self, request: Request<'_>) -> io::Result<Response> {
+        let deadline = std::time::Instant::now()
+            .checked_add(self.limits.total_timeout)
+            .ok_or_else(|| invalid("HTTP deadline cannot be represented"))?;
+        let mut url = std::borrow::Cow::Borrowed(request.url);
+        let mut headers = std::borrow::Cow::Borrowed(request.headers);
+        let mut method = request.method;
+        let mut body = request.body;
+        for hop in 0..=self.limits.max_redirects {
+            let response = self
+                .execute_once(
+                    Request {
+                        method,
+                        url: &url,
+                        headers: &headers,
+                        body,
+                    },
+                    deadline,
+                )
+                .await?;
+            if self.limits.max_redirects == 0
+                || !matches!(response.status(), 301..=303 | 307..=308)
+            {
+                return Ok(response);
+            }
+            let Some(location) = response.header("location") else {
+                return Ok(response);
+            };
+            if hop == self.limits.max_redirects {
+                return Err(invalid("HTTP redirect limit exceeded"));
+            }
+            if location.len() > self.limits.max_url_bytes {
+                return Err(invalid("HTTP redirect URL exceeds limit"));
+            }
+            let location =
+                std::str::from_utf8(location).map_err(|_| invalid("invalid HTTP redirect URL"))?;
+            let previous = response.inner.url();
+            let next = previous
+                .join(location)
+                .map_err(|_| invalid("invalid HTTP redirect URL"))?;
+            if previous.scheme() == "https" && next.scheme() != "https" {
+                return Err(invalid("HTTP redirect would downgrade HTTPS"));
+            }
+            if next.origin() != previous.origin() {
+                headers = std::borrow::Cow::Borrowed(&[]);
+            }
+            if method == Method::Post && matches!(response.status(), 301..=303) {
+                method = Method::Get;
+                body = &[];
+                headers.to_mut().retain(|(name, _)| {
+                    !name.eq_ignore_ascii_case("content-type")
+                        && !name.eq_ignore_ascii_case("content-encoding")
+                });
+            }
+            // Drop the intermediate body before the next hop. Every response
+            // has already passed the same header/body-declaration limits.
+            url = std::borrow::Cow::Owned(next.into());
+        }
+        Err(invalid("HTTP redirect limit exceeded"))
+    }
+
+    async fn execute_once(
+        &self,
+        request: Request<'_>,
+        deadline: std::time::Instant,
+    ) -> io::Result<Response> {
         if request.url.len() > self.limits.max_url_bytes
             || request.body.len() > self.limits.max_request_bytes
             || request.headers.len() > self.limits.max_header_count
@@ -274,7 +347,13 @@ impl Client {
         if request.method == Method::Post {
             builder = builder.body(request.body.to_vec());
         }
-        let inner = builder.send().await.map_err(transport)?;
+        let timeout = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "HTTP total deadline expired")
+            })?;
+        let inner = builder.timeout(timeout).send().await.map_err(transport)?;
         if inner.headers().len() > self.limits.max_header_count {
             return Err(invalid("HTTP response header count exceeds limit"));
         }
@@ -293,6 +372,7 @@ impl Client {
             return Err(invalid("HTTP response body exceeds limit"));
         }
         Ok(Response {
+            deadline,
             inner,
             remaining: self.limits.max_body_bytes,
             pending: bytes::Bytes::new(),
@@ -304,6 +384,7 @@ impl Client {
 
 /// Owned response, with backend resources released when dropped.
 pub struct Response {
+    deadline: std::time::Instant,
     inner: reqwest::Response,
     remaining: u64,
     pending: bytes::Bytes,
@@ -334,6 +415,14 @@ impl Response {
         }
         if buffer.is_empty() {
             return Ok(0);
+        }
+        if !self.eof && std::time::Instant::now() >= self.deadline {
+            self.failed = true;
+            self.pending = bytes::Bytes::new();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP total deadline expired",
+            ));
         }
         while self.pending.is_empty() && !self.eof {
             match self.inner.chunk().await {

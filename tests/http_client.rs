@@ -90,7 +90,8 @@ fn blocking_stream_preserves_overflow_and_timeout_errors() {
     assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
 }
 
-fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
+fn fixture(response: &[u8]) -> (String, std::thread::JoinHandle<()>) {
+    let response = response.to_vec();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let worker = std::thread::spawn(move || {
@@ -100,9 +101,140 @@ fn fixture(response: &'static [u8]) -> (String, std::thread::JoinHandle<()>) {
             .unwrap();
         let mut request = [0; 4096];
         let _ = socket.read(&mut request).unwrap();
-        let _ = socket.write_all(response);
+        let _ = socket.write_all(&response);
     });
     (url, worker)
+}
+
+#[tokio::test]
+async fn opted_in_redirects_follow_and_enforce_hop_limit() {
+    let (final_url, final_worker) =
+        fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let redirect = format!("HTTP/1.1 302 Found\r\nLocation: {final_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (url, worker) = fixture(redirect.as_bytes());
+    let response = Client::new(Limits {
+        max_redirects: 1,
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.into_bytes().await.unwrap(), b"ok");
+    worker.join().unwrap();
+    final_worker.join().unwrap();
+
+    let (middle, middle_worker) = fixture(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let redirect = format!("HTTP/1.1 302 Found\r\nLocation: {middle}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let (url, worker) = fixture(redirect.as_bytes());
+    let error = Client::new(Limits {
+        max_redirects: 1,
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    worker.join().unwrap();
+    middle_worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn redirects_drop_cross_origin_headers_and_convert_post_to_get() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = format!("http://{}/next", listener.local_addr().unwrap());
+    let worker = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+            assert!(request.len() < 4096);
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let (url, first) = fixture(format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+    let response = Client::new(Limits {
+        max_redirects: 2,
+        ..Limits::default()
+    })
+    .unwrap()
+    .execute(Request {
+        method: Method::Post,
+        headers: &[("X-Secret", "private"), ("Content-Type", "text/plain")],
+        body: b"ping",
+        ..Request::get(&url)
+    })
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    first.join().unwrap();
+    let wire = worker.join().unwrap().to_ascii_lowercase();
+    assert!(wire.starts_with("get /next http/1.1"));
+    assert!(!wire.contains("x-secret"));
+    assert!(!wire.contains("content-type"));
+}
+
+#[tokio::test]
+async fn redirect_hops_reject_unsafe_urls_and_oversized_metadata() {
+    for target in ["file:///secret", "http://user:secret@127.0.0.1:1/"] {
+        let (url, worker) = fixture(format!("HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
+        let error = Client::new(Limits {
+            max_redirects: 1,
+            ..Limits::default()
+        })
+        .unwrap()
+        .get(&url)
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        worker.join().unwrap();
+    }
+    let (url, worker) = fixture(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nX-Large: abcdef\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let error = Client::new(Limits {
+        max_redirects: 1,
+        max_header_bytes: 8,
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn total_deadline_applies_to_already_buffered_unread_body() {
+    let (url, worker) =
+        fixture(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef");
+    let mut response = Client::new(Limits {
+        total_timeout: std::time::Duration::from_millis(100),
+        ..Limits::default()
+    })
+    .unwrap()
+    .get(&url)
+    .await
+    .unwrap();
+    assert_eq!(response.read(&mut [0; 1]).await.unwrap(), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert_eq!(
+        response.read(&mut [0; 1]).await.unwrap_err().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    worker.join().unwrap();
 }
 
 #[tokio::test]

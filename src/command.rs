@@ -62,6 +62,7 @@ pub struct OptionSpec {
     conflicts: Vec<String>,
     requires_any: Vec<String>,
     help: Option<String>,
+    hidden: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,6 +84,7 @@ impl OptionSpec {
             conflicts: Vec::new(),
             requires_any: Vec::new(),
             help: None,
+            hidden: false,
         }
     }
 
@@ -97,6 +99,7 @@ impl OptionSpec {
             conflicts: Vec::new(),
             requires_any: Vec::new(),
             help: None,
+            hidden: false,
         }
     }
 
@@ -137,6 +140,12 @@ impl OptionSpec {
     /// Describe this option in facade-rendered help.
     pub fn help(mut self, text: impl Into<String>) -> Self {
         self.help = Some(text.into());
+        self
+    }
+
+    /// Keep this option parseable but omit it from facade-rendered help.
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
         self
     }
 }
@@ -203,6 +212,9 @@ impl Command {
         if !self.options.is_empty() {
             output.push_str("\nOptions:\n");
             for option in &self.options {
+                if option.hidden {
+                    continue;
+                }
                 let suffix = match &option.kind {
                     None => String::new(),
                     Some(_) if option.default_missing.is_some() => " [VALUE]".to_owned(),

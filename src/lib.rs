@@ -22,6 +22,9 @@ mod process_adapter;
 
 #[cfg(feature = "command-arguments")]
 pub mod arguments;
+/// Bounded command-line schema parsing with facade-owned values and diagnostics.
+#[cfg(feature = "command-schema")]
+pub mod command;
 
 /// Bounded configuration decoding with caller-owned schemas and defaults.
 #[cfg(feature = "config-toml")]

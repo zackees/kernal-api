@@ -28,6 +28,14 @@ use std::time::Duration;
 
 use tokio::sync::Notify as BackendNotify;
 
+mod broadcast;
+pub use broadcast::{
+    broadcast_channel, BroadcastReceiver, BroadcastRecvError, BroadcastSender,
+    BroadcastTryRecvError,
+};
+#[cfg(feature = "event-stream")]
+pub use broadcast::{BroadcastLagged, BroadcastStream};
+
 /// Current engine implementation, retained for diagnostics and bug reports.
 pub const BACKEND_NAME: &str = "tokio";
 /// Exact backend version selected by this `kernal-api` release.
@@ -388,6 +396,48 @@ pub async fn yield_now() {
 /// Wait for a duration without blocking an async worker.
 pub async fn sleep(duration: Duration) {
     tokio::time::sleep(duration).await;
+}
+
+/// Wait until a shared deadline expires. Cancelling the wait does not change
+/// the deadline, so retrying uses the original expiry rather than a new budget.
+pub async fn sleep_until(deadline: Deadline) {
+    tokio::time::sleep_until(deadline.at).await;
+}
+
+/// A fixed-cadence timer with an immediate first tick.
+///
+/// Missed ticks are delivered in a burst until the original schedule catches
+/// up. No background task is spawned. Drop the timer to stop observing ticks.
+#[derive(Debug)]
+pub struct PeriodicTimer {
+    inner: tokio::time::Interval,
+}
+
+impl PeriodicTimer {
+    /// Create a periodic timer in the current runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside a runtime or when `period` is zero or exceeds
+    /// 365 days. The runtime must have its timer driver enabled.
+    pub fn new(period: Duration) -> std::io::Result<Self> {
+        if period.is_zero() || period > Duration::from_secs(365 * 24 * 60 * 60) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period must be positive and at most 365 days",
+            ));
+        }
+        RuntimeHandle::current().map_err(std::io::Error::other)?;
+        let mut inner = tokio::time::interval(period);
+        inner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+        Ok(Self { inner })
+    }
+
+    /// Wait for the next scheduled tick. Cancelling a pending call does not
+    /// consume its tick; a subsequent call observes the same scheduled time.
+    pub async fn tick(&mut self) {
+        self.inner.tick().await;
+    }
 }
 
 /// An absolute deadline that can be shared across composed async operations.
@@ -801,6 +851,15 @@ impl Semaphore {
         self.inner.available_permits()
     }
 
+    /// Acquire one owned permit immediately, or return `None` without waiting
+    /// when no permit is available. Dropping it restores shared capacity.
+    pub fn try_acquire(&self) -> Option<SemaphorePermit> {
+        Arc::clone(&self.inner)
+            .try_acquire_owned()
+            .ok()
+            .map(|permit| SemaphorePermit { _permit: permit })
+    }
+
     /// Acquire one permit, waiting until one is available.
     pub async fn acquire(&self) -> SemaphorePermit {
         SemaphorePermit {
@@ -869,6 +928,25 @@ impl<T> Sender<T> {
             .send(value)
             .await
             .map_err(|error| SendError(error.0))
+    }
+
+    /// Send from a synchronous producer, parking this thread until capacity is
+    /// available. No runtime is created, and the bounded queue is unchanged.
+    ///
+    /// There is no independent timeout. The consumer must close or drop the
+    /// receiver to wake waiting producers when cancelling its work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unsent value if the receiver closes or is dropped, or if
+    /// this thread has entered a runtime. Use [`Self::send`] inside a runtime.
+    pub fn blocking_send(&self, value: T) -> Result<(), BlockingSendError<T>> {
+        if RuntimeHandle::current().is_ok() {
+            return Err(BlockingSendError::AsyncContext(value));
+        }
+        self.inner
+            .blocking_send(value)
+            .map_err(|error| BlockingSendError::Closed(error.0))
     }
 
     /// Send a value without waiting for capacity.
@@ -1025,6 +1103,17 @@ pub fn unbounded_channel<T>() -> (UnboundedSender<T>, UnboundedReceiver<T>) {
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 #[error("the kernal-api channel receiver has been dropped")]
 pub struct SendError<T>(pub T);
+
+/// A synchronous send failed, retaining the unsent value.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+pub enum BlockingSendError<T> {
+    /// The receiving half has been closed or dropped.
+    #[error("the kernal-api channel receiver is closed")]
+    Closed(T),
+    /// Blocking is forbidden on a thread that has entered a runtime.
+    #[error("blocking channel send cannot run inside a runtime")]
+    AsyncContext(T),
+}
 
 /// A value could not be sent through a bounded channel without waiting.
 #[derive(Clone, Copy, Debug, thiserror::Error)]

@@ -43,6 +43,12 @@ jobs:
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - run: soldr cargo fmt --all -- --check
+      - name: Verify HTTP wire semantics under backend feature unification
+        # Run after locked checks: this deliberately resolves a backend feature
+        # outside our manifest's production graph and may update the lockfile.
+        run: >-
+          soldr cargo test --features http-client,reqwest/gzip
+          --test http_client encoded_responses_preserve_wire_bytes_and_headers
 
   # Compile the aarch64-apple-darwin test binaries on Linux. Nothing here
   # needs a Mac: Soldr carries its own LLVM and macOS SDK, and clippy is a
@@ -143,6 +149,8 @@ jobs:
           - fs
           - fs-watch
           - hash-sha256
+          - event-stream
+          - http-client
           - ipc
           - ipc-async
           - profile

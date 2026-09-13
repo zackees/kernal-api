@@ -2,6 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+#[test]
+fn http_parser_version_is_pinned_for_published_consumers() {
+    let manifest = include_str!("../Cargo.toml");
+    assert!(manifest
+        .contains("hyper = { version = \"=1.11.0\", default-features = false, optional = true }"));
+    assert!(manifest.contains("http-client = [\"dep:reqwest\", \"dep:bytes\", \"dep:hyper\"]"));
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();

@@ -4,6 +4,8 @@ The first command in every pair is the RED state: it must *not* find the
 optional implementation.  The second is GREEN: enabling its owning feature
 must find it.  `cargo tree`, rather than Cargo.lock, is intentional: a lockfile
 contains every optional package and therefore cannot prove feature isolation.
+Measure normal/build edges: TLS fixtures may use OpenSSL as a dev dependency
+without making it part of a default consumer's compilation graph.
 """
 
 from __future__ import annotations
@@ -18,6 +20,9 @@ CASES = (
     ("allocator", "mimalloc-pprof"),
     ("fs-watch", "notify"),
     ("hash-sha256", "sha2"),
+    ("http-client", "reqwest"),
+    ("http-client", "hyper"),
+    ("event-stream", "tokio-stream"),
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),
@@ -49,6 +54,8 @@ def tree(features: str) -> set[str]:
         "tree",
         "--locked",
         "--no-default-features",
+        "--edges",
+        "normal,build",
         "--prefix",
         "none",
     ]

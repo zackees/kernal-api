@@ -27,6 +27,8 @@ pub mod hash;
 /// Bounded, fallible operating-system entropy without token-format policy.
 #[cfg(feature = "secure-random")]
 pub mod random;
+#[cfg(feature = "text-similarity")]
+pub mod text;
 
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]

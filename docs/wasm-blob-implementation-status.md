@@ -233,6 +233,28 @@ passes, parent counters drain, staging disappears, and the preserved original,
 neighbor, and obstructing directory contents are unchanged. This is a native
 replacement failure, not a permissions/disk-exhaustion or renamed-parent proof.
 
+A real contained cancellation-during-load proof exposed a cooperative shutdown
+bug: epoch interruption did not wake a guest suspended in the generated async
+`operation_yield` host import, so the parent had to force containment. The epoch
+broker now weakly tracks the root's shared operation hub and revokes it after
+publishing cancellation/deadline, outside its registration lock. Revocation
+uses a nonblocking hub-lock attempt and retries on subsequent ticks, so a
+stalled filesystem replacement cannot stall the shared ticker. This wakes
+operation waiters and cancels producers without changing the guest ABI. Binding
+after an interruption is covered too. The actual native regression passes in
+4.90 seconds with `Stopped(Cancelled)`, no forced termination, zero transported
+hub/compiler and parent worker/task/lease counters, no capture, and unchanged
+output/neighbor with no staging. A unit test covers both cancellation and
+deadline before/after hub binding. This does not make native atomic waits
+cooperatively interruptible; the block-after-capture proof still requires force.
+The full 17-test native screenshot suite passes (146.41 seconds) with the
+initial wakeup fix; the nonblocking refinement passes ten epoch-focused tests
+and strict combined-feature Clippy; its native cancellation rerun passes in
+4.54 seconds. A broader worker-feature library run passes
+345 tests and fails the pre-existing GNU build-ID assertion: `readelf -n` confirms
+this Soldr-produced test executable lacks a GNU build-ID note. This is not a
+fully green library-suite claim, and that failure remains unresolved.
+
 The generated guest yield facade now accepts only the host's success sentinel
 `1`. A native scalar-import regression reproduced `-1` incorrectly returning
 success before the fix; it now verifies success, failure, zero, and unknown

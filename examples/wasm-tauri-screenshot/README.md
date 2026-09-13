@@ -12,11 +12,14 @@ receives a URL/path string nor reads PNG bytes into guest memory.
 The library's `SketchWorkerConfig::with_webview_capture` now runs this real
 guest in a separate contained worker on Linux. The focused
 `wasm_tauri_screenshot` tests matching `inside_containment` prove successful
-pixel capture and trap-after-capture output preservation when built with
+pixel capture, trap-after-capture output preservation, and cooperative
+cancellation during an unfinished page load when built with
 `wasm-sketch-worker,tauri-webview-test-support`. They use the same normal/trap
 artifact environment variables documented below. Windows/macOS native worker
 execution and exhaustive renderer-destruction evidence
 remain pending. Linux also passes the forced-deadline proof described below.
+The cancellation proof requires `Stopped(Cancelled)`, not forced termination,
+and checks transported worker cleanup plus parent counters and unchanged output.
 
 For the containment-only blocking variant, build with
 `build-guest.sh --block-after-capture` (PowerShell: `-BlockAfterCapture`) and

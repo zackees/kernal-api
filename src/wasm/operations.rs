@@ -2404,9 +2404,23 @@ impl OperationHub {
     }
 
     pub(super) fn close_all(&self, terminal: Terminal) {
-        let Ok(mut state) = self.state.lock() else {
+        let Ok(state) = self.state.lock() else {
             return;
         };
+        Self::close_locked(state, terminal);
+    }
+
+    /// The shared epoch ticker must never wait behind a filesystem commit.
+    #[cfg(feature = "wasm-sketch-host")]
+    pub(super) fn try_close_all(&self, terminal: Terminal) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        Self::close_locked(state, terminal);
+        true
+    }
+
+    fn close_locked(mut state: std::sync::MutexGuard<'_, State>, terminal: Terminal) {
         state.closed = true;
         state.resources.clear();
         state.buffered_blob_bytes = 0;
@@ -3870,6 +3884,20 @@ mod tests {
         );
         let write = hub.submit_blob_write(1, blob, b"x").unwrap();
         assert_eq!(hub.poll_wire(1, write.0) as u8, STATUS_CLOSED);
+    }
+
+    #[test]
+    #[cfg(feature = "wasm-sketch-host")]
+    fn epoch_revocation_retries_a_busy_hub_without_blocking() {
+        let hub = OperationHub::new(1, 1).unwrap();
+        let (operation, _) = hub.submit(0, None, 0, 0).unwrap();
+        let held = hub.state.lock().unwrap();
+        assert!(!hub.try_close_all(Terminal::Cancelled));
+        drop(held);
+        assert_eq!(hub.poll_wire(0, operation.0), 0);
+        assert!(hub.try_close_all(Terminal::Cancelled));
+        assert_eq!(hub.poll_wire(0, operation.0), 2);
+        assert!(hub.submit(0, None, 0, 0).is_err());
     }
 
     #[test]

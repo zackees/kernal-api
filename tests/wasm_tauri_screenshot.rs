@@ -33,6 +33,14 @@ enum ContainedScenario {
     Capture,
     Trap,
     Block,
+    CancelLoad,
+}
+
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[test]
+#[ignore = "requires a native display and actual screenshot artifact"]
+fn actual_screenshot_guest_cancellation_inside_containment_drains_load() {
+    run_contained_screenshot(ContainedScenario::CancelLoad);
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
@@ -47,7 +55,9 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
     let artifact = std::env::var_os(match scenario {
         ContainedScenario::Trap => "KERNAL_API_SCREENSHOT_TRAP_ARTIFACT_WASM",
         ContainedScenario::Block => "KERNAL_API_SCREENSHOT_BLOCK_ARTIFACT_WASM",
-        ContainedScenario::Capture => "KERNAL_API_SCREENSHOT_ARTIFACT_WASM",
+        ContainedScenario::Capture | ContainedScenario::CancelLoad => {
+            "KERNAL_API_SCREENSHOT_ARTIFACT_WASM"
+        }
     })
     .expect("built screenshot artifact");
     let directory = tempfile::tempdir().unwrap();
@@ -67,6 +77,8 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         }
     }
     let stopping = Arc::clone(&stop);
+    let requested = Arc::new(AtomicBool::new(false));
+    let observed_request = Arc::clone(&requested);
     let thread = std::thread::spawn(move || {
         while !stopping.load(Ordering::Acquire) {
             match listener.accept() {
@@ -79,6 +91,13 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
                         .unwrap();
                     let mut request = [0; 4096];
                     if stream.read(&mut request).unwrap_or(0) > 0 {
+                        observed_request.store(true, Ordering::Release);
+                        if scenario == ContainedScenario::CancelLoad {
+                            while !stopping.load(Ordering::Acquire) {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            continue;
+                        }
                         let page = include_str!(
                             "../examples/wasm-tauri-screenshot/fixtures/viewport.html"
                         );
@@ -103,6 +122,8 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
         output.clone(),
     )
     .unwrap();
+    let trace = kernal_api::wasm::SketchWorkerTrace::default();
+    let config = config.with_trace(trace.clone());
     let epochs = SketchEpochLimits::default();
     let compiler = SketchCompiler::new(
         SketchCompilerConfig::default()
@@ -130,8 +151,56 @@ fn run_contained_screenshot(scenario: ContainedScenario) {
             .unwrap(),
     );
     let runtime = RuntimeBuilder::multi_thread().enable_all().build().unwrap();
-    let terminal = runtime.run(sketch.execute_threaded_root_contained(runtime.handle(), &config));
-    if scenario == ContainedScenario::Block {
+    let cancellation = kernal_api::async_engine::CancellationSource::new();
+    let cancel_task = if scenario == ContainedScenario::CancelLoad {
+        let source = cancellation.clone();
+        Some(runtime.handle().launch(async move {
+            for _ in 0..1_000 {
+                if requested.load(Ordering::Acquire) {
+                    // The response stays unfinished. The returned trace below
+                    // must prove the guest actually submitted its load wait.
+                    kernal_api::async_engine::sleep(Duration::from_millis(500)).await;
+                    source.cancel();
+                    return true;
+                }
+                kernal_api::async_engine::sleep(Duration::from_millis(10)).await;
+            }
+            source.cancel();
+            false
+        }))
+    } else {
+        None
+    };
+    let terminal = runtime.run(sketch.execute_threaded_root_contained_cancellable(
+        runtime.handle(),
+        &config,
+        cancellation.token(),
+    ));
+    if let Some(task) = cancel_task {
+        assert!(
+            runtime.run(task).unwrap(),
+            "cancellation never observed a native HTTP request"
+        );
+    }
+    if scenario == ContainedScenario::CancelLoad {
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Stopped(kernal_api::wasm::SketchWorkerStopReason::Cancelled)
+        );
+        let trace = trace
+            .take()
+            .expect("cooperative cancellation must report worker cleanup");
+        validate_teardown_trace(&trace).unwrap();
+        assert!(
+            trace.lines().any(
+                |line| line.starts_with("kernal-webview-trace phase=submit ")
+                    && line.ends_with("opcode=15")
+            ),
+            "load wait was not submitted: {trace}"
+        );
+        assert!(!trace.contains("phase=capture-requested"));
+        assert_eq!(std::fs::read(&output).unwrap(), b"original");
+    } else if scenario == ContainedScenario::Block {
         assert_eq!(
             terminal,
             SketchWorkerTerminal::ForcedContainment {

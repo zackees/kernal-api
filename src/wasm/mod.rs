@@ -937,6 +937,10 @@ impl AdmittedSketch {
         let mut validation_getter = None;
         let mut _instance_observation = None;
         let outcome = async {
+            logical_epoch.bind_operations(&operation_cleanup)?;
+            if let Some(error) = epoch_error(&logical_epoch) {
+                return Err(error);
+            }
             if store.set_fuel(root.root_fuel).is_err() {
                 Err(SketchExecutionError::PrelinkFailed)
             } else {
@@ -1094,6 +1098,7 @@ impl AdmittedSketch {
                     cancellation: crate::async_engine::CancellationSource::new().token(),
                     deadline: Instant::now() + self.epoch_broker.limits.wall_clock_deadline,
                     winner: AtomicU8::new(EPOCH_COMPLETED),
+                    operations: Mutex::new(None),
                 }),
                 operations: OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
@@ -2095,6 +2100,44 @@ struct LogicalEpoch {
     cancellation: crate::async_engine::CancellationToken,
     deadline: Instant,
     winner: AtomicU8,
+    operations: Mutex<Option<Weak<OperationHub>>>,
+}
+impl LogicalEpoch {
+    fn bind_operations(&self, operations: &Arc<OperationHub>) -> Result<(), SketchExecutionError> {
+        let mut bound = self
+            .operations
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        *bound = Some(Arc::downgrade(operations));
+        drop(bound);
+        // Also cover interruption before the root finished creating grants.
+        self.wake_interrupted_operations();
+        Ok(())
+    }
+
+    fn wake_interrupted_operations(&self) {
+        let terminal = match self.winner.load(Ordering::Acquire) {
+            EPOCH_CANCELLED => operations::Terminal::Cancelled,
+            EPOCH_DEADLINE_EXCEEDED => operations::Terminal::TimedOut,
+            _ => return,
+        };
+        let operations = self
+            .operations
+            .lock()
+            .ok()
+            .and_then(|bound| bound.clone())
+            .and_then(|bound| bound.upgrade());
+        if let Some(operations) = operations {
+            // Epoch interrupts executing Wasm, but cannot wake an async host
+            // import parked on operation_yield. Revoke its shared authority
+            // and cancel producers so both root and child waiters can drain.
+            if operations.try_close_all(terminal) {
+                if let Ok(mut bound) = self.operations.lock() {
+                    *bound = None;
+                }
+            }
+        }
+    }
 }
 struct EpochEntry {
     logical: Arc<LogicalEpoch>,
@@ -2128,6 +2171,7 @@ impl EpochBroker {
             cancellation,
             deadline: Instant::now() + self.limits.wall_clock_deadline,
             winner: AtomicU8::new(EPOCH_PENDING),
+            operations: Mutex::new(None),
         });
         self.register_entry(runtime, logical, true)
     }
@@ -2236,6 +2280,10 @@ impl EpochBroker {
             };
             if entries.is_empty() {
                 return;
+            }
+            // Never take operation-hub locks while holding registration state.
+            for entry in &entries {
+                entry.logical.wake_interrupted_operations();
             }
             self.engine.increment_epoch();
             // Released after this tick published every terminal winner, so a
@@ -2481,11 +2529,53 @@ mod epoch_broker_tests {
     }
 
     #[test]
+    fn interrupted_epochs_wake_host_operations_before_or_after_binding() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (winner, status) in [(EPOCH_CANCELLED, 2), (EPOCH_DEADLINE_EXCEEDED, 3)] {
+            for interrupt_before_binding in [false, true] {
+                let epoch = LogicalEpoch {
+                    cancellation: crate::async_engine::CancellationSource::new().token(),
+                    deadline: Instant::now(),
+                    winner: AtomicU8::new(EPOCH_PENDING),
+                    operations: Mutex::new(None),
+                };
+                let hub = OperationHub::new(2, 1).unwrap();
+                let (operation, _) = hub.submit(0, None, 0, 0).unwrap();
+                let wake = hub.suspend_wire(0, operation.wire()).unwrap();
+                if interrupt_before_binding {
+                    epoch.winner.store(winner, Ordering::Release);
+                    epoch.wake_interrupted_operations();
+                }
+                epoch.bind_operations(&hub).unwrap();
+                if !interrupt_before_binding {
+                    assert_eq!(hub.poll_wire(0, operation.wire()), 0);
+                    epoch.winner.store(winner, Ordering::Release);
+                    epoch.wake_interrupted_operations();
+                }
+                runtime.run(async {
+                    crate::async_engine::timeout(Duration::from_secs(1), wake.notified())
+                        .await
+                        .expect("interrupted host operation must wake");
+                });
+                assert_eq!(hub.poll_wire(0, operation.wire()), status);
+                assert!(hub.submit(0, None, 0, 0).is_err());
+                assert_eq!(hub.snapshot().pending_operations, 0);
+                assert!(epoch.operations.lock().unwrap().is_none());
+                epoch.wake_interrupted_operations();
+            }
+        }
+    }
+
+    #[test]
     fn cancellation_wins_a_same_tick_deadline_without_reclassifying_fuel() {
         let epoch = LogicalEpoch {
             cancellation: crate::async_engine::CancellationSource::new().token(),
             deadline: Instant::now(),
             winner: AtomicU8::new(EPOCH_CANCELLED),
+            operations: Mutex::new(None),
         };
         assert_eq!(epoch_error(&epoch), Some(SketchExecutionError::Cancelled));
         let fuel = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
@@ -4779,6 +4869,7 @@ mod result_precedence_tests {
             cancellation: crate::async_engine::CancellationSource::new().token(),
             deadline: Instant::now() + Duration::from_secs(1),
             winner: AtomicU8::new(EPOCH_PENDING),
+            operations: Mutex::new(None),
         };
         assert_eq!(
             map_root_error(&error, &epoch),

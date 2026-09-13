@@ -146,7 +146,9 @@ async fn lifecycle(
     if scenario == SmokeScenario::Bootstrap {
         let window = WebviewWindowOptions::new("kernal-api bootstrap proof", 800, 600)
             .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
-        let bootstrap = WebviewPageBootstrap::new("window.__kernal_bootstrap = 17;")
+        let bootstrap = WebviewPageBootstrap::new(
+            "if (Object.isFrozen(kernalWindow) && Number.isFinite(kernalWindow.initialScaleFactor) && kernalWindow.initialScaleFactor > 0) { window.__kernal_bootstrap = 17; }",
+        )
             .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
         let outcome = match client
             .open_webview_with_bootstrap(url, window, WebviewPermissions::deny_all(), bootstrap)

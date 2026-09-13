@@ -28,3 +28,28 @@ allocations performed by callers while constructing their values.
 JSON is distinct from TOML configuration: null, unsigned integers and JSON
 output semantics should not alter the configuration contract. The private
 JSON backend is also used by the existing Firefox profile exporter.
+
+## Duplicate-aware schema inspection
+
+`parse_members` is an opt-in alternative for typed application protocols that
+must distinguish duplicate known fields from duplicate unknown fields. Every
+object, including nested objects, becomes `Value::ObjectMembers`, a sequence
+of decoded key/value pairs in source order. It does not decide which names are
+schema fields and does not merge repeated keys. Escaped equivalent keys have
+the same decoded spelling. Ordinary `parse` continues to return last-key-wins
+map objects, so existing dynamic-object consumers are unchanged.
+
+The same byte, depth and node limits apply. Unlike ordinary map parsing,
+member parsing checks node/depth bounds during decoding and counts all repeated
+member values, rather than only values surviving a merge. It does not build a
+second tree or a separate duplicate index. Encoding a member object preserves
+all members and their order; it does not promise to preserve source whitespace
+or number spellings. Caller-constructed member objects receive the same
+encoding validation and output limits as map objects.
+
+Private borrowed raw-value slices distinguish actual objects from the synthetic
+number dispatch enabled by dependency feature unification. Numeric scalars stay
+numeric with `serde_json/arbitrary_precision`; user object keys cannot impersonate
+that dispatch. Raw syntax validation precedes member decoding and can revisit
+nested slices, with work constrained by input size and accepted depth rather
+than a separate CPU quota. No raw backend type crosses the public API.

@@ -13,7 +13,8 @@ pub const MAX_NODES: usize = 262_144;
 pub const MAX_DEPTH: usize = 64;
 
 /// Owned JSON values, independent of the private serialization backend.
-/// Objects encode in key order. Positive parsed integers use `Signed` when
+/// Map objects encode in key order; member objects preserve order and duplicates.
+/// Positive parsed integers use `Signed` when
 /// representable, otherwise `Unsigned`; numeric variant identity is not a
 /// wire-format guarantee. Floating-point values must be finite when encoded.
 #[derive(Clone, Debug, PartialEq)]
@@ -26,6 +27,10 @@ pub enum Value {
     String(String),
     Array(Vec<Value>),
     Object(BTreeMap<String, Value>),
+    /// Unmerged members from [`parse_members`], in source order. Applications
+    /// decide which duplicate fields their schemas accept. Encoding preserves
+    /// all entries; it does not merge them into a map.
+    ObjectMembers(Vec<(String, Value)>),
 }
 
 /// Output style; neither style appends a trailing newline.
@@ -70,6 +75,104 @@ pub fn parse(source: &[u8]) -> Result<Value, Error> {
     let value = serde_json::from_slice(source).map_err(|_| Error::InvalidSyntax)?;
     let mut remaining = MAX_NODES;
     convert(value, 0, &mut remaining)
+}
+
+/// Parse without merging object members, including objects nested in arrays or
+/// other objects. Every object becomes [`Value::ObjectMembers`]. Scalars and
+/// arrays have the same representation as [`parse`].
+///
+/// The input byte limit applies before parsing. Depth and node limits apply
+/// during decoding, counting every member value even when keys repeat. Keys
+/// are not nodes. There is no second tree or duplicate-key index. These bounds
+/// are not independent CPU or allocator quotas; individual strings and keys
+/// are also bounded by the source byte limit. No partial result is returned.
+/// Private borrowed raw-value syntax validation precedes member decoding and
+/// can revisit nested source slices, bounded by input size and accepted depth.
+pub fn parse_members(source: &[u8]) -> Result<Value, Error> {
+    use serde::de::DeserializeSeed;
+    if source.len() > MAX_INPUT_BYTES {
+        return Err(Error::InputTooLarge);
+    }
+    let mut state = MemberState {
+        remaining: MAX_NODES,
+        failure: None,
+    };
+    let mut parser = serde_json::Deserializer::from_slice(source);
+    let result = MemberSeed {
+        state: &mut state,
+        depth: 0,
+    }
+    .deserialize(&mut parser);
+    let value = result.map_err(|_| state.failure.unwrap_or(Error::InvalidSyntax))?;
+    parser.end().map_err(|_| Error::InvalidSyntax)?;
+    Ok(value)
+}
+
+struct MemberState {
+    remaining: usize,
+    failure: Option<Error>,
+}
+
+struct MemberSeed<'a> {
+    state: &'a mut MemberState,
+    depth: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for MemberSeed<'_> {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        if let Err(error) = visit(self.depth, &mut self.state.remaining) {
+            self.state.failure = Some(error);
+            return Err(serde::de::Error::custom("JSON resource limit"));
+        }
+        // A private raw slice distinguishes actual objects from the synthetic
+        // map used by serde_json when arbitrary_precision is feature-unified.
+        // Never interpret a user-controlled object key as a backend marker.
+        let raw: &'de serde_json::value::RawValue = serde::Deserialize::deserialize(deserializer)?;
+        let mut parser = serde_json::Deserializer::from_str(raw.get());
+        use serde::Deserializer;
+        match raw.get().as_bytes().first() {
+            Some(b'{') => parser
+                .deserialize_map(self)
+                .map_err(serde::de::Error::custom),
+            Some(b'[') => parser
+                .deserialize_seq(self)
+                .map_err(serde::de::Error::custom),
+            _ => {
+                let value = serde_json::from_str(raw.get()).map_err(serde::de::Error::custom)?;
+                let mut scalar_budget = 1;
+                convert(value, 0, &mut scalar_budget).map_err(serde::de::Error::custom)
+            }
+        }
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for MemberSeed<'_> {
+    type Value = Value;
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element_seed(MemberSeed {
+            state: &mut *self.state,
+            depth: self.depth + 1,
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut object: A) -> Result<Value, A::Error> {
+        let mut members = Vec::new();
+        while let Some(key) = object.next_key::<String>()? {
+            let value = object.next_value_seed(MemberSeed {
+                state: &mut *self.state,
+                depth: self.depth + 1,
+            })?;
+            members.push((key, value));
+        }
+        Ok(Value::ObjectMembers(members))
+    }
 }
 
 fn visit(depth: usize, remaining: &mut usize) -> Result<(), Error> {
@@ -124,6 +227,11 @@ fn validate(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), Er
                 validate(value, depth + 1, remaining)?;
             }
         }
+        Value::ObjectMembers(values) => {
+            for (_, value) in values {
+                validate(value, depth + 1, remaining)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -151,6 +259,13 @@ impl serde::Serialize for Borrowed<'_> {
                 output.end()
             }
             Value::Object(values) => {
+                let mut output = serializer.serialize_map(Some(values.len()))?;
+                for (key, value) in values {
+                    output.serialize_entry(key, &Borrowed(value))?;
+                }
+                output.end()
+            }
+            Value::ObjectMembers(values) => {
                 let mut output = serializer.serialize_map(Some(values.len()))?;
                 for (key, value) in values {
                     output.serialize_entry(key, &Borrowed(value))?;

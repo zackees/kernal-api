@@ -14,6 +14,59 @@ fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
+#[test]
+fn bodyless_statuses_reject_payloads_and_connection_headers_are_private() {
+    for status in [204, 205, 304] {
+        assert!(Response::new(status, b"unexpected".to_vec()).is_err());
+        assert!(Response::new(status, Vec::new()).is_ok());
+    }
+    for header in ["keep-alive", "proxy-connection", "te"] {
+        assert!(Response::new(200, Vec::new())
+            .unwrap()
+            .with_header(header, "value")
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn response_header_acceptance_counts_duplicates_and_wire_bytes() {
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_response_headers: 2,
+            max_response_header_bytes: 16,
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|request| async move {
+        let response = Response::new(200, Vec::new()).unwrap();
+        match request.target() {
+            "/count" => response
+                .with_header("x", "")
+                .unwrap()
+                .with_header("x", "")
+                .unwrap()
+                .with_header("x", "")
+                .unwrap(),
+            "/bytes" => response.with_header("x", "123456789012").unwrap(),
+            _ => response.with_header("x", "12345678901").unwrap(),
+        }
+    }));
+    for (path, status) in [("/count", 500), ("/bytes", 500), ("/exact", 200)] {
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let response = exchange(addr, request.as_bytes()).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+    }
+    drop(task);
+}
+
 async fn exchange(addr: SocketAddr, request: &[u8]) -> String {
     let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
     socket.write_all(request).await.unwrap();

@@ -33,6 +33,12 @@ pub struct Limits {
     pub max_header_bytes: usize,
     /// Maximum parsed header count.
     pub max_headers: usize,
+    /// Maximum accepted application response header entries, counting duplicates.
+    pub max_response_headers: usize,
+    /// Maximum application header bytes: name + value + four framing bytes per
+    /// entry. Excludes transport-generated headers and the status line; this is
+    /// an acceptance limit, not a limit on prior application allocations.
+    pub max_response_header_bytes: usize,
     /// Maximum time to receive each request's headers.
     pub header_timeout: Duration,
     /// Maximum time to collect a request body.
@@ -56,6 +62,8 @@ impl Default for Limits {
             max_event_bytes: 64 * 1024,
             max_header_bytes: 32 * 1024,
             max_headers: 100,
+            max_response_headers: 100,
+            max_response_header_bytes: 32 * 1024,
             header_timeout: Duration::from_secs(10),
             body_timeout: Duration::from_secs(30),
             handler_timeout: Duration::from_secs(30),
@@ -71,6 +79,8 @@ impl Limits {
             || self.max_connections > 65_536
             || !(8192..=1024 * 1024).contains(&self.max_header_bytes)
             || !(1..=1024).contains(&self.max_headers)
+            || self.max_response_headers > 1024
+            || self.max_response_header_bytes > 1024 * 1024
             || self.max_request_body_bytes > 1024 * 1024 * 1024
             || self.max_response_body_bytes > 1024 * 1024 * 1024
             || self.max_file_bytes > 1024 * 1024 * 1024 * 1024
@@ -136,6 +146,7 @@ impl Response {
     ///
     /// # Errors
     /// Rejects status values outside 200..=599; interim responses are transport-owned.
+    /// Statuses 204, 205 and 304 require an empty body.
     pub fn new(status: u16, body: impl Into<Vec<u8>>) -> io::Result<Self> {
         if !(200..=599).contains(&status) {
             return Err(io::Error::new(
@@ -143,10 +154,17 @@ impl Response {
                 "invalid final HTTP status",
             ));
         }
+        let body = body.into();
+        if matches!(status, 204 | 205 | 304) && !body.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HTTP status does not permit response content",
+            ));
+        }
         Ok(Self {
             status: hyper::StatusCode::from_u16(status).map_err(io::Error::other)?,
             headers: hyper::HeaderMap::new(),
-            body: ServerBody::bytes(Bytes::from(body.into())),
+            body: ServerBody::bytes(Bytes::from(body)),
         })
     }
 
@@ -194,7 +212,14 @@ impl Response {
             hyper::header::HeaderName::from_bytes(name.as_bytes()).map_err(io::Error::other)?;
         if matches!(
             name.as_str(),
-            "content-length" | "transfer-encoding" | "connection" | "upgrade" | "trailer"
+            "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "upgrade"
+                | "trailer"
+                | "keep-alive"
+                | "proxy-connection"
+                | "te"
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -312,7 +337,19 @@ where
         Ok(response) => response,
         Err(_) => return Ok(empty(hyper::StatusCode::GATEWAY_TIMEOUT)),
     };
-    if response.body.configure(limits).is_err() {
+    let header_bytes = response
+        .headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())?
+                .checked_add(4)
+        });
+    if response.headers.len() > limits.max_response_headers
+        || header_bytes.is_none_or(|bytes| bytes > limits.max_response_header_bytes)
+        || response.body.configure(limits).is_err()
+    {
         return Ok(empty(hyper::StatusCode::INTERNAL_SERVER_ERROR));
     }
     let mut result = hyper::Response::new(response.body);

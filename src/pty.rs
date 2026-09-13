@@ -82,3 +82,49 @@ impl Drop for PtySession {
         let _ = self.child.wait();
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn session_owns_a_shell_command_and_its_pty_io() {
+        let mut command = PtyCommand::new("/bin/sh");
+        command.arguments = vec!["-c".into(), "printf kernal-pty-session".into()];
+        let (mut session, mut reader) = PtySession::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("spawn shell in PTY");
+
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 64];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                // Linux PTYs report EIO when the slave closes normally.
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("read PTY output: {error}"),
+            }
+        }
+        assert!(String::from_utf8_lossy(&bytes).contains("kernal-pty-session"));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = session.try_wait().expect("reap shell") {
+                assert_eq!(status, 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "shell did not exit promptly");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}

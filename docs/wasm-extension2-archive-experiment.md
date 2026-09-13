@@ -314,9 +314,30 @@ update, failed update/construction cleanup, zero storage/resource counts, and
 terminal collection. Omitting cancellation cleanup made its regression retain
 sixteen bytes instead of zero; restoring cleanup fixes that failure.
 
-This is not yet an end-to-end async guest capability. The operation path still
-needs final-tag verification and atomic authenticated-resource publication;
-the large ZIP tests currently use the earlier direct native authentication
-path. An in-flight native write keeps its reservation until I/O returns, even
+This is not yet an end-to-end async guest capability. An in-flight native
+write keeps its reservation until I/O returns, even
 if cancellation wins meanwhile. No interruption of uninterruptible filesystem
 work, worker-process cleanup, or progress-deadline execution is claimed.
+
+## Final-tag operation handoff
+
+Finalization now consumes pending state from the operation table and performs
+tag verification, flush, and rewind outside the authority mutex. It then
+rechecks that the operation remains active. Resource insertion, attachment to
+the creating operation, activation, and terminal publication occur together
+under the same lock, using the existing resource allocator and terminal logic.
+Authentication or resource-quota failure publishes a resource-free rejection.
+The consumer receives the archive token only by collecting the operation's
+successful terminal result.
+
+The 17 MiB registry ZIP fixture now uses this complete native operation path:
+begin, bounded updates, final verification, terminal collection, and extraction.
+The cancellation regression runs deterministically after successful verification
+but before publication, both with and without collecting the cancelled terminal.
+It starts with sixteen charged bytes and requires zero resources/storage after
+the rejected handoff. A separate test verifies finalization's foreign-owner and
+resource-quota checks, also with nonzero staged data.
+
+All of this remains test-gated. It is not generated guest execution, an async
+dispatcher, real extension2 policy, or proof that filesystem calls can be
+interrupted. The latest implementation still needs its six-native-target runs.

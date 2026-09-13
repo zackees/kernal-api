@@ -97,6 +97,92 @@ impl OperationHub {
         Err(HubError::Invalid)
     }
 
+    fn finish_archive_authentication(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+        tag: &[u8; 16],
+    ) -> Result<(), HubError> {
+        self.finish_archive_authentication_with(store, operation, tag, || {})
+    }
+
+    fn finish_archive_authentication_with(
+        &self,
+        store: u64,
+        operation: OpaqueToken,
+        tag: &[u8; 16],
+        after_authentication: impl FnOnce(),
+    ) -> Result<(), HubError> {
+        let pending = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let slot = state
+                .operations
+                .get_mut(&operation)
+                .ok_or(HubError::Invalid)?;
+            if slot.owner.store != store {
+                return Err(HubError::WrongRights);
+            }
+            if slot.terminal.is_some() {
+                return Err(HubError::Closed);
+            }
+            slot.pending_authentication
+                .take()
+                .ok_or(HubError::Invalid)?
+        };
+        // Final crypto, flush, and seek are outside the authority mutex.
+        let authenticated = pending.authenticate(tag);
+        // Deterministic test seam for cancellation after verification but
+        // before publication. Ordinary finalization supplies an empty closure.
+        if authenticated.is_ok() {
+            after_authentication();
+        }
+        let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        if state.closed
+            || state
+                .operations
+                .get(&operation)
+                .is_none_or(|slot| slot.terminal.is_some())
+        {
+            return Err(HubError::Closed);
+        }
+        let resource = match authenticated {
+            Ok(archive) => self.create_resource_value_locked(
+                &mut state,
+                store,
+                ARCHIVE_KIND,
+                EXTRACT_RIGHT,
+                false,
+                ResourceValue::AuthenticatedArchive(archive),
+            ),
+            Err(_) => Err(HubError::Invalid),
+        };
+        let completion = match resource {
+            Ok(resource) => {
+                state
+                    .operations
+                    .get_mut(&operation)
+                    .ok_or(HubError::Closed)?
+                    .created_resource = Some(resource);
+                TerminalResult {
+                    terminal: Terminal::Completed,
+                    resource: Some(resource),
+                }
+            }
+            Err(_) => TerminalResult {
+                terminal: Terminal::Rejected,
+                resource: None,
+            },
+        };
+        // Insertion, linkage, activation, and terminal publication share one
+        // lock interval. Cancellation cannot observe an unowned live file.
+        let notify = Self::terminal_locked(&mut state, operation, completion)?;
+        drop(state);
+        if let Some(notify) = notify {
+            notify.notify_one();
+        }
+        resource.map(|_| ())
+    }
+
     fn register_authenticated_archive(
         &self,
         store: u64,
@@ -280,8 +366,9 @@ fn authenticated_archive_registry_extracts_large_zip_with_bounded_transfers() {
         let key = [19; 16];
         let nonce = [23; 12];
         let aad = b"synthetic registered ZIP";
-        let mut pending =
-            Authentication::begin(&key, &nonce, aad, length, &hub.staging_budget).unwrap();
+        let operation = hub
+            .begin_archive_authentication(1, &key, &nonce, aad, length)
+            .unwrap();
         let mut encoder =
             Crypter::new(Cipher::aes_128_gcm(), Mode::Encrypt, &key, Some(&nonce)).unwrap();
         encoder.aad_update(aad).unwrap();
@@ -295,7 +382,8 @@ fn authenticated_archive_registry_extracts_large_zip_with_bounded_transfers() {
                 break;
             }
             let encrypted = encoder.update(&input[..count], &mut ciphertext).unwrap();
-            pending.update(&ciphertext[..encrypted]).unwrap();
+            hub.update_archive_authentication(1, operation, &ciphertext[..encrypted])
+                .unwrap();
             assert_eq!(hub.snapshot().live_resources, 0);
             assert_eq!(hub.staging_budget.used(), length);
             assert!(!output.exists());
@@ -306,17 +394,17 @@ fn authenticated_archive_registry_extracts_large_zip_with_bounded_transfers() {
         if case == 1 {
             tag[0] ^= 1;
         }
-        let authenticated = pending.authenticate(&tag);
+        let authenticated = hub.finish_archive_authentication(1, operation, &tag);
+        let completion = hub.observe_terminal(1, operation).unwrap().unwrap();
         if case == 1 {
-            assert_eq!(
-                authenticated.unwrap_err().kind(),
-                io::ErrorKind::InvalidData
-            );
+            assert_eq!(authenticated, Err(HubError::Invalid));
+            assert_eq!(completion.terminal, Terminal::Rejected);
+            assert_eq!(completion.resource, None);
             assert!(!output.exists());
         } else {
-            let token = hub
-                .register_authenticated_archive(1, authenticated.unwrap())
-                .unwrap();
+            authenticated.unwrap();
+            assert_eq!(completion.terminal, Terminal::Completed);
+            let token = completion.resource.unwrap();
             assert_eq!(hub.snapshot().live_resources, 1);
             assert_eq!(hub.staging_budget.used(), length);
             assert!(Authentication::begin(&key, &nonce, aad, 1, &hub.staging_budget).is_err());
@@ -432,4 +520,84 @@ fn authenticated_archive_pending_errors_and_teardown_reclaim_staging() {
             .terminal,
         Terminal::Rejected
     );
+}
+
+#[test]
+fn authenticated_archive_finalization_does_not_publish_after_cancellation() {
+    for collect in [false, true] {
+        let hub = OperationHub::new(2, 2).unwrap();
+        let (operation, tag) = pending_nist_operation(&hub);
+        let verified = std::cell::Cell::new(false);
+        assert_eq!(
+            hub.finish_archive_authentication_with(1, operation, &tag, || {
+                verified.set(true);
+                assert_eq!(hub.staging_budget.used(), 16);
+                hub.cancel_wire(1, operation.wire()).unwrap();
+                if collect {
+                    assert_eq!(
+                        hub.observe_terminal(1, operation)
+                            .unwrap()
+                            .unwrap()
+                            .terminal,
+                        Terminal::Cancelled
+                    );
+                }
+            }),
+            Err(HubError::Closed)
+        );
+        assert!(verified.get());
+        assert_eq!(hub.snapshot().live_resources, 0);
+        assert_eq!(hub.staging_budget.used(), 0);
+        if !collect {
+            assert_eq!(
+                hub.observe_terminal(1, operation)
+                    .unwrap()
+                    .unwrap()
+                    .terminal,
+                Terminal::Cancelled
+            );
+        }
+    }
+}
+
+#[test]
+fn authenticated_archive_finalization_resource_quota_rejects_and_cleans_up() {
+    let hub = OperationHub::new(2, 0).unwrap();
+    let (operation, tag) = pending_nist_operation(&hub);
+    assert_eq!(
+        hub.finish_archive_authentication(2, operation, &tag),
+        Err(HubError::WrongRights)
+    );
+    assert_eq!(hub.staging_budget.used(), 16);
+    assert_eq!(
+        hub.finish_archive_authentication(1, operation, &tag),
+        Err(HubError::Quota)
+    );
+    let completion = hub.observe_terminal(1, operation).unwrap().unwrap();
+    assert_eq!(completion.terminal, Terminal::Rejected);
+    assert_eq!(completion.resource, None);
+    assert_eq!(hub.snapshot().live_resources, 0);
+    assert_eq!(hub.staging_budget.used(), 0);
+}
+
+fn pending_nist_operation(hub: &OperationHub) -> (OpaqueToken, [u8; 16]) {
+    let operation = hub
+        .begin_archive_authentication(1, &[0; 16], &[0; 12], &[], 16)
+        .unwrap();
+    hub.update_archive_authentication(
+        1,
+        operation,
+        &[
+            0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92, 0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2,
+            0xfe, 0x78,
+        ],
+    )
+    .unwrap();
+    (
+        operation,
+        [
+            0xab, 0x6e, 0x47, 0xd4, 0x2c, 0xec, 0x13, 0xbd, 0xf5, 0x3a, 0x67, 0xb2, 0x12, 0x57,
+            0xbd, 0xdf,
+        ],
+    )
 }

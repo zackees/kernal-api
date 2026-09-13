@@ -2107,6 +2107,18 @@ impl OperationHub {
         value: ResourceValue,
     ) -> Result<OpaqueToken, HubError> {
         let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+        self.create_resource_value_locked(&mut state, store, kind, rights, shareable, value)
+    }
+
+    fn create_resource_value_locked(
+        &self,
+        state: &mut State,
+        store: u64,
+        kind: u8,
+        rights: u8,
+        shareable: bool,
+        value: ResourceValue,
+    ) -> Result<OpaqueToken, HubError> {
         if state.closed {
             return Err(HubError::Closed);
         }

@@ -36,6 +36,14 @@ initial transport tests alone.
   Duplicate fields count separately; byte accounting includes each field's
   name, value and four framing bytes. Transport-generated fields and the status
   line are excluded. Zero permits no application fields.
+- Server-wide application-selected response headers override matching handler
+  fields and apply to dispatched body-rejection, timeout and response-rejection
+  errors. Configuration and merged responses obey the same header budget. The
+  kernel does not select a CORS origin or preflight policy. Parser-generated
+  errors before dispatch and connections closed without responses do not pass
+  through this hook; that boundary must be included in product parity checks.
+- HEAD suppresses response body polling, including live SSE sources. OPTIONS
+  reaches the product handler, which chooses status, headers and route policy.
 - Constructors reject nonempty bodies for 204, 205 and 304, per
   [HTTP semantics](https://httpwg.org/specs/rfc9110.html). Connection-specific
   headers remain private, including keep-alive, proxy-connection and TE.
@@ -69,8 +77,8 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 ## Required before the server migration can land
 
 - Ensure file-open/read behavior fits the streamed routes.
-- Application-owned response-header/CORS policy,
-  including behavior for transport-generated errors and HEAD/OPTIONS requests.
+- Adopt application-owned response-header/CORS policy and prove parity,
+  including parser errors, dispatched errors and HEAD/OPTIONS routes.
 - Product route migration and parity checks before removing Axum, Tower HTTP and
   direct Tokio file/listener calls from FastLED.
 - Native CI, review, merge, release and exact published application adoption.
@@ -78,7 +86,7 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 ## Local evidence
 
 The foundation's focused test initially failed to import the missing module.
-Sixteen integration tests cover the draft with `http-server,event-stream` enabled:
+Nineteen integration tests cover the draft with `http-server,event-stream` enabled:
 request/response round trip, request rejection, cancellation cleanup,
 invalid limits, connection-capacity waiting, body/handler deadlines,
 header/connection deadlines, response limit/framing validation, a streamed file
@@ -86,7 +94,8 @@ larger than the memory-body limit, SSE delivery before source closure, and a
 non-reading client releasing its connection slot, duplicate/header-byte limits,
 bodyless-status/connection-header rejection, and diagnostic counters for
 rejections, handler panics, protocol failures and deadlines, and path/query
-decoding. Seven focused unit tests cover
+decoding, server header overrides/error coverage, merged header budgets, and
+HEAD/OPTIONS behavior. Seven focused unit tests cover
 bounded file reads, growth/truncation, SSE backpressure/encoding/keepalives, and
 write-timeout activation, malformed queries and once-only path decoding.
 The full kernel suite with `http-server,event-stream`,

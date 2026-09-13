@@ -15,6 +15,103 @@ fn loopback() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn server_headers_apply_to_generated_errors_and_override_handler_values() {
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_request_body_bytes: 1,
+            max_response_body_bytes: 1,
+            body_timeout: Duration::from_millis(10),
+            handler_timeout: Duration::from_millis(10),
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap()
+    .with_response_header("x-policy", "server")
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|request| async move {
+        if request.target() == "/timeout" {
+            std::future::pending::<()>().await;
+        }
+        let body = if request.target() == "/large" {
+            "xx"
+        } else {
+            "x"
+        };
+        Response::new(200, body.as_bytes().to_vec())
+            .unwrap()
+            .with_header("x-policy", "handler")
+            .unwrap()
+    }));
+    for (target, length, body, status) in [
+        ("/", 0, "", 200),
+        ("/large", 0, "", 500),
+        ("/timeout", 0, "", 504),
+        ("/", 2, "xx", 413),
+        ("/", 1, "", 408),
+    ] {
+        let request = format!("POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}");
+        let response = exchange(addr, request.as_bytes()).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+        assert!(response.contains("x-policy: server\r\n"), "{response}");
+        assert!(!response.contains("x-policy: handler"), "{response}");
+    }
+    drop(task);
+}
+
+#[tokio::test]
+async fn merged_response_headers_stay_within_the_acceptance_budget() {
+    let server = Server::bind(
+        loopback(),
+        Limits {
+            max_response_headers: 1,
+            ..Limits::default()
+        },
+    )
+    .await
+    .unwrap()
+    .with_response_header("x-policy", "server")
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|_| async {
+        Response::new(200, Vec::new())
+            .unwrap()
+            .with_header("extra", "value")
+            .unwrap()
+    }));
+    let response = exchange(
+        addr,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500"), "{response}");
+    assert!(response.contains("x-policy: server\r\n"), "{response}");
+    assert!(!response.contains("extra:"));
+    drop(task);
+    assert!(Server::bind(
+        loopback(),
+        Limits {
+            max_response_headers: 0,
+            ..Limits::default()
+        }
+    )
+    .await
+    .unwrap()
+    .with_response_header("x", "y")
+    .is_err());
+    assert!(Server::bind(loopback(), Limits::default())
+        .await
+        .unwrap()
+        .with_response_header("content-length", "0")
+        .is_err());
+}
+
+#[tokio::test]
 async fn request_path_and_query_decode_without_hiding_duplicates() {
     let server = Server::bind(loopback(), Limits::default()).await.unwrap();
     let addr = server.local_addr().unwrap();
@@ -42,6 +139,46 @@ async fn request_path_and_query_decode_without_hiding_duplicates() {
     }));
     let response = exchange(addr, b"GET /some%20file+name?name=first+value&name=%E2%98%83&empty&x=a%26b%3Dc&& HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(task);
+}
+
+#[tokio::test]
+async fn head_suppresses_stream_polling_and_options_reaches_product_handler() {
+    struct NeverPoll;
+    impl futures_core::Stream for NeverPoll {
+        type Item = std::io::Result<String>;
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            panic!("HEAD must not consume an event source");
+        }
+    }
+    let server = Server::bind(loopback(), Limits::default()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|request| async move {
+        match request.method() {
+            "HEAD" => Response::event_stream(NeverPoll, Duration::from_secs(1)).unwrap(),
+            "OPTIONS" => Response::new(204, Vec::new())
+                .unwrap()
+                .with_header("allow", "GET, HEAD, OPTIONS")
+                .unwrap(),
+            _ => panic!("unexpected method"),
+        }
+    }));
+    for (method, status) in [("HEAD", 200), ("OPTIONS", 204)] {
+        let request =
+            format!("{method} / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let response = exchange(addr, request.as_bytes()).await;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+        assert!(response.ends_with("\r\n\r\n"), "{response}");
+        if method == "OPTIONS" {
+            assert!(response.contains("allow: GET, HEAD, OPTIONS\r\n"));
+        }
+    }
     drop(task);
 }
 

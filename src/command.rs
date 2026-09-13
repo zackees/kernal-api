@@ -155,6 +155,7 @@ impl OptionSpec {
 pub struct Command {
     name: String,
     about: Option<String>,
+    version: Option<String>,
     options: Vec<OptionSpec>,
     positionals: Vec<PositionalSpec>,
     subcommands: Vec<Self>,
@@ -167,6 +168,7 @@ impl Command {
         Self {
             name: name.into(),
             about: None,
+            version: None,
             options: Vec::new(),
             positionals: Vec::new(),
             subcommands: Vec::new(),
@@ -184,6 +186,20 @@ impl Command {
     pub fn about(mut self, text: impl Into<String>) -> Self {
         self.about = Some(text.into());
         self
+    }
+
+    /// Set the version rendered by [`Command::render_version`].
+    pub fn version(mut self, value: impl Into<String>) -> Self {
+        self.version = Some(value.into());
+        self
+    }
+
+    /// Render deterministic, backend-independent version text.
+    pub fn render_version(&self) -> String {
+        match &self.version {
+            Some(version) => format!("{} {version}\n", self.name),
+            None => format!("{}\n", self.name),
+        }
     }
 
     /// Render deterministic, backend-independent help for this command.

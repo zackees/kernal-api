@@ -251,6 +251,12 @@ fn hidden_options_parse_but_are_absent_from_help_and_double_dash_is_literal() {
     assert_eq!(literal.value("directory"), Some("--not-an-option"));
 }
 
+#[test]
+fn version_is_rendered_from_facade_owned_metadata() {
+    let schema = Command::new("fastled").version("2.0.20");
+    assert_eq!(schema.render_version(), "fastled 2.0.20\n");
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_native_arguments_are_rejected_without_lossy_replacement() {

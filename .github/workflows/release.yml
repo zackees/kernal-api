@@ -38,6 +38,13 @@ jobs:
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+      - name: Install native webview development packages
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+      - name: Restore native pkg-config search path
+        run: |
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - name: Verify exact release version
         shell: bash
         run: |
@@ -54,7 +61,9 @@ jobs:
       - name: Test every facility together
         run: soldr cargo test --locked --all-features
       - name: Package exact Rust source
-        run: soldr cargo package --locked
+        # Registry consumers do not inherit this checkout's Git patches. Check
+        # the extracted package with every advertised feature before publishing.
+        run: soldr cargo package --locked --all-features
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*

@@ -291,6 +291,7 @@ jobs:
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - run: uv run --no-project ci/check_compilation_boundary_dependencies.py
+      - run: uv run --no-project ci/test_release_package_features.py
 
   supported-targets:
     strategy:

@@ -100,3 +100,44 @@ not execution of the preview decoder or a Wasm archive fixture.
 The upstream producer-contract test returns successfully without exercising
 the producer bundle when `TW_ORANGE_PREVIEW_TEST_SITE` is unset. Its default
 test result therefore must not be cited as encrypted fixture evidence.
+
+## Required storage and authentication boundary
+
+The current `ResourceValue::Blob` in `src/wasm/operations.rs` is a bounded
+`VecDeque<u8>` with a producer-EOF flag. Reads consume its contents. It cannot
+provide ZIP central-directory seeks, and increasing its byte quota to hold
+the archive would defeat the independent-of-total-length memory requirement.
+
+The next implementation must add private seekable backing under the existing
+resource registry, with separate retained-memory and staged-storage quotas.
+It must not turn the existing blob's EOF flag into an authentication verdict.
+The required lifecycle is:
+
+1. Reserve bounded staging capacity under the logical sketch before consuming
+   ciphertext. Keep the staging handle private and unregistered as readable.
+2. Validate the bounded envelope and stream ciphertext through a maintained
+   AES-GCM implementation using the original AAD and one final tag. Write
+   intermediate plaintext only to private staging, never to a guest-readable
+   queue, output capability, archive parser, or progress callback.
+3. Verify the final tag and release identity before making staging readable.
+   On malformed input, authentication failure, cancellation, trap, or quota
+   failure, close staging and release its storage reservation exactly once.
+4. Register an authenticated seekable resource using the existing scoped,
+   generation-safe token machinery. Archive inspection and entry reads then
+   use bounded operations; the sketch receives bounded inventory records and
+   applies extension2 policy, not a native path or whole ZIP.
+
+The distinction between update output and authenticated output is explicit
+in the maintained [OpenSSL authenticated-decryption example](https://github.com/openssl/openssl/blob/master/demos/cipher/aesgcm.c)
+and [Rust OpenSSL Crypter API](https://docs.rs/openssl/0.10.81/openssl/symm/struct.Crypter.html).
+These are implementation references, not a selected or added dependency.
+Do not hand-roll AES/GHASH to avoid a dependency, or use per-chunk AEAD records
+that are incompatible with the existing single-message envelope.
+
+The first integration regressions must pause before final authentication and
+prove that no readable resource or output exists, then independently mutate
+AAD, ciphertext, and tag and require the same cleanup. A successful synthetic
+key fixture must exceed 16 MiB, preserve bytes through bounded reads and
+central-directory seeks, and report peak memory, staged bytes, and zero live
+resources after close/cancel/teardown. A native crypto-only test is not a
+substitute for running that sequence through the actual guest ABI.

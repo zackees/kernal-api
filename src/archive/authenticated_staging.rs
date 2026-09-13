@@ -10,6 +10,96 @@ use openssl::symm::{Cipher, Crypter, Mode};
 
 const CHUNK: usize = 64 * 1024;
 
+#[test]
+fn encrypted_large_zip_reuses_bounded_extractor_only_after_authentication() {
+    use std::io::Read;
+    const LENGTH: u64 = 17 * 1024 * 1024;
+    // Success, bad tag, per-entry limit, entry-count limit, and unsafe path.
+    for case in 0..5 {
+        let mut writer = zip::ZipWriter::new(tempfile::tempfile().unwrap());
+        let name = if case == 4 { "../escaped" } else { "payload" };
+        writer
+            .start_file(
+                name,
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        let chunk = [0x5a; CHUNK];
+        for _ in 0..LENGTH / CHUNK as u64 {
+            writer.write_all(&chunk).unwrap();
+        }
+        let mut source = writer.finish().unwrap();
+        let length = source.metadata().unwrap().len();
+        assert!(length > 16 * 1024 * 1024);
+        source.rewind().unwrap();
+        let used = Arc::new(AtomicU64::new(0));
+        let key = [13; 16];
+        let nonce = [17; 12];
+        let aad = b"synthetic ZIP envelope";
+        let mut pending = Authentication::begin(&key, &nonce, aad, length, length, &used).unwrap();
+        let mut encoder =
+            Crypter::new(Cipher::aes_128_gcm(), Mode::Encrypt, &key, Some(&nonce)).unwrap();
+        encoder.aad_update(aad).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("output");
+        let mut input = [0; CHUNK];
+        let mut ciphertext = [0; CHUNK + 16];
+        loop {
+            let read = source.read(&mut input).unwrap();
+            if read == 0 {
+                break;
+            }
+            let count = encoder.update(&input[..read], &mut ciphertext).unwrap();
+            pending.update(&ciphertext[..count]).unwrap();
+            assert!(!output.exists());
+            assert_eq!(used.load(Ordering::SeqCst), length);
+        }
+        assert_eq!(encoder.finalize(&mut ciphertext).unwrap(), 0);
+        let mut tag = [0; 16];
+        encoder.get_tag(&mut tag).unwrap();
+        if case == 1 {
+            tag[0] ^= 1;
+        }
+        let authenticated = pending.authenticate(&tag);
+        if case == 1 {
+            assert_eq!(
+                authenticated.unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert!(!output.exists());
+        } else {
+            let limits = super::ExtractionLimits {
+                max_input_bytes: length,
+                max_entry_bytes: if case == 2 { LENGTH - 1 } else { LENGTH },
+                max_output_bytes: LENGTH,
+                max_entries: if case == 3 { 0 } else { 1 },
+                ..super::ExtractionLimits::default()
+            };
+            let result = authenticated.unwrap().extract(&output, limits);
+            if case == 0 {
+                result.unwrap();
+                let mut file = File::open(output.join("payload")).unwrap();
+                let mut total = 0;
+                loop {
+                    let count = file.read(&mut input).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    assert!(input[..count].iter().all(|byte| *byte == 0x5a));
+                    total += count as u64;
+                }
+                assert_eq!(total, LENGTH);
+            } else {
+                assert!(result.is_err());
+                assert!(!output.join("payload").exists());
+                assert!(!root.path().join("escaped").exists());
+            }
+        }
+        assert_eq!(used.load(Ordering::SeqCst), 0);
+    }
+}
+
 #[derive(Debug)]
 struct Reservation {
     used: Arc<AtomicU64>,
@@ -24,6 +114,24 @@ impl Drop for Reservation {
 struct Authenticated {
     file: File,
     _reservation: Reservation,
+}
+
+impl Authenticated {
+    fn extract(
+        self,
+        destination: &std::path::Path,
+        limits: super::ExtractionLimits,
+    ) -> io::Result<()> {
+        let Self {
+            file,
+            _reservation: reservation,
+        } = self;
+        let result = super::extract_file(file, destination, super::ArchiveFormat::Zip, limits);
+        // Keep staged storage charged until the extractor has closed its
+        // source, including every error path. No source pathname is reopened.
+        drop(reservation);
+        result
+    }
 }
 
 struct Pending {

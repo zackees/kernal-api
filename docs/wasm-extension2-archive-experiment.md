@@ -176,3 +176,19 @@ to the final chunk; it is not an encrypted ZIP or a guest execution test.
 A temporary mutation that ignored failed final authentication caused the
 known-vector regression to fail by returning an authenticated file for a bad
 tag. Restoring error propagation returned all three tests to GREEN.
+
+The next native integration, `encrypted_large_zip_reuses_bounded_extractor_only_after_authentication`,
+adds a stored ZIP containing a 17 MiB entry. It creates, encrypts, decrypts,
+and verifies with 64 KiB transfer buffers, authenticates before calling the
+existing extractor, and verifies every extracted byte. Its ciphertext itself
+exceeds 16 MiB (not merely its decompressed output). The private consuming
+`Authenticated::extract` keeps the staging reservation alive until extraction
+returns, including failure paths, and never reopens a source pathname.
+
+The regression first failed because that consuming extraction method was
+absent. It now passes success, bad-tag, per-entry ceiling, entry-count ceiling,
+and escaping-path cases; no destination is created before authentication and
+the storage counter returns to zero in every case. The four native staging
+tests pass together in 0.56 seconds on Linux x86-64. This remains a synthetic
+native fixture: real extension2 envelope parsing/identity policy, guest ABI
+execution, asynchronous cancellation, and worker teardown are still required.

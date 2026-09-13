@@ -2,8 +2,18 @@
 
 Issue #13 requires a Component Model comparison before selecting a production
 binding design. This unpublished, separate workspace tests the toolchain first;
-it is not a second runtime backend or a public guest API. Neither this workspace
+it is not a second supported runtime backend or a public guest API. Neither this workspace
 nor its tools are dependencies of `kernal-api`.
+
+The hash control now depends on the actual public `kernal-api` facade with the
+temporary `wasm-component-hash-experiment` selection. It directly awaits the
+[shared hash policy](../shared/hash_policy.rs), which is also compiled by the
+Core candidate. Its additional private hash interface uses the native kernel
+hasher; no hash implementation is copied into the guest. Actual Linux execution
+passes, including empty input, two chunkings of 64 MiB, failed-export Drop, and
+oversized canonical update rejection. This is hash-only correctness evidence,
+not full facade parity or a hostile-input allocation bound. The exact-version
+local path dependency is migration-only and must not be released as-is.
 
 The pinned `wit-bindgen = 0.58.0` generates a private custom world with one
 kernel interface: a granted blob resource exposes a typed `stream<u8>`.
@@ -44,7 +54,7 @@ optional `engine-probe` has subsequently compiled the actual component with
 Wasmtime 45.0.0. Its later `execution-probe` links the exact generated world and
 executes the rebuilt async-import component through `kernal_api::async_engine`.
 
-Remaining work includes adapting the same public Rust guest facade, deterministic
+Remaining work includes adapting the remaining public Rust guest facade, deterministic
 checked-in bindings, broader host execution through the existing kernel executor,
 backpressure and cancellation/teardown tests, ABI/capability version
 negotiation, ten edit measurements, and six native target validation. Do not

@@ -8,6 +8,9 @@ const MAX_MODULE_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(feature = "execution-probe")]
 mod host;
 
+#[cfg(feature = "execution-probe")]
+mod hash_host;
+
 #[cfg(feature = "engine-probe")]
 fn compile_component(bytes: &[u8]) -> wasmtime::Result<()> {
     let mut config = wasmtime::Config::new();
@@ -20,7 +23,7 @@ fn compile_component(bytes: &[u8]) -> wasmtime::Result<()> {
 fn validate_component(bytes: &[u8]) -> Result<()> {
     Validator::new_with_features(WasmFeatures::all()).validate_all(bytes)?;
     let mut depth = 0_u32;
-    let mut imports = 0;
+    let mut imports = std::collections::BTreeSet::new();
     for payload in Parser::new(0).parse_all(bytes) {
         match payload? {
             Payload::Version { encoding, .. } => {
@@ -34,7 +37,10 @@ fn validate_component(bytes: &[u8]) -> Result<()> {
                 for import in section {
                     let import = import?;
                     ensure!(
-                        import.name.name == "kernal:probe/blobs@0.1.0",
+                        matches!(
+                            import.name.name,
+                            "kernal:probe/blobs@0.1.0" | "kernal:hash-experiment/hashes@0.1.0"
+                        ),
                         "non-kernel component import: {}",
                         import.name.name
                     );
@@ -42,13 +48,19 @@ fn validate_component(bytes: &[u8]) -> Result<()> {
                         matches!(import.ty, wasmparser::ComponentTypeRef::Instance(_)),
                         "expected the typed kernel interface"
                     );
-                    imports += 1;
+                    ensure!(
+                        imports.insert(import.name.name),
+                        "duplicate kernel interface"
+                    );
                 }
             }
             _ => {}
         }
     }
-    ensure!(imports == 1, "expected exactly one kernel interface import");
+    ensure!(
+        imports.len() == 2,
+        "expected exactly the blob and hash kernel interfaces"
+    );
     Ok(())
 }
 
@@ -80,7 +92,7 @@ fn main() -> Result<()> {
     file.write_all(&component)?;
     #[cfg(not(feature = "execution-probe"))]
     println!(
-        "validated component: {} bytes; one kernel import; not executed",
+        "validated component: {} bytes; two kernel imports; not executed",
         component.len()
     );
     #[cfg(all(feature = "engine-probe", not(feature = "execution-probe")))]

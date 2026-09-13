@@ -144,9 +144,16 @@ the freshly built module and embed metadata using the ABI generator, then set
 `hash_actual_guest_streams_64_mib_through_public_facade` host test.
 
 This control does not yet connect the shared zccache request encoder to the
-guest, remove its native dependency graph, or establish the same-facade
-Component comparison. Revision-5 archive and screenshot runs cannot establish
-revision-6 compatibility; those artifacts must be rebuilt and rerun.
+guest or remove its native dependency graph. A private Component adapter now
+executes the exact shared hash policy through the same public facade on Linux
+(3.52 s), including failed-export cleanup and direct canonical oversized-input
+rejection. This establishes hash correctness only: canonical list lifting is
+not yet bounded before allocation, Blob semantics remain a separate private
+probe, and no matched runtime-performance selection has been made.
+
+The freshly rebuilt revision-6 archive guest also passes all eight cases on
+Linux (42.45 s). Revision-5 screenshot runs cannot establish revision-6
+compatibility; its fresh native harness is still being rebuilt.
 
 ## Remaining proof
 

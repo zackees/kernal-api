@@ -1,5 +1,37 @@
 # Private component encoder probe
 
+## Current shared hash control
+
+The current world additionally imports `kernal:hash-experiment/hashes@0.1.0`.
+Encoding requires exactly that interface and the existing private blob interface;
+Core scalar imports or ambient interfaces fail closed. Rebuild the guest before
+encoding: historical artifacts below do not contain the new exports.
+
+The Component export directly awaits [the shared policy](../shared/hash_policy.rs)
+through the actual `kernal_api::guest::Blake3Hasher` facade. A temporary
+`wasm-component-hash-experiment` feature selects the private generated WIT
+transport. Native hashing remains owned by kernal-api. The same policy checks
+empty input and 64 MiB in two chunkings in both candidates. The actual Linux
+Component test passed in 3.52 s, including failed-export Drop cleanup and a
+direct canonical oversized-update rejection that preserves the empty digest.
+Host quota and teardown unit checks also pass. All five actual-artifact tests
+pass in 21.43 s, including the existing transfer, trap, cancellation/reuse, and
+slow-consumer cases; the five ordinary unit tests pass separately.
+
+Run `actual_component_shared_public_hash` with `--ignored` and
+`KERNAL_COMPONENT_PROBE` pointing to the newly encoded component. The full
+stream/trap runner also executes this hash control. Fuel is now 500 million
+units for the combined control; this is not a matched performance measurement.
+
+Canonical list lifting occurs before the host rejects updates above 64 KiB.
+There is no claimed 64 KiB pre-lift allocation bound or concurrent aggregate
+memory proof. The hash-only table caps live handles at 64; the legacy private
+blob table remains separate. Blob facade parity, full zccache policy, six-host
+Component validation, and candidate selection remain incomplete. Remove the
+temporary candidate selection before releasing a single supported backend.
+
+## Original stream probe
+
 This standalone, unpublished workspace encodes the sibling guest's core Wasm
 using pinned `wit-component = 0.251.0`, matching wit-bindgen 0.58's metadata
 format. By default it does not instantiate a component or grant effects.
@@ -12,9 +44,10 @@ check. Compilation errors occur before the output is created. Without the
 feature, only structural validation is performed; the success output states
 explicitly when engine compilation has also passed.
 
-This experimental tool has its own lockfile and does not change the parent
-crate's features or dependencies. Wasmtime is optional here and no second
-production runtime fallback is introduced.
+This experimental tool has its own lockfile. The newer shared hash control adds
+an optional guest-only binding dependency to the parent facade; native default
+builds do not compile it. Wasmtime is optional here and no second production
+runtime fallback is introduced.
 
 ## Opt-in stream execution
 
@@ -32,7 +65,7 @@ Normal return requires an empty blob table and matching host/guest byte counts.
 All five runs require zero live blob and producer objects after
 store teardown. The probe uses the kernel runtime builder and timeout wrapper,
 not a direct Tokio dependency or a second executor implementation. Each run has
-a 30-second async timeout, 100 million fuel units, and an 8 MiB per-memory limit.
+a 30-second async timeout, 500 million fuel units, and an 8 MiB per-memory limit.
 These bounds are not a complete hostile-component admission policy.
 
 Build the guest, then add `--features execution-probe` to the encoder command

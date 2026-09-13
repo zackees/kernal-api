@@ -43,6 +43,8 @@ required-features = ["wasm-sketch-worker", "tauri-webview"]
 
 [features]
 default = []
+# Temporary private candidate selection for #13; not a supported second runtime.
+wasm-component-hash-experiment = ["dep:wit-bindgen"]
 # Advisory locking and modification-time setting are implemented natively
 # per host (see `src/platform_linux/fs.rs`, `src/platform_macos/fs.rs`,
 # `src/platform_win/fs.rs`) rather than through a wrapper crate, matching the
@@ -267,6 +269,9 @@ zstd = { version = "=0.13.3", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.189"
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+wit-bindgen = { version = "=0.58.0", default-features = false, features = ["macros", "realloc", "std"], optional = true }
 
 # The guest uses the generated kernel ABI, not a native runtime or OS substrate.
 # These remain mandatory (not feature-optional) for every native consumer.

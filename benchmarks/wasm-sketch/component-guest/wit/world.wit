@@ -13,6 +13,9 @@ interface blobs {
 
 world sketch {
     import blobs;
+    export hash-proof: async func() -> result;
+    export hash-fail: async func() -> result;
+    export hash-reject-overflow: async func() -> result<list<u8>>;
     export run: async func() -> result<u64>;
     export cancel-read: async func() -> result<u64>;
     export slow-consumer: async func() -> result<u64>;

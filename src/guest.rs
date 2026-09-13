@@ -7,6 +7,15 @@
 #[path = "wasm/generated/v1/guest_bindings.rs"]
 mod bindings;
 
+std::cfg_select! {
+    feature = "wasm-component-hash-experiment" => {
+        #[path = "guest_component_hash.rs"]
+        mod component_hash;
+        use component_hash::Blake3Hasher as HashBackend;
+    }
+    _ => { use bindings::Blake3Hasher as HashBackend; }
+}
+
 /// A kernel operation's terminal failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationError {
@@ -58,25 +67,26 @@ pub async fn sleep(milliseconds: u32) -> Result<(), OperationError> {
 
 /// Kernel-owned incremental BLAKE3 state. Updates are bounded to 64 KiB.
 pub struct Blake3Hasher {
-    inner: bindings::Blake3Hasher,
+    inner: HashBackend,
 }
 
 impl Blake3Hasher {
     pub async fn new() -> Result<Self, OperationError> {
         Ok(Self {
-            inner: bindings::Blake3Hasher::new().await?,
+            inner: HashBackend::new().await?,
         })
     }
 
     /// Feed one bounded chunk. After an update fails or is abandoned, dispose
     /// of this hasher: cancellation does not roll back committed bytes.
     pub async fn update(&mut self, bytes: &[u8]) -> Result<(), OperationError> {
-        self.inner.update(bytes).await.map_err(OperationError::from)
+        self.inner.update(bytes).await?;
+        Ok(())
     }
 
     /// Consume the hasher and return its canonical 32-byte digest.
     pub async fn finalize(self) -> Result<[u8; 32], OperationError> {
-        self.inner.finalize().await.map_err(OperationError::from)
+        Ok(self.inner.finalize().await?)
     }
 }
 

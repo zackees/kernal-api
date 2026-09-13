@@ -32,6 +32,7 @@ impl Drop for BlobState {
 }
 #[derive(Default)]
 struct State {
+    hash: super::hash_host::State,
     table: ResourceTable,
     granted: bool,
     live: Arc<AtomicUsize>,
@@ -232,7 +233,7 @@ pub(super) fn execute(bytes: &[u8]) -> wasmtime::Result<()> {
     execute_case(bytes, Mode::CancelPending)?;
     execute_case(bytes, Mode::GuestCancel)?;
     execute_case(bytes, Mode::SlowConsumer)?;
-    println!("executed component: bounded transfer, trap cleanup, pending-call teardown, guest read cancellation with instance reuse, and slow-consumer backpressure passed");
+    println!("executed component: shared public hash policy, failed-export hash cleanup, canonical oversize rejection, bounded transfer, trap cleanup, pending-call teardown, guest read cancellation with instance reuse, and slow-consumer backpressure passed");
     Ok(())
 }
 
@@ -246,6 +247,7 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
     let component = wasmtime::component::Component::new(&engine, bytes)?;
     let mut linker = Linker::new(&engine);
     bindings::Sketch::add_to_linker::<State, Host>(&mut linker, |state| state)?;
+    super::hash_host::add_to_linker(&mut linker, |state: &mut State| &mut state.hash)?;
     let mut store = Store::new(
         &engine,
         State {
@@ -257,7 +259,8 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
         },
     );
     store.limiter(|state| &mut state.limits);
-    store.set_fuel(100_000_000)?;
+    store.set_fuel(500_000_000)?;
+    let live_hashes = store.data().hash.live.clone();
     let live = store.data().live.clone();
     let live_blobs = store.data().live_blobs.clone();
     let produced = store.data().produced.clone();
@@ -270,6 +273,41 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
         async {
             let sketch =
                 bindings::Sketch::instantiate_async(&mut store, &component, &linker).await?;
+            if mode == Mode::Transfer {
+                let result = store
+                    .run_concurrent(async |accessor| sketch.call_hash_proof(accessor).await)
+                    .await??;
+                wasmtime::ensure!(result.is_ok(), "shared public hash policy failed");
+                wasmtime::ensure!(
+                    live_hashes.load(Ordering::SeqCst) == 0,
+                    "hash resources leaked after export"
+                );
+                let failed = store
+                    .run_concurrent(async |accessor| sketch.call_hash_fail(accessor).await)
+                    .await??;
+                wasmtime::ensure!(failed.is_err(), "expected intentional hash export failure");
+                wasmtime::ensure!(
+                    live_hashes.load(Ordering::SeqCst) == 0,
+                    "failed export leaked hash"
+                );
+                let digest = store
+                    .run_concurrent(async |accessor| {
+                        sketch.call_hash_reject_overflow(accessor).await
+                    })
+                    .await??;
+                wasmtime::ensure!(
+                    digest
+                        == Ok(kernal_api::hash::Blake3Hasher::new()
+                            .finalize()
+                            .as_bytes()
+                            .to_vec()),
+                    "oversized canonical update mutated hash"
+                );
+                wasmtime::ensure!(
+                    live_hashes.load(Ordering::SeqCst) == 0,
+                    "overflow rejection leaked hash"
+                );
+            }
             if mode == Mode::GuestCancel {
                 let count = store
                     .run_concurrent(async |accessor| sketch.call_cancel_read(accessor).await)
@@ -358,6 +396,10 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
     ));
     drop(store);
     wasmtime::ensure!(
+        live_hashes.load(Ordering::SeqCst) == 0,
+        "hash resources leaked after store teardown"
+    );
+    wasmtime::ensure!(
         live.load(Ordering::SeqCst) == 0,
         "host stream producer leaked"
     );
@@ -396,6 +438,16 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the freshly built shared-hash component in KERNAL_COMPONENT_PROBE"]
+    fn actual_component_shared_public_hash() {
+        let path = std::env::var_os("KERNAL_COMPONENT_PROBE").expect("set KERNAL_COMPONENT_PROBE");
+        let bytes = std::fs::read(path).expect("read the actual component fixture");
+        super::execute_case(&bytes, super::Mode::Transfer).expect(
+            "shared public hash policy, failed export cleanup, and canonical oversize rejection",
+        );
+    }
+
     #[test]
     #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
     fn actual_component_slow_consumer_backpressure() {

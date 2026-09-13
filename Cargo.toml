@@ -94,6 +94,9 @@ daemon-registration-v2 = ["running-process/daemon-registration-v2"]
 pty = ["dep:portable-pty", "terminal-input"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
 http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures-core"]
+# HTTP/1 WebSocket upgrading remains part of the owned server surface: callers
+# exchange facade messages and never name Hyper or a WebSocket implementation.
+websocket = ["http-server", "dep:futures-util", "dep:tokio-tungstenite"]
 # Window-icon and stock-icon mechanics for the host console or a child. This
 # is GUI hosting: on Linux it decodes PNG and speaks the X11 client protocol,
 # so it is gated like every peer capability rather than sitting in the
@@ -239,6 +242,7 @@ dirs = { version = "=6.0.0", optional = true }
 flate2 = { version = "=1.1.9", optional = true }
 framehop = { version = "=0.13.3", optional = true }
 futures-core = { version = "=0.3.34", optional = true }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink"], optional = true }
 getrandom = { version = "=0.4.3", optional = true }
 strsim = { version = "=0.11.1", optional = true }
 toml = { version = "=0.8.23", optional = true }
@@ -284,6 +288,7 @@ tokio = { version = "=1.53.1", default-features = false, features = [
   "time",
 ] }
 tokio-stream = { version = "=0.1.19", optional = true }
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"], optional = true }
 tonic = { version = "=0.14.6", default-features = false, features = [
   "codegen",
   "transport",

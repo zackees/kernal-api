@@ -1,4 +1,5 @@
 //! Private generated-world host adapter for the Component Model experiment.
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -36,8 +37,16 @@ struct State {
     live: Arc<AtomicUsize>,
     live_blobs: Arc<AtomicUsize>,
     produced: Arc<AtomicUsize>,
-    force_trap: bool,
+    mode: Mode,
+    pending: Arc<AtomicUsize>,
     limits: wasmtime::StoreLimits,
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Mode {
+    #[default]
+    Transfer,
+    Trap,
+    CancelPending,
 }
 struct Host;
 impl HasData for Host {
@@ -86,7 +95,8 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
             blob.read_started = true;
             let live = access.get().live.clone();
             let produced = access.get().produced.clone();
-            let force_trap = access.get().force_trap;
+            let mode = access.get().mode;
+            let pending = access.get().pending.clone();
             live.fetch_add(1, Ordering::SeqCst);
             StreamReader::new(
                 &mut access,
@@ -94,7 +104,8 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
                     remaining: 64 * 1024 * 1024,
                     live,
                     produced,
-                    force_trap,
+                    mode,
+                    pending,
                 },
             )
         })
@@ -105,7 +116,8 @@ struct Producer {
     remaining: usize,
     live: Arc<AtomicUsize>,
     produced: Arc<AtomicUsize>,
-    force_trap: bool,
+    mode: Mode,
+    pending: Arc<AtomicUsize>,
 }
 impl Drop for Producer {
     fn drop(&mut self) {
@@ -128,10 +140,16 @@ impl<T> StreamProducer<T> for Producer {
         if self.remaining == 0 {
             return Poll::Ready(Ok(StreamResult::Dropped));
         }
-        if self.force_trap && self.remaining < 64 * 1024 * 1024 {
+        if self.mode == Mode::Trap && self.remaining < 64 * 1024 * 1024 {
             return Poll::Ready(Err(wasmtime::format_err!(
                 "intentional probe producer trap"
             )));
+        }
+        if self.mode == Mode::CancelPending && self.remaining < 64 * 1024 * 1024 {
+            // Deliberately never ready: the observer cancels the enclosing host
+            // call only after this poll actually returns Pending.
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            return Poll::Pending;
         }
         let count = destination
             .remaining(&mut store)
@@ -146,13 +164,14 @@ impl<T> StreamProducer<T> for Producer {
 }
 
 pub(super) fn execute(bytes: &[u8]) -> wasmtime::Result<()> {
-    execute_case(bytes, false)?;
-    execute_case(bytes, true)?;
-    println!("executed component: 64 MiB through <=64 KiB host chunks; normal and forced-trap teardown returned blob/producer counts to zero");
+    execute_case(bytes, Mode::Transfer)?;
+    execute_case(bytes, Mode::Trap)?;
+    execute_case(bytes, Mode::CancelPending)?;
+    println!("executed component: 64 MiB through <=64 KiB host chunks; normal, forced-trap, and pending-call cancellation teardown returned blob/producer counts to zero");
     Ok(())
 }
 
-fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
+fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
     let mut config = wasmtime::Config::new();
     config
         .wasm_component_model_async(true)
@@ -165,7 +184,7 @@ fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
     let mut store = Store::new(
         &engine,
         State {
-            force_trap,
+            mode,
             limits: wasmtime::StoreLimitsBuilder::new()
                 .memory_size(8 * 1024 * 1024)
                 .build(),
@@ -177,6 +196,7 @@ fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
     let live = store.data().live.clone();
     let live_blobs = store.data().live_blobs.clone();
     let produced = store.data().produced.clone();
+    let pending = store.data().pending.clone();
     let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
         .enable_all()
         .build()?;
@@ -185,6 +205,26 @@ fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
         async {
             let sketch =
                 bindings::Sketch::instantiate_async(&mut store, &component, &linker).await?;
+            if mode == Mode::CancelPending {
+                let mut call = Box::pin(
+                    store.run_concurrent(async |accessor| sketch.call_run(accessor).await),
+                );
+                std::future::poll_fn(|cx| {
+                    let status = call.as_mut().poll(cx);
+                    if status.is_ready() {
+                        return Poll::Ready(Err(wasmtime::format_err!(
+                            "call completed before a pending read"
+                        )));
+                    }
+                    if pending.load(Ordering::SeqCst) != 0 {
+                        return Poll::Ready(Ok(()));
+                    }
+                    Poll::Pending
+                })
+                .await?;
+                drop(call);
+                return Ok(());
+            }
             let count = store
                 .run_concurrent(async |accessor| sketch.call_run(accessor).await)
                 .await??;
@@ -210,7 +250,7 @@ fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
         "host blob leaked after teardown"
     );
     let outcome = result?;
-    if force_trap {
+    if mode == Mode::Trap {
         let error = outcome
             .err()
             .ok_or_else(|| wasmtime::format_err!("expected producer trap"))?;
@@ -224,12 +264,31 @@ fn execute_case(bytes: &[u8], force_trap: bool) -> wasmtime::Result<()> {
         );
     } else {
         outcome?;
+        if mode == Mode::CancelPending {
+            wasmtime::ensure!(
+                pending.load(Ordering::SeqCst) > 0,
+                "no pending read observed"
+            );
+            wasmtime::ensure!(
+                produced.load(Ordering::SeqCst) == 64 * 1024,
+                "pending read was not after exactly one chunk"
+            );
+        }
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
+    fn actual_component_pending_call_cancellation() {
+        let path = std::env::var_os("KERNAL_COMPONENT_PROBE").expect("set KERNAL_COMPONENT_PROBE");
+        let bytes = std::fs::read(path).expect("read the actual component fixture");
+        super::execute_case(&bytes, super::Mode::CancelPending)
+            .expect("cancel an observed pending read");
+    }
+
     #[test]
     #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
     fn actual_component_stream_and_trap_cleanup() {

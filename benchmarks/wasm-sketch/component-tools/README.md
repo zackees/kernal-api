@@ -19,12 +19,13 @@ production runtime fallback is introduced.
 ## Opt-in stream execution
 
 `--features execution-probe` additionally links the exact generated private
-world and executes two isolated instances: a 64 MiB stream, and a producer trap
-after exactly one 64 KiB chunk. It grants one synthetic blob and permits one
+world and executes three isolated instances: a 64 MiB stream, a producer trap
+after exactly one 64 KiB chunk, and host-call cancellation after observing a
+pending second read. It grants one synthetic blob and permits one
 stream, with no filesystem/network/WASI host imports. The host produces at most
 the reader's capacity and 64 KiB per call; no whole-payload vector is created.
 Normal return requires an empty blob table and matching host/guest byte counts.
-Both normal and trapped runs require zero live blob and producer objects after
+All three runs require zero live blob and producer objects after
 store teardown. The probe uses the kernel runtime builder and timeout wrapper,
 not a direct Tokio dependency or a second executor implementation. Each run has
 a 30-second async timeout, 100 million fuel units, and an 8 MiB per-memory limit.
@@ -53,9 +54,23 @@ instantiation pass, without weakening linker type checks. The rebuilt component
 is 60,841 bytes; the two-scenario output is retained at
 `/tmp/kernal-component-execution-probe-2.wasm`, SHA-256
 `4d762703cb75c1c5f684443fdcec6bf111964ac45b660c75446995218cedc141`.
-This is Linux x86-64 fixture evidence, not a public-facade comparison, pending
+This is Linux x86-64 fixture evidence, not a public-facade comparison, guest-side
 read/write cancellation proof, slow-consumer test, six-target validation, or
 go/no-go selection.
+
+The pending-call test uses the same component bytes. Its producer supplies one
+64 KiB chunk and then returns `Poll::Pending` without producing more bytes. The
+driver polls the real component call and drops it only after observing both the
+producer's pending marker and a pending outer future. It then tears down the
+store, verifies that exactly one chunk was produced, and checks that live blob
+and producer counts are zero. Cancellation is observation-driven, not timed
+with a sleep; the 30-second timeout remains only a failure guard.
+
+The focused test initially failed with `call completed before a pending read`
+when the producer still ran to completion. Adding the deliberately pending mode
+made the same test pass. This proves cleanup after abandoning a pending host
+call and destroying its store, not a guest-issued cancellation handshake or
+continued use of the same instance after cancellation.
 
 ## Encoding-only commands and earlier evidence
 

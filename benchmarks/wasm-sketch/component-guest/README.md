@@ -11,7 +11,8 @@ The async export reads with one reusable 64 KiB buffer, counts up to 64 MiB,
 and returns an error on cancellation or overflow. Grant and read methods are
 explicitly async in the WIT. Resource and stream handles are dropped on return.
 The sibling tool's opt-in execution probe has exercised normal transfer and a
-forced producer trap on Linux x86-64; pending-operation cancellation and the
+forced producer trap on Linux x86-64, plus store teardown after an observed
+pending host-call cancellation. Guest-issued operation cancellation and the
 full lifecycle contract are not yet proven.
 
 From the repository root, on the pinned Rust 1.95.0 toolchain:

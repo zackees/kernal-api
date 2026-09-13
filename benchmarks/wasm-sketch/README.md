@@ -7,7 +7,8 @@ or latency gate is claimed yet.
 The private [Component Model guest probe](component-guest/README.md) and
 [encoder](component-tools/README.md) establish a non-WASI Rust 1.95.0 build
 and structural encoding path. The optional execution probe also verifies a
-64 MiB stream and forced-producer-trap teardown on Linux x86-64 through the
+64 MiB stream, forced-producer-trap cleanup, and teardown after cancellation of
+an observed pending host call on Linux x86-64 through the
 kernel executor. This is not yet the representative candidate behind the public
 guest facade or a comparative measurement.
 

@@ -352,7 +352,12 @@ pub fn read_context_regular_file_bounded(
         return Err(io::Error::new(io::ErrorKind::InvalidData, "context input changed while it was read"));
     }
     let path_metadata = std::fs::symlink_metadata(path)?;
-    if !path_metadata.is_file() || FileIdentity { device: path_metadata.dev(), file: path_metadata.ino() } != identity {
+    if !path_metadata.is_file()
+        || (FileIdentity {
+            device: path_metadata.dev(),
+            file: path_metadata.ino(),
+        }) != identity
+    {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "context input path changed while it was read"));
     }
     Ok(crate::platform::fs::ContextFileObservation { bytes, metadata: crate::platform::fs::context_regular_file_metadata(&after, identity)? })

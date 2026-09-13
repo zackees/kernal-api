@@ -19,13 +19,14 @@ production runtime fallback is introduced.
 ## Opt-in stream execution
 
 `--features execution-probe` additionally links the exact generated private
-world and executes three isolated instances: a 64 MiB stream, a producer trap
+world and executes four isolated instances: a 64 MiB stream, a producer trap
 after exactly one 64 KiB chunk, and host-call cancellation after observing a
-pending second read. It grants one synthetic blob and permits one
-stream, with no filesystem/network/WASI host imports. The host produces at most
+pending second read, and guest-issued read cancellation followed by a fresh
+transfer in that same instance. It grants one synthetic blob and permits one
+stream at a time, with no filesystem/network/WASI host imports. The host produces at most
 the reader's capacity and 64 KiB per call; no whole-payload vector is created.
 Normal return requires an empty blob table and matching host/guest byte counts.
-All three runs require zero live blob and producer objects after
+All four runs require zero live blob and producer objects after
 store teardown. The probe uses the kernel runtime builder and timeout wrapper,
 not a direct Tokio dependency or a second executor implementation. Each run has
 a 30-second async timeout, 100 million fuel units, and an 8 MiB per-memory limit.
@@ -54,8 +55,8 @@ instantiation pass, without weakening linker type checks. The rebuilt component
 is 60,841 bytes; the two-scenario output is retained at
 `/tmp/kernal-component-execution-probe-2.wasm`, SHA-256
 `4d762703cb75c1c5f684443fdcec6bf111964ac45b660c75446995218cedc141`.
-This is Linux x86-64 fixture evidence, not a public-facade comparison, guest-side
-read/write cancellation proof, slow-consumer test, six-target validation, or
+This earlier artifact is Linux x86-64 fixture evidence, not a public-facade comparison,
+write cancellation proof, slow-consumer test, six-target validation, or
 go/no-go selection.
 
 The pending-call test uses the same component bytes. Its producer supplies one
@@ -71,6 +72,29 @@ when the producer still ran to completion. Adding the deliberately pending mode
 made the same test pass. This proves cleanup after abandoning a pending host
 call and destroying its store, not a guest-issued cancellation handshake or
 continued use of the same instance after cancellation.
+
+The additional guest-cancellation fixture exports `cancel-read`. It reads one
+64 KiB chunk, polls the second read to Pending, then uses a **test-only** async
+checkpoint in the private WIT to wait until the host has also observed Pending.
+The checkpoint uses the kernel executor's yield operation and adds no ambient
+capability; it is instrumentation, not a proposed public API. The guest calls
+the binding's explicit read-cancellation operation and requires a Cancelled
+result with an empty returned buffer, then drops the stream and blob.
+
+Before any store destruction, the host checks the pending and cancellation
+markers, exactly one produced chunk, an empty resource table, and zero live
+blob/producer objects. It then explicitly grants another blob and runs the
+64 MiB transfer through the **same** Store and component instance. This proves
+guest-issued pending-read cancellation and subsequent instance reuse for this
+fixture, but not pending writes, cancellation races, or slow-consumer behavior.
+
+The test first failed when `cancel-read` simply performed a full transfer.
+The actual cancellation implementation passed the same focused test. Its
+updated component is 68,382 bytes, retained at
+`/tmp/kernal-component-guest-cancel-green.wasm`, SHA-256
+`1725402199c4a68725e6626d7b114203499b3c24af58acd413cca1f26d41f6f3`.
+Use this rebuilt world for current artifact tests; earlier components lack the
+new export and cannot satisfy the generated host's exact-world checks.
 
 ## Encoding-only commands and earlier evidence
 

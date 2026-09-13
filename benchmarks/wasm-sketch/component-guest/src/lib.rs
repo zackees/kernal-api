@@ -8,6 +8,32 @@ mod bindings {
 struct Sketch;
 
 impl bindings::Guest for Sketch {
+    async fn cancel_read() -> Result<u64, ()> {
+        use std::{future::Future, task::Poll};
+        let blob = bindings::kernal::probe::blobs::granted().await.ok_or(())?;
+        let mut stream = blob.read().await;
+        let (status, mut buffer) = stream.read(Vec::with_capacity(64 * 1024)).await;
+        if status != wit_bindgen::StreamResult::Complete(64 * 1024) || buffer.len() != 64 * 1024 {
+            return Err(());
+        }
+        buffer.clear();
+        let mut read = Box::pin(stream.read(buffer));
+        std::future::poll_fn(|cx| match read.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(Ok(())),
+            Poll::Ready(_) => Poll::Ready(Err(())),
+        })
+        .await?;
+        bindings::kernal::probe::blobs::await_pending_read().await;
+        let (status, buffer) = read.as_mut().cancel();
+        drop(read);
+        if status != wit_bindgen::StreamResult::Cancelled || !buffer.is_empty() {
+            return Err(());
+        }
+        drop(stream);
+        drop(blob);
+        Ok(64 * 1024)
+    }
+
     async fn run() -> Result<u64, ()> {
         let blob = bindings::kernal::probe::blobs::granted().await.ok_or(())?;
         let mut stream = blob.read().await;

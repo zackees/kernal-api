@@ -12,8 +12,11 @@ and returns an error on cancellation or overflow. Grant and read methods are
 explicitly async in the WIT. Resource and stream handles are dropped on return.
 The sibling tool's opt-in execution probe has exercised normal transfer and a
 forced producer trap on Linux x86-64, plus store teardown after an observed
-pending host-call cancellation. Guest-issued operation cancellation and the
-full lifecycle contract are not yet proven.
+pending host-call cancellation. A further export explicitly cancels a pending
+read, drops its resources, and is followed by another transfer in the same
+instance. A test-only private WIT checkpoint synchronizes this proof with the
+host's pending-read observation. Write cancellation, races, slow consumers,
+and the full lifecycle contract are not yet proven.
 
 From the repository root, on the pinned Rust 1.95.0 toolchain:
 

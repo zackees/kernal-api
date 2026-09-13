@@ -39,6 +39,7 @@ struct State {
     produced: Arc<AtomicUsize>,
     mode: Mode,
     pending: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
     limits: wasmtime::StoreLimits,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -47,6 +48,7 @@ enum Mode {
     Transfer,
     Trap,
     CancelPending,
+    GuestCancel,
 }
 struct Host;
 impl HasData for Host {
@@ -56,6 +58,22 @@ impl bindings::kernal::probe::blobs::HostBlob for State {}
 impl bindings::kernal::probe::blobs::Host for State {}
 
 impl bindings::kernal::probe::blobs::HostWithStore for Host {
+    async fn await_pending_read<T: Send>(accessor: &Accessor<T, Self>) -> wasmtime::Result<()> {
+        loop {
+            let ready = accessor.with(|mut access| {
+                wasmtime::ensure!(
+                    access.get().mode == Mode::GuestCancel,
+                    "checkpoint outside cancellation probe"
+                );
+                Ok::<_, wasmtime::Error>(access.get().pending.load(Ordering::SeqCst) > 0)
+            })?;
+            if ready {
+                return Ok(());
+            }
+            kernal_api::async_engine::yield_now().await;
+        }
+    }
+
     async fn granted<T: Send>(
         accessor: &Accessor<T, Self>,
     ) -> wasmtime::Result<Option<Resource<BlobState>>> {
@@ -97,6 +115,7 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
             let produced = access.get().produced.clone();
             let mode = access.get().mode;
             let pending = access.get().pending.clone();
+            let cancelled = access.get().cancelled.clone();
             live.fetch_add(1, Ordering::SeqCst);
             StreamReader::new(
                 &mut access,
@@ -106,6 +125,7 @@ impl bindings::kernal::probe::blobs::HostBlobWithStore for Host {
                     produced,
                     mode,
                     pending,
+                    cancelled,
                 },
             )
         })
@@ -118,6 +138,7 @@ struct Producer {
     produced: Arc<AtomicUsize>,
     mode: Mode,
     pending: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
 }
 impl Drop for Producer {
     fn drop(&mut self) {
@@ -135,6 +156,7 @@ impl<T> StreamProducer<T> for Producer {
         finish: bool,
     ) -> Poll<wasmtime::Result<StreamResult>> {
         if finish {
+            self.cancelled.fetch_add(1, Ordering::SeqCst);
             return Poll::Ready(Ok(StreamResult::Cancelled));
         }
         if self.remaining == 0 {
@@ -145,7 +167,9 @@ impl<T> StreamProducer<T> for Producer {
                 "intentional probe producer trap"
             )));
         }
-        if self.mode == Mode::CancelPending && self.remaining < 64 * 1024 * 1024 {
+        if matches!(self.mode, Mode::CancelPending | Mode::GuestCancel)
+            && self.remaining < 64 * 1024 * 1024
+        {
             // Deliberately never ready: the observer cancels the enclosing host
             // call only after this poll actually returns Pending.
             self.pending.fetch_add(1, Ordering::SeqCst);
@@ -167,7 +191,8 @@ pub(super) fn execute(bytes: &[u8]) -> wasmtime::Result<()> {
     execute_case(bytes, Mode::Transfer)?;
     execute_case(bytes, Mode::Trap)?;
     execute_case(bytes, Mode::CancelPending)?;
-    println!("executed component: 64 MiB through <=64 KiB host chunks; normal, forced-trap, and pending-call cancellation teardown returned blob/producer counts to zero");
+    execute_case(bytes, Mode::GuestCancel)?;
+    println!("executed component: bounded transfer, trap cleanup, pending-call teardown, and guest read cancellation with same-instance reuse passed");
     Ok(())
 }
 
@@ -205,6 +230,37 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
         async {
             let sketch =
                 bindings::Sketch::instantiate_async(&mut store, &component, &linker).await?;
+            if mode == Mode::GuestCancel {
+                let count = store
+                    .run_concurrent(async |accessor| sketch.call_cancel_read(accessor).await)
+                    .await??;
+                wasmtime::ensure!(
+                    count == Ok(64 * 1024),
+                    "guest did not return after cancelling its second read"
+                );
+                wasmtime::ensure!(
+                    store.data().pending.load(Ordering::SeqCst) > 0,
+                    "guest cancellation never reached a pending producer"
+                );
+                wasmtime::ensure!(
+                    store.data().cancelled.load(Ordering::SeqCst) > 0,
+                    "producer did not receive cancellation"
+                );
+                wasmtime::ensure!(
+                    store.data().table.is_empty()
+                        && live.load(Ordering::SeqCst) == 0
+                        && live_blobs.load(Ordering::SeqCst) == 0,
+                    "guest cancellation left resources alive before store teardown"
+                );
+                wasmtime::ensure!(
+                    produced.load(Ordering::SeqCst) == 64 * 1024,
+                    "guest cancellation produced extra bytes"
+                );
+                // Explicitly grant a new blob; reuse the same Store and Sketch.
+                store.data_mut().mode = Mode::Transfer;
+                store.data_mut().granted = false;
+                produced.store(0, Ordering::SeqCst);
+            }
             if mode == Mode::CancelPending {
                 let mut call = Box::pin(
                     store.run_concurrent(async |accessor| sketch.call_run(accessor).await),
@@ -280,6 +336,15 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
+    fn actual_component_guest_cancellation_and_reuse() {
+        let path = std::env::var_os("KERNAL_COMPONENT_PROBE").expect("set KERNAL_COMPONENT_PROBE");
+        let bytes = std::fs::read(path).expect("read the actual component fixture");
+        super::execute_case(&bytes, super::Mode::GuestCancel)
+            .expect("guest cancellation then same-instance transfer");
+    }
+
     #[test]
     #[ignore = "requires the separately built async component in KERNAL_COMPONENT_PROBE"]
     fn actual_component_pending_call_cancellation() {

@@ -15,6 +15,37 @@ fn loopback() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn request_path_and_query_decode_without_hiding_duplicates() {
+    let server = Server::bind(loopback(), Limits::default()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(|request| async move {
+        assert_eq!(request.path(), "/some%20file+name");
+        assert_eq!(request.decoded_path().unwrap(), "/some file+name");
+        assert_eq!(
+            request.query(),
+            Some("name=first+value&name=%E2%98%83&empty&x=a%26b%3Dc&&")
+        );
+        let pairs = request
+            .query_pairs()
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            pairs,
+            [
+                ("name".into(), "first value".into()),
+                ("name".into(), "☃".into()),
+                ("empty".into(), "".into()),
+                ("x".into(), "a&b=c".into())
+            ]
+        );
+        Response::new(200, Vec::new()).unwrap()
+    }));
+    let response = exchange(addr, b"GET /some%20file+name?name=first+value&name=%E2%98%83&empty&x=a%26b%3Dc&& HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    drop(task);
+}
+
+#[tokio::test]
 async fn diagnostics_survive_server_and_report_rejections_and_task_failures() {
     let server = Server::bind(
         loopback(),

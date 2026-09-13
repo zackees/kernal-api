@@ -11,10 +11,12 @@ use std::{convert::Infallible, future::Future, io, net::SocketAddr, time::Durati
 
 mod body;
 mod diagnostics;
+mod target;
 mod transport;
 use body::ServerBody;
 use diagnostics::increment;
 pub use diagnostics::{Diagnostics, Snapshot};
+pub use target::QueryPairs;
 
 /// Per-server resource and time limits. Body limits bound accepted values, not
 /// memory already allocated by application handlers before returning a response.
@@ -113,6 +115,7 @@ impl Limits {
 pub struct Request {
     method: String,
     target: String,
+    uri: hyper::Uri,
     headers: hyper::HeaderMap,
     body: Vec<u8>,
 }
@@ -125,6 +128,28 @@ impl Request {
     /// Original request target including an optional query string.
     pub fn target(&self) -> &str {
         &self.target
+    }
+    /// Encoded URI path, without the query. No percent decoding or normalization.
+    pub fn path(&self) -> &str {
+        self.uri.path()
+    }
+    /// Decode the path once as UTF-8, preserving literal `+`. This does not
+    /// authorize filesystem access or normalize dots, slashes, backslashes or NUL.
+    ///
+    /// # Errors
+    /// Returns `InvalidData` for malformed escapes or non-UTF-8 bytes.
+    pub fn decoded_path(&self) -> io::Result<String> {
+        target::decode(self.path(), false)
+    }
+    /// Encoded query without `?`; absent and present-but-empty remain distinct.
+    pub fn query(&self) -> Option<&str> {
+        self.uri.query()
+    }
+    /// Iterate decoded form-query pairs without collecting them. Input size is
+    /// bounded by request parsing; each decoded field is no larger than its
+    /// encoded bytes. Applications own duplicate and unknown-parameter policy.
+    pub fn query_pairs(&self) -> QueryPairs<'_> {
+        QueryPairs::new(self.query().unwrap_or(""))
     }
     /// First matching header's raw bytes; names are case-insensitive.
     pub fn header(&self, name: &str) -> Option<&[u8]> {
@@ -356,6 +381,7 @@ where
     let request = Request {
         method: parts.method.to_string(),
         target: parts.uri.to_string(),
+        uri: parts.uri,
         headers: parts.headers,
         body,
     };

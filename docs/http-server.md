@@ -16,6 +16,11 @@ initial transport tests alone.
 - Request/response types expose no HTTP implementation types. Framing response
   headers are rejected. Applications select addresses, methods, targets and
   payloads; authentication and routing are not transport responsibilities.
+- Requests expose encoded paths, optional raw queries, strict once-only UTF-8
+  path decoding, and pull-driven form-query pairs. Query `+` becomes a space;
+  path `+` stays literal. Duplicate fields and order are preserved. Malformed
+  escapes/UTF-8 return errors; path normalization, filesystem authorization,
+  duplicate-field rejection and route selection remain product decisions.
 - Cancelling the serving future drops the listener and aborts its owned task
   set, closing incomplete client connections.
 - Pull-driven file bodies preserve an optional prefix and stream bounded frames
@@ -48,7 +53,9 @@ initial transport tests alone.
   ends. Writes follow trusted caller-selected paths and are not atomic or
   crash-durable. A timeout can leave partial output or finish an OS effect after
   return. FastLED still owns PNG validation, authorization, path selection and
-  success/failure events; adoption remains pending.
+  success/failure events. FastLED's local commit `ee71b06` adopts this writer
+  with four slots, a 64 MiB limit and 30-second deadline, with endpoint success
+  and failure checks. Registry adoption remains pending.
 
 The body limits are acceptance limits, not precise process-memory guarantees.
 Request collection currently copies the bounded collected body into a vector;
@@ -61,9 +68,8 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 
 ## Required before the server migration can land
 
-- Adopt bounded filesystem effects for screenshot persistence and retain product
-  error reporting; ensure file-open/read behavior fits the streamed routes.
-- Request path/query handling and application-owned response-header/CORS policy,
+- Ensure file-open/read behavior fits the streamed routes.
+- Application-owned response-header/CORS policy,
   including behavior for transport-generated errors and HEAD/OPTIONS requests.
 - Product route migration and parity checks before removing Axum, Tower HTTP and
   direct Tokio file/listener calls from FastLED.
@@ -72,16 +78,18 @@ blocking I/O pool. SSE encoding adds bounded overhead to the payload limit.
 ## Local evidence
 
 The foundation's focused test initially failed to import the missing module.
-Fifteen integration tests cover the draft with `http-server,event-stream` enabled:
+Sixteen integration tests cover the draft with `http-server,event-stream` enabled:
 request/response round trip, request rejection, cancellation cleanup,
 invalid limits, connection-capacity waiting, body/handler deadlines,
 header/connection deadlines, response limit/framing validation, a streamed file
 larger than the memory-body limit, SSE delivery before source closure, and a
 non-reading client releasing its connection slot, duplicate/header-byte limits,
 bodyless-status/connection-header rejection, and diagnostic counters for
-rejections, handler panics, protocol failures and deadlines. Five focused unit tests cover
+rejections, handler panics, protocol failures and deadlines, and path/query
+decoding. Seven focused unit tests cover
 bounded file reads, growth/truncation, SSE backpressure/encoding/keepalives, and
-write-timeout activation. The full kernel suite with `http-server,event-stream`,
+write-timeout activation, malformed queries and once-only path decoding.
+The full kernel suite with `http-server,event-stream`,
 strict all-target Clippy, formatting, and dependency-isolation RED -> GREEN
 checks pass locally. The suite uses the Linux build-ID flag required by process
 identity tests; an initial Soldr relay failure passed on retry.

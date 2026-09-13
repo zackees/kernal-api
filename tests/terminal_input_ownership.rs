@@ -1,6 +1,7 @@
 #![cfg(all(unix, feature = "pty"))]
 
 use std::io;
+use std::io::Write;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -39,6 +40,23 @@ fn native_session_rejects_overlap_and_restores_mode() {
         assert_eq!(before.c_lflag, after.c_lflag);
         assert_eq!(before.c_cc, after.c_cc);
         drop(kernal_api::TerminalInputSession::new().unwrap().unwrap());
+        let mut keys = kernal_api::keys::TerminalKeys::new().unwrap().unwrap();
+        use kernal_api::keys::Key;
+        for expected in [
+            Key::Other,
+            Key::Character(' '),
+            Key::Character('é'),
+            Key::Enter,
+        ] {
+            assert_eq!(keys.poll(Duration::ZERO).unwrap().unwrap().key, expected);
+        }
+        assert!(keys.poll(Duration::ZERO).unwrap().is_none());
+        assert_eq!(
+            keys.poll(Duration::from_secs(1)).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        drop(keys);
+        assert_eq!(before.c_lflag, stdin_mode().c_lflag);
         return;
     }
 
@@ -58,7 +76,10 @@ fn native_session_rejects_overlap_and_restores_mode() {
         0
     );
     // SAFETY: successful openpty returns two fresh owned descriptors.
-    let _master = unsafe { OwnedFd::from_raw_fd(master) };
+    let mut master = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(master) });
+    // This complete canonical line is queued before the child starts. Raw
+    // capture uses TCSANOW, preserving bytes for zero-wait decoding tests.
+    master.write_all(b"\x1b[12 z \xc3\xa9\r").unwrap();
     // SAFETY: slave is the other fresh descriptor, transferred to child stdin.
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     let mut child = Command::new(std::env::current_exe().unwrap())

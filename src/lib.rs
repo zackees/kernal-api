@@ -30,6 +30,10 @@ pub mod random;
 #[cfg(feature = "text-similarity")]
 pub mod text;
 
+/// Bounded terminal key decoding and owned native polling.
+#[cfg(feature = "pty")]
+pub mod keys;
+
 /// Bounded extraction into caller-exclusive staging directories.
 #[cfg(feature = "archive")]
 pub mod archive;

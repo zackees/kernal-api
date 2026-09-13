@@ -6,40 +6,31 @@ use std::fmt::{self, Display, Formatter, Write as _};
 /// Maximum UTF-8 bytes retained for one error context message.
 pub const MAX_CONTEXT_BYTES: usize = 8 * 1024;
 
-/// Facade-owned application error with optional source chaining.
+/// Context wrapper used by [`Context`] to retain an underlying error.
 #[derive(Debug)]
-pub struct Error {
+struct ContextError {
     message: String,
-    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    source: Error,
 }
 
-impl Error {
-    /// Construct a message-only error, truncating excessively long context.
-    pub fn message(message: impl Display) -> Self {
-        Self {
-            message: bounded(message),
-            source: None,
-        }
-    }
-
-    /// Wrap a standard error with bounded caller-owned context.
-    pub fn context<E>(message: impl Display, source: E) -> Self
+impl ContextError {
+    fn new<E>(message: impl Display, source: E) -> Self
     where
-        E: StdError + Send + Sync + 'static,
+        E: Into<Error>,
     {
         Self {
             message: bounded(message),
-            source: Some(Box::new(source)),
+            source: source.into(),
         }
     }
 }
 
-impl Display for Error {
+impl Display for ContextError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)?;
         if formatter.alternate() {
-            let mut source = self.source();
-            while let Some(error) = source {
+        let mut source: Option<&(dyn StdError + 'static)> = Some(self.source.as_ref());
+        while let Some(error) = source {
                 write!(formatter, ": {error}")?;
                 source = error.source();
             }
@@ -48,16 +39,35 @@ impl Display for Error {
     }
 }
 
-impl StdError for Error {
+impl StdError for ContextError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        self.source
-            .as_deref()
-            .map(|source| source as &(dyn StdError + 'static))
+        Some(self.source.as_ref())
     }
 }
 
-/// Facade-owned application result alias.
-pub type Result<T> = std::result::Result<T, Error>;
+/// Facade-owned application error type. Its standard conversion support lets
+/// callers use `?` with any thread-safe standard error.
+pub type Error = Box<dyn StdError + Send + Sync + 'static>;
+
+/// Construct a message-only error, truncating excessively long text.
+pub fn message(message: impl Display) -> Error {
+    Box::new(MessageError(bounded(message)))
+}
+
+#[derive(Debug)]
+struct MessageError(String);
+
+impl Display for MessageError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl StdError for MessageError {}
+
+/// Facade-owned application result alias. The optional second parameter keeps
+/// ordinary `Result<T, E>` signatures source-compatible during migration.
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Add bounded context to a standard fallible result.
 pub trait Context<T> {
@@ -72,10 +82,10 @@ pub trait Context<T> {
 
 impl<T, E> Context<T> for std::result::Result<T, E>
 where
-    E: StdError + Send + Sync + 'static,
+    E: Into<Error>,
 {
     fn context(self, message: impl Display) -> Result<T> {
-        self.map_err(|source| Error::context(message, source))
+        self.map_err(|source| Box::new(ContextError::new(message, source)) as Error)
     }
 
     fn with_context<F, M>(self, message: F) -> Result<T>
@@ -83,7 +93,21 @@ where
         F: FnOnce() -> M,
         M: Display,
     {
-        self.map_err(|source| Error::context(message(), source))
+        self.map_err(|source| Box::new(ContextError::new(message(), source)) as Error)
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, message: impl Display) -> Result<T> {
+        self.ok_or_else(|| crate::error::message(message))
+    }
+
+    fn with_context<F, M>(self, message: F) -> Result<T>
+    where
+        F: FnOnce() -> M,
+        M: Display,
+    {
+        self.ok_or_else(|| crate::error::message(message()))
     }
 }
 
@@ -119,7 +143,7 @@ mod tests {
         assert_eq!(error.to_string(), "opening test file");
         assert!(error.source().is_some());
         assert_eq!(
-            Error::message("x".repeat(MAX_CONTEXT_BYTES + 1))
+            message("x".repeat(MAX_CONTEXT_BYTES + 1))
                 .to_string()
                 .len(),
             MAX_CONTEXT_BYTES

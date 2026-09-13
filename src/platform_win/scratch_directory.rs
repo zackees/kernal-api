@@ -1,5 +1,5 @@
-//! Keep only a metadata handle during worker execution. A capability directory
-//! handle denies delete sharing on Windows and can pin ancestor renames.
+//! Keep an ID-opened metadata handle during worker execution. Path-opened
+//! directory handles pin ancestor renames even when delete sharing is enabled.
 //! Acquire that stronger handle only for cleanup, then verify its identity
 //! against the still-live original before allowing recursive removal.
 
@@ -9,12 +9,14 @@ use std::io;
 use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::{Path, PathBuf};
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Storage::FileSystem::{
-    FileIdInfo, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+    FileIdInfo, FileIdType, GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OpenFileById,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 
 pub(crate) struct Anchor(File);
@@ -32,8 +34,12 @@ impl Anchor {
         }
         // Fail before transferring TempDir ownership if identity queries are
         // unavailable on this filesystem. Never fall back to a stored path.
-        identity(&file)?;
-        Ok(Self(file))
+        let anchor = reopen_by_id(&file)?;
+        require_same_directory(&file, &anchor)?;
+        // Ownership overlaps: the object cannot disappear and have its ID
+        // recycled between closing the path handle and acquiring the anchor.
+        drop(file);
+        Ok(Self(anchor))
     }
 
     pub(crate) fn remove(self) -> io::Result<()> {
@@ -48,6 +54,35 @@ impl Anchor {
         drop(self);
         result
     }
+}
+
+fn reopen_by_id(original: &File) -> io::Result<File> {
+    let id = super::fs::file_identity(original)?
+        .ok_or_else(|| io::Error::other("scratch directory has no reopenable file identity"))?;
+    let descriptor = FILE_ID_DESCRIPTOR {
+        dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+        Type: FileIdType,
+        Anonymous: FILE_ID_DESCRIPTOR_0 {
+            FileId: id.file as i64,
+        },
+    };
+    // SAFETY: the volume-hint handle remains live and descriptor uses the
+    // matching FileId discriminator. No security pointer is supplied.
+    let raw = unsafe {
+        OpenFileById(
+            original.as_raw_handle(),
+            &descriptor,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: OpenFileById returned a new owned, valid handle.
+    Ok(unsafe { File::from_raw_handle(raw) })
 }
 
 fn require_same_directory(original: &File, candidate: &File) -> io::Result<()> {
@@ -108,50 +143,16 @@ fn current_path(file: &File) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Native NTFS experiment: opening by object ID rather than a pathname
-    /// may avoid the ancestor pin held by a name-opened directory handle.
-    /// Do not adopt this in production before this entire lifecycle passes.
+    /// Preserve the native NTFS lifecycle that established ID-opened handles
+    /// avoid the ancestor pin. Exercise the production constructor directly.
     #[test]
     fn id_opened_directory_survives_ancestor_rename_and_cleans_original() {
-        use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FileIdType, OpenFileById, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
-        };
-
         let root = tempfile::tempdir().unwrap();
         let parent = root.path().join("parent");
         let scratch = parent.join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
         std::fs::write(scratch.join("partial"), b"owned").unwrap();
-        let original = Anchor::open(&scratch).unwrap();
-        let id = super::super::fs::file_identity(&original.0)
-            .unwrap()
-            .unwrap();
-        let descriptor = FILE_ID_DESCRIPTOR {
-            dwSize: std::mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
-            Type: FileIdType,
-            Anonymous: FILE_ID_DESCRIPTOR_0 {
-                FileId: id.file as i64,
-            },
-        };
-        // SAFETY: the volume-hint handle remains live and descriptor uses
-        // the matching FileId discriminator. No security pointer is supplied.
-        let raw = unsafe {
-            OpenFileById(
-                original.0.as_raw_handle(),
-                &descriptor,
-                FILE_READ_ATTRIBUTES,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null(),
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            )
-        };
-        assert_ne!(raw, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
-        // SAFETY: OpenFileById returned a new owned, valid handle.
-        let by_id = Anchor(unsafe { File::from_raw_handle(raw) });
-        require_same_directory(&original.0, &by_id.0).unwrap();
-        drop(original);
+        let by_id = Anchor::open(&scratch).unwrap();
 
         let moved = root.path().join("moved");
         std::fs::rename(&parent, &moved).unwrap();

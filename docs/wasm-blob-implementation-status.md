@@ -580,6 +580,19 @@ for the missing rename behavior. Keep the regression failures visible while
 revisiting directory ownership; neither cross-compilation nor the clean
 static review substitutes for this native result.
 
+The follow-up ID-opened-handle experiment **passed natively on Windows x64**
+at `c41062b`, run `34731497151`, job `103654994865`. It verified continuous
+ownership during handle transfer, ancestor rename, cleanup of the moved
+original, and survival of unrelated data at the reused pathname. The run
+still failed the two production renamed-parent regressions (618 passed,
+2 failed, 3 ignored), because production had not yet adopted that sequence.
+The next candidate moves that tested sequence into the Windows constructor;
+the test now exercises the production constructor directly. File-ID reopening
+must succeed and match the original full identity before ownership transfers;
+unsupported filesystems fail rather than reverting to a pathname-only owner.
+This does not yet establish production native GREEN or filesystem coverage
+beyond the native NTFS experiment.
+
 The actual contained screenshot guest now also passes the renamed-parent
 scenario on Linux x86-64 (9.33s). The fixture renames the destination parent
 upon the first native HTTP request, after staging/grant creation. The guest

@@ -19,6 +19,16 @@ for arch in x64 arm64 x86; do
   source_dir="${repo_root}/vendor/win32/conpty/${arch}"
   stage="${output_dir}/stage-${arch}"
   archive="${output_dir}/conpty-sidecar-${arch}.tar.zst"
+  for input in "${source_dir}/conpty.dll" "${source_dir}/OpenConsole.exe"; do
+    if [[ ! -s "${input}" ]]; then
+      echo "required ConPTY input is absent or empty: ${input}" >&2
+      exit 1
+    fi
+    if head -c 64 "${input}" | grep -Fq "version https://git-lfs.github.com/spec/v1"; then
+      echo "required ConPTY input is an unresolved Git LFS pointer: ${input}" >&2
+      exit 1
+    fi
+  done
   rm -rf "${stage}"
   mkdir -p "${stage}"
   cp "${source_dir}/conpty.dll" "${stage}/conpty.dll"

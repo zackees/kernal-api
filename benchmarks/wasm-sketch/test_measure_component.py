@@ -38,6 +38,10 @@ class ComponentMeasurementTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 edit_source(invalid, 64, 65)
 
+    def test_runner_edits_the_default_component_policy_not_dispatch_glue(self):
+        runner = Path(__file__).parent / "measure_component.py"
+        self.assertIn('guest / "src/legacy.rs"', runner.read_text(encoding="utf-8"))
+
     def test_requires_encoding_and_engine_compilation_of_exact_size(self):
         output = (
             "validated component: 123 bytes; two kernel imports; not executed\n"

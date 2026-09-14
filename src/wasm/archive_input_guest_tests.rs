@@ -2,6 +2,15 @@ use super::*;
 use crate::operations::archive_input::EncryptedInput;
 use std::io::Write;
 
+fn extension2_header() -> Vec<u8> {
+    format!(
+        r#"{{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"4.8.7", "commit":"{}", "sha256":"{}", "keyId":"0123456789abcdef", "nonce":"AAAAAAAAAAAAAAAA" }}"#,
+        "a".repeat(40),
+        "b".repeat(64),
+    )
+    .into_bytes()
+}
+
 #[test]
 #[ignore = "requires Cargo-built auth-proof artifact in KERNAL_EXTENSION2_AUTH_WASM"]
 fn authenticated_input_actual_guest_authenticates_large_zip_and_rejects_bad_tag_or_nonce() {
@@ -41,7 +50,7 @@ fn authenticated_guest_control(artifact_variable: &str) {
     let stream_proof = artifact_variable == "KERNAL_EXTENSION2_STREAM_WASM";
     for case in 0..if stream_proof { 8 } else { 3 } {
         let sketch = compiler.admit(&bytes, policy).unwrap();
-        let header = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#;
+        let header = extension2_header();
         let (name, payload_bytes, value) = match case {
             3 => ("other", 17 * 1024 * 1024, 0x5a),
             4 => ("../payload", 17 * 1024 * 1024, 0x5a),
@@ -56,7 +65,7 @@ fn authenticated_guest_control(artifact_variable: &str) {
         let entries = std::iter::once((name.to_owned(), payload_bytes, value))
             .chain((0..extra_entries).map(|index| (format!("extra-{index}"), 0, 0)));
         let (input, length) = crate::operations::archive_input::tests::encrypted_zip_entries(
-            header,
+            &header,
             [7; 16],
             if case == 2 { [8; 12] } else { [0; 12] },
             case == 1,
@@ -132,11 +141,11 @@ fn authenticated_input_actual_guest_validates_header_and_rejects_missing_or_wron
         let archive = if case == 2 {
             None
         } else {
-            let mut header = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#.to_vec();
+            let mut header = extension2_header();
             if case == 1 {
                 let offset = header
-                    .windows(b"synthetic-1".len())
-                    .position(|part| part == b"synthetic-1")
+                    .windows(b"4.8.7".len())
+                    .position(|part| part == b"4.8.7")
                     .unwrap();
                 header[offset] = b'X';
             }

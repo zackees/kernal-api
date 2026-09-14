@@ -508,7 +508,7 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 [[package]]
 name = "tw-orange-preview-policy"
 version = "0.1.0"
-source = "git+https://github.com/TechWatchProject/extension2?rev=f3e739f758f5a2f99ed5af643f7660328ba2ab8a#f3e739f758f5a2f99ed5af643f7660328ba2ab8a"
+source = "git+https://github.com/TechWatchProject/extension2?rev=cffb98b2a1fa933a8ce126deeebba9c2efa55be0#cffb98b2a1fa933a8ce126deeebba9c2efa55be0"
 dependencies = [
  "semver",
  "serde",

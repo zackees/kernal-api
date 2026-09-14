@@ -228,9 +228,10 @@ worker teardown are still required. The actual guest now additionally runs the
 upstream portable `tw-orange-preview-policy` feed identity policy from
 extension2 revision `f3e739f758f5a2f99ed5af643f7660328ba2ab8a` before consuming
 archive authority. That validates the official feed origin, one encrypted
-same-origin asset, commit/digest/key shapes, and required suites; it does not
-yet bind feed identity to the synthetic envelope or constitute full extension2
-acceptance.
+same-origin asset, commit/digest/key shapes, and required suites. The guest
+also binds those accepted semantic fields to its authenticated envelope header
+before releasing the nonce for archive authentication. The envelope remains a
+synthetic fixture and this does not constitute full extension2 acceptance.
 
 ## Owned authenticated entry reader
 

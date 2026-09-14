@@ -7,21 +7,28 @@ use std::collections::BTreeSet;
 pub const MAX_HEADER: usize = 16 * 1024 + 12;
 pub const PAYLOAD_BYTES: u64 = 17 * 1024 * 1024;
 
-/// Exercise the unchanged portable extension2 preview-feed policy before this
-/// guest consumes any archive authority.  The feed is a deterministic fixture;
-/// no network capability is granted to the guest.
-pub fn validates_real_extension2_preview_policy() -> bool {
+/// Return the deterministic real extension2 feed identity only if its exact
+/// upstream policy accepts the official encrypted asset and rejects a hostile
+/// replacement. No network capability is granted to the guest.
+fn real_extension2_preview_identity() -> Option<tw_orange_preview_policy::PreviewFeedIdentity> {
     const FEED_URL: &str = "https://techwatchproject.github.io/extension/manifest.dev.json";
     let commit = "a".repeat(40);
     let digest = "b".repeat(64);
     let feed = format!(
         r#"{{"schemaVersion":1,"addonId":"{{92875af4-bd83-4876-92d9-7c6d716b002f}}","previews":[{{"version":"4.8.7","commit":"{commit}","commitTimestamp":42,"url":"preview/tw-orange-preview-v1-4.8.7-{commit}-{digest}.zip.aes","sha256":"{digest}","size":1234,"algorithm":"AES-128-GCM","keyId":"0123456789abcdef","testSuites":["unit","playwright"]}}]}}"#,
     );
-    if tw_orange_preview_policy::validate_preview_feed_json(feed.as_bytes(), FEED_URL).is_err() {
-        return false;
-    }
+    let identity = tw_orange_preview_policy::parse_preview_feed_identity(feed.as_bytes(), FEED_URL)
+        .ok()?;
     let hostile = feed.replace("preview/tw-orange", "https://attacker.test/preview/tw-orange");
-    tw_orange_preview_policy::validate_preview_feed_json(hostile.as_bytes(), FEED_URL).is_err()
+    tw_orange_preview_policy::validate_preview_feed_json(hostile.as_bytes(), FEED_URL)
+        .is_err()
+        .then_some(identity)
+}
+
+/// Exercise the upstream portable extension2 preview-feed policy before this
+/// guest consumes archive authority.
+pub fn validates_real_extension2_preview_policy() -> bool {
+    real_extension2_preview_identity().is_some()
 }
 
 #[derive(Deserialize)]
@@ -31,6 +38,7 @@ struct Header {
     algorithm: String,
     version: String,
     commit: String,
+    sha256: String,
     key_id: String,
     nonce: String,
 }
@@ -53,11 +61,13 @@ pub fn validated_nonce(bytes: &[u8]) -> Option<[u8; 12]> {
     let Ok(header) = serde_json::from_slice::<Header>(&bytes[12..]) else {
         return None;
     };
+    let identity = real_extension2_preview_identity()?;
     let valid = header.schema_version == 1
         && header.algorithm == "AES-128-GCM"
-        && header.version == "synthetic-1"
-        && header.commit == "synthetic-commit"
-        && header.key_id == "synthetic-key";
+        && header.version == identity.version
+        && header.commit == identity.commit
+        && header.sha256 == identity.sha256
+        && header.key_id == identity.key_id;
     if !valid {
         return None;
     }
@@ -109,18 +119,23 @@ mod tests {
 
     #[test]
     fn original_header_accepts_whitespace_but_rejects_wrong_identity_and_lengths() {
-        let json = br#"{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"synthetic-1", "commit":"synthetic-commit", "keyId":"synthetic-key", "nonce":"AAAAAAAAAAAAAAAA" }"#;
-        let bytes = envelope(json);
+        let json = format!(
+            r#"{{ "schemaVersion":1, "algorithm":"AES-128-GCM", "version":"4.8.7", "commit":"{}", "sha256":"{}", "keyId":"0123456789abcdef", "nonce":"AAAAAAAAAAAAAAAA" }}"#,
+            "a".repeat(40),
+            "b".repeat(64),
+        );
+        let bytes = envelope(json.as_bytes());
         assert!(validate_header(&bytes));
         for field in [
             "schemaVersion",
             "algorithm",
             "version",
             "commit",
+            "sha256",
             "keyId",
             "nonce",
         ] {
-            let mut header: serde_json::Value = serde_json::from_slice(json).unwrap();
+            let mut header: serde_json::Value = serde_json::from_str(&json).unwrap();
             header[field] = serde_json::Value::Null;
             assert!(!validate_header(&envelope(
                 &serde_json::to_vec(&header).unwrap()
@@ -138,7 +153,7 @@ mod tests {
             assert!(!validate_header(&bytes[..length]));
         }
         for length in [0, 11, 13] {
-            let mut header: serde_json::Value = serde_json::from_slice(json).unwrap();
+            let mut header: serde_json::Value = serde_json::from_str(&json).unwrap();
             header["nonce"] = serde_json::json!(STANDARD.encode(vec![0; length]));
             assert!(!validate_header(&envelope(
                 &serde_json::to_vec(&header).unwrap()

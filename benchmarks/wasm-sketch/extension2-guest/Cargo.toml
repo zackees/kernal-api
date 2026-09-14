@@ -25,7 +25,7 @@ zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa97
 zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
 # Exact portable extension2 policy fixture. This guest package is publish = false;
 # the source pin is evidence for #13, never a released kernal-api dependency.
-tw-orange-preview-policy = { git = "https://github.com/TechWatchProject/extension2", rev = "f3e739f758f5a2f99ed5af643f7660328ba2ab8a", package = "tw-orange-preview-policy" }
+tw-orange-preview-policy = { git = "https://github.com/TechWatchProject/extension2", rev = "cffb98b2a1fa933a8ce126deeebba9c2efa55be0", package = "tw-orange-preview-policy" }
 # Migration-only source proof, not release-pin acceptance.
 kernal-api = { version = "=0.1.2", path = "../../..", default-features = false }
 base64 = "=0.22.1"

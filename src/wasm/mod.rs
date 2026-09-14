@@ -4149,9 +4149,9 @@ mod threaded_root_observation_tests {
             )
             .expect("transfer limits")
             .with_blob_limits(
-                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 2, 2, 2)
+                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 2, 2, 4)
                     .unwrap()
-                    .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
+                    .with_maximum_transfer_bytes(3 * 1024 * 1024)
                     .unwrap(),
             );
         let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
@@ -4256,18 +4256,31 @@ mod threaded_root_observation_tests {
         );
         // Each of the 128 create/drop iterations consumes one create result;
         // synchronous Drop itself allocates and consumes no operation slot.
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128 + 10);
+        // The two child streams consume 46 results: create, sixteen fills,
+        // one scheduler yield, one resumed capacity write, one cancelled
+        // write, one read, seal, and close each. The cancellation itself
+        // still has one terminal result, even though it never publishes bytes.
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128 + 46);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),
             1
         );
-        assert_eq!(operations.peak_buffered_blob_bytes, 1024 * 1024);
-        // The pressure phase overlaps one full blob, one pending input,
-        // and one bounded pull result. Measure allocations, not just payload.
-        assert_eq!(
-            operations.peak_retained_transfer_capacity,
-            1024 * 1024 + 2 * 64 * 1024
+        // Each guest child reaches its independent 1 MiB blob capacity before
+        // a bounded read releases its awaited write. Scheduling can interleave
+        // the two children at any chunk boundary, but the two-blob policy
+        // remains a hard ceiling.
+        assert!(
+            (1024 * 1024..=2 * 1024 * 1024).contains(&operations.peak_buffered_blob_bytes),
+            "{operations:?}"
+        );
+        // The pressure phase overlaps full blobs, pending inputs, and bounded
+        // pull results. The policy's 3 MiB combined-transfer cap applies to
+        // every scheduling interleaving; measure allocations, not payload.
+        assert!(
+            (2 * 1024 * 1024..=3 * 1024 * 1024)
+                .contains(&operations.peak_retained_transfer_capacity),
+            "{operations:?}"
         );
         assert_eq!(operations.retained_transfer_capacity, 0);
         assert_eq!(operations.buffered_blob_bytes, 0);

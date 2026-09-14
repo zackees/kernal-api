@@ -475,10 +475,11 @@ also makes each of its two child Stores create, write, read, seal, and close a
 separate 64 KiB blob through the public generated operation API. Its supplied
 artifact proof grants exactly two live blobs, pending reads, and pending writes;
 it records both child-stream completions and verifies that every resource and
-operation counter drains to zero. This establishes independent guest-thread
-stream lifecycle use, but does not yet force those child streams through a
-capacity-awaited write or cancellation race; the existing root 64 MiB proof
-remains the backpressure evidence.
+operation counter drains to zero. Each child fills its independent 1 MiB blob,
+proves a seventeenth write remains pending across a scheduler turn, cancels a
+second pending write, then releases the first only after a bounded read. This
+establishes bounded backpressure and cancellation through real guest-thread
+streams; the existing root 64 MiB proof remains the total-transfer evidence.
 All 42 hub tests pass. With the count limits enabled, the existing 64 MiB
 Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
@@ -577,8 +578,8 @@ on Linux x86-64. The admitted artifact was reused and the host rebuilt.
 - Configure and account total bytes, live blobs, pending reads/writes, and all
   in-flight allocations, including retained capacity and completed results.
 - Complete ordering and progress-timeout behavior under multiple producers and
-  consumers; extend the real child-stream proof with forced capacity and
-  cancellation scheduler races.
+  consumers; extend the real child-stream proof to worker containment and
+  progress-timeout scheduler races.
 - Complete output commit cancellation coverage. Dispatch now uses the caller's
   blocking lane, reserves exclusive blob consumption, and checks the operation
   terminal winner at final replacement under the hub lock. A stalled filesystem

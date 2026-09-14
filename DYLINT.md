@@ -68,6 +68,14 @@ the item, whether or not it is re-exported, so a `pub use` grep does not see
 it. A private field of a public newtype, a private item, and a trait
 implementation that adapts a facade type into a backend one all remain legal.
 
+An exported `pub use` of a backend item or module is rejected as well, including
+a rename such as `pub use running_process::StreamKind as CaptureStream` and a
+glob. Renaming changes only the spelling: the re-export still resolves to the
+backend's definition, so a client receives the backend type and inherits its
+versioning. Private and `pub(crate)` imports, and a `pub use` inside a module no
+client can reach, stay legal. `tests/facade_policy.rs` repeats the textual half
+of this check for hosts the Linux lint job never compiles.
+
 The same coupling arrives from the other direction when this crate implements
 a backend's trait for one of its own exported types. `impl
 tokio::io::AsyncRead for IpcAsyncStream` names no backend in any signature,
@@ -99,11 +107,13 @@ facade-owned trait implemented for a backend type -- the adapter direction --
 is reachable only by a caller that already holds the backend type, so it
 imposes no vocabulary on one that does not.
 
-`running-process` is classified as an owned implementation dependency. It is
-allowed inside `kernal-api`, where the private adapter now lives
-(`src/process_adapter.rs`, on a mandatory dependency). It is denied in each
-first-party application once that application's required process and broker
-facade is available.
+`running-process` is classified as an owned implementation dependency, with
+the same rule as Tokio and no approved exceptions. It is allowed privately
+inside `kernal-api`, where the private adapter now lives
+(`src/process_adapter.rs`, on a mandatory dependency) alongside the
+facade-owned `independent-spawn` capability. It is denied in each first-party
+application once that application's required process and broker facade is
+available.
 `running-process` must never depend in the opposite direction.
 
 Adoption is a capability-by-capability ratchet, not a flag-day waiver. Land a

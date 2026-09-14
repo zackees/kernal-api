@@ -26,8 +26,12 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIsNotNone(match, f"missing independent job {name}")
         return match.group(1)
 
-    def test_both_jobs_retain_all_six_native_hosts(self):
-        for name in ("wasm-archive-native", "wasm-tauri-screenshot-native"):
+    def test_all_native_proof_jobs_retain_all_six_native_hosts(self):
+        for name in (
+            "wasm-archive-native",
+            "wasm-compiler-native",
+            "wasm-tauri-screenshot-native",
+        ):
             with self.subTest(job=name):
                 job = self.job(name)
                 pairs = re.findall(r"- os: (\S+)\s+target: (\S+)", job)
@@ -40,6 +44,7 @@ class NativeProofJobsTests(unittest.TestCase):
 
     def test_archive_job_is_self_contained_and_screenshot_budget_is_separate(self):
         archive = self.job("wasm-archive-native")
+        compiler = self.job("wasm-compiler-native")
         screenshot = self.job("wasm-tauri-screenshot-native")
         for required in (
             "toolchain: 1.95.0",
@@ -58,6 +63,10 @@ class NativeProofJobsTests(unittest.TestCase):
             archive,
             "the helper must own the single native harness build",
         )
+        self.assertIn("ci/run_compiler_guest.py --native-target", compiler)
+        self.assertIn("ci.test_run_compiler_guest ci.test_native_proof_jobs", compiler)
+        self.assertNotIn("run_extension2_guest", compiler)
+        self.assertIn("compiler-cache", compiler)
         self.assertIn("--test wasm_tauri_screenshot", screenshot)
 
 

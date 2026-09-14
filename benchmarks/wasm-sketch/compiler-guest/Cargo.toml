@@ -1,0 +1,27 @@
+[package]
+name = "kernal-compiler-guest-proof"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+publish = false
+
+[workspace]
+
+[features]
+guest-proof = ["compiler-artifact-output"]
+compiler-artifact-output = []
+
+[[bin]]
+name = "kernal-compiler-guest-proof"
+path = "src/main.rs"
+required-features = ["guest-proof"]
+
+[dependencies]
+# This fixture intentionally excludes extension2 and its private source pin:
+# it is the independently runnable Core compiler/cache proof for #13.
+zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }
+zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
+kernal-api = { version = "=0.1.2", path = "../../..", default-features = false }
+base64 = "=0.22.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"

@@ -14,7 +14,7 @@ class ComponentMeasurementTests(unittest.TestCase):
                 build_rss(invalid)
 
     def test_recorded_diagnostic_has_ten_distinct_compiled_edits(self):
-        for profile in ("debug", "release"):
+        for profile in ("debug", "release", "release-rss"):
             with self.subTest(profile=profile):
                 path = (
                     Path(__file__).parent
@@ -22,7 +22,8 @@ class ComponentMeasurementTests(unittest.TestCase):
                 )
                 record = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(record["status"], "complete-diagnostic-only")
-                self.assertEqual(record["encoder_profile"], profile)
+                if profile != "release-rss":
+                    self.assertEqual(record["encoder_profile"], profile)
                 self.assertEqual(len(record["samples"]), 12)
                 self.assertEqual(
                     edit_summary(record["samples"][2:]), record["edit_summary"]
@@ -30,6 +31,11 @@ class ComponentMeasurementTests(unittest.TestCase):
                 for sample in record["samples"]:
                     self.assertGreater(sample["module_bytes"], 0)
                     self.assertGreater(sample["encode_and_compile_command_ns"], 0)
+                if profile == "release-rss":
+                    peaks = [sample["build_peak_rss_bytes"] for sample in record["samples"]]
+                    self.assertTrue(all(type(peak) is int and peak > 0 for peak in peaks))
+                    self.assertEqual(record["build_memory"]["peak_rss_bytes"], max(peaks))
+                    self.assertIsNone(record["peak_compiler_rss_bytes"])
 
     def test_edit_changes_exactly_one_runtime_limit(self):
         source = "if total > 64 * 1024 * 1024 {"

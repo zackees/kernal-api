@@ -1,0 +1,151 @@
+{
+  "schema": 1,
+  "status": "complete-diagnostic-only",
+  "candidate": "component-private-probe",
+  "revision": "3c659a2bd2ebea3fd4969687a6ba7ab8cbdb2a20",
+  "host": "Linux-6.18.48-x86_64-with-glibc2.42",
+  "samples": [
+    {
+      "label": "cold",
+      "wall_ns": 36139822203,
+      "build_ns": 36016555886,
+      "encode_and_compile_command_ns": 122828956,
+      "build_peak_rss_bytes": 544808960,
+      "module_bytes": 149109,
+      "source_sha256": "4c8e47313618cf7170c16853e55edfe23338237037f426f097060117203fb898",
+      "module_sha256": "e70613a7d84231951f5a4ab954494dc1d0326bda6f63ca5996ffbdc6eaa0a9dd"
+    },
+    {
+      "label": "noop",
+      "wall_ns": 615697279,
+      "build_ns": 490168733,
+      "encode_and_compile_command_ns": 125078901,
+      "build_peak_rss_bytes": 61550592,
+      "module_bytes": 149109,
+      "source_sha256": "4c8e47313618cf7170c16853e55edfe23338237037f426f097060117203fb898",
+      "module_sha256": "e70613a7d84231951f5a4ab954494dc1d0326bda6f63ca5996ffbdc6eaa0a9dd"
+    },
+    {
+      "label": "edit-1",
+      "wall_ns": 1985423094,
+      "build_ns": 1862181464,
+      "encode_and_compile_command_ns": 122829697,
+      "build_peak_rss_bytes": 170790912,
+      "module_bytes": 149109,
+      "source_sha256": "a514a5c5b1c4b1dc0b3f3cec137a21511fc554690b67c25cbd0ea181fe8a3a0d",
+      "module_sha256": "28a9597a395c84b4a7b5a2749c90764c19e153a7fb03abd1f14775241d5a2b67"
+    },
+    {
+      "label": "edit-2",
+      "wall_ns": 1979733757,
+      "build_ns": 1855270899,
+      "encode_and_compile_command_ns": 124098567,
+      "build_peak_rss_bytes": 170778624,
+      "module_bytes": 149109,
+      "source_sha256": "ba1c8ec2ccb8bf568bd6f34ab1a60824560cadf4d93f42a5eaf3c57e21ff5f2c",
+      "module_sha256": "7ff3315945aba67afb2dc5892953dec0104ce3568531ec0110dcc9211ac98506"
+    },
+    {
+      "label": "edit-3",
+      "wall_ns": 1933076764,
+      "build_ns": 1812722361,
+      "encode_and_compile_command_ns": 119977537,
+      "build_peak_rss_bytes": 170786816,
+      "module_bytes": 149109,
+      "source_sha256": "752a1568ce4ba68d7032511c4b3c0f5d2aff71ce6ea1744090cced75620c3dcd",
+      "module_sha256": "6df6ae3cc360e065bd4bc23e32e13fe935bdb0bc201b5eb91476a9b5b6de0251"
+    },
+    {
+      "label": "edit-4",
+      "wall_ns": 2100527675,
+      "build_ns": 1970153795,
+      "encode_and_compile_command_ns": 129968209,
+      "build_peak_rss_bytes": 170704896,
+      "module_bytes": 149109,
+      "source_sha256": "589cbab4bd8ebd8588d5725a7232f31558cc02670b95262a4aeb3b07e280b9ce",
+      "module_sha256": "099a3bb128f5f4ca6353952469da374cbe91c259cb07ce8caf3a81a3a752c132"
+    },
+    {
+      "label": "edit-5",
+      "wall_ns": 1971087884,
+      "build_ns": 1848637048,
+      "encode_and_compile_command_ns": 121992135,
+      "build_peak_rss_bytes": 170713088,
+      "module_bytes": 149109,
+      "source_sha256": "0d54f2d9bddd52543c528290b1028dc925657fcd874933f3f55cf7e4a989d71c",
+      "module_sha256": "ebbe3a67c33f11e9320a692818c31408fb7430536a7def8df9297c5fa386b380"
+    },
+    {
+      "label": "edit-6",
+      "wall_ns": 1910745679,
+      "build_ns": 1790751341,
+      "encode_and_compile_command_ns": 119556767,
+      "build_peak_rss_bytes": 170717184,
+      "module_bytes": 149109,
+      "source_sha256": "2bbc1b9830b72092cbee26e767e7a94d13a6ce15828c28c572ed3eb0101e70e7",
+      "module_sha256": "ea722727b0e1e50a45bf521830b2cbc30886b8433bf767f483ba7144fe6caeda"
+    },
+    {
+      "label": "edit-7",
+      "wall_ns": 1952340143,
+      "build_ns": 1834732290,
+      "encode_and_compile_command_ns": 117250224,
+      "build_peak_rss_bytes": 170188800,
+      "module_bytes": 149109,
+      "source_sha256": "6f3bf9e03c7497733fce2aa5c8d2a90ef4a604ef2d5f5637dcc3c9a503606706",
+      "module_sha256": "93b915688d444a324a1bdf07f460086c9f0c1a6d1d7df36dcb6f5e0715f5b360"
+    },
+    {
+      "label": "edit-8",
+      "wall_ns": 1917132093,
+      "build_ns": 1797788963,
+      "encode_and_compile_command_ns": 118917141,
+      "build_peak_rss_bytes": 170737664,
+      "module_bytes": 149109,
+      "source_sha256": "a14a38cb552c5876b74b7e49c07794c18b531d4014f697c0fa659e55954995ed",
+      "module_sha256": "743346e8b5d7d70b825a68fd4b8e9dbac235c944e5756fe0a9b034d23ed6af3f"
+    },
+    {
+      "label": "edit-9",
+      "wall_ns": 1941319805,
+      "build_ns": 1819799528,
+      "encode_and_compile_command_ns": 121118693,
+      "build_peak_rss_bytes": 170782720,
+      "module_bytes": 149109,
+      "source_sha256": "5f5e99c04d4ab69e14efbf4e60f4de86be05f62f04e608592875da15a5a30b74",
+      "module_sha256": "61237f1e70236827234d56b073d7f02d1536467d1ccf5eee712eb3636f4b11de"
+    },
+    {
+      "label": "edit-10",
+      "wall_ns": 1933990504,
+      "build_ns": 1814114582,
+      "encode_and_compile_command_ns": 119417832,
+      "build_peak_rss_bytes": 170708992,
+      "module_bytes": 149109,
+      "source_sha256": "3c62bdba0330392fc2794e20d4ec04e04adf44ab28f90b337457c52f4792f68c",
+      "module_sha256": "ea5c1124f20277d8a90ec0d1531ef6f33e3cd793f926c97b276c32b8c99e988e"
+    }
+  ],
+  "encoder_sha256": "4cfa7675d593900acf7951ded86ce9e7002a3be4c87b5b164c87dc952ae77e52",
+  "cache_mode": "soldr-disabled",
+  "cache_hit_rate": null,
+  "peak_compiler_rss_bytes": null,
+  "build_memory": {
+    "method": "gnu-time-%M",
+    "tool_version": "time (GNU Time) 1.10",
+    "scope": "build command peak RSS; not aggregate concurrent RSS",
+    "peak_rss_bytes": 544808960
+  },
+  "limitations": [
+    "shared host, not the controlled reference-host latency gate",
+    "private generated API, not the same public facade as core",
+    "cache hit rate and compiler-specific RSS are not collected",
+    "GNU time does not account for detached daemon processes",
+    "includes encoding and engine compilation, no instantiation or execution",
+    "encoder optimization profile is caller supplied; retain its build log"
+  ],
+  "edit_summary": {
+    "p50_ns": 1946829974.0,
+    "p95_ns": 2100527675
+  }
+}

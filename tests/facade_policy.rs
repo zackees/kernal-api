@@ -10,6 +10,29 @@ fn http_parser_version_is_pinned_for_published_consumers() {
     assert!(manifest.contains("http-client = [\"dep:reqwest\", \"dep:bytes\", \"dep:hyper\"]"));
 }
 
+/// `crash-handler` exports unmangled signal and exception symbols
+/// (`pthread_create`, `ehsetjmp`, ...). A second locked version anywhere in
+/// the graph, such as through zccache, fails every all-features native link.
+#[test]
+fn crash_handler_is_locked_at_exactly_one_version() {
+    let lock = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock"))
+        .expect("read Cargo.lock");
+    let versions: Vec<&str> = lock
+        .split("[[package]]")
+        .filter(|package| {
+            package
+                .lines()
+                .any(|line| line.trim_end() == "name = \"crash-handler\"")
+        })
+        .filter_map(|package| {
+            package
+                .lines()
+                .find_map(|line| line.trim_end().strip_prefix("version = "))
+        })
+        .collect();
+    assert_eq!(versions, ["\"0.7.0\""]);
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();

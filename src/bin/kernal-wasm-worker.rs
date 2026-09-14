@@ -290,9 +290,19 @@ fn reconstruct(
         *destination = usize::try_from(source).map_err(|_| "blob-limit-overflow")?;
     }
     let [chunk, blob, sketch, live, reads, writes, transfer] = blob_values;
+    let idle_nanos = u32::try_from(metadata.blob_progress_idle_timeout_nanos)
+        .map_err(|_| "blob-idle-timeout-nanos-overflow")?;
+    if idle_nanos >= 1_000_000_000 {
+        return Err("blob-idle-timeout-nanos-invalid".into());
+    }
     let blobs = kernal_api::wasm::SketchBlobLimits::new(chunk, blob, sketch, live, reads, writes)
         .map_err(|e| e.to_string())?
         .with_maximum_transfer_bytes(transfer)
+        .map_err(|e| e.to_string())?
+        .with_progress_idle_timeout(Duration::new(
+            metadata.blob_progress_idle_timeout_secs,
+            idle_nanos,
+        ))
         .map_err(|e| e.to_string())?;
     let roots =
         usize::try_from(metadata.maximum_active_roots).map_err(|_| "active-roots-overflow")?;
@@ -494,10 +504,18 @@ mod tests {
                 .unwrap()
                 .with_maximum_transfer_bytes(24)
                 .unwrap()
+                .with_progress_idle_timeout(Duration::new(9, 123))
+                .unwrap()
         );
         metadata.blob_limits[0] = 0;
         assert!(reconstruct(&metadata).is_err());
         metadata.blob_limits[0] = u64::MAX;
+        assert!(reconstruct(&metadata).is_err());
+        metadata.blob_limits[0] = 4;
+        metadata.blob_progress_idle_timeout_secs = 0;
+        metadata.blob_progress_idle_timeout_nanos = 0;
+        assert!(reconstruct(&metadata).is_err());
+        metadata.blob_progress_idle_timeout_nanos = 1_000_000_000;
         assert!(reconstruct(&metadata).is_err());
     }
 
@@ -566,6 +584,8 @@ mod tests {
             webview_url: None,
             staged_output: None,
             blob_limits: [4, 8, 16, 2, 3, 4, 24],
+            blob_progress_idle_timeout_secs: 9,
+            blob_progress_idle_timeout_nanos: 123,
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 1,
             maximum_active_roots: 1,

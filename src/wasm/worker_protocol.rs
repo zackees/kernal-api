@@ -6,7 +6,7 @@
 use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"KWW1";
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 const HEADER_LEN: usize = 11;
 pub(super) const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
 /// One-request worker protocol ceiling.  This is intentionally distinct from
@@ -205,6 +205,10 @@ pub(super) struct ExecuteMetadata {
     pub(super) staged_output: Option<std::path::PathBuf>,
     /// Chunk bytes, blob bytes, sketch bytes, live blobs, reads, writes, transfer bytes.
     pub(super) blob_limits: [u64; 7],
+    /// Exact nonzero blob-transfer idle budget, split to preserve all valid
+    /// `Duration` values without rounding a sub-millisecond host policy.
+    pub(super) blob_progress_idle_timeout_secs: u64,
+    pub(super) blob_progress_idle_timeout_nanos: u64,
     pub(super) max_wasm_stack_bytes: u64,
     pub(super) reserved_memory_bytes: u64,
     pub(super) maximum_active_roots: u64,
@@ -777,6 +781,8 @@ fn put_metadata(out: &mut Vec<u8>, value: &ExecuteMetadata) -> Result<(), Protoc
     for v in value.blob_limits {
         put_u64(out, v);
     }
+    put_u64(out, value.blob_progress_idle_timeout_secs);
+    put_u64(out, value.blob_progress_idle_timeout_nanos);
     for v in [
         value.max_wasm_stack_bytes,
         value.reserved_memory_bytes,
@@ -808,6 +814,8 @@ fn take_metadata(input: &mut &[u8]) -> Result<ExecuteMetadata, ProtocolError> {
             take_u64(input)?,
             take_u64(input)?,
         ],
+        blob_progress_idle_timeout_secs: take_u64(input)?,
+        blob_progress_idle_timeout_nanos: take_u64(input)?,
         max_wasm_stack_bytes: take_u64(input)?,
         reserved_memory_bytes: take_u64(input)?,
         maximum_active_roots: take_u64(input)?,
@@ -895,6 +903,8 @@ mod tests {
             webview_url: None,
             staged_output: None,
             blob_limits: [12, 13, 14, 15, 16, 17, 18],
+            blob_progress_idle_timeout_secs: 19,
+            blob_progress_idle_timeout_nanos: 20,
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 2,
             maximum_active_roots: 3,

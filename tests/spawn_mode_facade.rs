@@ -1,40 +1,88 @@
-//! #189: compile-time proof that the opt-in scoped spawn surface is not a
-//! facade mirror.
+//! #189: the opt-in placement surface is facade-owned. `running-process` is a
+//! private backend, so these contracts are exercised only through
+//! `kernal_api` names; no test here names a substrate type.
 #![cfg(feature = "independent-spawn")]
 
 use std::io;
 use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+use kernal_api::{
+    spawn_with_options, IndependentBackend, LaunchSpec, Readiness, SpawnExit, SpawnHandle,
+    SpawnLifetime, SpawnMode, SpawnOptions,
+};
+
+fn spec() -> LaunchSpec {
+    LaunchSpec {
+        program: std::env::current_exe().unwrap().into_os_string(),
+        args: Vec::new(),
+        cwd: std::env::temp_dir().into_os_string(),
+        environment: Vec::new(),
+        stdout: None,
+        stderr: None,
+        readiness: Readiness::default(),
+    }
+}
+
+fn rejection(options: SpawnOptions, cancelled: bool) -> io::ErrorKind {
+    match spawn_with_options(&spec(), &options, &AtomicBool::new(cancelled)) {
+        Ok(_) => panic!("{options:?} must be rejected before launch"),
+        Err(error) => error.kind(),
+    }
+}
 
 #[test]
-fn canonical_spawn_contract_has_identical_type_identity() {
-    fn accepts_backend_mode(_: running_process::SpawnMode) {}
-    fn accepts_facade_mode(_: kernal_api::SpawnMode) {}
-    accepts_backend_mode(kernal_api::SpawnMode::Inherited);
-    accepts_facade_mode(running_process::SpawnMode::Independent);
+fn defaults_require_no_external_authority() {
+    assert_eq!(
+        SpawnOptions::default(),
+        SpawnOptions {
+            mode: SpawnMode::Inherited,
+            lifetime: SpawnLifetime::KillOnDrop,
+            backend: None,
+            timeout: Duration::from_secs(30),
+        }
+    );
+    assert!(matches!(Readiness::default(), Readiness::ProcessStarted));
+}
 
-    fn accepts_backend_options(_: running_process::SpawnOptions) {}
-    fn accepts_facade_options(_: kernal_api::SpawnOptions) {}
-    let options = kernal_api::SpawnOptions::default();
-    assert_eq!(options.mode, kernal_api::SpawnMode::Inherited);
-    accepts_backend_options(options.clone());
-    accepts_facade_options(running_process::SpawnOptions::default());
+#[test]
+fn invalid_requests_are_rejected_with_their_documented_kinds() {
+    assert_eq!(
+        rejection(SpawnOptions::default(), true),
+        io::ErrorKind::Interrupted
+    );
+    for timeout in [Duration::ZERO, Duration::from_secs(31)] {
+        let options = SpawnOptions {
+            timeout,
+            ..SpawnOptions::default()
+        };
+        assert_eq!(rejection(options, false), io::ErrorKind::InvalidInput);
+    }
+    let inherited_with_backend = SpawnOptions {
+        backend: Some(IndependentBackend::ExternalBroker {
+            endpoint: "broker".to_owned(),
+        }),
+        ..SpawnOptions::default()
+    };
+    assert_eq!(
+        rejection(inherited_with_backend, false),
+        io::ErrorKind::InvalidInput
+    );
+    let independent_without_authority = SpawnOptions {
+        mode: SpawnMode::Independent,
+        ..SpawnOptions::default()
+    };
+    assert_eq!(
+        rejection(independent_without_authority, false),
+        io::ErrorKind::Unsupported
+    );
+}
 
-    let _: fn(running_process::SpawnLifetime) = |_: kernal_api::SpawnLifetime| {};
-    let _: fn(kernal_api::SpawnLifetime) = |_: running_process::SpawnLifetime| {};
-    let _: fn(running_process::IndependentBackend) = |_: kernal_api::IndependentBackend| {};
-    let _: fn(kernal_api::IndependentBackend) = |_: running_process::IndependentBackend| {};
-    let _: fn(running_process::SpawnHandle) = |_: kernal_api::SpawnHandle| {};
-    let _: fn(kernal_api::SpawnHandle) = |_: running_process::SpawnHandle| {};
-    let _: fn(running_process::SpawnExit) = |_: kernal_api::SpawnExit| {};
-    let _: fn(kernal_api::SpawnExit) = |_: running_process::SpawnExit| {};
-    let _: fn(running_process::independent_spawn::LaunchSpec) = |_: kernal_api::LaunchSpec| {};
-    let _: fn(kernal_api::LaunchSpec) = |_: running_process::independent_spawn::LaunchSpec| {};
-    let _: fn(running_process::independent_spawn::Readiness) = |_: kernal_api::Readiness| {};
-    let _: fn(kernal_api::Readiness) = |_: running_process::independent_spawn::Readiness| {};
-
-    let _: fn(
-        &running_process::independent_spawn::LaunchSpec,
-        &running_process::SpawnOptions,
-        &AtomicBool,
-    ) -> io::Result<running_process::SpawnHandle> = kernal_api::spawn_with_options;
+#[test]
+fn handle_operations_use_facade_types() {
+    let _: fn(&SpawnHandle) -> u32 = SpawnHandle::id;
+    let _: fn(&SpawnHandle) -> SpawnMode = SpawnHandle::actual_mode;
+    let _: fn(&mut SpawnHandle) -> io::Result<bool> = SpawnHandle::is_alive;
+    let _: fn(&mut SpawnHandle, Duration) -> io::Result<()> = SpawnHandle::stop;
+    let _: fn(&mut SpawnHandle, Duration, &AtomicBool) -> io::Result<SpawnExit> = SpawnHandle::wait;
 }

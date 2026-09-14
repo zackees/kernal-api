@@ -1,0 +1,46 @@
+error: `running_process` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:13:1
+   |
+LL | pub use running_process::spawn;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[deny(kernal_api_boundary)]` on by default
+
+error: `running_process` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:16:1
+   |
+LL | pub use running_process::StreamKind as CaptureStream;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:18:1
+   |
+LL | pub use tokio::sync::Mutex as Lock;
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `tokio` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:20:1
+   |
+LL | pub use tokio::task::*;
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: `running_process` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:22:27
+   |
+LL | pub use running_process::{spawn as spawn_again, StreamKind as Stream};
+   |                           ^^^^^^^^^^^^^^^^^^^^
+
+error: `running_process` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:22:49
+   |
+LL | pub use running_process::{spawn as spawn_again, StreamKind as Stream};
+   |                                                 ^^^^^^^^^^^^^^^^^^^^
+
+error: `running_process` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead
+  --> $DIR/facade_public_reexport.rs:25:5
+   |
+LL |     pub use running_process::spawn as spawn_process;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 7 previous errors
+

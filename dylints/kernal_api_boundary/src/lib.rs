@@ -8,7 +8,9 @@ extern crate rustc_span;
 use rustc_errors::DiagDecorator;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId, LOCAL_CRATE};
-use rustc_hir::{AmbigArg, Expr, ExprKind, ImplItem, Item, ItemKind, TraitItem, Ty, TyKind};
+use rustc_hir::{
+    AmbigArg, Expr, ExprKind, ImplItem, Item, ItemKind, TraitItem, Ty, TyKind, UseKind,
+};
 use rustc_lint::{LateContext, LateLintPass, LintContext};
 use rustc_middle::ty;
 use rustc_span::{FileName, RemapPathScopeComponents, Span};
@@ -27,10 +29,13 @@ dylint_linting::declare_late_lint! {
     /// may be used privately, but naming one in a public type position --
     /// enum variant payload, public field, function parameter or return type,
     /// alias, or bound -- puts backend vocabulary back into the application
-    /// interface just as surely as a `pub use` does. Implementing a backend's
-    /// own trait for an exported type does the same from the other direction,
-    /// because the trait has to be in scope to call the method; only the
-    /// async mirrors of `std::io` are exempt.
+    /// interface just as surely as a `pub use` does. An exported `pub use` of an
+    /// owned crate is rejected directly, renamed or not: `as` changes only the
+    /// spelling, never the backend type a client receives, and no owned crate
+    /// -- `running_process` included -- has an approved exception. Implementing
+    /// a backend's own trait for an exported type does the same from the other
+    /// direction, because the trait has to be in scope to call the method; only
+    /// the async mirrors of `std::io` are exempt.
     pub KERNAL_API_BOUNDARY,
     Deny,
     "require systems and async APIs owned by kernal-api to pass through its facades"
@@ -142,6 +147,13 @@ impl<'tcx> LateLintPass<'tcx> for KernalApiBoundary {
         if is_facade_owner(cx) {
             check_public_signature(cx, item.owner_id.def_id);
             check_owned_trait_impl(cx, item.owner_id.def_id);
+            // A braced list lowers to one item per leaf plus a stem naming only
+            // the shared prefix; checking the leaves reports each re-export once.
+            if let ItemKind::Use(path, kind) = item.kind {
+                if !matches!(kind, UseKind::ListStem) {
+                    check_public_reexport(cx, item, path);
+                }
+            }
             return;
         }
         if is_boundary_source(cx, item.span) {
@@ -265,6 +277,40 @@ fn check_public_signature(cx: &LateContext<'_>, def_id: LocalDefId) {
         }
     }
     leaks.report(cx);
+}
+
+/// Reject an exported re-export of an owned crate's item or module.
+///
+/// A rename (`pub use running_process::StreamKind as CaptureStream`) or a glob
+/// resolves to the same backend definition, so clients still receive the
+/// backend type and inherit its versioning. Private and `pub(crate)` imports,
+/// and `pub use` inside a module no client can reach, publish nothing.
+fn check_public_reexport(cx: &LateContext<'_>, item: &Item<'_>, path: &rustc_hir::UsePath<'_>) {
+    let def_id = item.owner_id.def_id;
+    let tcx = cx.tcx;
+    let exported = cx.effective_visibilities.is_exported(def_id)
+        || (tcx.visibility(def_id).is_public()
+            && cx.effective_visibilities.is_exported(tcx.local_parent(def_id)));
+    if !exported {
+        return;
+    }
+    let mut leaks = OwnedTypeLeaks::default();
+    for resolution in path.res.into_iter().flatten() {
+        if let Res::Def(_, resolved) = resolution {
+            leaks.record_def(cx, item.span, resolved);
+        }
+    }
+    for (crate_name, span) in leaks.found {
+        cx.opt_span_lint(
+            KERNAL_API_BOUNDARY,
+            Some(span),
+            DiagDecorator(move |diag| {
+                diag.primary_message(format!(
+                    "`{crate_name}` is publicly re-exported by kernal-api; renaming it does not change the backend type a client receives -- expose a facade-owned type instead"
+                ));
+            }),
+        );
+    }
 }
 
 /// Reject an owned backend's own trait implemented for an exported type.

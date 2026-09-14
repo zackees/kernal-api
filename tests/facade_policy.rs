@@ -90,6 +90,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use pdb_addr2line",
         "pub use portable_pty",
         "pub use reflink_copy",
+        "pub use running_process",
         "pub use rusqlite",
         "pub use sysinfo",
         "pub use tokio",
@@ -121,7 +122,7 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
     );
     assert!(
         manifest.contains("independent-spawn = [\"running-process/independent-spawn\"]"),
-        "the canonical spawn exception must remain an explicit lightweight-facade opt-in"
+        "the facade-owned independent-spawn capability must remain an explicit opt-in"
     );
     assert!(
         manifest.contains("# Exact first-party pre-1.0 pin."),
@@ -170,35 +171,13 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
         );
     }
 
-    let spawn_reexports = [
-        "pub use running_process::{\n    spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,\n    SpawnOptions,\n};",
-        "pub use running_process::independent_spawn::{LaunchSpec, Readiness};",
-    ];
-    assert!(
-        spawn_reexports
-            .iter()
-            .all(|reexport| lib.contains(reexport)),
-        "only the selected canonical spawn contract may cross the facade boundary"
-    );
-    assert_eq!(
-        lib.matches("pub use running_process").count(),
-        spawn_reexports.len(),
-        "the independent-spawn exception must not grow into a general substrate re-export"
-    );
-    assert_eq!(
-        lib.matches("#[cfg(feature = \"independent-spawn\")]")
-            .count(),
-        spawn_reexports.len(),
-        "each canonical spawn re-export must remain outside the default facade API"
-    );
-
     for path in rust_sources(&root.join("src")) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         for line in source.lines() {
             let line = line.trim_start();
             if line.starts_with("pub ") {
                 assert!(
-                    !line.contains("running_process") || path == root.join("src/lib.rs"),
+                    !line.contains("running_process"),
                     "{} exposes a running-process type in {line:?}",
                     path.display()
                 );
@@ -657,15 +636,9 @@ fn backend_types_are_absent_from_public_type_positions() {
     for path in rust_sources(&root) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");
         for (line, position) in public_type_positions(&source) {
-            let canonical_spawn_reexport = path == root.join("lib.rs")
-                && matches!(
-                    position,
-                    "pub use running_process::{"
-                        | "pub use running_process::independent_spawn::{LaunchSpec, Readiness};"
-                );
             for spelling in OWNED_BACKEND_PATHS {
                 assert!(
-                    canonical_spawn_reexport || !position.contains(spelling),
+                    !position.contains(spelling),
                     "{}:{line} names backend type {spelling:?} in a public type position: {}",
                     path.display(),
                     position.trim()

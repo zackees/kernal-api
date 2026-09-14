@@ -6,11 +6,10 @@ native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
 `running-process` phase-1 adapter has landed: this crate depends on the exact
-published `running-process` 4.10.14 registry release unconditionally. Its
-canonical independent-spawn contract is the sole backend-type exception: the
-selected mode, options, launch payload, readiness, handle, and entry point are
-re-exported unchanged behind the explicit `independent-spawn` feature so live
-control retains Rust type identity.
+published `running-process` 4.10.14 registry release unconditionally. Like
+Tokio, it is a private backend: no `running-process` type appears in this
+crate's public API, including the facade-owned placement contract behind the
+explicit `independent-spawn` feature.
 
 In the target architecture, applications use `kernal-api`; they do not use
 `running-process` or Tokio directly. The permanent dependency direction and
@@ -48,8 +47,8 @@ direct use of implementation crates owned by this package.
 
 The base crate contains the async process/host facade. Its bounded process
 adapter uses `running-process` 4.10.14; that dependency is mandatory, not
-feature-gated. Except for the selected canonical independent-spawn contract,
-backend types remain private. With `independent-spawn`,
+feature-gated. Backend types, `running-process` included, remain private.
+With `independent-spawn`,
 `SpawnMode::Inherited` remains the default; `SpawnMode::Independent` requires
 verified native scheduler or already-external broker placement and never
 silently falls back. Independent placement is not detachment, privilege
@@ -110,9 +109,9 @@ The four daemon slices are deliberately outside `full`, because each one
 carries a frozen wire that only an application already speaking it should
 compile. They are documented on docs.rs but must be enabled by name:
 
-- `independent-spawn` for the canonical scheduler/broker resource-placement
-  contract; it keeps its options, launch payload, and live handle type-identical
-  to the selected `running-process` release
+- `independent-spawn` for the facade-owned scheduler/broker resource-placement
+  contract; its options, launch payload, and live handle convert to the
+  selected `running-process` release privately
 - `daemon-identity` for direct-daemon identity, sidecar, probe, and
   endpoint-mux semantics over an existing endpoint; endpoint naming, payload
   protocols, and daemon lifecycle stay with the application

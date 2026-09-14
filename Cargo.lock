@@ -106,7 +106,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -117,7 +117,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -448,7 +448,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -912,19 +912,6 @@ dependencies = [
 
 [[package]]
 name = "crash-handler"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2066907075af649bcb8bcb1b9b986329b243677e6918b2d920aa64b0aac5ace3"
-dependencies = [
- "cfg-if",
- "crash-context",
- "libc",
- "mach2",
- "parking_lot",
-]
-
-[[package]]
-name = "crash-handler"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0df5c9639f4942eb7702b964b3f9adf03a55724a57558cc177407388a8b936e2"
@@ -1258,7 +1245,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1486,7 +1473,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2340,7 +2327,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.62.2",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -2808,7 +2795,7 @@ dependencies = [
  "clap",
  "console-api",
  "console-subscriber",
- "crash-handler 0.7.0",
+ "crash-handler",
  "dirs 6.0.0",
  "flate2",
  "framehop",
@@ -3251,7 +3238,7 @@ dependencies = [
  "png 0.18.1",
  "serde",
  "thiserror 2.0.20",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3398,7 +3385,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4400,7 +4387,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix",
- "windows 0.62.2",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -4632,7 +4619,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5145,7 +5132,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5625,10 +5612,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6949,7 +6936,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7762,7 +7749,7 @@ dependencies = [
 [[package]]
 name = "zccache-artifact"
 version = "1.13.22"
-source = "git+https://github.com/zackees/zccache?rev=e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae#e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae"
+source = "git+https://github.com/zackees/zccache?rev=d385a184ca5ad3cad207daf25093374f27b219de#d385a184ca5ad3cad207daf25093374f27b219de"
 dependencies = [
  "bincode",
  "blake3",
@@ -7785,9 +7772,9 @@ dependencies = [
 [[package]]
 name = "zccache-core"
 version = "1.13.22"
-source = "git+https://github.com/zackees/zccache?rev=e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae#e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae"
+source = "git+https://github.com/zackees/zccache?rev=d385a184ca5ad3cad207daf25093374f27b219de#d385a184ca5ad3cad207daf25093374f27b219de"
 dependencies = [
- "crash-handler 0.6.3",
+ "crash-handler",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -7798,7 +7785,7 @@ dependencies = [
 [[package]]
 name = "zccache-hash"
 version = "1.13.22"
-source = "git+https://github.com/zackees/zccache?rev=e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae#e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae"
+source = "git+https://github.com/zackees/zccache?rev=d385a184ca5ad3cad207daf25093374f27b219de#d385a184ca5ad3cad207daf25093374f27b219de"
 dependencies = [
  "blake3",
  "memmap2",
@@ -7808,9 +7795,9 @@ dependencies = [
 [[package]]
 name = "zccache-platform"
 version = "1.13.22"
-source = "git+https://github.com/zackees/zccache?rev=e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae#e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae"
+source = "git+https://github.com/zackees/zccache?rev=d385a184ca5ad3cad207daf25093374f27b219de#d385a184ca5ad3cad207daf25093374f27b219de"
 dependencies = [
- "crash-handler 0.6.3",
+ "crash-handler",
  "interprocess",
  "libc",
  "tokio",

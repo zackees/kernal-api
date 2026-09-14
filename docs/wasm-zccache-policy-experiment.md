@@ -273,7 +273,7 @@ exact key matching, store ownership, miss/hit values, and zero spawn attempts.
 
 The Core private threaded-root fixture now uses the real
 `zccache-artifact::KvStore`, pinned at
-`e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae`, in the private
+`d385a184ca5ad3cad207daf25093374f27b219de`, in the private
 `kernal-compiler-v1` namespace. On a miss, after the guest has completed its
 normal process/output lifecycle and the exact output job has drained, the
 host reads that embedding-selected output and atomically retains it under the

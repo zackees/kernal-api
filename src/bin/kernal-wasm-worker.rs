@@ -78,7 +78,16 @@ fn execute_request(
     module: Vec<u8>,
     output: &mut impl io::Write,
 ) -> Result<(), String> {
-    let (config, policy) = reconstruct(metadata).map_err(|text| {
+    #[cfg(not(feature = "tauri-webview"))]
+    if metadata.webview_url.is_some() {
+        return protocol_terminal(output, request_id, "native-webview-worker-unavailable");
+    }
+    #[cfg(feature = "tauri-webview")]
+    let native_grant = match native_grant(&metadata) {
+        Ok(grant) => grant,
+        Err(error) => return protocol_terminal(output, request_id, error),
+    };
+    let (config, policy) = reconstruct(&metadata).map_err(|text| {
         protocol_terminal(output, request_id, &text)
             .err()
             .unwrap_or(text)
@@ -96,7 +105,12 @@ fn execute_request(
         }
         control_done_thread.store(true, Ordering::Release);
     });
-    let runtime = RuntimeBuilder::current_thread()
+    let runtime_builder = if metadata.webview_url.is_some() {
+        RuntimeBuilder::multi_thread()
+    } else {
+        RuntimeBuilder::current_thread()
+    };
+    let runtime = runtime_builder
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
@@ -105,17 +119,65 @@ fn execute_request(
         Err(error) => return protocol_terminal(output, request_id, error.to_string().as_str()),
     };
     let sketch = match compiler.admit(&module, policy) {
-        Ok(value) => value,
+        Ok(value) => Arc::new(value),
         Err(error) => return protocol_terminal(output, request_id, error.to_string().as_str()),
     };
-    let result = runtime.run(async {
-        sketch
-            .execute_threaded_root_cancellable(runtime.handle(), token)
-            .await
-    });
+    let execute_plain = || {
+        runtime.run(async {
+            match metadata.staged_output {
+                Some(destination) => {
+                    sketch
+                        .execute_threaded_root_with_output(
+                            runtime.handle(),
+                            token.clone(),
+                            destination,
+                        )
+                        .await
+                }
+                None => {
+                    sketch
+                        .execute_threaded_root_cancellable(runtime.handle(), token.clone())
+                        .await
+                }
+            }
+        })
+    };
+    #[cfg(not(feature = "tauri-webview"))]
+    let result = execute_plain();
+    #[cfg(feature = "tauri-webview")]
+    let mut trace = None;
+    #[cfg(feature = "tauri-webview")]
+    let result = match native_grant {
+        Some((grant, destination)) => execute_native(
+            &runtime,
+            Arc::clone(&sketch),
+            token,
+            grant,
+            destination,
+            &mut trace,
+        ),
+        None => execute_plain(),
+    };
     let _ = sketch.close_threaded_root();
     drop(sketch);
     let counters = snapshot(&compiler);
+    #[cfg(feature = "tauri-webview")]
+    if let Some(mut text) = trace {
+        use std::fmt::Write as _;
+        let counts = compiler.execution_limits_snapshot();
+        writeln!(
+            text,
+            " roots={} threads={} stores={} instances={} epochs={} memory_bytes={}",
+            counts.active_root_executions(),
+            counts.live_guest_threads(),
+            counts.live_stores(),
+            counts.live_instances(),
+            counts.active_epoch_registrations(),
+            counts.reserved_shared_memory_bytes()
+        )
+        .expect("format trace");
+        write_message(output, &Message::Trace { request_id, text }).map_err(protocol_text)?;
+    }
     let (kind, detail, diagnostic) = map_result(result);
     let (kind, detail, diagnostic) = if counters_are_zero(counters) {
         (kind, detail, diagnostic)
@@ -141,9 +203,97 @@ fn execute_request(
     Ok(())
 }
 
+#[cfg(feature = "tauri-webview")]
+fn native_grant(
+    metadata: &ExecuteMetadata,
+) -> Result<Option<(kernal_api::webview::WebviewUrlGrant, std::path::PathBuf)>, &'static str> {
+    let Some(url) = metadata.webview_url.as_deref() else {
+        return Ok(None);
+    };
+    let grant =
+        kernal_api::webview::WebviewUrlGrant::new(url).map_err(|_| "invalid-native-webview-url")?;
+    let destination = metadata
+        .staged_output
+        .clone()
+        .ok_or("native-webview-output-required")?;
+    Ok(Some((grant, destination)))
+}
+
+/// The UI loop stays on process main; the root runs on this worker's runtime.
+/// The parent remains responsible for the hard deadline and process-tree reap.
+#[cfg(feature = "tauri-webview")]
+fn execute_native(
+    runtime: &kernal_api::async_engine::Runtime,
+    sketch: Arc<kernal_api::wasm::AdmittedSketch>,
+    token: kernal_api::async_engine::CancellationToken,
+    grant: kernal_api::webview::WebviewUrlGrant,
+    destination: std::path::PathBuf,
+    _trace: &mut Option<String>,
+) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+    let host = kernal_api::webview::ExternalWebviewHost::new(runtime.handle())
+        .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+    let client = host.client();
+    #[cfg(feature = "tauri-webview-test-support")]
+    let observer = client.clone();
+    let handle = runtime.handle();
+    let task = handle.clone().launch(async move {
+        // Unwinding or dropping the task must also release the UI loop.
+        struct ExitOnDrop(kernal_api::webview::ExternalWebviewClient);
+        impl Drop for ExitOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.request_exit();
+            }
+        }
+        let _exit = ExitOnDrop(client.clone());
+        sketch
+            .execute_threaded_root_with_webview(handle, token, client.clone(), grant, destination)
+            .await
+    });
+    host.run();
+    let result = runtime
+        .run(task)
+        .map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
+    #[cfg(feature = "tauri-webview-test-support")]
+    {
+        use std::fmt::Write as _;
+        let (events, omitted) = observer.test_trace();
+        let mut text = String::new();
+        for event in events {
+            write!(
+                text,
+                "kernal-webview-trace phase={} elapsed_us={} opcode={}",
+                event.phase,
+                event.elapsed.as_micros(),
+                event.opcode.unwrap_or(0)
+            )
+            .expect("format trace");
+            if let Some(counts) = event.observation {
+                write!(text, " clocks={} output_jobs={} captures={} opens={} blobs={} transfer_bytes={} backings={} resources={} operations={}", counts.active_clocks, counts.active_output_jobs, counts.active_native_captures, counts.active_native_opens, counts.live_blobs, counts.retained_transfer_capacity, counts.native_backings, counts.live_resources, counts.pending_operations).expect("format trace");
+            }
+            text.push('\n');
+        }
+        write!(
+            text,
+            "kernal-webview-trace phase=trace-end omitted={omitted}"
+        )
+        .expect("format trace");
+        *_trace = Some(text);
+    }
+    result
+}
+
 fn reconstruct(
-    metadata: ExecuteMetadata,
+    metadata: &ExecuteMetadata,
 ) -> Result<(SketchCompilerConfig, SketchModulePolicy), String> {
+    let mut blob_values = [0_usize; 7];
+    for (destination, source) in blob_values.iter_mut().zip(metadata.blob_limits) {
+        *destination = usize::try_from(source).map_err(|_| "blob-limit-overflow")?;
+    }
+    let [chunk, blob, sketch, live, reads, writes, transfer] = blob_values;
+    let blobs = kernal_api::wasm::SketchBlobLimits::new(chunk, blob, sketch, live, reads, writes)
+        .map_err(|e| e.to_string())?
+        .with_maximum_transfer_bytes(transfer)
+        .map_err(|e| e.to_string())?;
     let roots =
         usize::try_from(metadata.maximum_active_roots).map_err(|_| "active-roots-overflow")?;
     let stack = usize::try_from(metadata.max_wasm_stack_bytes).map_err(|_| "stack-overflow")?;
@@ -163,7 +313,8 @@ fn reconstruct(
         .with_fuel_limits(fuel)
         .map_err(|e| e.to_string())?
         .with_epoch_limits(epoch)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?
+        .with_blob_limits(blobs);
     let config = SketchCompilerConfig::new(stack)
         .map_err(|e| e.to_string())?
         .with_execution_limits(limits)
@@ -331,8 +482,90 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn reconstruction_preserves_nondefault_blob_limits_and_rejects_invalid_ones() {
+        let mut metadata = metadata();
+        metadata.reserved_memory_bytes = 1024 * 1024 * 1024;
+        metadata.max_shared_memory_pages = 16_384;
+        let (config, _) = reconstruct(&metadata).unwrap();
+        assert_eq!(
+            config.execution_limits().blob_limits(),
+            kernal_api::wasm::SketchBlobLimits::new(4, 8, 16, 2, 3, 4)
+                .unwrap()
+                .with_maximum_transfer_bytes(24)
+                .unwrap()
+        );
+        metadata.blob_limits[0] = 0;
+        assert!(reconstruct(&metadata).is_err());
+        metadata.blob_limits[0] = u64::MAX;
+        assert!(reconstruct(&metadata).is_err());
+    }
+
+    #[test]
+    fn staging_grant_does_not_change_compiler_limit_reconstruction() {
+        let mut metadata = metadata();
+        metadata.reserved_memory_bytes = 1024 * 1024 * 1024;
+        metadata.max_shared_memory_pages = 16_384;
+        metadata.staged_output = Some(std::env::temp_dir().join("completed-output"));
+        assert!(reconstruct(&metadata).is_ok());
+    }
+
+    #[test]
+    #[cfg(not(feature = "tauri-webview"))]
+    fn unsupported_native_authority_is_rejected_before_module_execution() {
+        let mut request = metadata();
+        request.webview_url = Some("https://example.test/".into());
+        let mut output = Vec::new();
+        execute_request(7, request, Vec::new(), &mut output).unwrap();
+        assert!(
+            matches!(read_message(&mut output.as_slice()).unwrap(), Message::Terminal {
+            request_id: 7,
+            kind: TerminalKind::ProtocolFailure,
+            diagnostic,
+            ..
+        } if diagnostic == "native-webview-worker-unavailable")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "tauri-webview")]
+    fn native_authority_is_revalidated_without_starting_ui_or_compiler() {
+        let mut request = metadata();
+        assert!(native_grant(&request).unwrap().is_none());
+        for url in [
+            "file:///tmp/input",
+            "javascript:alert(1)",
+            "",
+            "https://user:password@example.test/",
+        ] {
+            request.webview_url = Some(url.into());
+            assert!(matches!(
+                native_grant(&request),
+                Err("invalid-native-webview-url")
+            ));
+            let mut output = Vec::new();
+            execute_request(7, request.clone(), Vec::new(), &mut output).unwrap();
+            assert!(
+                matches!(read_message(&mut output.as_slice()).unwrap(), Message::Terminal {
+                kind: TerminalKind::ProtocolFailure, diagnostic, ..
+            } if diagnostic == "invalid-native-webview-url")
+            );
+        }
+        request.webview_url = Some("https://example.test/exact".into());
+        assert!(matches!(
+            native_grant(&request),
+            Err("native-webview-output-required")
+        ));
+        let destination = std::env::temp_dir().join("worker-native-grant-test.png");
+        request.staged_output = Some(destination.clone());
+        assert_eq!(native_grant(&request).unwrap().unwrap().1, destination);
+    }
+
     fn metadata() -> ExecuteMetadata {
         ExecuteMetadata {
+            webview_url: None,
+            staged_output: None,
+            blob_limits: [4, 8, 16, 2, 3, 4, 24],
             max_wasm_stack_bytes: 1,
             reserved_memory_bytes: 1,
             maximum_active_roots: 1,

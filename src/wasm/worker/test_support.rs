@@ -130,51 +130,22 @@ fn platform_capture(pid: u32) -> std::io::Result<WorkerIdentity> {
 // declaration local because this is not a facade API.
 #[cfg(target_os = "macos")]
 fn platform_capture(pid: u32) -> std::io::Result<WorkerIdentity> {
-    #[repr(C)]
-    struct BsdInfo {
-        pbi_flags: u32,
-        pbi_status: u32,
-        pbi_xstatus: u32,
-        pbi_pid: u32,
-        pbi_ppid: u32,
-        pbi_uid: u32,
-        pbi_gid: u32,
-        pbi_ruid: u32,
-        pbi_rgid: u32,
-        pbi_svuid: u32,
-        pbi_svgid: u32,
-        rfu_1: u32,
-        pbi_comm: [u8; 17],
-        pbi_name: [u8; 33],
-        pbi_nfiles: u32,
-        pbi_pgid: u32,
-        pbi_pjobc: u32,
-        e_tdev: u32,
-        e_tpgid: u32,
-        pbi_nice: i32,
-        pbi_start_tvsec: u64,
-        pbi_start_tvusec: u64,
-    }
-    unsafe extern "C" {
-        fn proc_pidinfo(
-            pid: i32,
-            flavor: i32,
-            arg: u64,
-            buffer: *mut core::ffi::c_void,
-            buffersize: i32,
-        ) -> i32;
-    }
-    let mut info: BsdInfo = unsafe { std::mem::zeroed() };
+    // Keep this private test-only identity capture ABI-identical to the
+    // macOS verifier in `wasm_worker_containment`: a hand-written
+    // `proc_bsdinfo` layout can silently differ by architecture and make the
+    // worker reject marker publication before the proof can observe it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let expected = i32::try_from(std::mem::size_of_val(&info)).expect("proc_bsdinfo size");
     let written = unsafe {
-        proc_pidinfo(
-            pid as i32,
-            3,
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
             0,
-            (&mut info as *mut BsdInfo).cast(),
-            std::mem::size_of::<BsdInfo>() as i32,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            expected,
         )
     };
-    if written as usize != std::mem::size_of::<BsdInfo>() {
+    if written != expected {
         return Err(std::io::Error::last_os_error());
     }
     Ok(WorkerIdentity {

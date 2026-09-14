@@ -5,10 +5,11 @@ use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy,
 };
 
-const GENERATED_V1_MANIFEST: &str = include_str!("../src/wasm/generated/v1/kernal-api-v1.abi.toml");
+#[path = "support/abi_metadata.rs"]
+mod abi_metadata;
 
 fn generated_abi_metadata() -> Vec<u8> {
-    format!("capabilities=0\n{GENERATED_V1_MANIFEST}").into_bytes()
+    abi_metadata::METADATA.to_vec()
 }
 
 fn compiler() -> SketchCompiler {

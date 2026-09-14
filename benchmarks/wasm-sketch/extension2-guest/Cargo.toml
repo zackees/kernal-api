@@ -1,0 +1,40 @@
+[package]
+name = "kernal-extension2-guest-proof"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+publish = false
+
+[workspace]
+
+[features]
+# Source-only streaming proof; not full upstream/runtime acceptance.
+guest-proof = []
+header-proof = ["guest-proof"]
+auth-proof = ["guest-proof"]
+inventory-proof = ["guest-proof"]
+
+[[bin]]
+name = "kernal-extension2-guest-proof"
+path = "src/main.rs"
+required-features = ["guest-proof"]
+
+[dependencies]
+zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }
+# Exact source-only migration fixture; not published-pin acceptance.
+zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
+# Migration-only source proof, not release-pin acceptance.
+kernal-api = { version = "=0.1.2", path = "../../..", default-features = false }
+base64 = "=0.22.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+[[bin]]
+name = "kernal-hash-guest-proof"
+path = "src/hash_main.rs"
+required-features = ["guest-proof"]
+
+[[bin]]
+name = "kernal-compiler-guest-proof"
+path = "src/compiler_main.rs"
+required-features = ["guest-proof"]

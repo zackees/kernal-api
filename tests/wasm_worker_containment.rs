@@ -1,8 +1,8 @@
 #![cfg(feature = "wasm-sketch-worker")]
 
 //! Real-worker containment coverage for #28, including ignored inner helpers
-//! and externally controlled crash/parent-death proofs on native Windows and
-//! Linux targets.
+//! and externally controlled crash/parent-death proofs on native Windows,
+//! Linux, and macOS targets.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +29,7 @@ const CONTAINMENT_DEADLINE: Duration = Duration::from_secs(1);
 // exact live native identity before their intentional action.  Keep their
 // worker deadline beyond the outer acquisition bound so normal containment
 // cannot race the proof into a false success.
+#[cfg(feature = "wasm-sketch-worker-test-support")]
 const FAILURE_PROOF_DEADLINE: Duration = Duration::from_secs(30);
 const GRACE: Duration = Duration::from_secs(1);
 
@@ -71,7 +72,20 @@ fn compiler(deadline: Duration, fuel: SketchFuelLimits) -> SketchCompiler {
         .with_fuel_limits(fuel)
         .expect("fuel limits")
         .with_epoch_limits(epoch)
-        .expect("epoch limits");
+        .expect("epoch limits")
+        .with_blob_limits(
+            kernal_api::wasm::SketchBlobLimits::new(
+                64 * 1024,
+                1024 * 1024,
+                2 * 1024 * 1024,
+                1,
+                1,
+                1,
+            )
+            .unwrap()
+            .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
+            .unwrap(),
+        );
     SketchCompiler::new(
         SketchCompilerConfig::default()
             .with_execution_limits(limits)
@@ -106,13 +120,14 @@ async fn contained(
     runtime: RuntimeHandle,
     config: &SketchWorkerConfig,
     cancellation: Option<CancellationSource>,
+    outer_bound: Duration,
 ) -> SketchWorkerTerminal {
     let token = cancellation
         .as_ref()
         .map(CancellationSource::token)
         .unwrap_or_else(|| CancellationSource::new().token());
     async_engine::timeout(
-        OUTER_BOUND,
+        outer_bound,
         sketch.execute_threaded_root_contained_cancellable(runtime, config, token),
     )
     .await
@@ -149,6 +164,17 @@ fn run_case(
     cancel: bool,
     expected: SketchWorkerTerminal,
 ) {
+    run_case_with_outer_bound(bytes, deadline, fuel, cancel, expected, OUTER_BOUND);
+}
+
+fn run_case_with_outer_bound(
+    bytes: Vec<u8>,
+    deadline: Duration,
+    fuel: SketchFuelLimits,
+    cancel: bool,
+    expected: SketchWorkerTerminal,
+    outer_bound: Duration,
+) {
     let compiler = compiler(deadline, fuel);
     let sketch = admit(&compiler, bytes);
     let config = worker_config();
@@ -163,7 +189,7 @@ fn run_case(
             let config = config.clone();
             let source = source.clone();
             let handle = runtime.handle();
-            async move { contained(&sketch, handle, &config, Some(source)).await }
+            async move { contained(&sketch, handle, &config, Some(source), outer_bound).await }
         });
         if cancel {
             // Let the parent finish the bounded upload and the child enter
@@ -175,6 +201,26 @@ fn run_case(
         assert_eq!(task.await.expect("contained task"), expected);
         assert_clean(&compiler, &sketch).await;
     });
+}
+
+#[test]
+#[ignore = "requires the artifact built by scripts/build-threaded-smoke"]
+fn cargo_built_threaded_guest_runs_inside_killable_worker() {
+    let path = std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM")
+        .expect("explicit artifact proof must supply its Cargo-built Wasm");
+    let bytes = std::fs::read(path).expect("read real threaded guest");
+    // Intel macOS completes the real artifact in about 13 seconds under the
+    // native screenshot job. Keep this real-worker smoke bounded, but leave
+    // enough room for that supported host rather than misclassifying normal
+    // execution as containment expiry.
+    run_case_with_outer_bound(
+        bytes,
+        Duration::from_secs(20),
+        long_fuel(),
+        false,
+        SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started),
+        Duration::from_secs(30),
+    );
 }
 
 #[test]
@@ -203,6 +249,40 @@ fn real_worker_classifies_normal_and_trap() {
 }
 
 #[test]
+#[ignore = "requires the artifact built by scripts/build-threaded-smoke"]
+fn cargo_built_threaded_guest_commits_parent_owned_output() {
+    let artifact =
+        std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM").expect("threaded artifact");
+    let compiler = compiler(Duration::from_secs(20), long_fuel());
+    let sketch = admit(&compiler, std::fs::read(artifact).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("output.png");
+    std::fs::write(&destination, b"original").unwrap();
+    let config = worker_config()
+        .with_output_destination(destination.clone())
+        .unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let terminal = async_engine::timeout(
+            Duration::from_secs(30),
+            sketch.execute_threaded_root_contained(runtime.handle(), &config),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::Completed(ThreadedRootOutcome::Started)
+        );
+        assert_clean(&compiler, &sketch).await;
+    });
+    assert_eq!(std::fs::read(&destination).unwrap(), b"guest exact output");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+}
+
+#[test]
 fn real_worker_classifies_fuel_cancellation_and_deadline() {
     run_case(
         threaded_fixture::looping_root_wasm(),
@@ -225,6 +305,89 @@ fn real_worker_classifies_fuel_cancellation_and_deadline() {
         false,
         SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded),
     );
+}
+
+#[cfg(feature = "wasm-sketch-worker-test-support")]
+#[test]
+#[ignore = "requires the real threaded artifact and test-support worker"]
+fn cargo_built_threaded_guest_forced_output_cleanup() {
+    let artifact =
+        std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM").expect("threaded artifact");
+    let compiler = compiler(Duration::from_secs(30), long_fuel());
+    let sketch = admit(&compiler, std::fs::read(artifact).unwrap());
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("output.png");
+    std::fs::write(&destination, b"original").unwrap();
+    let config = worker_config()
+        .with_output_destination(destination.clone())
+        .unwrap();
+    let runtime = RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.run(async {
+        let source = CancellationSource::new();
+        let task = runtime.handle().launch({
+            let sketch = Arc::clone(&sketch);
+            let token = source.token();
+            let handle = runtime.handle();
+            async move {
+                sketch
+                    .execute_threaded_root_contained_cancellable(handle, &config, token)
+                    .await
+            }
+        });
+        let staging = async_engine::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(path) = std::fs::read_dir(directory.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| path.is_dir())
+                {
+                    break path;
+                }
+                async_engine::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("parent staging was created");
+        std::fs::write(staging.join(".proof-pause-output"), b"armed").unwrap();
+        async_engine::timeout(Duration::from_secs(20), async {
+            while !staging.join(".proof-output-paused").is_file() {
+                async_engine::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("worker reached an actual partial file write");
+        assert!(
+            std::fs::read_dir(&staging)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    !entry.file_name().to_string_lossy().starts_with(".proof-")
+                        && std::fs::read(entry.path())
+                            .is_ok_and(|bytes| bytes == b"guest exact output")
+                }),
+            "the worker must hold a nonempty partial output before cancellation"
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        source.cancel();
+        let terminal = async_engine::timeout(Duration::from_secs(10), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal,
+            SketchWorkerTerminal::ForcedContainment {
+                trigger: SketchWorkerStopReason::Cancelled
+            }
+        );
+        assert_clean(&compiler, &sketch).await;
+        assert!(!staging.exists());
+    });
+    assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
 }
 
 #[test]
@@ -283,25 +446,25 @@ fn real_worker_sequential_stress_leaves_no_parent_state() {
 mod failure_proof {
     use super::*;
     use std::fs;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use std::process::Command;
     use std::time::Instant;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     const MARKER: &str = "KERNAL_API_WASM_WORKER_IDENTITY_MARKER";
     const RESULT: &str = "KERNAL_API_WASM_WORKER_FAILURE_RESULT";
     const RELEASE: &str = "KERNAL_API_WASM_WORKER_FAILURE_RELEASE";
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     struct Artifacts {
         root: std::path::PathBuf,
         marker: std::path::PathBuf,
         result: std::path::PathBuf,
         release: std::path::PathBuf,
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     impl Artifacts {
         fn new() -> Self {
             let unique = format!(
@@ -322,21 +485,21 @@ mod failure_proof {
             }
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     impl Drop for Artifacts {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[derive(Clone, Copy)]
     struct Identity {
         pid: u32,
         a: u64,
         b: u64,
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn decode_marker(path: &std::path::Path) -> Option<Identity> {
         let text = fs::read_to_string(path).ok()?;
         let mut lines = text.lines();
@@ -349,7 +512,7 @@ mod failure_proof {
         };
         lines.next().is_none().then_some(value)
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn wait_for_marker(path: &std::path::Path) -> Identity {
         let deadline = Instant::now() + OUTER_BOUND;
         while Instant::now() < deadline {
@@ -362,9 +525,9 @@ mod failure_proof {
         }
         panic!("worker identity marker was not published")
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     struct InnerChild(Option<std::process::Child>);
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     impl InnerChild {
         fn wait_success(&mut self) {
             let deadline = Instant::now() + OUTER_BOUND;
@@ -380,7 +543,7 @@ mod failure_proof {
             self.0 = None;
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     impl Drop for InnerChild {
         fn drop(&mut self) {
             let Some(child) = self.0.as_mut() else {
@@ -396,7 +559,7 @@ mod failure_proof {
             }
         }
     }
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     fn launch(inner: &str, files: &Artifacts) -> InnerChild {
         let worker = worker_executable();
         assert!(worker.is_absolute(), "real worker path must be absolute");
@@ -423,8 +586,8 @@ mod failure_proof {
             .enable_all()
             .build()
             .expect("runtime");
-        let actual =
-            runtime.run(async { contained(&sketch, runtime.handle(), &config, None).await });
+        let actual = runtime
+            .run(async { contained(&sketch, runtime.handle(), &config, None, OUTER_BOUND).await });
         fs::write(std::env::var_os(RESULT).expect("result"), actual.code()).expect("result");
         runtime.run(async { assert_clean(&compiler, &sketch).await });
     }
@@ -769,7 +932,150 @@ mod failure_proof {
         process.wait_gone();
     }
     #[cfg(target_os = "macos")]
+    fn macos_identity(pid: u32) -> std::io::Result<Option<Identity>> {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let expected = i32::try_from(std::mem::size_of_val(&info)).expect("proc_bsdinfo size");
+        // `proc_pidinfo` copies into the fully initialized stack allocation
+        // above and returns the number of copied bytes. Its start timestamp is
+        // stable for a process lifetime, so it prevents a reused PID from
+        // satisfying this external containment proof.
+        let copied = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                expected,
+            )
+        };
+        if copied == expected {
+            return Ok(Some(Identity {
+                pid,
+                a: info.pbi_start_tvsec,
+                b: info.pbi_start_tvusec,
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if copied == 0 && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("proc_pidinfo copied {copied} of {expected} bytes: {error}"),
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    struct MacosWorkerExitWatch {
+        descriptor: i32,
+        identity: Identity,
+    }
+    #[cfg(target_os = "macos")]
+    impl MacosWorkerExitWatch {
+        fn register(identity: Identity) -> Self {
+            let descriptor = unsafe { libc::kqueue() };
+            assert!(
+                descriptor >= 0,
+                "kqueue: {}",
+                std::io::Error::last_os_error()
+            );
+            // Establish RAII ownership before any later fallible registration
+            // or identity check can unwind.
+            let watch = Self {
+                descriptor,
+                identity,
+            };
+            let change = libc::kevent {
+                ident: identity.pid as libc::uintptr_t,
+                filter: libc::EVFILT_PROC,
+                flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
+                fflags: libc::NOTE_EXIT,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            // kqueue retains this process-event registration, allowing the
+            // subsequent wait to observe this lifecycle rather than a later
+            // process that reuses the same numeric PID.
+            assert_eq!(
+                unsafe {
+                    libc::kevent(
+                        watch.descriptor,
+                        &change,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    )
+                },
+                0,
+                "kqueue registration: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(
+                matches!(
+                    macos_identity(identity.pid).expect("proc_pidinfo after kqueue registration"),
+                    Some(now) if now.a == identity.a && now.b == identity.b
+                ),
+                "worker exited or PID was reused before the parent-death action"
+            );
+            watch
+        }
+        fn wait_gone(&mut self) {
+            let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+            let timeout = libc::timespec {
+                tv_sec: OUTER_BOUND.as_secs() as libc::time_t,
+                tv_nsec: OUTER_BOUND.subsec_nanos() as libc::c_long,
+            };
+            assert_eq!(
+                unsafe {
+                    libc::kevent(
+                        self.descriptor,
+                        std::ptr::null(),
+                        0,
+                        &mut event,
+                        1,
+                        &timeout,
+                    )
+                },
+                1,
+                "exact worker survived bound: {}",
+                std::io::Error::last_os_error()
+            );
+            // Darwin declares `kevent` packed. Copy each returned field with
+            // unaligned reads before asserting on the registered lifecycle.
+            let event_ident = unsafe { std::ptr::addr_of!(event.ident).read_unaligned() };
+            let event_filter = unsafe { std::ptr::addr_of!(event.filter).read_unaligned() };
+            let event_flags = unsafe { std::ptr::addr_of!(event.fflags).read_unaligned() };
+            assert_eq!(event_ident, self.identity.pid as libc::uintptr_t);
+            assert_eq!(event_filter, libc::EVFILT_PROC);
+            assert_ne!(event_flags & libc::NOTE_EXIT, 0);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    impl Drop for MacosWorkerExitWatch {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::close(self.descriptor) };
+        }
+    }
+    #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "macOS owner-death evidence requires a native supervisor trace"]
-    fn d4_macos_native_evidence() {}
+    fn d4_parent_death_kills_exact_worker() {
+        let files = Artifacts::new();
+        let mut inner = launch(
+            "failure_proof::d4_inner_parent_death_exact_identity",
+            &files,
+        );
+        let identity = wait_for_marker(&files.marker);
+        assert!(
+            matches!(
+                macos_identity(identity.pid).expect("proc_pidinfo before kqueue registration"),
+                Some(now) if now.a == identity.a && now.b == identity.b
+            ),
+            "worker exited or PID was reused before kqueue registration"
+        );
+        let mut worker = MacosWorkerExitWatch::register(identity);
+        fs::write(&files.release, "go").expect("release");
+        inner.wait_success();
+        worker.wait_gone();
+    }
 }

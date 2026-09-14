@@ -1,5 +1,13 @@
 //! Windows implementation root for the process capability.
 
+#[cfg(feature = "wasm-sketch-worker")]
+#[path = "platform_win/scratch_directory.rs"]
+pub(crate) mod scratch_directory;
+
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_win/viewport_capture.rs"]
+pub(crate) mod viewport_capture;
+
 #[path = "platform_win/autostart.rs"]
 pub(crate) mod autostart;
 
@@ -16,8 +24,7 @@ pub use resources::{
 };
 
 pub use autostart::{
-    register as autostart_register,
-    render_registration as autostart_render_registration,
+    register as autostart_register, render_registration as autostart_render_registration,
     unregister as autostart_unregister,
 };
 
@@ -47,6 +54,7 @@ pub use process_owner_death::{
 
 #[path = "platform_win/host.rs"]
 pub(crate) mod host;
+pub use host::login_environment_block as host_login_environment_block;
 pub use host::{
     boot_id as host_boot_id, current_process_privilege as host_current_process_privilege,
     current_user as host_current_user,
@@ -57,28 +65,25 @@ pub use host::{
     namespace_id as host_namespace_id, user_machine_identity as host_user_machine_identity,
     PrivilegedIdentity as HostPrivilegedIdentity,
 };
-pub use host::login_environment_block as host_login_environment_block;
 
 #[cfg(feature = "fs")]
 #[path = "platform_win/fs.rs"]
 pub(crate) mod fs;
 #[cfg(feature = "fs")]
 pub use fs::{
-    create_private_file as fs_create_private_file,
-    decode_path_bytes as fs_decode_path_bytes,
-    replace_file as fs_replace_file, sync_directory as fs_sync_directory,
-    user_config_dir as fs_user_config_dir,
-    user_data_dir as fs_user_data_dir, encode_path_bytes as fs_encode_path_bytes,
-    file_identity as fs_file_identity, is_lock_conflict as fs_is_lock_conflict,
-    lock_exclusive as fs_lock_exclusive, lock_shared as fs_lock_shared,
-    open_lock_file as fs_open_lock_file, path_identity as fs_path_identity,
-    set_file_mtime as fs_set_file_mtime,
-    try_lock_exclusive as fs_try_lock_exclusive, try_lock_shared as fs_try_lock_shared,
-    unlock as fs_unlock,
-    user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
-    user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
+    create_private_file as fs_create_private_file, decode_path_bytes as fs_decode_path_bytes,
+    encode_path_bytes as fs_encode_path_bytes, file_identity as fs_file_identity,
+    is_lock_conflict as fs_is_lock_conflict, lock_exclusive as fs_lock_exclusive,
+    lock_shared as fs_lock_shared, open_lock_file as fs_open_lock_file,
+    path_identity as fs_path_identity,
     read_context_regular_file_bounded as fs_read_context_regular_file_bounded,
     read_private_regular_file_bounded as fs_read_private_regular_file_bounded,
+    replace_file as fs_replace_file, set_file_mtime as fs_set_file_mtime,
+    sync_directory as fs_sync_directory, try_lock_exclusive as fs_try_lock_exclusive,
+    try_lock_shared as fs_try_lock_shared, unlock as fs_unlock,
+    user_config_dir as fs_user_config_dir, user_data_dir as fs_user_data_dir,
+    user_run_data_root as fs_user_run_data_root, user_runtime_dir as fs_user_runtime_dir,
+    user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };
 
 #[cfg(feature = "fs-watch")]
@@ -105,10 +110,10 @@ pub(crate) mod ipc;
 mod ipc_private_dir;
 #[cfg(feature = "ipc")]
 pub use ipc::{
-    current_user_id as ipc_current_user_id, Endpoint as IpcEndpoint,
+    current_user_id as ipc_current_user_id,
     endpoint_is_filesystem_backed as ipc_endpoint_is_filesystem_backed,
     nonblocking_zero_read_is_pending as ipc_nonblocking_zero_read_is_pending,
-    select_endpoint_address as ipc_select_endpoint_address,
+    select_endpoint_address as ipc_select_endpoint_address, Endpoint as IpcEndpoint,
     InheritedListener as IpcInheritedListener, Listener as IpcListener,
     ListenerNonblockingMode as IpcListenerNonblockingMode, PeerIdentity as IpcPeerIdentity,
     PeerIdentitySource as IpcPeerIdentitySource, Stream as IpcStream,
@@ -344,26 +349,61 @@ use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_E
 use crate::SpawnSpec;
 
 #[derive(Default)]
-pub struct CaptureCancellation { handles: Mutex<CaptureHandles> }
+pub struct CaptureCancellation {
+    handles: Mutex<CaptureHandles>,
+}
 #[derive(Default)]
-struct CaptureHandles { stdout: Option<usize>, stderr: Option<usize> }
-pub fn prepare_capture_reader<R>(reader: R, cancellation: &CaptureCancellation, stream: crate::platform::process::CaptureStream) -> io::Result<Box<dyn Read + Send>>
-where R: Read + AsRawHandle + Send + 'static {
-    let mut handles = cancellation.handles.lock().expect("capture pipe handles mutex poisoned");
-    match stream { crate::platform::process::CaptureStream::Stdout => handles.stdout = Some(reader.as_raw_handle() as usize), crate::platform::process::CaptureStream::Stderr => handles.stderr = Some(reader.as_raw_handle() as usize) }
+struct CaptureHandles {
+    stdout: Option<usize>,
+    stderr: Option<usize>,
+}
+pub fn prepare_capture_reader<R>(
+    reader: R,
+    cancellation: &CaptureCancellation,
+    stream: crate::platform::process::CaptureStream,
+) -> io::Result<Box<dyn Read + Send>>
+where
+    R: Read + AsRawHandle + Send + 'static,
+{
+    let mut handles = cancellation
+        .handles
+        .lock()
+        .expect("capture pipe handles mutex poisoned");
+    match stream {
+        crate::platform::process::CaptureStream::Stdout => {
+            handles.stdout = Some(reader.as_raw_handle() as usize)
+        }
+        crate::platform::process::CaptureStream::Stderr => {
+            handles.stderr = Some(reader.as_raw_handle() as usize)
+        }
+    }
     Ok(Box::new(reader))
 }
-pub fn capture_reader_done(cancellation: &CaptureCancellation, stream: crate::platform::process::CaptureStream) {
-    let mut handles = cancellation.handles.lock().expect("capture pipe handles mutex poisoned");
-    match stream { crate::platform::process::CaptureStream::Stdout => handles.stdout = None, crate::platform::process::CaptureStream::Stderr => handles.stderr = None }
+pub fn capture_reader_done(
+    cancellation: &CaptureCancellation,
+    stream: crate::platform::process::CaptureStream,
+) {
+    let mut handles = cancellation
+        .handles
+        .lock()
+        .expect("capture pipe handles mutex poisoned");
+    match stream {
+        crate::platform::process::CaptureStream::Stdout => handles.stdout = None,
+        crate::platform::process::CaptureStream::Stderr => handles.stderr = None,
+    }
 }
 pub fn cancel_capture_reader(cancellation: &CaptureCancellation) {
     use winapi::shared::ntdef::HANDLE;
     use winapi::um::ioapiset::CancelIoEx;
-    let handles = cancellation.handles.lock().expect("capture pipe handles mutex poisoned");
+    let handles = cancellation
+        .handles
+        .lock()
+        .expect("capture pipe handles mutex poisoned");
     for handle in [handles.stdout, handles.stderr].into_iter().flatten() {
         // SAFETY: the slot remains populated until its reader completion callback runs.
-        unsafe { CancelIoEx(handle as HANDLE, std::ptr::null_mut()); }
+        unsafe {
+            CancelIoEx(handle as HANDLE, std::ptr::null_mut());
+        }
     }
 }
 
@@ -381,7 +421,12 @@ pub(crate) fn kill_tree_identity(
     identity: crate::platform::process::ProcessIdentity,
     timeout: std::time::Duration,
 ) -> Result<u32, crate::platform::process::ProcessIdentityActionError> {
-    process_tree::kill_tree(identity, timeout, capture_process_identity, force_kill_identity)
+    process_tree::kill_tree(
+        identity,
+        timeout,
+        capture_process_identity,
+        force_kill_identity,
+    )
 }
 
 pub fn exit_code(status: std::process::ExitStatus) -> i32 {
@@ -405,10 +450,18 @@ pub fn configure_process_command(
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     let caller = config.creation_flags.unwrap_or(0);
-    let group = if config.create_process_group { CREATE_NEW_PROCESS_GROUP } else { 0 };
+    let group = if config.create_process_group {
+        CREATE_NEW_PROCESS_GROUP
+    } else {
+        0
+    };
     let caller_has_console_opinion =
         caller & (CREATE_NO_WINDOW | CREATE_NEW_CONSOLE | DETACHED_PROCESS) != 0;
-    let no_window = if caller_has_console_opinion || parent_has_console() { 0 } else { CREATE_NO_WINDOW };
+    let no_window = if caller_has_console_opinion || parent_has_console() {
+        0
+    } else {
+        CREATE_NO_WINDOW
+    };
     let priority = match config.nice {
         Some(value) if value >= 15 => 0x0000_0040,
         Some(value) if value >= 1 => 0x0000_4000,
@@ -442,20 +495,31 @@ pub fn soft_terminate_process_group(pid: u32) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::ProcessIdentityCapture {
+pub(crate) fn capture_process_identity(
+    pid: u32,
+) -> crate::platform::process::ProcessIdentityCapture {
     use crate::platform::process::{ProcessIdentityCapture as Capture, ProcessIdentityUnavailable};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
-    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     if pid == 0 {
-        return Capture::Error(io::Error::new(io::ErrorKind::InvalidInput, "PID zero has no process identity"));
+        return Capture::Error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "PID zero has no process identity",
+        ));
     }
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     if handle.is_null() {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Capture::Exited,
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied),
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => {
+                Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied)
+            }
             _ => Capture::Error(error),
         };
     }
@@ -469,7 +533,10 @@ pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::Pr
     match error {
         None => Capture::Found(crate::platform::process::ProcessIdentity::from_native(
             pid,
-            [(u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime), 0],
+            [
+                (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+                0,
+            ],
         )),
         Some(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
             Capture::Unavailable(ProcessIdentityUnavailable::PermissionDenied)
@@ -480,20 +547,38 @@ pub(crate) fn capture_process_identity(pid: u32) -> crate::platform::process::Pr
 
 pub(crate) fn force_kill_identity(
     identity: crate::platform::process::ProcessIdentity,
-) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
-    use crate::platform::process::{ProcessIdentityAction as Action, ProcessIdentityActionError as Error};
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME};
-    use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+) -> Result<
+    crate::platform::process::ProcessIdentityAction,
+    crate::platform::process::ProcessIdentityActionError,
+> {
+    use crate::platform::process::{
+        ProcessIdentityAction as Action, ProcessIdentityActionError as Error,
+    };
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_TERMINATE,
+    };
 
     // Query and terminate through the same owned handle. Windows keeps the
     // process object (and therefore its PID generation) pinned while it is
     // open, so no PID can be recycled between revalidation and termination.
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, 0, identity.pid()) };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            0,
+            identity.pid(),
+        )
+    };
     if handle.is_null() {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
             Some(code) if code == ERROR_INVALID_PARAMETER as i32 => Ok(Action::AlreadyExited),
-            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Err(Error::Unavailable(crate::platform::process::ProcessIdentityUnavailable::PermissionDenied)),
+            Some(code) if code == ERROR_ACCESS_DENIED as i32 => Err(Error::Unavailable(
+                crate::platform::process::ProcessIdentityUnavailable::PermissionDenied,
+            )),
             _ => Err(Error::Host(error)),
         };
     }
@@ -501,8 +586,12 @@ pub(crate) fn force_kill_identity(
     let mut exit: FILETIME = unsafe { std::mem::zeroed() };
     let mut kernel: FILETIME = unsafe { std::mem::zeroed() };
     let mut user: FILETIME = unsafe { std::mem::zeroed() };
-    let queried = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
-    let key = [(u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime), 0];
+    let queried =
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    let key = [
+        (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime),
+        0,
+    ];
     if queried == 0 {
         let error = io::Error::last_os_error();
         unsafe { CloseHandle(handle) };
@@ -520,10 +609,15 @@ pub(crate) fn force_kill_identity(
 
 pub(crate) fn signal_terminate_identity(
     _identity: crate::platform::process::ProcessIdentity,
-) -> Result<crate::platform::process::ProcessIdentityAction, crate::platform::process::ProcessIdentityActionError> {
-    Err(crate::platform::process::ProcessIdentityActionError::Unavailable(
-        crate::platform::process::ProcessIdentityUnavailable::Unsupported,
-    ))
+) -> Result<
+    crate::platform::process::ProcessIdentityAction,
+    crate::platform::process::ProcessIdentityActionError,
+> {
+    Err(
+        crate::platform::process::ProcessIdentityActionError::Unavailable(
+            crate::platform::process::ProcessIdentityUnavailable::Unsupported,
+        ),
+    )
 }
 
 /// Windows compatibility stub for the Unix post-fork descriptor hook.
@@ -533,9 +627,13 @@ pub(crate) fn signal_terminate_identity(
 /// layer's post-fork/pre-exec boundary, even though it is a no-op on Windows.
 pub unsafe fn unix_mark_extra_fds_close_on_exec() {}
 
-pub fn configure_sync_daemon_command(_command: &mut std::process::Command) -> io::Result<()> { Ok(()) }
+pub fn configure_sync_daemon_command(_command: &mut std::process::Command) -> io::Result<()> {
+    Ok(())
+}
 
-pub fn configure_sync_contained_command(_command: &mut std::process::Command) -> io::Result<()> { Ok(()) }
+pub fn configure_sync_contained_command(_command: &mut std::process::Command) -> io::Result<()> {
+    Ok(())
+}
 
 pub fn parent_has_console() -> bool {
     unsafe { windows_sys::Win32::System::Console::GetConsoleCP() != 0 }
@@ -545,8 +643,13 @@ pub fn sync_child_native_handle(child: &std::process::Child) -> usize {
     use std::os::windows::io::AsRawHandle;
     child.as_raw_handle() as usize
 }
-pub fn observer_backend(scope: crate::platform::process::ObserverScope, category: crate::platform::process::ObserverCategory) -> crate::platform::process::ObserverBackend {
-    use crate::platform::process::{ObserverBackend as B, ObserverCategory as C, ObserverScope as S, ObserverSupport as P};
+pub fn observer_backend(
+    scope: crate::platform::process::ObserverScope,
+    category: crate::platform::process::ObserverCategory,
+) -> crate::platform::process::ObserverBackend {
+    use crate::platform::process::{
+        ObserverBackend as B, ObserverCategory as C, ObserverScope as S, ObserverSupport as P,
+    };
     match (scope, category) {
         (S::SystemWide, C::File) | (S::SystemWide, C::Network) | (S::SystemWide, C::Process) => B { support:P::Unavailable, backend:"etw", reason:"Phase 3: Windows ETW backend not yet implemented" },
         (S::LaunchedProcessTree, C::File) => B { support:P::Partial, backend:"nt-handle-snapshot", reason:"Windows NtQuerySystemInformation + DuplicateHandle + NtQueryObject snapshot via read_process_file_handles: NT type-File handles named in the NT object namespace (\\Device\\HarddiskVolumeN\\..), never DOS paths, and PROCESS_DUP_HANDLE on the target is required (#539 slice 4; no streaming file events)" },
@@ -555,23 +658,46 @@ pub fn observer_backend(scope: crate::platform::process::ObserverScope, category
     }
 }
 
-pub fn unix_set_priority(_pid: u32, _nice: i32) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix priority is unavailable on Windows")) }
-pub fn unix_signal_process(_pid: u32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
-pub fn unix_signal_process_group(_pid: i32, _signal: crate::platform::process::UnixSignalKind) -> io::Result<()> { Err(io::Error::new(io::ErrorKind::Unsupported, "Unix signals are unavailable on Windows")) }
-pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 { 0 }
-
+pub fn unix_set_priority(_pid: u32, _nice: i32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix priority is unavailable on Windows",
+    ))
+}
+pub fn unix_signal_process(
+    _pid: u32,
+    _signal: crate::platform::process::UnixSignalKind,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix signals are unavailable on Windows",
+    ))
+}
+pub fn unix_signal_process_group(
+    _pid: i32,
+    _signal: crate::platform::process::UnixSignalKind,
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix signals are unavailable on Windows",
+    ))
+}
+pub fn unix_signal_raw(_signal: crate::platform::process::UnixSignalKind) -> i32 {
+    0
+}
 
 pub(crate) fn shell_spec(command: &OsStr) -> SpawnSpec {
     SpawnSpec::new("cmd.exe").arg("/C").arg(command)
 }
 #[path = "platform_win/sync_spawn.rs"]
 mod sync_spawn;
-pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
-#[allow(unused_imports)] // strict-worker containment is consumed by the next worker-process phase.
+#[allow(unused_imports)]
+// strict-worker containment is consumed by the next worker-process phase.
 pub(crate) use sync_spawn::{
-    spawn_contained_worker, spawn_strict_contained_worker, StrictWorkerChild, StrictWorkerLimits, StrictWorkerSpawnError,
-    StrictWorkerSpawnStage,
+    spawn_contained_worker, spawn_strict_contained_worker, StrictWorkerChild, StrictWorkerLimits,
+    StrictWorkerSpawnError, StrictWorkerSpawnStage,
 };
+pub use sync_spawn::{spawn_sync, spawn_sync_daemon};
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -610,7 +736,9 @@ mod tests {
                 OsStr::new("\"")
             ]
         );
-        let output = command.output().expect("compat shell command should execute");
+        let output = command
+            .output()
+            .expect("compat shell command should execute");
         assert!(output.status.success());
         assert_eq!(output.stdout, b"shell-ok\r\n");
     }
@@ -651,13 +779,14 @@ mod endpoint_naming_tests {
         // broker, and the stability tests upstream would not notice.
         use super::ipc_endpoint_scope_bytes;
 
-        let mixed = ipc_endpoint_scope_bytes(std::path::Path::new(r"C:\Program Files\App\Broker.exe"));
+        let mixed =
+            ipc_endpoint_scope_bytes(std::path::Path::new(r"C:\Program Files\App\Broker.exe"));
         assert_eq!(mixed, b"c:/program files/app/broker.exe".to_vec());
 
-        let other = ipc_endpoint_scope_bytes(std::path::Path::new("c:/PROGRAM FILES/app/BROKER.exe"));
+        let other =
+            ipc_endpoint_scope_bytes(std::path::Path::new("c:/PROGRAM FILES/app/BROKER.exe"));
         assert_eq!(mixed, other);
     }
-
 }
 
 /// Replace this process's image with `command`.
@@ -677,5 +806,14 @@ pub fn process_replace_current_image(_command: &mut std::process::Command) -> st
 pub const fn process_can_replace_current_image() -> bool {
     false
 }
+#[cfg(all(feature = "tauri-webview", feature = "wasm-sketch-worker"))]
+pub(crate) fn configure_native_worker_environment(command: &mut std::process::Command) {
+    for key in ["SystemRoot", "WINDIR", "TEMP", "TMP", "LOCALAPPDATA"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+}
+
 #[path = "platform_win/interrupt.rs"]
 pub(crate) mod interrupt;

@@ -448,6 +448,70 @@ fn zip_extracts_nested_files_and_creates_destination() {
 }
 
 #[test]
+fn archive_entry_limit_is_independent_of_total_output() {
+    let mut tar = tar::Builder::new(Vec::new());
+    for name in ["first", "second"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(5);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, name, &b"12345"[..]).unwrap();
+    }
+    let tar = tar.into_inner().unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gzip.write_all(&tar).unwrap();
+    let fixtures = [
+        (
+            ArchiveFormat::Zip,
+            zip_fixture(&[("first", b"12345"), ("second", b"12345")]),
+        ),
+        (ArchiveFormat::TarGzip, gzip.finish().unwrap()),
+        (
+            ArchiveFormat::TarZstd,
+            zstd::stream::encode_all(&tar[..], 1).unwrap(),
+        ),
+    ];
+    for (format, bytes) in fixtures {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("archive");
+        std::fs::write(&input, bytes).unwrap();
+        let rejected = dir.path().join("rejected");
+        let limits = ExtractionLimits {
+            max_entry_bytes: 4,
+            max_output_bytes: 10,
+            ..ExtractionLimits::default()
+        };
+        let error = extract(&input, &rejected, format, limits).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(!rejected.join("first").exists());
+        if !matches!(format, ArchiveFormat::Zip) {
+            // Selecting a later member must not bypass validation of an
+            // oversized member that the tar backend would otherwise skip.
+            let selected = dir.path().join("selected");
+            let error =
+                kernal_api::archive::extract_member(&input, "second", &selected, format, limits)
+                    .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert!(!selected.exists());
+        }
+        let accepted = dir.path().join("accepted");
+        extract(
+            &input,
+            &accepted,
+            format,
+            ExtractionLimits {
+                max_entry_bytes: 5,
+                ..limits
+            },
+        )
+        .unwrap();
+        for name in ["first", "second"] {
+            assert_eq!(std::fs::read(accepted.join(name)).unwrap(), b"12345");
+        }
+    }
+}
+
+#[test]
 fn zip_rejects_traversal_and_resource_overflow() {
     for path in ["../escape", "/absolute", "C:/drive", "sub\\escape"] {
         let dir = tempfile::tempdir().unwrap();

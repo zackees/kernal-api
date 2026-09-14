@@ -126,7 +126,10 @@ fn publish_report_to_host() {
 fn complete_operation(
     operation: kernal_api_v1_bindings::OperationFuture,
 ) -> Result<u64, kernal_api_v1_bindings::OperationError> {
-    assert!(operation.poll()?.is_none(), "synthetic operation begins pending");
+    assert!(
+        operation.poll()?.is_none(),
+        "synthetic operation begins pending"
+    );
     operation.yield_now()?;
     Ok(operation
         .poll()?
@@ -136,13 +139,126 @@ fn complete_operation(
 /// Explicit result marker for public artifact inspection.
 #[export_name = "kernal-api-run"]
 pub extern "C" fn kernal_api_run() -> u32 {
+    // A generated kernel operation is the only clock boundary. No WASI
+    // clock import or guest runtime is needed to suspend this real module.
+    let clock = kernal_api_v1_bindings::clock_sleep(10).expect("submit kernel clock");
+    while clock.poll().expect("poll kernel clock").is_none() {
+        clock.yield_now().expect("suspend on kernel clock");
+    }
+    use kernal_api::guest::{self as guest, Blob, OperationError, OutputFile};
+    // Exceed the live-resource limit without explicit close. Blob Drop must
+    // revoke each host resource before the next create, not await teardown.
+    for _ in 0..128 {
+        drop(guest::run(Blob::create()).expect("dropped blob releases its quota"));
+    }
+    let blob = guest::run(Blob::create()).expect("public blob create");
+    // More than the host's 64 operation slots: Drop must reclaim each slot,
+    // not merely leave an uncollected Cancelled result until root teardown.
+    for _ in 0..128 {
+        drop(
+            blob.read_chunk(1)
+                .expect("abandoned read releases its slot"),
+        );
+    }
+    const CHUNK_BYTES: usize = 64 * 1024;
+    assert!(blob.read_chunk(0).is_err(), "zero-length read is rejected");
+    assert!(
+        blob.read_chunk(64 * 1024 + 1).is_err(),
+        "oversized read is rejected"
+    );
+    const CHUNKS: usize = 1024;
+    let mut sent = [0_u8; CHUNK_BYTES];
+    let mut received = [0_u8; CHUNK_BYTES];
+    // The default per-blob capacity is 1 MiB. Pause consumption and prove
+    // the seventeenth write cannot finish, even after a scheduler turn.
+    for _ in 0..16 {
+        assert!(blob.write_chunk(&sent).unwrap().poll().unwrap().is_some());
+    }
+    let mut blocked = blob.write_chunk(&sent).expect("capacity-awaited write");
+    assert!(blocked.poll().unwrap().is_none());
+    complete_operation(kernal_api_v1_bindings::synthetic_yield().unwrap()).unwrap();
+    assert!(
+        blocked.poll().unwrap().is_none(),
+        "producer must wait for consumption"
+    );
+    let mut first = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+    let mut cancelled_write = blob.write_chunk(&sent).unwrap();
+    assert!(cancelled_write.poll().unwrap().is_none());
+    cancelled_write.cancel();
+    assert_eq!(cancelled_write.poll(), Err(OperationError::Cancelled));
+    assert_eq!(first.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
+    assert!(
+        blocked.poll().unwrap().is_some(),
+        "bounded pull releases write capacity"
+    );
+    for _ in 0..16 {
+        let mut read = blob.read_chunk(CHUNK_BYTES as u32).unwrap();
+        assert_eq!(read.poll_into(&mut received).unwrap(), Some(CHUNK_BYTES));
+        assert_eq!(received, sent);
+    }
+    let mut cancelled_read = blob.read_chunk(1).unwrap();
+    assert!(cancelled_read
+        .poll_into(&mut received[..1])
+        .unwrap()
+        .is_none());
+    cancelled_read.cancel();
+    assert_eq!(
+        cancelled_read.poll_into(&mut received[..1]),
+        Err(OperationError::Cancelled)
+    );
+    for chunk in 0..CHUNKS {
+        for (index, byte) in sent.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_add(chunk as u8);
+        }
+        let mut write = blob.write_chunk(&sent).expect("submit bounded blob write");
+        if write.poll().expect("poll blob write").is_none() {
+            write.yield_now().expect("yield pending blob write");
+            assert!(write.poll().expect("poll completed blob write").is_some());
+        }
+        let mut read = blob
+            .read_chunk(CHUNK_BYTES as u32)
+            .expect("submit bounded blob read");
+        let count = loop {
+            if let Some(count) = read.poll_into(&mut received).expect("collect blob read") {
+                break count;
+            }
+            read.yield_now().expect("yield pending blob read");
+        };
+        assert_eq!(count, CHUNK_BYTES);
+        assert_eq!(received, sent);
+    }
+    let mut eof = blob.read_chunk(1).expect("submit EOF observation");
+    assert!(eof
+        .poll_into(&mut received[..1])
+        .expect("empty live blob")
+        .is_none());
+    guest::run(blob.seal()).expect("public seal");
+    assert_eq!(
+        eof.poll_into(&mut received[..1]).expect("sealed EOF"),
+        Some(0)
+    );
+    guest::run(blob.close()).expect("public blob close");
+    if let Some(output) = OutputFile::granted().expect("initial output grant") {
+        let image = guest::run(Blob::create()).unwrap();
+        let mut write = image.write_chunk(b"guest exact output").unwrap();
+        assert!(write.poll().unwrap().is_some());
+        assert_eq!(
+            guest::run(output.write_blob(&image)),
+            Err(OperationError::Rejected),
+            "unsealed output preflight must preserve both guest handles"
+        );
+        guest::run(image.seal()).unwrap();
+        guest::run(output.write_blob(&image)).expect("public exact output");
+    }
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));
     // Use an explicit deterministic hasher: the closed threaded P1 surface
     // intentionally owns no ambient `random_get` authority.
-    let map = Arc::new(DashMap::<u32, u32, BuildHasherDefault<DefaultHasher>>::with_hasher(
-        BuildHasherDefault::default(),
-    ));
+    let map = Arc::new(
+        DashMap::<u32, u32, BuildHasherDefault<DefaultHasher>>::with_hasher(
+            BuildHasherDefault::default(),
+        ),
+    );
     let (tx, rx) = mpsc::channel();
     let resource = kernal_api_v1_bindings::SyntheticResource::from_create_payload(
         complete_operation(
@@ -161,10 +277,13 @@ pub extern "C" fn kernal_api_run() -> u32 {
         workers.push(std::thread::spawn(move || {
             // Each native child crosses the kernel boundary too, proving the
             // supplied runtime handle is observed in every guest Store.
-            kernal_api_v1_bindings::imports::kernel_yield()
-                .expect("generated kernel yield ABI");
-            complete_operation(resource.use_().expect("submit generated shared resource use"))
-                .expect("generated shared resource use");
+            kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
+            complete_operation(
+                resource
+                    .use_()
+                    .expect("submit generated shared resource use"),
+            )
+            .expect("generated shared resource use");
             counter.fetch_add(1, Ordering::SeqCst);
             *totals.lock().expect("mutex") += 1;
             map.insert(key, 1_u32);
@@ -190,12 +309,8 @@ pub extern "C" fn kernal_api_run() -> u32 {
     complete_operation(resource.close().expect("submit generated resource close"))
         .expect("generated resource close");
     kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
-    let result = joined
-        + counter.load(Ordering::SeqCst)
-        + mutex_total
-        + channel_total
-        + map_sum
-        + tls_total;
+    let result =
+        joined + counter.load(Ordering::SeqCst) + mutex_total + channel_total + map_sum + tls_total;
     RESULT_RECORD.publish(
         joined,
         counter.load(Ordering::SeqCst),

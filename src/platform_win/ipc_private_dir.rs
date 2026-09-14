@@ -3,8 +3,10 @@ use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::Path;
-#[cfg(feature = "fs")]
-use std::{fs::File, os::windows::io::AsRawHandle as _};
+#[cfg(any(feature = "fs", feature = "ipc"))]
+use std::fs::File;
+#[cfg(any(feature = "fs", feature = "ipc"))]
+use std::os::windows::io::AsRawHandle as _;
 
 #[cfg(feature = "ipc")]
 use crate::platform::ipc::OwnerPrivateDirectoryOutcome;
@@ -22,6 +24,15 @@ fn private_dir_sddl() -> io::Result<String> {
         current_user_sid_sddl()?
     ))
 }
+
+/// Protected, non-inheriting current-user-and-SYSTEM DACL for a private regular
+/// file.
+///
+/// A file created below `PRIVATE_DIR_SDDL` normally inherits effective owner
+/// and SYSTEM ACEs. The private-file creator instead pins the current token
+/// user's concrete SID on its still-open handle after assigning that user as
+/// owner. An `OWNER RIGHTS` ACE is not equivalent here: its stored SID does
+/// not prove which principal owns a file when the reader validates it later.
 
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
@@ -48,6 +59,14 @@ pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDir
 pub fn owner_private_directory(path: &Path) -> io::Result<bool> {
     let actual = file_security_descriptor(path)?;
     if !actual.dacl_is_protected()? {
+        return Ok(false);
+    }
+    // `OW` follows the file owner's SID.  An elevated token may otherwise
+    // create a directory owned by the Administrators group, which would make
+    // every member of that group an Owner Rights principal.  A private
+    // directory is private to this token's user SID, not to its default-owner
+    // group.
+    if actual.owner_sid_bytes()? != current_user_sid_bytes()? {
         return Ok(false);
     }
     // Binary equality covers ACL revision, ACE flags/masks/SIDs/order and
@@ -164,9 +183,10 @@ fn exact_full_control_ace(dacl: &[u8], offset: usize, principal: &[u8]) -> Optio
 
 fn current_user_sid_bytes() -> io::Result<Vec<u8>> {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_USER};
+    use windows_sys::Win32::Security::{
+        GetLengthSid, GetTokenInformation, IsValidSid, TokenUser, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-    use windows_sys::Win32::Security::TOKEN_QUERY;
 
     let mut token = std::ptr::null_mut();
     // SAFETY: output pointer is valid; returned token is closed before return.
@@ -238,6 +258,165 @@ fn apply_protected_dacl_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     apply_dacl_sddl(path, sddl, PROTECTED_DACL_SECURITY_INFORMATION)
 }
 
+/// Open a directory for DACL inspection and update without demanding an owner
+/// change that ordinary owners are not entitled to make.
+///
+/// Windows grants an object owner `READ_CONTROL` and `WRITE_DAC` implicitly,
+/// but not `WRITE_OWNER`. Request only the former two rights on the normal
+/// path; ownership correction reopens with `WRITE_OWNER` below only when the
+/// live object actually needs it.
+#[cfg(feature = "ipc")]
+fn open_directory_for_dacl_update(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+    use winapi::um::winnt::{READ_CONTROL, WRITE_DAC};
+
+    std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// Reopen only after inspection showed that assigning TokenUser is necessary.
+/// Both mutating calls then target this one handle, so a pathname race cannot
+/// split the owner and DACL updates across different directories.
+#[cfg(feature = "ipc")]
+fn open_directory_for_owner_and_dacl_update(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winbase::FILE_FLAG_BACKUP_SEMANTICS;
+    use winapi::um::winnt::{READ_CONTROL, WRITE_DAC, WRITE_OWNER};
+
+    std::fs::OpenOptions::new()
+        .access_mode(READ_CONTROL | WRITE_DAC | WRITE_OWNER)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// Compare the owner of this live handle to the caller's TokenUser SID.
+///
+/// This deliberately requests no pathname metadata. The caller may use the
+/// answer to decide whether `WRITE_OWNER` is required, and it must recheck
+/// after opening the stronger handle before mutating a mismatched object.
+#[cfg(feature = "ipc")]
+fn opened_owner_is_current_user(file: &File) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: `file` owns a live handle with READ_CONTROL; every output
+    // pointer is a writable local. On success the descriptor is adopted below
+    // and freed by `LocalSecurityDescriptor` before this function returns.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if descriptor.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory security query returned a null descriptor",
+        ));
+    }
+    let _descriptor = LocalSecurityDescriptor(descriptor);
+    if owner.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory security descriptor has no owner",
+        ));
+    }
+    let current_sid = current_user_sid_bytes()?;
+    // SAFETY: `owner` is borrowed from `_descriptor`, which remains live, and
+    // `current_sid` is the valid SID copied from the live process token.
+    Ok(unsafe { EqualSid(owner, current_sid.as_ptr().cast_mut().cast()) } != 0)
+}
+
+/// Assign the current token user as an open file's owner without accepting
+/// its default owner SID (which can be an elevated local group).
+///
+/// This operates on the caller's handle, rather than reopening its pathname:
+/// the object whose owner changes is necessarily the one the caller created
+/// and still holds. The handle must have `WRITE_OWNER` access.
+#[cfg(any(feature = "fs", feature = "ipc"))]
+pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let current_sid = current_user_sid_bytes()?;
+    // SAFETY: `file` owns a live handle with WRITE_OWNER access, and the
+    // current-user SID was copied from a live process token. The API consumes
+    // neither buffer and changes the handle's object, never a path lookup.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            current_sid.as_ptr().cast_mut().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
+/// Bind the effective private-file DACL to an already-created file handle.
+///
+/// The caller must first assign TokenUser as owner on this same handle. This
+/// avoids a path reopen and binds the concrete user SID rather than an
+/// elevated token's default-owner group.
+#[cfg(feature = "fs")]
+pub(super) fn apply_current_user_private_file_dacl(file: &File) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let descriptor = LocalSecurityDescriptor::from_sddl(&format!(
+        "D:P(A;;FA;;;{})(A;;FA;;;SY)",
+        current_user_sid_sddl()?
+    ))?;
+    let dacl = descriptor.dacl()?;
+    // SAFETY: `file` is the still-open newly-created object, opened with
+    // WRITE_DAC by the caller. `dacl` borrows `descriptor`, which stays live
+    // through this synchronous call; no pathname is resolved.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl.as_ptr(),
+            std::ptr::null_mut(),
+        )
+    };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status as i32))
+    }
+}
+
 #[cfg(feature = "ipc")]
 fn apply_dacl_sddl(
     path: &Path,
@@ -245,23 +424,33 @@ fn apply_dacl_sddl(
     inheritance_control: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
 ) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-    use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
+    let file = open_directory_for_dacl_update(path)?;
+    let file = if opened_owner_is_current_user(&file)? {
+        file
+    } else {
+        drop(file);
+        let file = open_directory_for_owner_and_dacl_update(path)?;
+        // The first inspection intentionally carries no authority across this
+        // reopen. Recheck the stronger handle, then bind both mutating calls
+        // to exactly that live object.
+        if !opened_owner_is_current_user(&file)? {
+            apply_current_user_owner(&file)?;
+        }
+        file
+    };
     let descriptor = LocalSecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
-
-    let wide = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: `wide` is NUL-terminated; `dacl` borrows the live descriptor
-    // for this call; all unused owner/group/SACL pointers are null as the
-    // requested flags update only the DACL.
+    // SAFETY: `file` pins the object updated above and has WRITE_DAC access;
+    // `dacl` borrows the live descriptor for this call. All unused
+    // owner/group/SACL pointers are null. When ownership differed, TokenUser
+    // was assigned on this same handle first, so `OW` is a single-user
+    // principal even for an elevated token whose default owner is a group.
     let status = unsafe {
-        SetNamedSecurityInfoW(
-            wide.as_ptr(),
+        SetSecurityInfo(
+            file.as_raw_handle() as _,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION | inheritance_control,
             std::ptr::null_mut(),
@@ -280,7 +469,9 @@ fn apply_dacl_sddl(
 fn file_security_descriptor(path: &Path) -> io::Result<LocalSecurityDescriptor> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
-    use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
 
     let wide = path
         .as_os_str()
@@ -294,7 +485,7 @@ fn file_security_descriptor(path: &Path) -> io::Result<LocalSecurityDescriptor> 
         GetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
@@ -384,6 +575,35 @@ impl LocalSecurityDescriptor {
             descriptor: std::marker::PhantomData,
         })
     }
+
+    fn owner_sid_bytes(&self) -> io::Result<Vec<u8>> {
+        use windows_sys::Win32::Security::{
+            GetLengthSid, GetSecurityDescriptorOwner, IsValidSid, PSID,
+        };
+
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: `self.0` is a live descriptor; both output pointers are
+        // writable locals. The returned SID remains owned by the descriptor.
+        if unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if owner.is_null() || unsafe { IsValidSid(owner) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "security descriptor has no valid owner SID",
+            ));
+        }
+        let length = unsafe { GetLengthSid(owner) } as usize;
+        if length == 0 || length > 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "implausible security descriptor owner SID length",
+            ));
+        }
+        // SAFETY: the validated SID is borrowed from the live descriptor.
+        Ok(unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), length).to_vec() })
+    }
 }
 
 struct SecurityDescriptorDacl<'descriptor> {
@@ -453,6 +673,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dacl_update_handle_opens_and_reads_a_new_directory_owner() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        fs::create_dir(&directory).unwrap();
+
+        // Regression for GitHub-hosted Windows: an owner gets WRITE_DAC, not
+        // implicit WRITE_OWNER. DACL hardening must therefore inspect the
+        // ordinary handle before asking for an owner-changing handle. An
+        // elevated token may create the directory with a group default owner,
+        // so both owner answers are valid here; successful inspection is the
+        // invariant this path needs before conditionally escalating access.
+        let handle = open_directory_for_dacl_update(&directory).unwrap();
+        let _is_current_user_owner = opened_owner_is_current_user(&handle).unwrap();
+    }
+
+    #[test]
     fn ensure_private_dir_is_a_noop_for_an_already_private_populated_tree() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
@@ -512,22 +748,15 @@ mod tests {
         use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 
         let temporary = tempfile::tempdir().unwrap();
-        let parent = temporary.path().join("parent");
-        let directory = parent.join("private");
+        let directory = temporary.path().join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(
-            &parent,
-            &format!(
-                "D:P(A;;FA;;;{})(A;;FA;;;SY)",
-                current_user_sid_sddl().unwrap()
-            ),
-        )
-        .unwrap();
+        // Establish the production owner and DACL first. A raw test-created
+        // directory may retain an elevated token's default-owner group, which
+        // does not imply WRITE_DAC for TokenUser once its inherited DACL is
+        // replaced. This test is about the protected-DACL bit, not that
+        // unrelated elevated-owner edge case.
+        ensure_owner_private_directory(&directory).unwrap();
         let private_sddl = private_dir_sddl().unwrap();
-        apply_protected_dacl_sddl(&directory, &private_sddl).unwrap();
-        let protected = file_security_descriptor(&directory).unwrap();
-        let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
-
         apply_dacl_sddl(
             &directory,
             &private_sddl,
@@ -536,7 +765,9 @@ mod tests {
         .unwrap();
         let unprotected = file_security_descriptor(&directory).unwrap();
         assert!(!unprotected.dacl_is_protected().unwrap());
-        assert_eq!(unprotected.dacl().unwrap().bytes().unwrap(), protected_bytes);
+        // Clearing protection causes Windows to materialize inheritable ACEs
+        // from the parent, so the byte representation need not remain equal.
+        // The policy decision is the protection bit and its subsequent repair.
         assert!(!owner_private_directory(&directory).unwrap());
         assert_eq!(
             ensure_owner_private_directory(&directory).unwrap(),
@@ -599,12 +830,18 @@ mod tests {
 
     #[cfg(feature = "fs")]
     #[test]
-    fn inherited_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
+    fn created_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
         ensure_owner_private_directory(&directory).unwrap();
         let child = directory.join("marker");
-        fs::write(&child, b"marker").unwrap();
+        // An elevated token can default file ownership to Administrators.
+        // Exercise the production creator: it pins TokenUser ownership and
+        // applies the effective owner/SYSTEM policy on that same handle.
+        let mut child_file = crate::platform::fs::create_private_file(&child).unwrap();
+        use std::io::Write as _;
+        child_file.write_all(b"marker").unwrap();
+        drop(child_file);
 
         let read = crate::platform::fs::read_private_regular_file_bounded(&child, 6);
         assert!(

@@ -60,6 +60,10 @@ fn fixture(response: Vec<u8>) -> (u16, JoinHandle<bool>) {
             assert!(request.len() < 8192);
         }
         tls.write_all(&response).unwrap();
+        // Send TLS close-notify before dropping the stream. OpenSSL 3's client
+        // path can otherwise surface an EOF as a generic SSL error while
+        // reading this otherwise complete local response.
+        tls.shutdown().unwrap();
         true
     });
     (port, worker)

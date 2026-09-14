@@ -1,0 +1,14 @@
+package kernal:hash-experiment@0.1.0;
+
+interface hashes {
+    enum error { rejected, failed }
+    resource hasher {
+        update: func(bytes: list<u8>) -> result<_, error>;
+    }
+    create: func() -> result<hasher, error>;
+    finish: func(hash: own<hasher>) -> result<list<u8>, error>;
+}
+
+world hash-client {
+    import hashes;
+}

@@ -2,9 +2,14 @@
 
 This source-only experiment exercises the #13 public guest archive capability.
 The `guest-proof` binary now compiles with authentication, inventory, and
-entry-to-Blob streaming. It remains a synthetic policy fixture, not the full
-upstream extension2 application or final runtime acceptance. Do not replace
-its kernel calls with host-side orchestration or cite library tests as guest evidence.
+entry-to-Blob streaming. It also executes the upstream portable
+`tw-orange-preview-policy` preview-feed policy from extension2 revision
+`f3e739f758f5a2f99ed5af643f7660328ba2ab8a` before archive authority is
+consumed. The source-only guest package is `publish = false`; this exact pin
+is experiment evidence, not a released kernal-api dependency. It remains
+short of the full upstream extension2 application or final runtime acceptance.
+Do not replace its kernel calls with host-side orchestration or cite library
+tests as guest evidence.
 
 ```sh
 soldr cargo check --locked \
@@ -18,11 +23,12 @@ JSON header bytes, synthetic schema/algorithm/version/commit/key identity,
 96-bit nonce, duplicate names, strict relative paths, and count/size bounds.
 The fixture also caps each entry name at 4 KiB; host inventory records must
 enforce that bound before transferring or allocating a guest-visible name.
-It contains a manually adapted subset of decisions inspected in extension2's
-`tw-orange-preview-source/src/implementation.rs` at
-`f1e1173b3136a46d1ca778840a7b775411581096`. It does **not** execute the unchanged
-upstream policy crate. No private key was copied; the host fixture must use a
-synthetic key. The 32 MiB per-entry ceiling is a conservative fixture policy
+The envelope/inventory portion contains a manually adapted subset of decisions
+inspected in extension2's `tw-orange-preview-source/src/implementation.rs` at
+`f1e1173b3136a46d1ca778840a7b775411581096`; the preview-feed decision above
+does execute the upstream policy crate. No private key was copied;
+the host fixture must use a synthetic key. The 32 MiB per-entry ceiling is a
+conservative fixture policy
 borrowed from extension2's nested-XPI limit, not a claim that its outer preview
 decoder imposes that same ceiling.
 
@@ -35,7 +41,7 @@ soldr cargo clippy --locked \
   --target-dir target/extension2-guest-proof -- -D warnings
 ```
 
-Recorded on Linux x86-64: both policy tests pass (0.03 s), strict library
+Recorded on Linux x86-64: all three policy tests pass (0.03 s), strict library
 Clippy passes, and a `cargo check --lib` using the same Wasm target and lock
 passes (5.31 s). The original guest binary failed on the missing facade import
 with E0432; inventory and entry streaming now compile through the public facade.

@@ -223,8 +223,14 @@ absent. It now passes success, bad-tag, per-entry ceiling, entry-count ceiling,
 and escaping-path cases; no destination is created before authentication and
 the storage counter returns to zero in every case. The four native staging
 tests pass together in 0.56 seconds on Linux x86-64. This remains a synthetic
-native fixture: real extension2 envelope parsing/identity policy, guest ABI
-execution, asynchronous cancellation, and worker teardown are still required.
+native envelope fixture: guest ABI execution, asynchronous cancellation, and
+worker teardown are still required. The actual guest now additionally runs the
+upstream portable `tw-orange-preview-policy` feed identity policy from
+extension2 revision `f3e739f758f5a2f99ed5af643f7660328ba2ab8a` before consuming
+archive authority. That validates the official feed origin, one encrypted
+same-origin asset, commit/digest/key shapes, and required suites; it does not
+yet bind feed identity to the synthetic envelope or constitute full extension2
+acceptance.
 
 ## Owned authenticated entry reader
 

@@ -9,8 +9,8 @@ publish = false
 
 # This tool is deliberately outside the published package and is invoked only
 # by the explicit regeneration/check command.  The immutable revision is the
-# scalar Core-Wasm backend accepted for #36.
+# Core-Wasm backend and owned-resource lowering accepted for #36 and #13.
 [dependencies]
-fp-bindgen = { git = "https://github.com/zackees/fp-bindgen.git", rev = "4e44d9e5408653e3c428ee3f855cc194d53f60b0", default-features = false, features = ["wasmtime-core-wasm"] }
+fp-bindgen = { git = "https://github.com/zackees/fp-bindgen.git", rev = "df94a6988dac3ade189466adbaaa58be4524393e", default-features = false, features = ["wasmtime-core-wasm"] }
 toml = "=0.8.23"
 wasmparser = { version = "=0.248.0", default-features = false }

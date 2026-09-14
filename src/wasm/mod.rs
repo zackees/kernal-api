@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=8\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=9\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -2065,6 +2065,22 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         }
         let _ = controller.prelink.get();
         Ok(())
+    }
+
+    fn resource_release_blob(
+        &mut self,
+        blob: generated_v1::resources::Blob,
+    ) -> wasmtime::Result<i32> {
+        // Generated guest Drop reaches the same Store-scoped authority path
+        // used by explicit blob abandonment.  It validates kind, owner, and
+        // generation under OperationHub's single registry mutex.
+        Ok(match self
+            .operations
+            .abandon_blob_wire(self.store_owner, blob.0)
+        {
+            Ok(()) => 0,
+            Err(_) => 1,
+        })
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
@@ -4080,19 +4096,19 @@ mod threaded_root_observation_tests {
         let mut operation_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut operation_skew,
-            b"operation_protocol_revision=8\n",
-            b'9',
+            b"operation_protocol_revision=9\n",
+            b'8',
         );
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let mut previous_operations = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(
             &mut previous_operations,
-            b"operation_protocol_revision=8\n",
-            b'7',
+            b"operation_protocol_revision=9\n",
+            b'8',
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=8\n", "");
+            .replace("operation_protocol_revision=9\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -6141,9 +6157,9 @@ fn threaded_import_signature(
             results: generated_v1_contract::KERNEL_YIELD_RESULTS,
         },
         // These are the closed scalar lifecycle imports generated from the
-        // admitted v1 manifest.  Resource operations remain opcode variants
-        // of `operation_submit`; admission deliberately grants no additional
-        // resource or native-backend import surface.
+        // admitted v1 manifest. Blob transfer operations remain opcode
+        // variants of `operation_submit`; the generated owned Blob wrapper
+        // has one explicit release control, delegated to OperationHub.
         (ABI_MODULE, "operation_submit") => Signature {
             params: &[ValType::I32, ValType::I64, ValType::I64],
             results: &[ValType::I64],
@@ -6153,6 +6169,10 @@ fn threaded_import_signature(
             results: &[ValType::I64],
         },
         (ABI_MODULE, "operation_yield") | (ABI_MODULE, "operation_cancel") => Signature {
+            params: &[ValType::I64],
+            results: I32,
+        },
+        (ABI_MODULE, "resource_release_blob") => Signature {
             params: &[ValType::I64],
             results: I32,
         },

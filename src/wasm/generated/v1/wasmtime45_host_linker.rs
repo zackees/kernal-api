@@ -1,5 +1,17 @@
-// Generated private Wasmtime 45 glue for scalar Core Wasm ABI `kernal-api:v1`.
-// Host trait and invocation helpers use semantic Rust scalar types.
+// Generated private Wasmtime 45 glue for Core Wasm ABI `kernal-api:v1`.
+// Host trait and invocation helpers use semantic scalar and resource types.
+
+pub(crate) mod resources {
+    #[repr(transparent)]
+    #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+    pub(crate) struct Blob(pub(crate) u64);
+
+    impl Blob {
+        pub(crate) fn decode_i64(raw: i64) -> ::wasmtime::Result<Self> { ::std::result::Result::Ok(Self(raw as u64)) }
+        pub(crate) fn encode_i64(self) -> i64 { self.0 as i64 }
+    }
+
+ }
 
 fn i32_from_i32(value: i32) -> wasmtime::Result<i32> {
     Ok(value)
@@ -26,6 +38,8 @@ pub(crate) trait KernalApiV1Imports {
     fn operation_poll(&mut self, operation: u64) -> wasmtime::Result<u64>;
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64>;
     fn operation_yield(&mut self, operation: u64) -> wasmtime::Result<std::sync::Arc<crate::async_engine::Notify>>;
+    /// Atomically revoke this guest-owned handle through the host's canonical scope/generation registry.
+    fn resource_release_blob(&mut self, resource: resources::Blob) -> wasmtime::Result<i32>;
 }
 
 pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>
@@ -82,6 +96,13 @@ where
             Box::new(async move {
                 match waiter { Ok(waiter) => { waiter.notified().await; 1_i32 }, Err(_) => -1_i32 }
             })
+        },
+    )?;
+    linker.func_wrap(
+        "kernal-api:v1",
+        "resource_release_blob",
+        |mut caller: wasmtime::Caller<'_, T>, resource: i64| -> wasmtime::Result<i32> {
+            caller.data_mut().resource_release_blob(resources::Blob::decode_i64(resource)?)
         },
     )?;
     Ok(())

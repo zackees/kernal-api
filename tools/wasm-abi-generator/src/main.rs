@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 const CAPABILITIES: u32 = 0;
 // Revision 7 adds host-granted compiler spawn/output/exit/close (35-47).
 // Bump when operation meaning changes, even if scalar signatures do not.
-const OPERATION_PROTOCOL_REVISION: u32 = 8;
+// Revision 9 adds the generated, Store-scoped Blob release control.
+const OPERATION_PROTOCOL_REVISION: u32 = 9;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -19,14 +20,25 @@ fn packaged_bindings_match_the_standalone_generated_fixture() {
     );
 }
 
-fp_import! {
-    fn kernel_yield();
-    fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> u64;
-    fn operation_poll(operation: u64) -> u64;
-    fn operation_yield(operation: u64) -> i32;
-    fn operation_cancel(operation: u64) -> i32;
+fn binding_declarations() -> (FunctionList, FunctionList, TypeMap) {
+    let mut imports = FunctionList::new();
+    imports.add_function("fn kernel_yield();");
+    imports.add_function("fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> u64;");
+    imports.add_function("fn operation_poll(operation: u64) -> u64;");
+    imports.add_function("fn operation_yield(operation: u64) -> i32;");
+    imports.add_function("fn operation_cancel(operation: u64) -> i32;");
+
+    // Blob ownership is still enforced solely by OperationHub.  This
+    // declaration makes the generated Core-Wasm guest wrapper release it via
+    // that canonical scope/generation registry instead of a handwritten raw
+    // scalar abandon call.
+    let mut types = TypeMap::new();
+    types.insert(
+        TypeIdent::from("Blob"),
+        Type::Resource(Resource::owned("Blob")),
+    );
+    (imports, FunctionList::new(), types)
 }
-fp_export! {}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let output = std::env::var_os("KERNAL_API_ABI_OUTPUT")
@@ -49,12 +61,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
-    fp_bindgen!(BindingConfig {
-        bindings_type: BindingsType::RustWasmtimeCoreWasm,
-        path: output
+    let (imports, exports, types) = binding_declarations();
+    try_generate_wasmtime_core_wasm_bindings(
+        imports,
+        exports,
+        types,
+        output
             .to_str()
             .ok_or("generator output path is not UTF-8")?,
-    });
+    )?;
     relocate_guest_package(&output)?;
     append_semantic_lifecycle(&output)?;
     // Cargo excludes nested packages when packaging the facade. Emit the
@@ -217,7 +232,7 @@ impl Webview {
     pub async fn capture_visible_png(&self) -> Result<BlobHandle, OperationError> {
         let token = OperationFuture::submit(16, self.token, 0)?.wait().await?;
         if token == 0 { return Err(OperationError::Failed); }
-        Ok(BlobHandle { token })
+        Ok(BlobHandle::from_create_payload(token))
     }
     pub async fn close(self) -> Result<(), OperationError> {
         OperationFuture::submit(17, self.token, 0)?.wait().await?;
@@ -241,7 +256,9 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 }
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
-pub struct BlobHandle { token: u64 }
+/// Generated owned-handle lifecycle delegates release to OperationHub's
+/// canonical Store-scoped registry through `resource_release_blob`.
+pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
 pub struct EncryptedArchive { token: u64 }
 impl EncryptedArchive {
@@ -329,7 +346,7 @@ impl ArchiveEntryOpen {
         loop {
             if let Some(token) = self.inner.poll()? {
                 if token == 0 { return Err(OperationError::Failed); }
-                return Ok(BlobHandle { token });
+                return Ok(BlobHandle::from_create_payload(token));
             }
             self.inner.yield_now()?;
         }
@@ -350,7 +367,7 @@ impl OutputFile {
     /// no authority: every commit checks the host's resource registry.
     pub fn from_granted_token(token: u64) -> Self { Self { token } }
     pub fn write_blob(&self, blob: &BlobHandle) -> Result<OperationFuture, OperationError> {
-        OperationFuture::submit(10, blob.token, self.token)
+        OperationFuture::submit(10, blob.token()?, self.token)
     }
 }
 pub struct BlobReadFuture { operation: u64 }
@@ -374,35 +391,39 @@ impl BlobReadFuture {
     pub fn abandon_transfer(&self) { OperationFuture { operation: self.operation }.abandon_transfer(); }
 }
 impl BlobHandle {
+    fn token(&self) -> Result<u64, OperationError> {
+        self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed)
+    }
     /// Revoke this resource synchronously without allocating an operation.
-    pub fn abandon(&self) { let _ = imports::operation_submit(19, self.token, 0); }
+    pub fn abandon(self) { let _ = self.resource.close(); }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
-    pub fn from_create_payload(token: u64) -> Self { Self { token } }
+    pub fn from_create_payload(token: u64) -> Self { Self { resource: resources::Blob::from_abi(token) } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {
-        let operation = OperationFuture::submit(7, self.token, u64::from(maximum_bytes))?;
+        let operation = OperationFuture::submit(7, self.token()?, u64::from(maximum_bytes))?;
         Ok(BlobReadFuture { operation: operation.operation })
     }
     /// Publish EOF. Call only after preceding writes have completed; pending
     /// writes are rejected when the producer seals its stream.
-    pub fn seal(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(9, self.token, 0) }
-    pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
+    pub fn seal(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(9, self.token()?, 0) }
+    pub fn close(self) -> Result<(), OperationError> { self.resource.close().map_err(|_| OperationError::Closed) }
     /// The host copies this bounded slice before returning the future.
     /// No guest pointer or borrow is retained while waiting for capacity.
     pub fn write_chunk(&self, bytes: &[u8]) -> Result<OperationFuture, OperationError> {
         let length = u32::try_from(bytes.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(bytes.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        OperationFuture::submit(6, self.token, (u64::from(length) << 32) | u64::from(pointer))
+        OperationFuture::submit(6, self.token()?, (u64::from(length) << 32) | u64::from(pointer))
     }
 }
 "#;
     let path = output.join("guest/src/lib.rs");
     let source = fs::read_to_string(&path)?;
-    // The pinned scalar generator emits its conversion helpers at crate scope
-    // but its `imports` module only imports raw_imports/AbiError.  Primitive
-    // argument imports therefore need these explicit lexical imports.
+    // `fp-bindgen` names resources in this nested import module even when the
+    // declaration only contributes a release control.  The semantic Blob
+    // wrapper below lives at crate scope, so keep this generated module
+    // warning-free without widening its lexical API.
     let source = source.replace(
+        "use super::{raw_imports, AbiError, resources};",
         "use super::{raw_imports, AbiError};",
-        "use super::{raw_imports, AbiError, i32_from_i32, u32_to_i32, u64_from_i64, u64_to_i64};",
     );
     fs::write(&path, source)?;
     use std::io::Write as _;
@@ -457,6 +478,21 @@ impl Contract {
                 .and_then(|value| u8::try_from(value).ok())
                 .ok_or_else(|| format!("invalid revision field {key}"))
         };
+        let resources = root
+            .get("resources")
+            .and_then(toml::Value::as_array)
+            .ok_or("missing resources")?;
+        if resources.len() != 1 {
+            return Err("unexpected resource declaration".into());
+        }
+        let blob = resources[0].as_table().ok_or("resource must be a table")?;
+        if blob.get("name").and_then(toml::Value::as_str) != Some("Blob")
+            || blob.get("kind").and_then(toml::Value::as_str) != Some("opaque_host_handle")
+            || blob.get("ownership").and_then(toml::Value::as_str) != Some("owned")
+            || blob.get("abi").and_then(toml::Value::as_str) != Some("i64")
+        {
+            return Err("unexpected Blob resource declaration".into());
+        }
         let imports = root
             .get("imports")
             .and_then(toml::Value::as_array)
@@ -481,6 +517,14 @@ impl Contract {
             if !import_names.insert(name) {
                 return Err("duplicate import name".into());
             }
+            let generated_blob_release = name == "resource_release_blob";
+            if generated_blob_release
+                && (import.get("generated").and_then(toml::Value::as_bool) != Some(true)
+                    || import.get("resource_control").and_then(toml::Value::as_str)
+                        != Some("release"))
+            {
+                return Err("invalid Blob release control".into());
+            }
             for field in ["params", "results"] {
                 let values = import
                     .get(field)
@@ -490,12 +534,18 @@ impl Contract {
                     let value = value.as_table().ok_or("ABI value must be a table")?;
                     let semantic = value.get("semantic").and_then(toml::Value::as_str);
                     let abi = value.get("abi").and_then(toml::Value::as_str);
-                    if !matches!(
+                    let scalar_shape = matches!(
                         (semantic, abi),
                         (Some("()"), Some("unit"))
                             | (Some("i32" | "u32"), Some("i32"))
                             | (Some("u64"), Some("i64"))
-                    ) {
+                    );
+                    let blob_release_shape = generated_blob_release
+                        && field == "params"
+                        && semantic == Some("Blob")
+                        && abi == Some("i64")
+                        && value.get("kind").and_then(toml::Value::as_str) == Some("resource");
+                    if !(scalar_shape || blob_release_shape) {
                         return Err("unsupported semantic/ABI value shape".into());
                     }
                 }
@@ -625,10 +675,17 @@ mod tests {
     extern "C" fn operation_poll(_operation: i64) -> i64 {
         POLL_RESPONSE.get()
     }
+    static BLOB_RELEASE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    #[no_mangle]
+    extern "C" fn resource_release_blob(blob: i64) -> i32 {
+        BLOB_RELEASE.store(blob, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
     #[test]
-    fn generated_blob_abandon_is_a_scoped_scalar_submission() {
+    fn generated_blob_abandon_delegates_to_the_owned_resource_release_control() {
+        BLOB_RELEASE.store(-1, std::sync::atomic::Ordering::SeqCst);
         generated_guest::BlobHandle::from_create_payload(42).abandon();
-        assert_eq!(SUBMISSION.get(), (19, 42, 0));
+        assert_eq!(BLOB_RELEASE.load(std::sync::atomic::Ordering::SeqCst), 42);
     }
 
     #[test]
@@ -770,7 +827,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=8\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=9\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

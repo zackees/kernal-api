@@ -342,14 +342,8 @@ impl Blob {
 
     /// Release the blob's host resources explicitly.
     pub async fn close(self) -> Result<(), OperationError> {
-        self.inner.close()?.wait().await?;
+        self.inner.close()?;
         Ok(())
-    }
-}
-
-impl Drop for Blob {
-    fn drop(&mut self) {
-        self.inner.abandon();
     }
 }
 
@@ -505,11 +499,17 @@ impl Webview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
+        Mutex,
+    };
 
     static COMPLETED: AtomicBool = AtomicBool::new(false);
     static CANCELLATIONS: AtomicUsize = AtomicUsize::new(0);
     static ABANDONMENTS: AtomicUsize = AtomicUsize::new(0);
+    static BLOB_RELEASES: AtomicUsize = AtomicUsize::new(0);
+    static LAST_BLOB_RELEASE: AtomicI64 = AtomicI64::new(-1);
+    static BLOB_RELEASE_LOCK: Mutex<()> = Mutex::new(());
 
     // Scalar import shims exercise adapter ownership without a native runtime.
     // Actual ABI execution remains covered by the Cargo-built Wasm fixtures.
@@ -537,9 +537,37 @@ mod tests {
     }
     #[export_name = "kernel_yield"]
     extern "C" fn kernel_yield() {}
+    #[export_name = "resource_release_blob"]
+    extern "C" fn resource_release_blob(blob: i64) -> i32 {
+        LAST_BLOB_RELEASE.store(blob, Ordering::SeqCst);
+        BLOB_RELEASES.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+
+    #[test]
+    fn generated_blob_release_is_exactly_once_for_drop_and_explicit_close() {
+        let _release_lock = BLOB_RELEASE_LOCK.lock().unwrap();
+        BLOB_RELEASES.store(0, Ordering::SeqCst);
+        LAST_BLOB_RELEASE.store(-1, Ordering::SeqCst);
+        drop(bindings::BlobHandle::from_create_payload(41));
+        assert_eq!(BLOB_RELEASES.load(Ordering::SeqCst), 1);
+        assert_eq!(LAST_BLOB_RELEASE.load(Ordering::SeqCst), 41);
+
+        run(async {
+            Blob {
+                inner: bindings::BlobHandle::from_create_payload(99),
+            }
+            .close()
+            .await
+        })
+        .unwrap();
+        assert_eq!(BLOB_RELEASES.load(Ordering::SeqCst), 2);
+        assert_eq!(LAST_BLOB_RELEASE.load(Ordering::SeqCst), 99);
+    }
 
     #[test]
     fn dropping_transfers_abandons_but_preserves_explicit_cancellation() {
+        let _release_lock = BLOB_RELEASE_LOCK.lock().unwrap();
         CANCELLATIONS.store(0, Ordering::SeqCst);
         ABANDONMENTS.store(0, Ordering::SeqCst);
         COMPLETED.store(false, Ordering::SeqCst);

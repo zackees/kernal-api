@@ -144,12 +144,16 @@ the freshly built module and embed metadata using the ABI generator, then set
 `hash_actual_guest_streams_64_mib_through_public_facade` host test.
 
 The initial control did not connect the shared zccache request encoder to the
-guest. A private Component adapter now
-executes the exact shared hash policy through the same public facade on Linux
-(3.52 s), including failed-export cleanup and direct canonical oversized-input
-rejection. This establishes hash correctness only: canonical list lifting is
-not yet bounded before allocation, Blob semantics remain a separate private
-probe, and no matched runtime-performance selection has been made.
+guest. A private Component adapter now executes the exact shared hash policy
+through the same public facade on Linux, including failed-export cleanup and
+framed oversized-input rejection. Hash updates use 256-byte scalar-only frames
+with an explicit final marker; the host reserves 64 KiB, stages the input, and
+commits only after that marker, so malformed, oversized, cancelled, or torn-down
+streams do not mutate the hasher. The real Component probe establishes that
+framing and rejection behavior. This establishes hash correctness only: the
+64 MiB control needs a 5 billion fuel diagnostic ceiling, Blob semantics remain
+a separate private probe, and no matched runtime-performance selection has been
+made.
 
 The shared guest policy now also executes the real zccache request encoder,
 pinned to source commit `2543136ea8b648b295d2f7115a19656ff0854531` with default

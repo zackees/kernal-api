@@ -259,7 +259,10 @@ fn execute_case(bytes: &[u8], mode: Mode) -> wasmtime::Result<()> {
         },
     );
     store.limiter(|state| &mut state.limits);
-    store.set_fuel(500_000_000)?;
+    // Scalar-only bounded hash frames deliberately avoid list lifting. Their
+    // 64 MiB control is a correctness diagnostic, not a performance result;
+    // retain enough fuel to observe its terminal behavior.
+    store.set_fuel(5_000_000_000)?;
     let live_hashes = store.data().hash.live.clone();
     let live = store.data().live.clone();
     let live_blobs = store.data().live_blobs.clone();

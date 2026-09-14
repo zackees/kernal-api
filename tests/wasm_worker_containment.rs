@@ -227,6 +227,27 @@ fn cargo_built_threaded_guest_runs_inside_killable_worker() {
 }
 
 #[test]
+#[ignore = "requires the artifact built by scripts/build-threaded-smoke"]
+fn cargo_built_threaded_guest_deadline_stops_and_releases_parent_state() {
+    let path = std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM")
+        .expect("explicit artifact proof must supply its Cargo-built Wasm");
+    // The artifact spends longer than this deadline in its two child stream
+    // pressure paths. The worker must communicate the deadline, terminate the
+    // child execution, and release every parent lease/protocol task instead of
+    // relying on the in-process epoch path.
+    run_case_with_outer_bound(
+        std::fs::read(path).expect("read real threaded guest"),
+        CONTAINMENT_DEADLINE,
+        long_fuel(),
+        false,
+        SketchWorkerTerminal::ForcedContainment {
+            trigger: SketchWorkerStopReason::DeadlineExceeded,
+        },
+        Duration::from_secs(30),
+    );
+}
+
+#[test]
 fn real_worker_classifies_normal_and_trap() {
     run_case(
         threaded_fixture::threaded_root_wasm(None, false, false, false),

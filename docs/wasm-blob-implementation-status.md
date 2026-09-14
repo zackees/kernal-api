@@ -484,7 +484,10 @@ The same admitted artifact passes execution and parent-owned-output commit
 inside the killable worker, forced-output cancellation cleanup, and the native
 parent-death worker-reap proof with those two-child limits. This extends the
 guest-stream evidence through the containment boundary rather than treating an
-in-process result as a worker guarantee.
+in-process result as a worker guarantee. A one-second worker deadline during
+the actual child-stream pressure workload produces
+`ForcedContainment { DeadlineExceeded }` and releases the parent state; it is
+not misclassified as a successful in-process epoch stop.
 All 42 hub tests pass. With the count limits enabled, the existing 64 MiB
 Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
@@ -584,7 +587,7 @@ on Linux x86-64. The admitted artifact was reused and the host rebuilt.
   in-flight allocations, including retained capacity and completed results.
 - Complete ordering and progress-timeout behavior under multiple producers and
   consumers; extend the real child-stream proof to progress-timeout scheduler
-  races.
+  races beyond the worker deadline containment evidence.
 - Complete output commit cancellation coverage. Dispatch now uses the caller's
   blocking lane, reserves exclusive blob consumption, and checks the operation
   terminal winner at final replacement under the hub lock. A stalled filesystem

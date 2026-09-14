@@ -293,10 +293,36 @@ pub extern "C" fn kernal_api_run() -> u32 {
             // Each guest-native child owns this generation-scoped blob; its
             // bounded stream work crosses the shared host operation authority
             // without sharing a backend handle with the other child.
-            let mut write = blob.write_chunk(&sent).expect("child blob write");
-            while write.poll().expect("child write poll").is_none() {
-                write.yield_now().expect("child write yield");
+            for _ in 0..16 {
+                let mut write = blob.write_chunk(&sent).expect("child blob fill");
+                while write.poll().expect("child fill poll").is_none() {
+                    write.yield_now().expect("child fill yield");
+                }
             }
+            let mut waiting = blob.write_chunk(&sent).expect("child awaited write");
+            assert!(waiting.poll().expect("child awaited write poll").is_none());
+            complete_operation(kernal_api_v1_bindings::synthetic_yield().expect("child yield"))
+                .expect("child yield completion");
+            assert!(
+                waiting
+                    .poll()
+                    .expect("child awaited write stays pending")
+                    .is_none(),
+                "a full child blob cannot make progress without consumption"
+            );
+            let mut cancelled = blob.write_chunk(&sent).expect("child cancelled write");
+            assert!(
+                cancelled
+                    .poll()
+                    .expect("child cancelled write poll")
+                    .is_none()
+            );
+            cancelled.cancel();
+            assert_eq!(
+                cancelled.poll(),
+                Err(OperationError::Cancelled),
+                "child cancellation must release its pending write"
+            );
             let mut received = [0_u8; 64 * 1024];
             let mut read = blob
                 .read_chunk(received.len() as u32)
@@ -309,6 +335,13 @@ pub extern "C" fn kernal_api_run() -> u32 {
             };
             assert_eq!(count, sent.len(), "child receives its bounded write");
             assert_eq!(received, sent, "child stream preserves bytes");
+            while waiting
+                .poll()
+                .expect("child awaited write resumes after read")
+                .is_none()
+            {
+                waiting.yield_now().expect("child awaited write yield");
+            }
             guest::run(blob.seal()).expect("child blob seal");
             guest::run(blob.close()).expect("child blob close");
             threaded_streams.fetch_add(1, Ordering::SeqCst);

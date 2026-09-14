@@ -195,3 +195,12 @@ A native combined-feature check was active concurrently. This improves the
 diagnostic latency evidence but is still not a quiet reference-host run,
 same-facade comparison, full correctness gate, or candidate selection.
 Raw evidence remains at `/tmp/kernal-component-release-measure-ff7965e`.
+
+The RSS-instrumented release diagnostic is retained in
+[results/component-release-rss-diagnostic.json](results/component-release-rss-diagnostic.json).
+From committed snapshot `3c659a2`, all ten real policy edits changed both the
+source and admitted component hashes. End-to-end edit p50 was 1.947s and p95
+2.101s; the cold build's GNU-time high-water mark was 544,808,960 bytes. This
+is the build-command metric described above, not aggregate process RSS, an
+isolated rustc allocation measurement, a quiet reference-host result, or a
+candidate-selection claim.

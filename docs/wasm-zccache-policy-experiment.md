@@ -581,8 +581,9 @@ The Component compiler adaptation and one exact zccache request-key hit/miss
 decision now exist. The Core fixture transfers one verified compiler artifact
 through exact-output authority, retains it privately in the real
 `zccache-artifact::KvStore`, and restores the matching embedding-selected
-output before guest instantiation on a hit. Matched candidate measurements and
-the remaining #13 acceptance evidence remain unfinished. The Core-Wasm/Wasmtime
+output before guest instantiation on a hit. A current matched diagnostic is
+recorded in the benchmark workspace, but the remaining #13 acceptance evidence
+is unfinished. The Core-Wasm/Wasmtime
 threaded substrate is the recorded v1 decision; this does not turn the
 Component candidate into a runtime fallback or close #13 before the
 outstanding evidence exists.

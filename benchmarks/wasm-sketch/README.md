@@ -229,3 +229,15 @@ source and admitted component hashes. End-to-end edit p50 was 1.947s and p95
 is the build-command metric described above, not aggregate process RSS, an
 isolated rustc allocation measurement, a quiet reference-host result, or a
 candidate-selection claim.
+
+The current revision-10 matched diagnostic ran from `43f1fdb` on Linux x86-64
+with Rust 1.95 and its full isolated source, artifact, command-log, and
+GNU-Time evidence remains at `/tmp/kernal-revision10-measure-43f1fdb`. All ten
+edits changed both candidates' module hashes. Core produced 140,619--140,620
+byte admitted modules with 0.991s p50 and 1.031s p95 end-to-end edit time;
+Component produced 142,075--142,079 byte encoded modules with 1.856s p50 and
+1.894s p95. The largest individual build-command high-water mark was
+545,337,344 bytes. Soldr was deliberately disabled, so this records neither a
+cache-hit rate nor compiler/process-tree RSS. The adapters still differ in
+exact-output authority and timed artifacts are not all executed; these figures
+therefore satisfy neither the full selection gate nor a runtime-choice claim.

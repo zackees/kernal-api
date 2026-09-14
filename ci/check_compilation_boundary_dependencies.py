@@ -64,12 +64,10 @@ def tree(features: str, *, normal_only: bool = False) -> set[str]:
         "--locked",
         "--no-default-features",
         "--edges",
-        "normal,build",
+        "normal" if normal_only else "normal,build",
         "--prefix",
         "none",
     ]
-    if normal_only:
-        command.extend(("--edges", "normal"))
     if features:
         command.extend(("--features", features))
     completed = subprocess.run(command, check=True, text=True, capture_output=True)

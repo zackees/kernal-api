@@ -188,6 +188,25 @@ for this exact sealed archive guest proof; it does not turn the earlier local
 timing into a cross-host performance comparison or satisfy the separate
 Component/facade selection gates below.
 
+### Bounded stream progress deadlines
+
+Each opaque Blob now owns an independent progress domain and a host-selected
+idle budget (five seconds by default, configurable through
+`SketchBlobLimits`). The generated `operation_yield` path arms that budget
+only for a pending Blob read or write; timers, scalar operations, and the
+logical sketch wall-clock deadline remain outside it. Successful bounded reads
+and writes report progress only to their own Blob domain. A new pending
+transfer restarts its own initial idle window rather than inheriting an old
+Blob's last activity.
+
+Focused RED/GREEN coverage creates a full Blob with a pending four-byte write.
+With no read or write progress it terminalizes `TimedOut`; with three one-byte
+pulls at seven-millisecond intervals it remains pending beyond two ten-
+millisecond idle intervals and completes only when the final pull makes room.
+The tests exercise the real operation table, waiter, cancellation source, and
+terminal status. This is per-Blob idle-timeout evidence, not a claim that every
+future process or Component stream has progress accounting.
+
 ## Remaining proof
 
 The actual Rustc parser is now exercised by the shared `rustc_policy.rs`

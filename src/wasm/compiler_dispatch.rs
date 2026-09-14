@@ -377,7 +377,6 @@ mod tests {
                         }),
                     }),
                     output: Some(output.clone()),
-                    ..RootGrants::default()
                 },
             )),
             Ok(ThreadedRootOutcome::Started)

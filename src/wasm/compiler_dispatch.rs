@@ -290,17 +290,44 @@ mod tests {
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
-    fn compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes() {
-        execute_actual_guest(false);
+    fn compiler_actual_guest_spawns_drains_hashes_persists_waits_and_caches() {
+        let cache = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let artifact = output.path().join("compiler-artifact");
+        execute_actual_guest(cache.path(), artifact.clone(), compiler_helper_spec());
+        assert_verified_artifact(&artifact);
+        let expected = std::fs::read(&artifact).unwrap();
+        assert_eq!(
+            compiler_cache::CompilerArtifactStore::open(cache.path())
+                .unwrap()
+                .get(CACHE_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(expected.as_slice())
+        );
     }
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
-    fn compiler_actual_guest_cache_hit_does_not_spawn_the_granted_compiler() {
-        execute_actual_guest(true);
+    fn compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler() {
+        let cache = tempfile::tempdir().unwrap();
+        let outputs = tempfile::tempdir().unwrap();
+        let miss = outputs.path().join("miss-artifact");
+        execute_actual_guest(cache.path(), miss.clone(), compiler_helper_spec());
+        let expected = std::fs::read(&miss).unwrap();
+        let hit = outputs.path().join("hit-artifact");
+        let forbidden = crate::SpawnSpec::new(
+            std::env::current_dir()
+                .unwrap()
+                .join("cache-hit-must-not-spawn"),
+        )
+        .current_dir(std::env::current_dir().unwrap())
+        .clear_env(true);
+        execute_actual_guest(cache.path(), hit.clone(), forbidden);
+        assert_eq!(std::fs::read(hit).unwrap(), expected);
     }
 
-    fn execute_actual_guest(cache_hit: bool) {
+    fn execute_actual_guest(cache_root: &std::path::Path, output: std::path::PathBuf, spec: crate::SpawnSpec) {
         let bytes = std::fs::read(
             std::env::var_os("KERNAL_COMPILER_GUEST_WASM").expect("compiler guest artifact"),
         )
@@ -336,19 +363,6 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let spec = if cache_hit {
-            crate::SpawnSpec::new(
-                std::env::current_dir()
-                    .unwrap()
-                    .join("cache-hit-must-not-spawn"),
-            )
-            .current_dir(std::env::current_dir().unwrap())
-            .clear_env(true)
-        } else {
-            compiler_helper_spec()
-        };
-        let output_root = tempfile::tempdir().unwrap();
-        let output = output_root.path().join("compiler-artifact");
         assert_eq!(
             runtime.run(sketch.execute_threaded_root_with_grant(
                 runtime.handle(),
@@ -357,22 +371,18 @@ mod tests {
                     compiler: Some(RootCompilerGrant {
                         spec,
                         deadline: Duration::from_secs(15),
-                        cache: Some((CACHE_KEY, cache_hit)),
+                        cache: Some(RootCompilerArtifactCache {
+                            key: CACHE_KEY,
+                            store: compiler_cache::CompilerArtifactStore::open(cache_root).unwrap(),
+                        }),
                     }),
-                    output: (!cache_hit).then_some(output.clone()),
+                    output: Some(output.clone()),
                     ..RootGrants::default()
                 },
             )),
             Ok(ThreadedRootOutcome::Started)
         );
-        if cache_hit {
-            assert!(!output.exists(), "cache hit must not publish an artifact");
-        } else {
-            let bytes = std::fs::read(&output).unwrap();
-            assert_eq!(bytes.len(), 4 * 1024 * 1024);
-            assert_eq!(bytes.iter().filter(|byte| **byte == 0xf1).count(), 2 * 1024 * 1024);
-            assert_eq!(bytes.iter().filter(|byte| **byte == 0xf2).count(), 2 * 1024 * 1024);
-        }
+        assert_verified_artifact(&output);
         let snapshot = sketch
             .root_execution_observation_for_test()
             .unwrap()
@@ -387,5 +397,12 @@ mod tests {
             compiler.execution_limits_snapshot(),
             SketchExecutionSnapshot::default()
         );
+    }
+
+    fn assert_verified_artifact(output: &std::path::Path) {
+        let bytes = std::fs::read(output).unwrap();
+        assert_eq!(bytes.len(), 4 * 1024 * 1024);
+        assert_eq!(bytes.iter().filter(|byte| **byte == 0xf1).count(), 2 * 1024 * 1024);
+        assert_eq!(bytes.iter().filter(|byte| **byte == 0xf2).count(), 2 * 1024 * 1024);
     }
 }

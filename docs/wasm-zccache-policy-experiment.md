@@ -241,12 +241,29 @@ close. The same cache-aware shared policy passes freshly rebuilt revision-8
 Core and Component guest artifacts on Linux x86-64. Unit coverage also checks
 exact key matching, store ownership, miss/hit values, and zero spawn attempts.
 
-This is one fixture-selected cache decision, not a cache store: artifact
-movement and cache persistence remain native. Reserve
-operation/resource capacity before the controlled miss spawn; revocation
-between reservation and attachment must reclaim a spawned session. Output
-delivery retains its aggregate in-flight byte budget in addition to native
-queue limits.
+The Core private threaded-root fixture now uses the real
+`zccache-artifact::KvStore`, pinned at
+`e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae`, in the private
+`kernal-compiler-v1` namespace. On a miss, after the guest has completed its
+normal process/output lifecycle and the exact output job has drained, the
+host reads that embedding-selected output and atomically retains it under the
+same 32-byte request key. On a hit, the host reads and verifies the zccache
+value, restores it through the existing exact-output atomic replacement path
+before instantiating the Store, and withholds output authority from the guest.
+The guest sees only `Hit` and returns before spawn; cache root, namespace, and
+artifact bytes remain private host state.
+
+The ignored actual Core round-trip test first runs the controlled miss, then
+runs the same request with a deliberately nonexistent compiler executable.
+It verifies the second embedding-selected output equals the cached first
+artifact, so success demonstrates both retention/retrieval and no compiler
+spawn. The focused KV test independently verifies persistence through the
+real zccache format. This remains a bounded private experiment, not a public
+cache API, a cache enumeration capability, or an artifact-cache selection
+decision. Reserve operation/resource capacity before the controlled miss
+spawn; revocation between reservation and attachment must reclaim a spawned
+session. Output delivery retains its aggregate in-flight byte budget in
+addition to native queue limits.
 
 The facade documents that session kill/drop terminates and reaps only the
 direct child. Post-exit drain grace reports abandoned descendant-held pipes;

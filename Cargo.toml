@@ -222,7 +222,7 @@ symbolize-worker = [
 # The sketch host is intentionally isolated from ordinary async/process users.
 # It uses core Wasm plus Cranelift; WASI, the Component Model, pooling, Winch,
 # and a second executor remain out of this first admission-only slice.
-wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser", "fs"]
+wasm-sketch-host = ["dep:wasmtime", "dep:wasmparser", "dep:zccache-artifact", "fs"]
 # Private one-request worker protocol; the executable/supervisor follows in
 # phase B. Keeping this separate preserves default-feature isolation.
 wasm-sketch-worker = ["wasm-sketch-host", "dep:tempfile", "dep:cap-std"]
@@ -288,6 +288,7 @@ tar = { version = "=0.4.46", default-features = false, optional = true }
 zip = { version = "=2.4.2", optional = true }
 openssl = { version = "=0.10.81", features = ["vendored"], optional = true }
 tempfile = { version = "=3.27.0", optional = true }
+zccache-artifact = { git = "https://github.com/zackees/zccache", rev = "e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae", package = "zccache-artifact", optional = true }
 cap-std = { version = "=4.0.3", optional = true }
 thiserror = "=2.0.20"
 tokio-stream = { version = "=0.1.19", optional = true }

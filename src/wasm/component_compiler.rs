@@ -812,10 +812,11 @@ const HASH_INPUT_CHUNK_BYTES: usize = 256;
 struct HashInputConsumer {
     bytes: Vec<u8>,
     lease: Option<ComponentResourceLease>,
-    result: Option<
-        crate::async_engine::OneshotSender<Result<(Vec<u8>, ComponentResourceLease), ()>>,
-    >,
+    result: Option<HashInputResultSender>,
 }
+
+type HashInputResultSender =
+    crate::async_engine::OneshotSender<Result<(Vec<u8>, ComponentResourceLease), ()>>;
 
 enum HashInputFrame {
     Continue,

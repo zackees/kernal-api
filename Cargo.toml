@@ -288,7 +288,7 @@ tar = { version = "=0.4.46", default-features = false, optional = true }
 zip = { version = "=2.4.2", optional = true }
 openssl = { version = "=0.10.81", features = ["vendored"], optional = true }
 tempfile = { version = "=3.27.0", optional = true }
-zccache-artifact = { git = "https://github.com/zackees/zccache", rev = "e473e4cd8945f8e7e3bf3d93b2bb3c5b469e72ae", package = "zccache-artifact", optional = true }
+zccache-artifact = { git = "https://github.com/zackees/zccache", rev = "d385a184ca5ad3cad207daf25093374f27b219de", package = "zccache-artifact", optional = true }
 cap-std = { version = "=4.0.3", optional = true }
 thiserror = "=2.0.20"
 tokio-stream = { version = "=0.1.19", optional = true }

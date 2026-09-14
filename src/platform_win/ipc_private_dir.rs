@@ -25,15 +25,14 @@ fn private_dir_sddl() -> io::Result<String> {
     ))
 }
 
-/// Protected, non-inheriting owner-and-SYSTEM DACL for a private regular file.
+/// Protected, non-inheriting current-user-and-SYSTEM DACL for a private regular
+/// file.
 ///
 /// A file created below `PRIVATE_DIR_SDDL` normally inherits effective owner
-/// and SYSTEM ACEs. Some Windows token/filesystem combinations preserve
-/// `INHERIT_ONLY` on the Owner Rights ACE, which leaves the new file's owner
-/// unable to reopen it. The private-file creator applies this exact policy to
-/// its still-open handle after assigning TokenUser as owner.
-#[cfg(feature = "fs")]
-const PRIVATE_FILE_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)";
+/// and SYSTEM ACEs. The private-file creator instead pins the current token
+/// user's concrete SID on its still-open handle after assigning that user as
+/// owner. An `OWNER RIGHTS` ACE is not equivalent here: its stored SID does
+/// not prove which principal owns a file when the reader validates it later.
 
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
@@ -382,8 +381,8 @@ pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
 /// Bind the effective private-file DACL to an already-created file handle.
 ///
 /// The caller must first assign TokenUser as owner on this same handle. This
-/// avoids a path reopen and ensures the Owner Rights ACE resolves to exactly
-/// that user rather than an elevated token's default-owner group.
+/// avoids a path reopen and binds the concrete user SID rather than an
+/// elevated token's default-owner group.
 #[cfg(feature = "fs")]
 pub(super) fn apply_current_user_private_file_dacl(file: &File) -> io::Result<()> {
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
@@ -392,7 +391,10 @@ pub(super) fn apply_current_user_private_file_dacl(file: &File) -> io::Result<()
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    let descriptor = LocalSecurityDescriptor::from_sddl(PRIVATE_FILE_SDDL)?;
+    let descriptor = LocalSecurityDescriptor::from_sddl(&format!(
+        "D:P(A;;FA;;;{})(A;;FA;;;SY)",
+        current_user_sid_sddl()?
+    ))?;
     let dacl = descriptor.dacl()?;
     // SAFETY: `file` is the still-open newly-created object, opened with
     // WRITE_DAC by the caller. `dacl` borrows `descriptor`, which stays live
@@ -746,19 +748,15 @@ mod tests {
         use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
 
         let temporary = tempfile::tempdir().unwrap();
-        let parent = temporary.path().join("parent");
-        let directory = parent.join("private");
+        let directory = temporary.path().join("private");
         fs::create_dir_all(&directory).unwrap();
-        apply_protected_dacl_sddl(
-            &parent,
-            &format!(
-                "D:P(A;;FA;;;{})(A;;FA;;;SY)",
-                current_user_sid_sddl().unwrap()
-            ),
-        )
-        .unwrap();
+        // Establish the production owner and DACL first. A raw test-created
+        // directory may retain an elevated token's default-owner group, which
+        // does not imply WRITE_DAC for TokenUser once its inherited DACL is
+        // replaced. This test is about the protected-DACL bit, not that
+        // unrelated elevated-owner edge case.
+        ensure_owner_private_directory(&directory).unwrap();
         let private_sddl = private_dir_sddl().unwrap();
-        apply_protected_dacl_sddl(&directory, &private_sddl).unwrap();
         let protected = file_security_descriptor(&directory).unwrap();
         let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
 

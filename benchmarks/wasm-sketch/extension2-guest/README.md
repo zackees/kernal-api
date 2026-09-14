@@ -18,9 +18,10 @@ soldr cargo check --locked \
   --target wasm32-unknown-unknown --target-dir target/extension2-guest-proof
 ```
 
-The policy library independently checks bounded original `TWPV1AES` prefix and
-JSON header bytes, synthetic schema/algorithm/version/commit/key identity,
-96-bit nonce, duplicate names, strict relative paths, and count/size bounds.
+The policy library checks a bounded original `TWPV1AES` prefix and JSON header
+whose schema/algorithm/version/commit/digest/key identity is bound to the
+upstream accepted feed asset, along with its 96-bit nonce, duplicate names,
+strict relative paths, and count/size bounds.
 The fixture also caps each entry name at 4 KiB; host inventory records must
 enforce that bound before transferring or allocating a guest-visible name.
 The envelope/inventory portion contains a manually adapted subset of decisions

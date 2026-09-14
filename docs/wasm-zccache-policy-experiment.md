@@ -511,7 +511,10 @@ The fixture lock now follows the same explicit migration-only process-substrate
 revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
 decision now exist. Artifact persistence/transfer, matched candidate
-measurements, and final runtime selection remain unfinished.
+measurements, and the remaining #13 acceptance evidence remain unfinished. The
+Core-Wasm/Wasmtime threaded substrate is the recorded v1 decision; this does
+not turn the Component candidate into a runtime fallback or close #13 before
+the outstanding evidence exists.
 
 The revision-8 archive and screenshot artifacts now have fresh six-native-host
 evidence from [Actions run 34790621949](https://github.com/zackees/kernal-api/actions/runs/34790621949): Linux, macOS, and Windows on x86-64 and ARM64 all completed

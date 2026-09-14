@@ -17,7 +17,7 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=7`, independently of the
+The metadata also binds `operation_protocol_revision=9`, independently of the
 scalar import signatures. Revision 1 included opcodes 1–19 and scoped
 transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
 header copy, and abandonment (20–22). Revision 3 adds authentication and scoped
@@ -35,6 +35,10 @@ exit observation, acknowledged close, and scoped abandonment (35–47). Command
 paths and arguments remain host-owned. Output collection requires a 64-KiB
 destination and writes directly to validated shared memory without another
 host payload copy. EOF, abandonment, read failure, and exhaustion are distinct.
+Revision 9 adds generated `resource_release_blob`: it is not an opcode, but a
+Store-scoped owned-Blob release control delegated to the same `OperationHub`
+registry as the existing blob-abandon path. Revision-8 guests must be rebuilt,
+not relabeled, before they can import that control.
 Rebuild guest code before embedding the new
 metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.
@@ -50,9 +54,14 @@ of guest source behavior; it never grants resource authority by itself.
 Run `soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml`
 for malformed-manifest/metadata, idempotency, and historical transport checks.
 
-The tool pins `zackees/fp-bindgen` at `4e44d9e5408653e3c428ee3f855cc194d53f60b0`.
+The tool pins `zackees/fp-bindgen` at `df94a6988dac3ade189466adbaaa58be4524393e`.
 It is a development tool outside the published package, so ordinary
 `kernal-api` builds do not resolve the generator or its dependency graph.
+
+That revision declares the generated `Blob` guest wrapper as an owned resource.
+Its `resource_release_blob` control calls the existing `OperationHub` registry,
+which atomically validates Store scope and generation before revoking the blob.
+It does not introduce a second guest resource registry or a raw-token public API.
 
 The generated scalar contract provides `kernel_yield` and operation
 submit/poll/yield/cancel imports. Semantic resource operations are closed
@@ -87,12 +96,10 @@ result remains available to poll. Public transfer guards use abandonment on
 drop. This additive opcode requires a matching guest-capable host release;
 the exact pre-1.0 client pin must not pair these guards with an older host.
 
-Opcode 19 is synchronous `blob_abandon(blob_token, 0)`. It validates the
-Store owner and blob kind under the same lock that revokes the generation,
-closes borrowing operations, and releases stored bytes. It allocates no
-operation slot, so public guest `Blob` Drop remains effective at operation
-quota. It returns 1 on success, 0 on invalid/stale/foreign/non-blob tokens or
-nonzero reserved arguments. Drop after explicit close or successful output
-commit is harmless and returns 0. Pending futures retain their typed terminal
-result until collection or their own abandonment. This additive opcode also
-requires the matching exact-pinned guest-capable host release.
+Opcode 19 is synchronous `blob_abandon(blob_token, 0)`. It remains the
+registry's low-level scoped release path: it validates Store ownership and blob
+kind under the same lock that revokes the generation, closes borrowing
+operations, and releases stored bytes. The revision-9 generated guest wrapper
+now calls `resource_release_blob`, whose host implementation delegates to that
+same path and maps its success to the generated release status. Pending futures
+retain typed terminal results until collection or their own abandonment.

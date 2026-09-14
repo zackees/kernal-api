@@ -1,5 +1,5 @@
-// Generated scalar Core Wasm guest bindings for `kernal-api:v1`.
-// The public API uses semantic Rust scalar types; raw ABI values stay private.
+// Generated Core Wasm guest bindings for `kernal-api:v1`.
+// Public APIs use semantic scalar and resource types; raw ABI values stay private.
 
 use std::sync::OnceLock;
 
@@ -7,12 +7,30 @@ use std::sync::OnceLock;
 pub enum AbiError {
     InvalidBoolean(i32),
     OutOfRange { ty: &'static str, value: i32 },
+    ResourceClosed { resource: &'static str },
+    ResourceReleaseRejected { resource: &'static str, status: i32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExportInstallError {
     AlreadyInstalled,
 }
+
+pub mod resources {
+    #[derive(Debug, Eq, Hash, PartialEq)]
+    pub struct Blob(::core::option::Option<u64>);
+
+    impl Blob {
+        pub(crate) fn from_abi(raw: u64) -> Self { Self(::core::option::Option::Some(raw)) }
+        pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> { ::core::result::Result::Ok(Self::from_abi(raw as u64)) }
+        pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> { self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed { resource: "Blob" }) }
+        pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> { self.release() }
+        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "Blob" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_resource_release_blob(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "Blob", status }) } }
+    }
+
+    impl ::core::ops::Drop for Blob { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
+
+ }
 
 fn bool_from_i32(value: i32) -> Result<bool, AbiError> { match value { 0 => Ok(false), 1 => Ok(true), value => Err(AbiError::InvalidBoolean(value)) } }
 fn i8_from_i32(value: i32) -> Result<i8, AbiError> { value.try_into().map_err(|_| AbiError::OutOfRange { ty: "i8", value }) }
@@ -51,11 +69,16 @@ mod raw_imports {
         pub(super) fn __kernal_api_v1_import_operation_submit(kind: i32, arg0: i64, arg1: i64) -> i64;
         #[link_name = "operation_yield"]
         pub(super) fn __kernal_api_v1_import_operation_yield(operation: i64) -> i32;
+
+        #[link_name = "resource_release_blob"]
+        pub(super) fn __kernal_api_v1_import_resource_release_blob(resource: i64) -> i32;
+
     }
 }
 
+
 pub mod imports {
-    use super::{raw_imports, AbiError, i32_from_i32, u32_to_i32, u64_from_i64, u64_to_i64};
+    use super::{raw_imports, AbiError};
 
     pub fn kernel_yield() -> Result<(), AbiError> {
         unsafe { raw_imports::__kernal_api_v1_import_kernel_yield() };
@@ -63,23 +86,23 @@ pub mod imports {
     }
 
     pub fn operation_cancel(operation: u64) -> Result<i32, AbiError> {
-        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_cancel(u64_to_i64(operation)) };
-        i32_from_i32(raw)
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_cancel(super::u64_to_i64(operation)) };
+        super::i32_from_i32(raw)
     }
 
     pub fn operation_poll(operation: u64) -> Result<u64, AbiError> {
-        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_poll(u64_to_i64(operation)) };
-        u64_from_i64(raw)
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_poll(super::u64_to_i64(operation)) };
+        super::u64_from_i64(raw)
     }
 
     pub fn operation_submit(kind: u32, arg0: u64, arg1: u64) -> Result<u64, AbiError> {
-        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_submit(u32_to_i32(kind), u64_to_i64(arg0), u64_to_i64(arg1)) };
-        u64_from_i64(raw)
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_submit(super::u32_to_i32(kind), super::u64_to_i64(arg0), super::u64_to_i64(arg1)) };
+        super::u64_from_i64(raw)
     }
 
     pub fn operation_yield(operation: u64) -> Result<i32, AbiError> {
-        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_yield(u64_to_i64(operation)) };
-        i32_from_i32(raw)
+        let raw = unsafe { raw_imports::__kernal_api_v1_import_operation_yield(super::u64_to_i64(operation)) };
+        super::i32_from_i32(raw)
     }
 }
 
@@ -205,7 +228,7 @@ impl Webview {
     pub async fn capture_visible_png(&self) -> Result<BlobHandle, OperationError> {
         let token = OperationFuture::submit(16, self.token, 0)?.wait().await?;
         if token == 0 { return Err(OperationError::Failed); }
-        Ok(BlobHandle { token })
+        Ok(BlobHandle::from_create_payload(token))
     }
     pub async fn close(self) -> Result<(), OperationError> {
         OperationFuture::submit(17, self.token, 0)?.wait().await?;
@@ -229,7 +252,9 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 }
 
 /// Opaque host-owned bulk resource. No buffer or native path is carried here.
-pub struct BlobHandle { token: u64 }
+/// Generated owned-handle lifecycle delegates release to OperationHub's
+/// canonical Store-scoped registry through `resource_release_blob`.
+pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
 pub struct EncryptedArchive { token: u64 }
 impl EncryptedArchive {
@@ -317,7 +342,7 @@ impl ArchiveEntryOpen {
         loop {
             if let Some(token) = self.inner.poll()? {
                 if token == 0 { return Err(OperationError::Failed); }
-                return Ok(BlobHandle { token });
+                return Ok(BlobHandle::from_create_payload(token));
             }
             self.inner.yield_now()?;
         }
@@ -338,7 +363,7 @@ impl OutputFile {
     /// no authority: every commit checks the host's resource registry.
     pub fn from_granted_token(token: u64) -> Self { Self { token } }
     pub fn write_blob(&self, blob: &BlobHandle) -> Result<OperationFuture, OperationError> {
-        OperationFuture::submit(10, blob.token, self.token)
+        OperationFuture::submit(10, blob.token()?, self.token)
     }
 }
 pub struct BlobReadFuture { operation: u64 }
@@ -362,24 +387,27 @@ impl BlobReadFuture {
     pub fn abandon_transfer(&self) { OperationFuture { operation: self.operation }.abandon_transfer(); }
 }
 impl BlobHandle {
+    fn token(&self) -> Result<u64, OperationError> {
+        self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed)
+    }
     /// Revoke this resource synchronously without allocating an operation.
-    pub fn abandon(&self) { let _ = imports::operation_submit(19, self.token, 0); }
+    pub fn abandon(self) { let _ = self.resource.close(); }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
-    pub fn from_create_payload(token: u64) -> Self { Self { token } }
+    pub fn from_create_payload(token: u64) -> Self { Self { resource: resources::Blob::from_abi(token) } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {
-        let operation = OperationFuture::submit(7, self.token, u64::from(maximum_bytes))?;
+        let operation = OperationFuture::submit(7, self.token()?, u64::from(maximum_bytes))?;
         Ok(BlobReadFuture { operation: operation.operation })
     }
     /// Publish EOF. Call only after preceding writes have completed; pending
     /// writes are rejected when the producer seals its stream.
-    pub fn seal(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(9, self.token, 0) }
-    pub fn close(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(4, self.token, 0) }
+    pub fn seal(&self) -> Result<OperationFuture, OperationError> { OperationFuture::submit(9, self.token()?, 0) }
+    pub fn close(self) -> Result<(), OperationError> { self.resource.close().map_err(|_| OperationError::Closed) }
     /// The host copies this bounded slice before returning the future.
     /// No guest pointer or borrow is retained while waiting for capacity.
     pub fn write_chunk(&self, bytes: &[u8]) -> Result<OperationFuture, OperationError> {
         let length = u32::try_from(bytes.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(bytes.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        OperationFuture::submit(6, self.token, (u64::from(length) << 32) | u64::from(pointer))
+        OperationFuture::submit(6, self.token()?, (u64::from(length) << 32) | u64::from(pointer))
     }
 }
 

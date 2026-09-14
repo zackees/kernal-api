@@ -4,6 +4,12 @@ generator_revision = 1
 abi_version = 1
 namespace = "kernal-api:v1"
 
+[[resources]]
+name = "Blob"
+kind = "opaque_host_handle"
+ownership = "owned"
+abi = "i64"
+
 [[imports]]
 namespace = "kernal-api:v1"
 name = "kernel_yield"
@@ -37,5 +43,14 @@ namespace = "kernal-api:v1"
 name = "operation_yield"
 direction = "guest-to-host"
 params = [{ semantic = "u64", abi = "i64" }]
+results = [{ semantic = "i32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "resource_release_blob"
+direction = "guest-to-host"
+generated = true
+resource_control = "release"
+params = [{ semantic = "Blob", abi = "i64", kind = "resource" }]
 results = [{ semantic = "i32", abi = "i32" }]
 

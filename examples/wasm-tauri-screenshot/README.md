@@ -13,7 +13,14 @@ types remain private inside the facade. Successful `OutputFile::write_blob`
 consumes both host authorities, so the guest does not close them again. The
 method borrows its handles so preflight failure does not discard the caller's
 ability to seal, retry, or close a blob.
-The source fixture uses an exact `=0.1.0` version plus a **migration-only local
+Before its first host grant, the artifact runs two actual Wasm guest threads.
+They rendezvous through a standard `Mutex`/`Condvar`, exchange bounded
+Crossbeam messages, and concurrently update a `DashMap`; both are joined before
+the screenshot lifecycle starts. The map uses a deterministic standard hasher
+and the channel reads are non-blocking after join: the closed profile therefore
+adds neither ambient `random_get` nor `poll_oneoff` imports.
+
+The source fixture uses an exact `=0.1.1` version plus a **migration-only local
 path**; it must switch to an actually published guest-capable release before
 release acceptance. The packaged facade has separately passed a Wasm check,
 but this is not evidence that the guest-capable package has been published.

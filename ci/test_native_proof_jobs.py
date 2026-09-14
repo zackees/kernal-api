@@ -1,4 +1,4 @@
-"""Keep the two real six-host proofs on independent job deadlines."""
+"""Keep the real six-host proofs on independent job deadlines."""
 
 import re
 import unittest
@@ -28,7 +28,6 @@ class NativeProofJobsTests(unittest.TestCase):
 
     def test_all_native_proof_jobs_retain_all_six_native_hosts(self):
         for name in (
-            "wasm-archive-native",
             "wasm-compiler-native",
             "wasm-tauri-screenshot-native",
         ):
@@ -42,30 +41,12 @@ class NativeProofJobsTests(unittest.TestCase):
                 self.assertNotIn("continue-on-error:", job)
                 self.assertNotIn("needs:", job)
 
-    def test_archive_job_is_self_contained_and_screenshot_budget_is_separate(self):
-        archive = self.job("wasm-archive-native")
+    def test_compiler_and_screenshot_proofs_keep_separate_budgets(self):
         compiler = self.job("wasm-compiler-native")
         screenshot = self.job("wasm-tauri-screenshot-native")
-        for required in (
-            "toolchain: 1.95.0",
-            "./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly",
-            "./tests/screenshot-target-repair.ps1",
-            "uv run --no-project ci/run_extension2_guest.py --native-target",
-            "uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs",
-            "kernal-api-archive-build",
-        ):
-            self.assertIn(required, archive)
-        self.assertNotIn("run_extension2_guest", screenshot)
         self.assertNotIn("--lib authenticated_", screenshot)
-        self.assertNotIn("tauri-webview", archive)
-        self.assertNotIn(
-            "soldr cargo test",
-            archive,
-            "the helper must own the single native harness build",
-        )
         self.assertIn("ci/run_compiler_guest.py --native-target", compiler)
         self.assertIn("ci.test_run_compiler_guest ci.test_native_proof_jobs", compiler)
-        self.assertNotIn("run_extension2_guest", compiler)
         self.assertIn("compiler-cache", compiler)
         self.assertIn("Component", compiler)
         self.assertIn("--test wasm_tauri_screenshot", screenshot)

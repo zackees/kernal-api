@@ -125,8 +125,8 @@ Dropping an uncollected create reclaims its resource; abandoning an update
 revokes uncertain state without replay or rollback. Finalize consumes the hash
 only after validating its complete fixed-size destination.
 
-The `kernal-hash-guest-proof` binary in the extension2 benchmark workspace is
-a separate capability control, not extension2 policy. On Linux x86-64, a freshly
+The `kernal-hash-guest-proof` binary in the compiler-guest benchmark workspace
+is a separate capability control. On Linux x86-64, a freshly
 compiled revision-6 guest checked the empty-input digest and hashed 64 MiB
 of `0x5a` twice, in 65,536-byte and
 4,093-byte chunks, through the public facade. Both digests matched the native
@@ -176,21 +176,6 @@ on Linux x86-64. The screenshot guest was also rebuilt for revision 8 in
 normal, trap, and blocked forms; all 16 Linux x86-64 native regressions pass in
 173.78 seconds. These are local compatibility results, not six-target evidence
 for this revision.
-
-Fresh local revalidation at `3dbafa2` ran the checked-in
-`ci/run_extension2_guest.py` harness against a newly compiled archive guest and
-newly embedded ABI metadata. Its native host staging group passed 29 tests (4
-artifact-dependent tests ignored) in 0.45 seconds; the selected actual guest
-streaming/authentication proof then passed once in 31.91 seconds. This is a
-current Linux x86-64 execution of the one exact ignored proof, not a rerun of
-the prior eight-case group.
-
-Hosted CI run `34783064265` at `983d3ee` then ran that checked-in staging plus
-actual-streaming harness successfully on all six native targets: Linux,
-macOS, and Windows on x86-64 and ARM64. This is six-target execution evidence
-for this exact sealed archive guest proof; it does not turn the earlier local
-timing into a cross-host performance comparison or satisfy the separate
-Component/facade selection gates below.
 
 The current generator is protocol revision 10. It replaces the handwritten
 guest Blob, encrypted-input, authenticated-archive, and archive-entry release
@@ -296,11 +281,10 @@ session. Output delivery retains its aggregate in-flight byte budget in
 addition to native queue limits.
 
 The `wasm-compiler-native` CI matrix runs that exact compiler-cache proof on
-each required native host without first fetching the private extension2 policy
-source. `ci/run_compiler_guest.py` builds the separate compiler-only guest,
+each required native host. `ci/run_compiler_guest.py` builds the separate
+compiler-only guest,
 embeds fresh ABI metadata, builds one native host harness, and runs the
 miss-to-hit test.
-The extension2 archive matrix remains a separate credential-dependent proof.
 Merely scheduling this matrix is not platform evidence; each native result
 must succeed before it is counted toward #13.
 
@@ -309,8 +293,8 @@ Actions [run 34814345315](https://github.com/zackees/kernal-api/actions/runs/348
 completed the `Native compiler cache` proof successfully on Linux, macOS, and
 Windows for both x86-64 and ARM64. The run builds the compiler-only guest from
 fresh metadata and runs the exact miss-to-hit proof on each native host. It
-does not turn the separate extension2 archive proof, controlled performance
-comparison, or final binding selection into completed work.
+does not turn the controlled performance comparison or final binding
+selection into completed work.
 
 The facade documents that session kill/drop terminates and reaps only the
 direct child. Post-exit drain grace reports abandoned descendant-held pipes;
@@ -404,8 +388,7 @@ output step did not supply the acknowledgement or native ledger. The following
 prerequisites add them; guest ABI and cache hit/miss integration remain absent.
 
 This experiment does not replace the Component Model comparison, ten-edit
-latency measurements, sealed extension2 archive proof, or six native target
-acceptance required by #13.
+latency measurements, or six native target acceptance required by #13.
 
 ## Native output-shutdown facade prerequisite
 

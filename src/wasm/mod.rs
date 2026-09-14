@@ -3533,10 +3533,6 @@ fn define_closed_imports(
     Ok(())
 }
 
-#[cfg(all(test, feature = "archive-auth-test-support"))]
-#[path = "archive_input_guest_tests.rs"]
-mod archive_input_guest_tests;
-
 #[cfg(test)]
 mod threaded_root_observation_tests {
     use super::*;

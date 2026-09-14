@@ -643,6 +643,16 @@ KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
   wasm::component_compiler::tests -- --include-ignored --nocapture
 ```
 
+At `9632be3`, fresh current-source artifacts revalidated the common policy
+path: the encoded Component compiler guest passed its normal
+`actual_guest_spawns_drains_hashes_waits_and_closes` execution and its
+`actual_guest_cache_hit_does_not_spawn_the_granted_compiler` execution; the
+fresh metadata-admitted Core compiler guest passed
+`compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler`.
+This is paired correctness evidence for the shared compiler policy, not a
+matched timing/RSS measurement, a selection decision, or Component parity for
+the Core candidate's exact-output artifact authority.
+
 The candidate remains incomplete for #13: hostile incoming hash lists are still
 canonically allocated before the host length check; the fixed 32-byte compiler
 cache key crosses the Component ABI as four scalar words. Cancellation coverage

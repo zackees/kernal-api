@@ -14,12 +14,12 @@
   has landed; the dependency is mandatory and asserted by
   `tests/facade_policy.rs`, so do not add it a second time. Never introduce the
   reverse dependency.
-- Keep backend types private. Public APIs use facade-owned semantic types rather
-  than re-exporting `running-process`, Tokio, or another implementation crate.
-  The only approved exception is the canonical independent-spawn contract:
-  re-export its selected `running-process` types and entry point unchanged so
-  live control handles retain type identity. Do not broaden this to general
-  backend, Tokio, runtime, or platform types.
+- Keep backend types private. Treat `running-process` exactly like Tokio or any
+  other implementation crate: public APIs use facade-owned semantic types and
+  never re-export, alias, or name a backend type in a public position. There
+  are no exceptions. Renaming with `pub use ... as ...` changes only the
+  spelling, not the backend type a client receives. `tests/facade_policy.rs`
+  and the `kernal_api_boundary` Dylint enforce this.
 - Do not add a second allocator, pprof schema, Tokio Console stack, crash
   handler, or OS HAL behind a runtime fallback. This crate is the canonical
   owner.

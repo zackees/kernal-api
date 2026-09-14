@@ -328,6 +328,9 @@ jobs:
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
           ./tests/screenshot-target-repair.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
+          # The Component compiler guest builds for wasm32-unknown-unknown; verify
+          # and repair that target's core/std libraries the same way.
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly -Target wasm32-unknown-unknown
       - name: Run actual Core and Component compiler-policy guest proofs from one native build
         shell: pwsh
         run: |

@@ -262,12 +262,6 @@ impl AuthenticatedArchive {
     }
 }
 
-impl Drop for AuthenticatedArchive {
-    fn drop(&mut self) {
-        self.inner.abandon();
-    }
-}
-
 /// One bounded inventory record and its independent scoped entry authority.
 pub struct ArchiveEntry {
     // Retains scoped authority until opened or dropped.
@@ -290,12 +284,6 @@ impl ArchiveEntry {
     }
     pub fn uncompressed_bytes(&self) -> u64 {
         self.bytes
-    }
-}
-
-impl Drop for EncryptedArchive {
-    fn drop(&mut self) {
-        self.inner.abandon();
     }
 }
 
@@ -541,6 +529,18 @@ mod tests {
     extern "C" fn resource_release_blob(blob: i64) -> i32 {
         LAST_BLOB_RELEASE.store(blob, Ordering::SeqCst);
         BLOB_RELEASES.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    #[export_name = "resource_release_encrypted_archive"]
+    extern "C" fn resource_release_encrypted_archive(_: i64) -> i32 {
+        0
+    }
+    #[export_name = "resource_release_authenticated_archive"]
+    extern "C" fn resource_release_authenticated_archive(_: i64) -> i32 {
+        0
+    }
+    #[export_name = "resource_release_archive_entry"]
+    extern "C" fn resource_release_archive_entry(_: i64) -> i32 {
         0
     }
 

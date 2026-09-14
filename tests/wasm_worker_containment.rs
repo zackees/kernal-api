@@ -78,12 +78,15 @@ fn compiler(deadline: Duration, fuel: SketchFuelLimits) -> SketchCompiler {
                 64 * 1024,
                 1024 * 1024,
                 2 * 1024 * 1024,
-                1,
-                1,
-                1,
+                // The real threaded smoke guest owns two independent child
+                // blob scopes. Each can retain an awaited write while it
+                // submits a second cancellation candidate.
+                2,
+                2,
+                4,
             )
             .unwrap()
-            .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
+            .with_maximum_transfer_bytes(3 * 1024 * 1024)
             .unwrap(),
         );
     SketchCompiler::new(

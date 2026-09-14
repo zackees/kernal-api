@@ -307,7 +307,9 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Cold --no-cache release builds of the Wasmtime component tools take
+    # 20-22 minutes on the fastest hosts and exceed 30 on Windows and Intel macOS.
+    timeout-minutes: 60
     env:
       NATIVE_TARGET: ${{ matrix.target }}
     steps:

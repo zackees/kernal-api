@@ -4455,8 +4455,9 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.pending_operations, 0);
         assert_eq!(operations.live_resources, 0);
         assert_eq!(operations.active_clocks, 0);
-        // One create, two child uses, and one close must each prove a real
-        // Pending -> async yield wake -> one terminal poll transition. The
+        // One create and two child uses must each prove a real Pending -> async
+        // yield wake -> one terminal poll transition. `Blob::close` is the
+        // generated synchronous `stream_close` release, not an operation. The
         // two guest-owned bounded streams add ten terminal operations; their
         // individual submissions may complete before or after waiter
         // registration, so only the suspension count remains a range.
@@ -4467,16 +4468,22 @@ mod threaded_root_observation_tests {
         // The 128 additional blob creates each require the ordinary deferred
         // create transition; their synchronous drops add no suspension.
         assert!(
-            (8 + 128 + 4..=11 + 128 + 10).contains(&operations.suspends),
+            (7 + 128 + 4..=10 + 128 + 10).contains(&operations.suspends),
             "{operations:?}"
         );
         // Each of the 128 create/drop iterations consumes one create result;
         // synchronous Drop itself allocates and consumes no operation slot.
-        // The two child streams consume 46 results: create, sixteen fills,
+        // The two child streams consume 44 results: create, sixteen fills,
         // one scheduler yield, one resumed capacity write, one cancelled
-        // write, one read, seal, and close each. The cancellation itself
-        // still has one terminal result, even though it never publishes bytes.
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128 + 46);
+        // write, one read, and seal each. The cancellation itself still has
+        // one terminal result, even though it never publishes bytes. The
+        // parent's and children's `Blob::close` calls are synchronous
+        // `stream_close` releases and consume no operation result.
+        assert_eq!(
+            operations.resumes,
+            11 + 2 * 1024 + 37 + 1 + 1 + 128 + 44,
+            "{operations:?}"
+        );
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),

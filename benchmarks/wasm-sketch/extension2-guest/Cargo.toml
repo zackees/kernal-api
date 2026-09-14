@@ -9,7 +9,8 @@ publish = false
 
 [features]
 # Source-only streaming proof; not full upstream/runtime acceptance.
-guest-proof = []
+guest-proof = ["compiler-artifact-output"]
+compiler-artifact-output = []
 header-proof = ["guest-proof"]
 auth-proof = ["guest-proof"]
 inventory-proof = ["guest-proof"]

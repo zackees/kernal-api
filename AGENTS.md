@@ -33,3 +33,15 @@
   migration-only and must not reach a release branch.
 - `0.0.0` is an unusable registry reservation and must never be restored as a
   dependency fallback or published from this source branch.
+- Keep host-platform selection structured: the one `std::cfg_select!` root in
+  `src/lib.rs` selects a private concrete platform tree. Ordinary modules use
+  the neutral crate-root facade and must not add `cfg(target_os = ...)`, name
+  `platform_imp`/a concrete platform tree, or reach into `std::os`/native OS
+  APIs. This does not prohibit host-neutral feature or test configuration;
+  the rule is about selecting a host implementation. Guest/WASM target
+  selection is a separate concern.
+- Read [docs/platform-boundary.md](docs/platform-boundary.md) before changing
+  a platform capability. Its target structure and enforcement plan are tracked
+  by #152. Until that issue lands, the repository's platform Dylint deliberately
+  exempts `kernal-api` itself, so passing Dylint alone is not evidence that new
+  facade-owner source follows this boundary.

@@ -40,6 +40,18 @@ bodies remain unlinted by it; `tests/facade_policy.rs` scans those as text
 regardless of host. Narrowing the feature set is a coverage decision, not a
 knob: if it is ever narrowed, say here exactly which features remain covered.
 
+## Platform-boundary status
+
+The intended platform layout is documented in
+[docs/platform-boundary.md](docs/platform-boundary.md). It has one structured
+`std::cfg_select!` host selector in the facade root and neutral capability
+modules below it. Do not treat the present Dylint as complete enforcement of
+that rule: `kernal_api_platform_boundary` currently exempts the `kernal-api`
+package so it can lint clients, and its CI job runs on Linux. Issue #152 owns
+removing that owner exemption with an AST/pre-expansion rule and adding a
+temporary exact occurrence baseline before taking it to zero. Until then,
+review new platform code against the guide as well as running the lint.
+
 The lint checks both the client manifest and resolved Rust code. An unused,
 aliased, target-specific, build, or test dependency on a facade-owned backend
 is rejected before it can create a duplicate compile unit; method calls,

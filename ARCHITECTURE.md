@@ -58,6 +58,16 @@ This one-way graph resolves the async/process cycle without creating a smaller
 The public API describes intent rather than backend vocabulary. This allows a
 backend to be trimmed, vendored, or rewritten without changing every client.
 
+### Native platform boundary
+
+Host selection has one owner: the `std::cfg_select!` block in `src/lib.rs`.
+It selects a private concrete platform tree and re-exports a neutral facade
+from the crate root. Capability modules consume that facade; they do not make
+their own `target_os` choices or name a concrete tree. Guest/WASM target
+selection is intentionally separate from native-host selection. The detailed
+authoring and validation guide is [docs/platform-boundary.md](docs/platform-boundary.md);
+issue #152 tracks completing Dylint enforcement of this architecture.
+
 ## WebAssembly sketch runtime
 
 `kernal-api` will host long-lived Rust sketches compiled to WebAssembly. A

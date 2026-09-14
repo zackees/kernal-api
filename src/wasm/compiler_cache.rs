@@ -3,8 +3,11 @@
 //! The guest receives only a fixed request key and a hit/miss answer. Cache
 //! roots, namespaces, and artifact bytes stay on the host side of the facade.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "wasm-sketch-host"))]
 use std::path::Path;
+
+#[cfg(feature = "wasm-sketch-host")]
+use super::operations::OperationHub;
 
 use zccache_artifact::{Key, KvStore};
 
@@ -33,6 +36,33 @@ impl CompilerArtifactStore {
             .map(|_| ())
             .map_err(|_| ())
     }
+}
+
+/// Read a private compiler artifact and restore a hit through the one exact
+/// host-owned output path.  The guest never receives the cache bytes or the
+/// destination capability, regardless of which private binding experiment
+/// asked for the cache decision.
+#[cfg(feature = "wasm-sketch-host")]
+pub(super) fn restore_cached_output_if_hit(
+    store: &CompilerArtifactStore,
+    hub: &OperationHub,
+    owner: u64,
+    key: [u8; 32],
+    destination: &Path,
+) -> Result<bool, CacheRestoreError> {
+    let Some(bytes) = store.get(key).map_err(|_| CacheRestoreError::Cache)? else {
+        return Ok(false);
+    };
+    hub.restore_cached_output(owner, destination, &bytes)
+        .map_err(|_| CacheRestoreError::Output)?;
+    Ok(true)
+}
+
+#[cfg(feature = "wasm-sketch-host")]
+#[derive(Debug)]
+pub(super) enum CacheRestoreError {
+    Cache,
+    Output,
 }
 
 #[cfg(test)]

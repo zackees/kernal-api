@@ -639,11 +639,17 @@ Disabling the budget's deferred-refund branch is RED (`20260913T142420Z`):
 resource destruction prematurely reduces the expected 64-KiB charge to zero.
 Restoring the branch makes the focused test GREEN.
 
-Linux x86-64 execution passes the cache hit, controlled 2-MiB-per-stream miss,
-allocator-trap, and admitted-read cancellation cases. The success path observes
-zero resources, operations, tracked process jobs, and transfer bytes after
-cleanup. To reproduce, use a fresh output directory because the encoder
-intentionally refuses to overwrite files:
+Linux x86-64 execution passes a real zccache-backed cache hit, the controlled
+2-MiB-per-stream miss, allocator trap, and admitted-read cancellation cases.
+For the hit, the host reads a stored 4-MiB artifact and restores it through the
+same exact-path hub operation used by Core before Component instantiation; the
+guest gets only a hit answer and a deliberately nonexistent compiler command.
+The test asserts the restored bytes, leaves an adjacent ungranted file intact,
+observes no compiler-output copy, and drains resources, operations, tracked
+process jobs, and transfer bytes. A miss leaves that exact destination absent:
+the Component guest still has no artifact-output authority. To reproduce, use
+a fresh output directory because the encoder intentionally refuses to overwrite
+files:
 
 ```sh
 SOLDR_LINKER=default soldr --no-cache cargo build --locked \
@@ -670,32 +676,32 @@ KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
   wasm::component_compiler::tests -- --include-ignored --nocapture
 ```
 
-At `9632be3`, fresh current-source artifacts revalidated the common policy
-path: the encoded Component compiler guest passed its normal
-`actual_guest_spawns_drains_hashes_waits_and_closes` execution and its
-`actual_guest_cache_hit_does_not_spawn_the_granted_compiler` execution; the
-fresh metadata-admitted Core compiler guest passed
+The reproducible compiler runner builds fresh admitted Core and encoded
+Component artifacts. Its Component cache-hit execution now uses the real
+private `CompilerArtifactStore` plus the shared exact-output restore helper,
+then verifies that the forbidden compiler was not spawned. The metadata-admitted
+Core guest independently passes
 `compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler`.
-This is paired correctness evidence for the shared compiler policy, not a
-matched timing/RSS measurement, a selection decision, or Component parity for
-the Core candidate's exact-output artifact authority.
+This is paired correctness evidence for the shared cache-hit policy and exact
+host containment, not a matched timing/RSS measurement, a selection decision,
+or Component parity for Core's exact-output artifact authority on a cache miss.
 
-At `79785d5`, the existing six-host compiler-policy CI matrix builds a fresh
-encoded Component candidate and runs those same normal and cache-hit Component
-executions alongside the Core proof in each lane. This is parent CI evidence
-for the Component build and its common-policy executions on the supported host
-matrix; it remains distinct from exact-output parity, a total-RSS bound, and a
-runtime selection decision.
+At `79785d5`, the existing six-host compiler-policy CI matrix built a fresh
+encoded Component candidate and ran the then-current normal and cache-hit
+Component executions alongside the Core proof in each lane. It does not cover
+the newer real cache-hit restore fixture, so fresh six-host evidence is still
+required for that path. The existing matrix remains distinct from exact-output
+parity, a total-RSS bound, and a runtime selection decision.
 
 The candidate remains incomplete for #13: hostile incoming hash lists are still
 canonically allocated before the host length check; the fixed 32-byte compiler
 cache key crosses the Component ABI as four scalar words. Cancellation coverage
-and public blob parity are not complete. Unlike the Core fixture, the Component
-candidate has no exact-output authority and therefore does not persist or move
-compiler artifacts. The six-host parent CI proof above is not exhaustive
-acceptance, a total-RSS bound, or the matched measurements needed to choose the
-final runtime. Fixture source pins remain migration-only, not
-published-dependency acceptance.
+and public blob parity are not complete. The Component guest has no exact-output
+authority, and therefore cannot persist or move a compiler artifact on a cache
+miss; cache-hit restoration is host-only through the shared exact-output path.
+The six-host parent CI proof above is not exhaustive acceptance, a total-RSS
+bound, or the matched measurements needed to choose the final runtime. Fixture
+source pins remain migration-only, not published-dependency acceptance.
 
 Local regression gates also pass: 116 operation tests, four native semantic
 guest-adapter tests, the revision-8 Core compiler and 64-MiB hash artifacts,

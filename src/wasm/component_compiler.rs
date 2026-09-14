@@ -5,6 +5,8 @@ use crate::async_engine::RuntimeHandle;
 use crate::operations::{
     ComponentResourceBudget, ComponentResourceLease, HubError, OpaqueToken, OperationHub,
 };
+#[cfg(test)]
+use crate::operations::BlobLimits;
 use std::sync::Arc;
 use wasmtime::component::{Accessor, HasData, Resource, ResourceTable};
 
@@ -216,10 +218,41 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let hub = OperationHub::new(64, 64).unwrap();
+        // Match the Core artifact proof's explicitly larger bounded payload:
+        // normal Component probe defaults remain unchanged.
+        let hub = OperationHub::with_blob_limits(
+            64,
+            64,
+            BlobLimits::new(64 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
+        )
+        .unwrap();
         let budget = ComponentResourceBudget::new(Arc::clone(&hub));
         let cancellation = crate::async_engine::CancellationSource::new();
-        let spec = if cache_hit {
+        let cache = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let artifact = output.path().join("compiler-artifact");
+        let neighbor = output.path().join("ungranted-neighbor");
+        std::fs::write(&neighbor, b"leave this file alone").unwrap();
+        let expected = cache_hit.then(|| {
+            let mut bytes = vec![0xf1; 2 * 1024 * 1024];
+            bytes.extend(std::iter::repeat_n(0xf2, 2 * 1024 * 1024));
+            bytes
+        });
+        let cache_store = crate::wasm::compiler_cache::CompilerArtifactStore::open(cache.path())
+            .unwrap();
+        if let Some(bytes) = expected.as_deref() {
+            cache_store.put(CACHE_KEY, bytes).unwrap();
+        }
+        let restored = crate::wasm::compiler_cache::restore_cached_output_if_hit(
+            &cache_store,
+            &hub,
+            0,
+            CACHE_KEY,
+            &artifact,
+        )
+        .unwrap();
+        assert_eq!(restored, cache_hit);
+        let spec = if restored {
             crate::SpawnSpec::new(
                 std::env::current_dir()
                     .unwrap()
@@ -235,7 +268,7 @@ mod tests {
                 0,
                 spec,
                 Duration::from_secs(15),
-                Some((CACHE_KEY, cache_hit)),
+                Some((CACHE_KEY, restored)),
             )
             .unwrap();
         let mut store = wasmtime::Store::new(
@@ -311,12 +344,16 @@ mod tests {
             assert!(live_before_drop > 0);
             assert_eq!(early_release, Some(Err(HubError::WrongRights)));
             assert!(retained_after_store_drop >= 65536);
-        } else if cache_hit {
+        } else if restored {
             result.unwrap();
             assert_eq!(copied, 0, "cache hit must not read compiler output");
+            assert_eq!(std::fs::read(&artifact).unwrap(), expected.unwrap());
+            assert_eq!(std::fs::read(&neighbor).unwrap(), b"leave this file alone");
         } else {
             result.unwrap();
             assert!(copied > 1);
+            assert!(!artifact.exists(), "a Component miss has no output authority");
+            assert_eq!(std::fs::read(&neighbor).unwrap(), b"leave this file alone");
         }
     }
 }

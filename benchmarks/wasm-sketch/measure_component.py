@@ -14,7 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from measure_core import edit_summary, run
+from measure_core import build_rss, edit_summary, run
 
 
 def edit_source(source: str, previous: int, following: int) -> str:
@@ -40,12 +40,30 @@ def main() -> None:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--encoder", required=True, type=Path)
     parser.add_argument("--edits", default=10, type=int)
+    parser.add_argument(
+        "--gnu-time",
+        type=Path,
+        help="optional GNU time executable; collect build command peak RSS",
+    )
     args = parser.parse_args()
     if args.edits < 10:
         parser.error("--edits must be at least 10")
     encoder = args.encoder.resolve()
     if not encoder.is_file():
         parser.error("build the engine-probe encoder first")
+    gnu_time = args.gnu_time.resolve() if args.gnu_time else None
+    time_version = None
+    if gnu_time is not None:
+        version = subprocess.run(
+            [str(gnu_time), "--version"],
+            capture_output=True,
+            text=True,
+            check=True,
+            env={"LC_ALL": "C"},
+        )
+        if "GNU Time" not in version.stdout:
+            parser.error("--gnu-time must name GNU time (not BSD time or a shell builtin)")
+        time_version = version.stdout.splitlines()[0]
     repo = Path(__file__).resolve().parents[2]
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -76,10 +94,17 @@ def main() -> None:
         "cache_mode": "soldr-disabled",
         "cache_hit_rate": None,
         "peak_compiler_rss_bytes": None,
+        "build_memory": {
+            "method": "gnu-time-%M" if gnu_time else None,
+            "tool_version": time_version,
+            "scope": "build command peak RSS; not aggregate concurrent RSS",
+            "peak_rss_bytes": None,
+        },
         "limitations": [
             "shared host, not the controlled reference-host latency gate",
             "private generated API, not the same public facade as core",
-            "cache hit rate and compiler memory are not collected",
+            "cache hit rate and compiler-specific RSS are not collected",
+            "GNU time does not account for detached daemon processes",
             "includes encoding and engine compilation, no instantiation or execution",
             "encoder optimization profile is caller supplied; retain its build log",
         ],
@@ -98,6 +123,7 @@ def main() -> None:
             previous = following
         component = output / f"{label}.wasm"
         started = time.monotonic_ns()
+        rss_log = output / f"{label}-build.rss-kib" if gnu_time else None
         build_ns, _ = run(
             [
                 "soldr",
@@ -115,7 +141,10 @@ def main() -> None:
             ],
             guest,
             output / f"{label}-build.log",
+            gnu_time=gnu_time,
+            rss_log=rss_log,
         )
+        peak_rss = build_rss(rss_log.read_text(encoding="utf-8")) if rss_log else None
         encode_ns, result = run(
             [str(encoder), str(artifact), str(component)],
             source,
@@ -130,6 +159,7 @@ def main() -> None:
                 "wall_ns": elapsed,
                 "build_ns": build_ns,
                 "encode_and_compile_command_ns": encode_ns,
+                "build_peak_rss_bytes": peak_rss,
                 "module_bytes": module_bytes,
                 "source_sha256": hashlib.sha256(guest_source.read_bytes()).hexdigest(),
                 "module_sha256": hashlib.sha256(component.read_bytes()).hexdigest(),
@@ -140,6 +170,10 @@ def main() -> None:
         )
         print(f"{label}: {elapsed / 1_000_000_000:.3f}s", flush=True)
     document["edit_summary"] = edit_summary(records[2:])
+    if gnu_time:
+        document["build_memory"]["peak_rss_bytes"] = max(
+            sample["build_peak_rss_bytes"] for sample in records
+        )
     document["status"] = "complete-diagnostic-only"
     (output / "result.json").write_text(
         json.dumps(document, indent=2) + "\n", encoding="utf-8"

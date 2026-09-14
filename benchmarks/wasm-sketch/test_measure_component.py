@@ -3,10 +3,16 @@ import unittest
 from pathlib import Path
 
 from measure_component import edit_source, validate_output
-from measure_core import edit_summary
+from measure_core import build_rss, edit_summary
 
 
 class ComponentMeasurementTests(unittest.TestCase):
+    def test_optional_component_rss_uses_the_shared_positive_kib_parser(self):
+        self.assertEqual(build_rss("64\n"), 64 * 1024)
+        for invalid in ("", "0", "1.5", "64\n65"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                build_rss(invalid)
+
     def test_recorded_diagnostic_has_ten_distinct_compiled_edits(self):
         for profile in ("debug", "release"):
             with self.subTest(profile=profile):

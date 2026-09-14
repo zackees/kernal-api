@@ -6,7 +6,7 @@ native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
 `running-process` phase-1 adapter has landed: this crate depends on the exact
-published `running-process` 4.10.12 registry release unconditionally. Its
+published `running-process` 4.10.14 registry release unconditionally. Its
 canonical independent-spawn contract is the sole backend-type exception: the
 selected mode, options, launch payload, readiness, handle, and entry point are
 re-exported unchanged behind the explicit `independent-spawn` feature so live
@@ -47,7 +47,7 @@ direct use of implementation crates owned by this package.
 ## Rust features
 
 The base crate contains the async process/host facade. Its bounded process
-adapter uses `running-process` 4.10.12; that dependency is mandatory, not
+adapter uses `running-process` 4.10.14; that dependency is mandatory, not
 feature-gated. Except for the selected canonical independent-spawn contract,
 backend types remain private. With `independent-spawn`,
 `SpawnMode::Inherited` remains the default; `SpawnMode::Independent` requires

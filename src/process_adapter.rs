@@ -418,6 +418,7 @@ fn session_options(options: ProcessSessionOptions) -> AsyncProcessSessionOptions
             ProcessPostExitDrain::AbandonAfter(grace) => Some(grace),
         },
         kill_on_drop: options.kill_on_drop,
+        kill_tree_on_drop: false,
     }
 }
 

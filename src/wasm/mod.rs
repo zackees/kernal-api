@@ -350,6 +350,23 @@ impl SketchBlobLimits {
     pub fn maximum_transfer_bytes(self) -> usize {
         self.limits.maximum_transfer_bytes
     }
+    /// Sets the maximum quiet interval for one pending blob transfer.
+    ///
+    /// This is reset only by bytes moving through that blob's own bounded
+    /// stream; it is independent of the logical sketch wall-clock deadline.
+    pub fn with_progress_idle_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, SketchCompilerError> {
+        if timeout.is_zero() {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.limits.progress_idle_timeout = timeout;
+        Ok(self)
+    }
+    pub fn progress_idle_timeout(self) -> Duration {
+        self.limits.progress_idle_timeout
+    }
 }
 impl Default for SketchBlobLimits {
     fn default() -> Self {
@@ -920,7 +937,7 @@ impl AdmittedSketch {
         // module start section sees only the already-authorized resource. A
         // cache hit gets no output token because the host restored it above.
         let initial_output = (!cache_hit)
-            .then(|| output.as_deref())
+            .then_some(output.as_deref())
             .flatten()
             .map(|path| operations.grant_exact_output_wire(0, path))
             .transpose()
@@ -1583,6 +1600,16 @@ mod execution_ledger_tests {
                 .unwrap()
                 .maximum_transfer_bytes(),
             24
+        );
+        assert!(blobs
+            .with_progress_idle_timeout(Duration::ZERO)
+            .is_err());
+        assert_eq!(
+            blobs
+                .with_progress_idle_timeout(Duration::from_millis(7))
+                .unwrap()
+                .progress_idle_timeout(),
+            Duration::from_millis(7)
         );
         let compiler = SketchCompiler::new(
             SketchCompilerConfig::default()
@@ -2373,8 +2400,14 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         // The generated future calls this only after submit/poll. The async
         // owner driver will replace this scalar acknowledgement with its
         // parked Wasmtime yield glue; no Caller escapes this boundary.
+        let Some(runtime) = self.runtime.clone() else {
+            return self
+                .operations
+                .suspend_wire(self.store_owner, operation)
+                .map_err(|_| wasmtime::Error::msg("operation cannot suspend"));
+        };
         self.operations
-            .suspend_wire(self.store_owner, operation)
+            .suspend_stream_wire(runtime, self.store_owner, operation)
             .map_err(|_| wasmtime::Error::msg("operation cannot suspend"))
     }
 

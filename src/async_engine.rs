@@ -817,18 +817,26 @@ impl ProgressReporter {
         }
     }
 
-    /// Record that the caller observed forward progress.
-    ///
-    /// Call this only after a meaningful byte, frame, or other contractually
-    /// defined unit has been consumed or produced. Merely polling an idle
-    /// transport must not reset the progress deadline.
-    pub fn report_progress(&self) {
+    /// Start a fresh idle window for a new transfer using this progress
+    /// domain. This establishes its initial budget; it is not evidence that
+    /// bytes have moved, so callers must still use [`report_progress`] for
+    /// actual transfer progress.
+    pub fn restart_idle_window(&self) {
         *self
             .state
             .last_progress
             .lock()
             .expect("progress state mutex must not be poisoned") = tokio::time::Instant::now();
         self.state.notify.notify_waiters();
+    }
+
+    /// Record that the caller observed forward progress.
+    ///
+    /// Call this only after a meaningful byte, frame, or other contractually
+    /// defined unit has been consumed or produced. Merely polling an idle
+    /// transport must not reset the progress deadline.
+    pub fn report_progress(&self) {
+        self.restart_idle_window();
     }
 }
 

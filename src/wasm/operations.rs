@@ -206,6 +206,9 @@ pub(crate) struct BlobLimits {
     pub(crate) maximum_pending_reads: usize,
     pub(crate) maximum_pending_writes: usize,
     pub(crate) maximum_transfer_bytes: usize,
+    /// Maximum quiet interval for one pending blob transfer.  This is an idle
+    /// budget, not a sketch wall-clock deadline.
+    pub(crate) progress_idle_timeout: std::time::Duration,
 }
 
 impl BlobLimits {
@@ -234,6 +237,7 @@ impl BlobLimits {
                 },
                 None => return Err(HubError::Quota),
             },
+            progress_idle_timeout: std::time::Duration::from_secs(5),
         })
     }
 }
@@ -246,6 +250,7 @@ const DEFAULT_BLOB_LIMITS: BlobLimits = BlobLimits {
     maximum_pending_reads: 128,
     maximum_pending_writes: 128,
     maximum_transfer_bytes: 12 * 1024 * 1024 + 64 * 1024,
+    progress_idle_timeout: std::time::Duration::from_secs(5),
 };
 
 /// Private typed requests shared by the generated ABI and heavyweight native
@@ -292,6 +297,9 @@ struct ResourceSlot {
     value: ResourceValue,
     reserved: bool,
     committing: bool,
+    // One opaque blob is one independent transfer-progress domain.  Progress
+    // on a different blob must never extend this blob's idle budget.
+    progress: crate::async_engine::ProgressReporter,
 }
 
 enum ResourceValue {
@@ -367,6 +375,7 @@ struct OperationSlot {
     is_blob_write: bool,
     blob_read_result: Option<Vec<u8>>,
     producer_cancel: Option<crate::async_engine::CancellationSource>,
+    progress_timeout_cancel: Option<crate::async_engine::CancellationSource>,
 }
 
 #[derive(Clone, Copy)]
@@ -409,6 +418,7 @@ struct State {
 pub(crate) struct NativeBlobChunk<'a> {
     hub: &'a OperationHub,
     bytes: Vec<u8>,
+    progress: crate::async_engine::ProgressReporter,
 }
 
 impl std::ops::Deref for NativeBlobChunk<'_> {
@@ -421,11 +431,15 @@ impl std::ops::Deref for NativeBlobChunk<'_> {
 impl Drop for NativeBlobChunk<'_> {
     fn drop(&mut self) {
         let capacity = self.bytes.capacity();
+        let observed_bytes = !self.bytes.is_empty();
         // Free the allocation before making its credits available to writers.
         drop(std::mem::take(&mut self.bytes));
         if let Ok(mut state) = self.hub.state.lock() {
             state.native_transfer_capacity =
                 state.native_transfer_capacity.saturating_sub(capacity);
+        }
+        if observed_bytes {
+            self.progress.report_progress();
         }
         let _ = self.hub.drive_blob_writes();
         let _ = self.hub.drive_blob_reads();
@@ -1175,6 +1189,85 @@ impl OperationHub {
         self.suspend(OpaqueToken(operation), store)
     }
 
+    /// Park a generated blob transfer and enforce its own idle budget.  The
+    /// timer watches only the transfer's resource progress domain; it is not
+    /// the logical sketch's wall-clock deadline and cannot be reset by a
+    /// different blob.
+    pub(crate) fn suspend_stream_wire(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        store: u64,
+        operation: u64,
+    ) -> Result<Arc<Notify>, HubError> {
+        let operation_token = OpaqueToken(operation);
+        let notify = self.suspend(operation_token, store)?;
+        let armed = {
+            let mut state = self.state.lock().map_err(|_| HubError::Closed)?;
+            let operation = state
+                .operations
+                .get(&operation_token)
+                .ok_or(HubError::Invalid)?;
+            let arm = operation.owner.store == store
+                && operation.terminal.is_none()
+                && (operation.is_blob_read || operation.is_blob_write)
+                && operation.progress_timeout_cancel.is_none();
+            if !arm {
+                None
+            } else {
+                let resource = operation.resource.ok_or(HubError::Invalid)?;
+                let reporter = state
+                    .resources
+                    .get(&resource)
+                    .ok_or(HubError::Invalid)?
+                    .progress
+                    .clone();
+                let watch = reporter.watch();
+                let cancel = crate::async_engine::CancellationSource::new();
+                let token = cancel.token();
+                state
+                    .operations
+                    .get_mut(&operation_token)
+                    .ok_or(HubError::Invalid)?
+                    .progress_timeout_cancel = Some(cancel);
+                Some((reporter, watch, token))
+            }
+        };
+        if let Some((reporter, watch, cancellation)) = armed {
+            // A Blob can outlive one transfer. Start this operation's own
+            // quiet interval now rather than inheriting the last activity of
+            // a prior transfer on the same resource.
+            reporter.restart_idle_window();
+            let hub = Arc::clone(self);
+            let idle = self.blob_limits.progress_idle_timeout;
+            runtime
+                .launch(async move {
+                    let stalled = matches!(
+                        crate::async_engine::cancellable(
+                            &cancellation,
+                            crate::async_engine::progress_timeout(
+                                idle,
+                                &watch,
+                                std::future::pending::<()>(),
+                            ),
+                        )
+                        .await,
+                        Ok(Err(_))
+                    );
+                    if stalled {
+                        let _ = hub.terminal(
+                            operation_token,
+                            TerminalResult {
+                                terminal: Terminal::TimedOut,
+                                resource: None,
+                            },
+                        );
+                    }
+                })
+                .detach();
+        }
+        Ok(notify)
+    }
+
     pub(crate) fn cancel_wire(&self, store: u64, operation: u64) -> Result<(), HubError> {
         #[cfg(feature = "wasm-sketch-host")]
         if self.cancel_compiler_output_wire(store, OpaqueToken(operation))? {
@@ -1403,7 +1496,13 @@ impl OperationHub {
         state.peak_buffered_blob_bytes = state
             .peak_buffered_blob_bytes
             .max(state.buffered_blob_bytes);
+        let progress = state
+            .resources
+            .get(&blob)
+            .map(|resource| resource.progress.clone())
+            .ok_or(HubError::Invalid)?;
         drop(state);
+        progress.report_progress();
         self.drive_blob_reads()?;
         Ok(bytes.len())
     }
@@ -1453,6 +1552,7 @@ impl OperationHub {
             // while its length-based byte ledger reports zero.
             *buffer = VecDeque::new();
         }
+        let progress = resource.progress.clone();
         state.peak_retained_transfer_capacity = state
             .peak_retained_transfer_capacity
             .max(retained_before_read.saturating_add(result.capacity()));
@@ -1461,6 +1561,7 @@ impl OperationHub {
         let result = NativeBlobChunk {
             hub: self,
             bytes: result,
+            progress,
         };
         drop(state);
         self.drive_blob_writes()?;
@@ -1609,6 +1710,7 @@ impl OperationHub {
             .map(|(token, _)| *token)
             .collect();
         let mut wakes = Vec::new();
+        let mut progress_reports = Vec::new();
         for token in tokens {
             let operation = &state.operations[&token];
             let resource = operation.resource.ok_or(HubError::Invalid)?;
@@ -1660,6 +1762,13 @@ impl OperationHub {
                 state.peak_buffered_blob_bytes = state
                     .peak_buffered_blob_bytes
                     .max(state.buffered_blob_bytes);
+                let progress = state
+                    .resources
+                    .get(&resource)
+                    .ok_or(HubError::Invalid)?
+                    .progress
+                    .clone();
+                progress_reports.push(progress);
             }
             if let Some(wake) = Self::terminal_locked(
                 &mut state,
@@ -1674,6 +1783,9 @@ impl OperationHub {
         }
         drop(state);
         let progressed = !wakes.is_empty();
+        for progress in progress_reports {
+            progress.report_progress();
+        }
         for wake in wakes {
             wake.notify_one();
         }
@@ -1726,6 +1838,7 @@ impl OperationHub {
             .map(|(token, _)| *token)
             .collect();
         let mut wakes = Vec::new();
+        let mut progress_reports = Vec::new();
         for token in tokens {
             let operation = &state.operations[&token];
             let resource = operation.resource.ok_or(HubError::Invalid)?;
@@ -1739,6 +1852,7 @@ impl OperationHub {
                 .sum();
             let Some(ResourceSlot {
                 value: ResourceValue::Blob { buffer, sealed },
+                progress,
                 ..
             }) = state.resources.get_mut(&resource)
             else {
@@ -1759,6 +1873,7 @@ impl OperationHub {
             if buffer.is_empty() {
                 *buffer = VecDeque::new();
             }
+            let progress = progress.clone();
             state.peak_retained_transfer_capacity = state
                 .peak_retained_transfer_capacity
                 .max(retained_before_read.saturating_add(bytes.capacity()));
@@ -1768,6 +1883,7 @@ impl OperationHub {
                 .get_mut(&token)
                 .ok_or(HubError::Invalid)?
                 .blob_read_result = Some(bytes);
+            progress_reports.push(progress);
             if let Some(wake) = Self::terminal_locked(
                 &mut state,
                 token,
@@ -1781,6 +1897,9 @@ impl OperationHub {
         }
         drop(state);
         let progressed = !wakes.is_empty();
+        for progress in progress_reports {
+            progress.report_progress();
+        }
         for wake in wakes {
             wake.notify_one();
         }
@@ -2364,6 +2483,7 @@ impl OperationHub {
                 value,
                 reserved: true,
                 committing: false,
+                progress: crate::async_engine::ProgressReporter::new(),
             },
         );
         Ok(token)
@@ -2451,6 +2571,7 @@ impl OperationHub {
                 is_blob_write: false,
                 blob_read_result: None,
                 producer_cancel: None,
+                progress_timeout_cancel: None,
             },
         );
         Ok((token, notify))
@@ -2625,6 +2746,9 @@ impl OperationHub {
             if let Some(cancel) = operation.producer_cancel.take() {
                 cancel.cancel();
             }
+            if let Some(cancel) = operation.progress_timeout_cancel.take() {
+                cancel.cancel();
+            }
             operation.pending_blob_write = None;
             operation.pending_blob_read = None;
             (Arc::clone(&operation.notify), operation.created_resource)
@@ -2759,6 +2883,9 @@ impl OperationHub {
             #[cfg(all(test, feature = "archive-auth-test-support"))]
             drop(operation.pending_authentication.take());
             if let Some(cancel) = operation.producer_cancel.take() {
+                cancel.cancel();
+            }
+            if let Some(cancel) = operation.progress_timeout_cancel.take() {
                 cancel.cancel();
             }
             operation.blob_read_result = None;
@@ -4810,6 +4937,92 @@ mod tests {
         hub.close_all(Terminal::Closed);
         assert_eq!(hub.snapshot().pending_operations, 0);
         assert_eq!(hub.snapshot().buffered_blob_bytes, 0);
+    }
+
+    #[test]
+    fn pending_blob_transfer_expires_after_its_own_idle_budget() {
+        let mut limits = BlobLimits::new(4, 4, 4).unwrap();
+        limits.progress_idle_timeout = std::time::Duration::from_millis(10);
+        let hub = OperationHub::with_blob_limits(4, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let wake = hub
+            .suspend_stream_wire(runtime.handle(), 1, write.wire())
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                .await
+                .expect("stalled blob transfer must wake its guest waiter");
+        });
+        assert_eq!(hub.poll_wire(1, write.wire()) as u8, STATUS_TIMED_OUT);
+        assert_eq!(hub.snapshot().pending_blob_writes, 0);
+    }
+
+    #[test]
+    fn a_new_blob_transfer_does_not_inherit_a_previous_idle_window() {
+        let mut limits = BlobLimits::new(4, 4, 4).unwrap();
+        limits.progress_idle_timeout = std::time::Duration::from_millis(10);
+        let hub = OperationHub::with_blob_limits(4, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::sleep(std::time::Duration::from_millis(20)).await;
+        });
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        let wake = hub
+            .suspend_stream_wire(runtime.handle(), 1, write.wire())
+            .unwrap();
+        runtime.run(async {
+            crate::async_engine::sleep(std::time::Duration::from_millis(5)).await;
+            assert_eq!(hub.poll_wire(1, write.wire()) as u8, STATUS_PENDING);
+            crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                .await
+                .expect("the new transfer must eventually report its own idle timeout");
+        });
+        assert_eq!(hub.poll_wire(1, write.wire()) as u8, STATUS_TIMED_OUT);
+    }
+
+    #[test]
+    fn blob_progress_keeps_a_pending_transfer_alive_past_one_idle_interval() {
+        let mut limits = BlobLimits::new(4, 4, 4).unwrap();
+        limits.progress_idle_timeout = std::time::Duration::from_millis(10);
+        let hub = OperationHub::with_blob_limits(4, 2, limits).unwrap();
+        let blob = hub.create_blob(1).unwrap();
+        hub.blob_write(1, blob, b"full").unwrap();
+        let write = hub.submit_blob_write(1, blob, b"next").unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let wake = hub
+            .suspend_stream_wire(runtime.handle(), 1, write.wire())
+            .unwrap();
+        runtime.run(async {
+            // Each one-byte pull is observable progress on this *same* blob.
+            // The pending four-byte write cannot yet complete, so crossing
+            // three idle intervals distinguishes a resettable idle deadline
+            // from a total worker or operation deadline.
+            for expected in [b'f', b'u', b'l'] {
+                crate::async_engine::sleep(std::time::Duration::from_millis(7)).await;
+                assert_eq!(hub.blob_read(1, blob, 1).unwrap(), [expected]);
+                assert_eq!(hub.poll_wire(1, write.wire()) as u8, STATUS_PENDING);
+            }
+            crate::async_engine::sleep(std::time::Duration::from_millis(7)).await;
+            assert_eq!(hub.blob_read(1, blob, 1).unwrap(), b"l");
+            crate::async_engine::timeout(std::time::Duration::from_secs(1), wake.notified())
+                .await
+                .expect("the now-admitted writer must wake its guest waiter");
+        });
+        assert_eq!(hub.poll_wire(1, write.wire()) as u8, STATUS_COMPLETED);
     }
 
     #[test]

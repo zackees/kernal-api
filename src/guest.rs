@@ -314,6 +314,18 @@ impl Blob {
         })
     }
 
+    /// Transfer one bounded chunk through the generated caller-memory stream
+    /// control. The host copies it before this call returns.
+    pub fn write(&mut self, bytes: &[u8]) -> Result<usize, OperationError> {
+        self.inner.write(bytes).map_err(OperationError::from)
+    }
+
+    /// Pull one bounded chunk through the generated caller-memory stream
+    /// control. No guest pointer survives this call.
+    pub fn read(&mut self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        self.inner.read(destination).map_err(OperationError::from)
+    }
+
     /// Request one bounded pull read; no guest pointer is retained by the host.
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<PendingRead, OperationError> {
         Ok(PendingRead {
@@ -497,6 +509,7 @@ mod tests {
     static ABANDONMENTS: AtomicUsize = AtomicUsize::new(0);
     static BLOB_RELEASES: AtomicUsize = AtomicUsize::new(0);
     static LAST_BLOB_RELEASE: AtomicI64 = AtomicI64::new(-1);
+    static REJECT_BLOB_TRANSFERS: AtomicBool = AtomicBool::new(false);
     static BLOB_RELEASE_LOCK: Mutex<()> = Mutex::new(());
 
     // Scalar import shims exercise adapter ownership without a native runtime.
@@ -525,11 +538,27 @@ mod tests {
     }
     #[export_name = "kernel_yield"]
     extern "C" fn kernel_yield() {}
-    #[export_name = "resource_release_blob"]
-    extern "C" fn resource_release_blob(blob: i64) -> i32 {
+    #[export_name = "stream_close"]
+    extern "C" fn stream_close(blob: i64) -> i32 {
         LAST_BLOB_RELEASE.store(blob, Ordering::SeqCst);
         BLOB_RELEASES.fetch_add(1, Ordering::SeqCst);
         0
+    }
+    #[export_name = "stream_read"]
+    extern "C" fn stream_read(_: i64, _: i32, length: i32) -> i32 {
+        if REJECT_BLOB_TRANSFERS.load(Ordering::SeqCst) {
+            -1
+        } else {
+            length
+        }
+    }
+    #[export_name = "stream_write"]
+    extern "C" fn stream_write(_: i64, _: i32, length: i32) -> i32 {
+        if REJECT_BLOB_TRANSFERS.load(Ordering::SeqCst) {
+            -1
+        } else {
+            length
+        }
     }
     #[export_name = "resource_release_encrypted_archive"]
     extern "C" fn resource_release_encrypted_archive(_: i64) -> i32 {
@@ -563,6 +592,30 @@ mod tests {
         .unwrap();
         assert_eq!(BLOB_RELEASES.load(Ordering::SeqCst), 2);
         assert_eq!(LAST_BLOB_RELEASE.load(Ordering::SeqCst), 99);
+    }
+
+    #[test]
+    fn blob_direct_stream_controls_stay_behind_the_guest_facade() {
+        let _release_lock = BLOB_RELEASE_LOCK.lock().unwrap();
+        let mut blob = Blob {
+            inner: bindings::BlobHandle::from_create_payload(7),
+        };
+        assert_eq!(blob.write(b"ping"), Ok(4));
+        let mut destination = [0; 2];
+        assert_eq!(blob.read(&mut destination), Ok(2));
+    }
+
+    #[test]
+    fn blob_stream_rejection_is_a_semantic_guest_error() {
+        let _release_lock = BLOB_RELEASE_LOCK.lock().unwrap();
+        REJECT_BLOB_TRANSFERS.store(true, Ordering::SeqCst);
+        let mut blob = Blob {
+            inner: bindings::BlobHandle::from_create_payload(7),
+        };
+        assert_eq!(blob.write(b"ping"), Err(OperationError::Rejected));
+        let mut destination = [0; 2];
+        assert_eq!(blob.read(&mut destination), Err(OperationError::Rejected));
+        REJECT_BLOB_TRANSFERS.store(false, Ordering::SeqCst);
     }
 
     #[test]

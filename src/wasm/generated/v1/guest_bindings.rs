@@ -9,6 +9,9 @@ pub enum AbiError {
     OutOfRange { ty: &'static str, value: i32 },
     ResourceClosed { resource: &'static str },
     ResourceReleaseRejected { resource: &'static str, status: i32 },
+            StreamChunkTooLarge { requested: usize, maximum: usize },
+            StreamRejected,
+            StreamInvalidCount { transferred: i32, requested: usize },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,8 +53,10 @@ pub mod resources {
         pub(crate) fn from_abi(raw: u64) -> Self { Self(::core::option::Option::Some(raw)) }
         pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> { ::core::result::Result::Ok(Self::from_abi(raw as u64)) }
         pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> { self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed { resource: "Blob" }) }
+        pub fn read(&mut self, destination: &mut [u8]) -> ::core::result::Result<usize, super::AbiError> { let stream = self.encode_i64()?; super::check_stream_chunk(destination.len())?; let transferred = unsafe { super::raw_imports::__kernal_api_v1_import_stream_read(stream, destination.as_mut_ptr() as usize as i32, destination.len() as i32) }; super::stream_count_from_i32(transferred, destination.len()) }
+        pub fn write(&mut self, source: &[u8]) -> ::core::result::Result<usize, super::AbiError> { let stream = self.encode_i64()?; super::check_stream_chunk(source.len())?; let transferred = unsafe { super::raw_imports::__kernal_api_v1_import_stream_write(stream, source.as_ptr() as usize as i32, source.len() as i32) }; super::stream_count_from_i32(transferred, source.len()) }
         pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> { self.release() }
-        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "Blob" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_resource_release_blob(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "Blob", status }) } }
+        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "Blob" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_stream_close(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "Blob", status }) } }
     }
 
     impl ::core::ops::Drop for Blob { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
@@ -95,6 +100,10 @@ fn u64_to_i64(value: u64) -> i64 { value as i64 }
 fn f32_to_f32(value: f32) -> f32 { value }
 fn f64_to_f64(value: f64) -> f64 { value }
 
+const MAX_STREAM_CHUNK_BYTES: usize = 65536usize;
+fn check_stream_chunk(requested: usize) -> Result<(), AbiError> { if requested <= MAX_STREAM_CHUNK_BYTES { Ok(()) } else { Err(AbiError::StreamChunkTooLarge { requested, maximum: MAX_STREAM_CHUNK_BYTES }) } }
+fn stream_count_from_i32(transferred: i32, requested: usize) -> Result<usize, AbiError> { if transferred == -1 { return Err(AbiError::StreamRejected); } let transferred = usize::try_from(transferred).map_err(|_| AbiError::StreamInvalidCount { transferred, requested })?; if transferred <= requested { Ok(transferred) } else { Err(AbiError::StreamInvalidCount { transferred: transferred as i32, requested }) } }
+
 mod raw_imports {
     #[link(wasm_import_module = "kernal-api:v1")]
     extern "C" {
@@ -113,10 +122,15 @@ mod raw_imports {
         pub(super) fn __kernal_api_v1_import_resource_release_archive_entry(resource: i64) -> i32;
         #[link_name = "resource_release_authenticated_archive"]
         pub(super) fn __kernal_api_v1_import_resource_release_authenticated_archive(resource: i64) -> i32;
-        #[link_name = "resource_release_blob"]
-        pub(super) fn __kernal_api_v1_import_resource_release_blob(resource: i64) -> i32;
         #[link_name = "resource_release_encrypted_archive"]
         pub(super) fn __kernal_api_v1_import_resource_release_encrypted_archive(resource: i64) -> i32;
+
+        #[link_name = "stream_read"]
+        pub(super) fn __kernal_api_v1_import_stream_read(stream: i64, destination: i32, destination_len: i32) -> i32;
+        #[link_name = "stream_write"]
+        pub(super) fn __kernal_api_v1_import_stream_write(stream: i64, source: i32, source_len: i32) -> i32;
+        #[link_name = "stream_close"]
+        pub(super) fn __kernal_api_v1_import_stream_close(stream: i64) -> i32;
 
     }
 }
@@ -296,9 +310,9 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
     OperationFuture::submit(12, u64::from(milliseconds), 0)
 }
 
-/// Opaque host-owned bulk resource. No buffer or native path is carried here.
-/// Generated owned-handle lifecycle delegates release to OperationHub's
-/// canonical Store-scoped registry through `resource_release_blob`.
+/// Opaque host-owned bulk stream. No buffer or native path is carried here.
+/// Generated bounded stream controls delegate ownership and close to
+/// OperationHub's canonical Store-scoped registry.
 pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
 pub struct EncryptedArchive { resource: resources::EncryptedArchive }
@@ -433,6 +447,14 @@ impl BlobHandle {
     }
     /// Revoke this resource synchronously without allocating an operation.
     pub fn abandon(self) { let _ = self.resource.close(); }
+    /// Transfer one bounded chunk synchronously through caller memory.
+    pub fn read(&mut self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        self.resource.read(destination).map_err(|_| OperationError::Rejected)
+    }
+    /// Transfer one bounded chunk synchronously through caller memory.
+    pub fn write(&mut self, source: &[u8]) -> Result<usize, OperationError> {
+        self.resource.write(source).map_err(|_| OperationError::Rejected)
+    }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { resource: resources::Blob::from_abi(token) } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {

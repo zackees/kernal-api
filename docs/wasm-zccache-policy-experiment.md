@@ -528,38 +528,38 @@ acknowledgement. Review found an interaction where producer Drop overwrote a
 successful exit with `Closed`; the focused wire-wait test reproduced it
 (`20260913T134311Z`) and passes with an atomic pending-only Drop transition.
 
-Linux build/execute commands (native builds additionally need the system's
-OpenSSL/pkg-config development environment):
+Linux build/execute commands:
 
 ```sh
 SOLDR_LINKER=default soldr --no-cache cargo build --locked \
-  --manifest-path benchmarks/wasm-sketch/extension2-guest/Cargo.toml \
+  --manifest-path benchmarks/wasm-sketch/compiler-guest/Cargo.toml \
   --features guest-proof --bin kernal-compiler-guest-proof \
-  --target wasm32-wasip1-threads --release --target-dir target/extension2-stream -j1
+  --target wasm32-wasip1-threads --release --target-dir target/compiler-guest -j1
 soldr --no-cache cargo run --locked \
   --manifest-path tools/wasm-abi-generator/Cargo.toml \
-  --target-dir target/extension2-abi -j1
-cp target/extension2-stream/wasm32-wasip1-threads/release/kernal-compiler-guest-proof.wasm \
-  target/extension2-stream/compiler.admitted.wasm
-target/extension2-abi/debug/kernal-api-wasm-abi-generator \
-  --embed-threaded-metadata target/extension2-stream/compiler.admitted.wasm
-KERNAL_COMPILER_GUEST_WASM="$PWD/target/extension2-stream/compiler.admitted.wasm" \
+  --target-dir target/compiler-abi -j1
+cp target/compiler-guest/wasm32-wasip1-threads/release/kernal-compiler-guest-proof.wasm \
+  target/compiler-guest/compiler.admitted.wasm
+target/compiler-abi/debug/kernal-api-wasm-abi-generator \
+  --embed-threaded-metadata target/compiler-guest/compiler.admitted.wasm
+KERNAL_COMPILER_GUEST_WASM="$PWD/target/compiler-guest/compiler.admitted.wasm" \
   soldr --no-cache cargo test --locked --no-default-features \
   --features wasm-sketch-host --lib -j1 \
-  wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes \
+  wasm::compiler_dispatch::tests::compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler \
   -- --exact --ignored --nocapture
 ```
 
 The fixture lock now follows the same explicit migration-only process-substrate
 revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
-decision now exist. The Core fixture also transfers one verified compiler
-artifact through the existing exact-output authority; it does not yet retain,
-address, or retrieve that artifact from a zccache backend. Matched candidate
-measurements and the remaining #13 acceptance evidence remain unfinished. The
-Core-Wasm/Wasmtime threaded substrate is the recorded v1 decision; this does
-not turn the Component candidate into a runtime fallback or close #13 before
-the outstanding evidence exists.
+decision now exist. The Core fixture transfers one verified compiler artifact
+through exact-output authority, retains it privately in the real
+`zccache-artifact::KvStore`, and restores the matching embedding-selected
+output before guest instantiation on a hit. Matched candidate measurements and
+the remaining #13 acceptance evidence remain unfinished. The Core-Wasm/Wasmtime
+threaded substrate is the recorded v1 decision; this does not turn the
+Component candidate into a runtime fallback or close #13 before the
+outstanding evidence exists.
 
 The revision-8 archive and screenshot artifacts now have fresh six-native-host
 evidence from [Actions run 34790621949](https://github.com/zackees/kernal-api/actions/runs/34790621949): Linux, macOS, and Windows on x86-64 and ARM64 all completed
@@ -646,11 +646,11 @@ KERNAL_COMPONENT_COMPILER_TRAP_WASM="$component_proof_dir/compiler-trap.wasm" \
 The candidate remains incomplete for #13: hostile incoming hash lists are still
 canonically allocated before the host length check; the fixed 32-byte compiler
 cache key crosses the Component ABI as four scalar words. Cancellation coverage
-and public blob parity are not complete. The request-key decision is
-not a complete artifact cache: it does not persist or move artifacts. Nor is it
-six-host parent acceptance, a total-RSS bound, or the matched measurements needed to
-choose the final runtime. Fixture source pins remain migration-only, not
-published-dependency acceptance.
+and public blob parity are not complete. Unlike the Core fixture, the Component
+candidate has no exact-output authority and therefore does not persist or move
+compiler artifacts. Nor is it six-host parent acceptance, a total-RSS bound,
+or the matched measurements needed to choose the final runtime. Fixture source
+pins remain migration-only, not published-dependency acceptance.
 
 Local regression gates also pass: 116 operation tests, four native semantic
 guest-adapter tests, the revision-8 Core compiler and 64-MiB hash artifacts,

@@ -27,6 +27,7 @@ use std::process::ExitStatus;
 mod process_adapter;
 
 /// Canonical launch payload and readiness contract for [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
 pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// Canonical resource-placement spawn contract selected by this facade.
 ///
@@ -51,6 +52,7 @@ pub use running_process::independent_spawn::{LaunchSpec, Readiness};
 /// that handle does; it is distinct from resource placement.  Readiness,
 /// cancellation, authority, and unsupported-platform failures propagate as
 /// the canonical `std::io::Error` from [`spawn_with_options`].
+#[cfg(feature = "independent-spawn")]
 pub use running_process::{
     spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,
     SpawnOptions,
@@ -59,6 +61,7 @@ pub use running_process::{
 /// Canonical daemon spawning with inherited or independently placed native
 /// resources. The namespace preserves the exact dependency's type identity;
 /// no facade enums or conversion tables are maintained here.
+#[cfg(feature = "independent-spawn")]
 pub use running_process::independent_spawn;
 
 /// Explicit foreground commands preserving the caller's native launch context.
@@ -67,8 +70,10 @@ pub use running_process::independent_spawn;
 /// remain subject to their existing cgroup or Job limits.
 pub use running_process::foreground;
 
+#[cfg(feature = "independent-spawn")]
 pub use independent_spawn::IndependentChild;
 /// Canonical options-based independent spawn entry point.
+#[cfg(feature = "independent-spawn")]
 pub use running_process::spawn_with_options as spawn_independent;
 
 /// Canonical semantic asynchronous child/session primitives. The opt-in

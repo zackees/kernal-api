@@ -250,14 +250,18 @@ fn implementation_crates_are_not_publicly_reexported() {
 }
 
 #[test]
-fn process_substrate_selects_independent_spawn_without_widening_kernel_substrate() {
+fn process_substrate_keeps_independent_spawn_opt_in() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
     assert!(
         manifest.contains(
-            "running-process = { version = \"=4.10.13\", default-features = false, features = [\"kernel-substrate\", \"independent-spawn\"] }"
+            "running-process = { version = \"=4.10.13\", default-features = false, features = [\"kernel-substrate\"] }"
         ),
-        "the facade must retain the exact published running-process pin and selected canonical capabilities"
+        "the facade must retain the exact published running-process pin without widening kernel-substrate"
+    );
+    assert!(
+        manifest.contains("independent-spawn = [\"running-process/independent-spawn\"]"),
+        "the canonical independent-spawn graph (IPC, serde_json) must stay behind its facade feature"
     );
     assert!(
         !manifest.contains("_vender/running-process"),

@@ -273,7 +273,7 @@ mod tests {
         }
     }
 
-    crate::task_local! {
+    task_local! {
         static TEARDOWN: TeardownProbe = TEARDOWN_SLOT;
     }
 
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    crate::task_local! {
+    task_local! {
         static MIGRATING: Cell<u32> = MIGRATING_SLOT;
     }
 

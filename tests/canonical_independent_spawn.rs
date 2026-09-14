@@ -1,4 +1,5 @@
 //! Compile-time identity contract for issue #189.
+#![cfg(feature = "independent-spawn")]
 
 use kernal_api::{
     IndependentBackend, IndependentChild, LaunchSpec, Readiness, SpawnHandle, SpawnLifetime,

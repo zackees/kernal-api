@@ -148,7 +148,8 @@ Build `component-tools` with only `--features engine-probe` (not
 ```sh
 uv run --no-project benchmarks/wasm-sketch/measure_component.py \
   --output /absolute/new/component-result-directory \
-  --encoder /absolute/path/to/kernal-component-tools
+  --encoder /absolute/path/to/kernal-component-tools \
+  --gnu-time /usr/bin/time
 ```
 
 This runner takes a committed source snapshot and an empty guest target
@@ -163,12 +164,15 @@ encoding-only executable cannot silently count as engine validation.
 The runner retains each component and command log and refuses an existing
 output directory. As with the core runner, cold means a fresh guest target,
 not a fresh registry/toolchain. Python 3.10+, Git, tar, Soldr, and the installed
-`wasm32-unknown-unknown` target are prerequisites. Build the encoder in release
-mode for performance conclusions; debug mode only diagnoses the pipeline.
+`wasm32-unknown-unknown` target are prerequisites. `--gnu-time` is optional,
+but when supplied it must be GNU time and records each build command's `%M`
+high-water mark in bytes. That metric is not aggregate process RSS or an
+isolated rustc allocation profile. Build the encoder in release mode for
+performance conclusions; debug mode only diagnoses the pipeline.
 
 This is still the private Component Model probe, not the same public facade
-as the core candidate. It regenerates bindings during compilation and does
-not measure instantiation, execution, cache hit rate, or compiler memory.
+as the core candidate. It regenerates bindings during compilation and does not
+measure instantiation, execution, cache hit rate, or compiler-specific RSS.
 Do not treat these diagnostic timings as the controlled reference-host gate
 or a binding selection. The existing execution tests separately cover the
 unchanged 64 MiB transfer workload.

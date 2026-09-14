@@ -47,7 +47,12 @@ jobs:
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
           echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - name: Test every native feature together
-        timeout-minutes: 15
+        # A cold Windows all-feature graph includes Wasmtime, Tauri/WebView2,
+        # OpenSSL, and the native archive stack.  Fifteen minutes can expire
+        # during compilation before a single test runs; keep this aligned with
+        # the six-target native proof lanes rather than reporting that as a
+        # behavioral failure.
+        timeout-minutes: 30
         run: soldr cargo test --locked --all-features
       - run: >-
           soldr cargo clippy

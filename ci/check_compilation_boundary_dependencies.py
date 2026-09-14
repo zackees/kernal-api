@@ -4,6 +4,8 @@ The first command in every pair is the RED state: it must *not* find the
 optional implementation.  The second is GREEN: enabling its owning feature
 must find it.  `cargo tree`, rather than Cargo.lock, is intentional: a lockfile
 contains every optional package and therefore cannot prove feature isolation.
+Measure normal/build edges: TLS fixtures may use OpenSSL as a dev dependency
+without making it part of a default consumer's compilation graph.
 """
 
 from __future__ import annotations
@@ -14,6 +16,10 @@ import sys
 CASES = (
     ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
+    ("command-arguments", "shell-words"),
+    ("json", "serde_json"),
+    ("source-cpp", "tree-sitter"),
+    ("source-cpp", "tree-sitter-cpp"),
     ("wasm-sketch-host", "wasmtime"),
     ("ipc", "interprocess"),
     ("tokio-console", "console-subscriber"),
@@ -29,6 +35,7 @@ CASES = (
     ("archive", "zip"),
     ("archive", "tar"),
     ("archive", "zstd"),
+    ("archive-auth-test-support", "openssl"),
     ("tauri-webview", "tauri"),
     ("tauri-webview", "tauri-runtime-wry"),
     ("tauri-webview", "wry"),
@@ -49,13 +56,15 @@ SKETCH_AND_WEBVIEW_PACKAGES = {
 }
 
 
-def tree(features: str) -> set[str]:
+def tree(features: str, *, normal_only: bool = False) -> set[str]:
     command = [
         "soldr",
         "cargo",
         "tree",
         "--locked",
         "--no-default-features",
+        "--edges",
+        "normal" if normal_only else "normal,build",
         "--prefix",
         "none",
     ]
@@ -72,6 +81,11 @@ def tree(features: str) -> set[str]:
 def main() -> int:
     default_graph = tree("")
     failures: list[str] = []
+    # TOML already builds the kernel's catalog. Only its runtime edge is opt-in.
+    if "toml" in tree("", normal_only=True):
+        failures.append("default runtime graph unexpectedly contains toml")
+    if "toml" not in tree("config-toml", normal_only=True):
+        failures.append("config-toml runtime graph omits toml")
     for label, graph in (("default", default_graph), ("full", tree("full"))):
         unexpected = sorted(graph & SKETCH_AND_WEBVIEW_PACKAGES)
         if unexpected:

@@ -7,7 +7,16 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use std::{convert::Infallible, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible, future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
+};
+
+#[cfg(feature = "websocket")]
+mod websocket;
+#[cfg(feature = "websocket")]
+pub use websocket::{
+    Message as WebSocketMessage, Upgrade as WebSocketUpgrade, WebSocket, WebSocketLimits,
+};
 
 mod body;
 mod diagnostics;
@@ -17,6 +26,9 @@ use body::ServerBody;
 use diagnostics::increment;
 pub use diagnostics::{Diagnostics, Snapshot};
 pub use target::QueryPairs;
+
+#[cfg(feature = "websocket")]
+type UpgradeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Shared bounded native preparation of file responses. Clones share admission;
 /// use one instance for a server's routes, not one instance per request.
@@ -185,10 +197,13 @@ impl Limits {
 #[derive(Debug)]
 pub struct Request {
     method: String,
+    http_1_1: bool,
     target: String,
     uri: hyper::Uri,
     headers: hyper::HeaderMap,
     body: Vec<u8>,
+    #[cfg(feature = "websocket")]
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
 }
 
 impl Request {
@@ -230,14 +245,33 @@ impl Request {
     pub fn body(&self) -> &[u8] {
         &self.body
     }
+
+    /// Consume this request as an RFC 6455 WebSocket upgrade. Validate route,
+    /// origin, host and authorization before calling this method. The returned
+    /// value owns the upgrade future; it cannot be reused as an HTTP request.
+    #[cfg(feature = "websocket")]
+    pub fn into_websocket(self) -> io::Result<WebSocketUpgrade> {
+        websocket::Upgrade::from_request(self)
+    }
 }
 
 /// An application-selected HTTP response with validated status and headers.
-#[derive(Debug)]
 pub struct Response {
     status: hyper::StatusCode,
     headers: hyper::HeaderMap,
     body: ServerBody,
+    #[cfg(feature = "websocket")]
+    upgrade_task: Option<UpgradeTask>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("headers", &self.headers)
+            .field("body", &self.body)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Response {
@@ -247,11 +281,37 @@ impl Default for Response {
             status: hyper::StatusCode::INTERNAL_SERVER_ERROR,
             headers: hyper::HeaderMap::new(),
             body: ServerBody::bytes(Bytes::new()),
+            #[cfg(feature = "websocket")]
+            upgrade_task: None,
         }
     }
 }
 
 impl Response {
+    #[cfg(feature = "websocket")]
+    pub(super) fn websocket_upgrade(accept: &str, upgrade_task: UpgradeTask) -> Self {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::CONNECTION,
+            hyper::header::HeaderValue::from_static("Upgrade"),
+        );
+        headers.insert(
+            hyper::header::UPGRADE,
+            hyper::header::HeaderValue::from_static("websocket"),
+        );
+        headers.insert(
+            hyper::header::HeaderName::from_static("sec-websocket-accept"),
+            hyper::header::HeaderValue::from_str(accept)
+                .expect("derived WebSocket accept key is valid"),
+        );
+        Self {
+            status: hyper::StatusCode::SWITCHING_PROTOCOLS,
+            headers,
+            body: ServerBody::bytes(Bytes::new()),
+            upgrade_task: Some(upgrade_task),
+        }
+    }
+
     /// Construct a response. The server separately enforces its body-size limit.
     ///
     /// # Errors
@@ -275,6 +335,8 @@ impl Response {
             status: hyper::StatusCode::from_u16(status).map_err(io::Error::other)?,
             headers: hyper::HeaderMap::new(),
             body: ServerBody::bytes(Bytes::from(body)),
+            #[cfg(feature = "websocket")]
+            upgrade_task: None,
         })
     }
 
@@ -433,15 +495,49 @@ impl Server {
                     let read_budget = self.read_budget.clone();
                     tasks.spawn(async move {
                         let request_diagnostics = diagnostics.clone();
-                        let service = service_fn(move |request| dispatch(request, handler.clone(), limits, request_diagnostics.clone(), response_headers.clone(), read_budget.clone()));
+                        #[cfg(feature = "websocket")]
+                        let (upgrades_tx, mut upgrades_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let service = service_fn(move |request| {
+                            dispatch(
+                                request,
+                                handler.clone(),
+                                limits,
+                                request_diagnostics.clone(),
+                                response_headers.clone(),
+                                read_budget.clone(),
+                                #[cfg(feature = "websocket")]
+                                upgrades_tx.clone(),
+                            )
+                        });
                         let mut builder = hyper::server::conn::http1::Builder::new();
                         builder.timer(TokioTimer::new())
                             .header_read_timeout(limits.header_timeout)
                             .max_buf_size(limits.max_header_bytes)
                             .max_headers(limits.max_headers);
                         let socket = transport::ProgressIo::new(socket, limits.write_timeout);
-                        let connection = builder.serve_connection(TokioIo::new(socket), service);
-                        match tokio::time::timeout(limits.connection_timeout, connection).await {
+                        let connection = builder
+                            .serve_connection(TokioIo::new(socket), service)
+                            .with_upgrades();
+                        #[cfg(feature = "websocket")]
+                        let mut upgrade_tasks = tokio::task::JoinSet::new();
+                        #[cfg(feature = "websocket")]
+                        let outcome = tokio::time::timeout(limits.connection_timeout, async {
+                            tokio::pin!(connection);
+                            loop {
+                                tokio::select! {
+                                    result = &mut connection => break result,
+                                    Some(task) = upgrades_rx.recv() => { upgrade_tasks.spawn(task); }
+                                    Some(result) = upgrade_tasks.join_next(), if !upgrade_tasks.is_empty() => {
+                                        if result.is_err() { increment(&diagnostics.0.task_failures); }
+                                    }
+                                }
+                            }
+                        }).await;
+                        #[cfg(not(feature = "websocket"))]
+                        let outcome = tokio::time::timeout(limits.connection_timeout, connection).await;
+                        #[cfg(feature = "websocket")]
+                        upgrade_tasks.abort_all();
+                        match outcome {
                             Err(_) => increment(&diagnostics.0.connection_timeouts),
                             Ok(Err(_)) => increment(&diagnostics.0.connection_errors),
                             Ok(Ok(())) => increment(&diagnostics.0.completed_connections),
@@ -466,12 +562,21 @@ async fn dispatch<H, F>(
     diagnostics: Diagnostics,
     response_headers: Arc<hyper::HeaderMap>,
     read_budget: body::ReadBudget,
+    #[cfg(feature = "websocket")] upgrades_tx: tokio::sync::mpsc::UnboundedSender<UpgradeTask>,
 ) -> Result<hyper::Response<ServerBody>, Infallible>
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
-    let mut result = dispatch_inner(request, handler, limits, diagnostics.clone()).await?;
+    let mut result = dispatch_inner(
+        request,
+        handler,
+        limits,
+        diagnostics.clone(),
+        #[cfg(feature = "websocket")]
+        upgrades_tx,
+    )
+    .await?;
     result.body_mut().set_read_budget(read_budget);
     for (name, value) in response_headers.iter() {
         result.headers_mut().insert(name.clone(), value.clone());
@@ -500,11 +605,15 @@ async fn dispatch_inner<H, F>(
     handler: H,
     limits: Limits,
     diagnostics: Diagnostics,
+    #[cfg(feature = "websocket")] upgrades_tx: tokio::sync::mpsc::UnboundedSender<UpgradeTask>,
 ) -> Result<hyper::Response<ServerBody>, Infallible>
 where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
+    let mut request = request;
+    #[cfg(feature = "websocket")]
+    let upgrade = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let collected = tokio::time::timeout(
         limits.body_timeout,
@@ -528,10 +637,13 @@ where
     };
     let request = Request {
         method: parts.method.to_string(),
+        http_1_1: parts.version == hyper::Version::HTTP_11,
         target: parts.uri.to_string(),
         uri: parts.uri,
         headers: parts.headers,
         body,
+        #[cfg(feature = "websocket")]
+        upgrade: Some(upgrade),
     };
     let mut response = match tokio::time::timeout(limits.handler_timeout, handler(request)).await {
         Ok(response) => response,
@@ -540,6 +652,10 @@ where
             return Ok(empty(hyper::StatusCode::GATEWAY_TIMEOUT));
         }
     };
+    #[cfg(feature = "websocket")]
+    if let Some(upgrade_task) = response.upgrade_task.take() {
+        let _ = upgrades_tx.send(upgrade_task);
+    }
     if !headers_fit(&response.headers, limits) || response.body.configure(limits).is_err() {
         increment(&diagnostics.0.response_rejections);
         return Ok(empty(hyper::StatusCode::INTERNAL_SERVER_ERROR));

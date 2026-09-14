@@ -50,12 +50,17 @@ pub fn install_shutdown_request_handler() -> io::Result<ShutdownRequest> {
 mod tests {
     use super::*;
 
+    // Installation resets the process-global latch. Keep each test's reset,
+    // real signal delivery, and observations in one exclusive interval.
+    static SIGNAL_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Installing reports "not asked yet", and a delivered signal is seen.
     ///
     /// The signal is raised in this process, which is the only way to test the
     /// real delivery path rather than a stand-in for it.
     #[test]
     fn a_delivered_signal_is_observed() {
+        let _guard = SIGNAL_TEST.lock().unwrap();
         let request = install_shutdown_request_handler().expect("install");
         assert!(!request.requested(), "nothing has asked yet");
 
@@ -68,6 +73,7 @@ mod tests {
     /// The answer latches, so a caller cannot miss a request by checking late.
     #[test]
     fn the_request_latches() {
+        let _guard = SIGNAL_TEST.lock().unwrap();
         let request = install_shutdown_request_handler().expect("install");
         // SAFETY: see above.
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);

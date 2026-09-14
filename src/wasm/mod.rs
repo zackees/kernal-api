@@ -6,6 +6,8 @@
 
 #[cfg(feature = "wasm-sketch-worker")]
 mod worker;
+#[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+pub use worker::SketchWorkerTrace;
 #[cfg(feature = "wasm-sketch-worker")]
 #[allow(dead_code)] // Consumed by the phase-B private worker binary/supervisor.
 mod worker_protocol;
@@ -119,7 +121,8 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\n{GENERATED_V1_MANIFEST}").as_bytes()
+        format!("capabilities=0\noperation_protocol_revision=11\n{GENERATED_V1_MANIFEST}")
+            .as_bytes()
     );
 }
 
@@ -192,6 +195,7 @@ pub struct SketchExecutionLimits {
     maximum_active_root_executions: usize,
     fuel_limits: SketchFuelLimits,
     epoch_limits: SketchEpochLimits,
+    blob_limits: SketchBlobLimits,
 }
 impl SketchExecutionLimits {
     pub fn new(
@@ -203,6 +207,7 @@ impl SketchExecutionLimits {
             maximum_active_root_executions,
             fuel_limits: SketchFuelLimits::default(),
             epoch_limits: SketchEpochLimits::default(),
+            blob_limits: SketchBlobLimits::default(),
         };
         limits
             .is_valid()
@@ -243,6 +248,14 @@ impl SketchExecutionLimits {
     pub fn epoch_limits(self) -> SketchEpochLimits {
         self.epoch_limits
     }
+    /// Sets per-logical-sketch opaque blob and pending-I/O limits.
+    pub fn with_blob_limits(mut self, limits: SketchBlobLimits) -> Self {
+        self.blob_limits = limits;
+        self
+    }
+    pub fn blob_limits(self) -> SketchBlobLimits {
+        self.blob_limits
+    }
     fn is_valid(self) -> bool {
         self.maximum_reserved_shared_memory_bytes >= THREADED_RUST_RESERVATION_BYTES
             && self.maximum_active_root_executions != 0
@@ -259,7 +272,106 @@ impl Default for SketchExecutionLimits {
             maximum_active_root_executions: 1,
             fuel_limits: SketchFuelLimits::default(),
             epoch_limits: SketchEpochLimits::default(),
+            blob_limits: SketchBlobLimits::default(),
         }
+    }
+}
+
+/// Host-selected bounds for opaque blob storage and pending I/O.
+/// Pending input and read-result byte budgets are each bounded by
+/// `maximum_sketch_bytes`, with a separate combined hub-capacity limit.
+/// Neither limit is a process-memory bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SketchBlobLimits {
+    limits: operations::BlobLimits,
+}
+impl SketchBlobLimits {
+    pub fn new(
+        maximum_chunk_bytes: usize,
+        maximum_blob_bytes: usize,
+        maximum_sketch_bytes: usize,
+        maximum_live_blobs: usize,
+        maximum_pending_reads: usize,
+        maximum_pending_writes: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let mut limits = operations::BlobLimits::new(
+            maximum_chunk_bytes,
+            maximum_blob_bytes,
+            maximum_sketch_bytes,
+        )
+        .map_err(|_| SketchCompilerError::InvalidExecutionLimits)?;
+        // The generated ABI encodes lengths in u32; do not accept a host
+        // policy that requires an unrepresentable bounded request.
+        if maximum_chunk_bytes > u32::MAX as usize {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        limits.maximum_live_blobs = maximum_live_blobs;
+        limits.maximum_pending_reads = maximum_pending_reads;
+        limits.maximum_pending_writes = maximum_pending_writes;
+        Ok(Self { limits })
+    }
+    pub fn maximum_chunk_bytes(self) -> usize {
+        self.limits.maximum_chunk_bytes
+    }
+    pub fn maximum_blob_bytes(self) -> usize {
+        self.limits.maximum_blob_bytes
+    }
+    pub fn maximum_sketch_bytes(self) -> usize {
+        self.limits.maximum_sketch_bytes
+    }
+    pub fn maximum_live_blobs(self) -> usize {
+        self.limits.maximum_live_blobs
+    }
+    pub fn maximum_pending_reads(self) -> usize {
+        self.limits.maximum_pending_reads
+    }
+    pub fn maximum_pending_writes(self) -> usize {
+        self.limits.maximum_pending_writes
+    }
+    /// Bounds combined blob, pending-input, read-result and native-chunk capacity.
+    /// One chunk is reserved for pull progress. Native chunks stay charged
+    /// until dropped; allocator-internal scratch is not covered by this limit.
+    pub fn with_maximum_transfer_bytes(
+        mut self,
+        maximum: usize,
+    ) -> Result<Self, SketchCompilerError> {
+        let minimum = self
+            .limits
+            .maximum_chunk_bytes
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(self.limits.maximum_sketch_bytes))
+            .ok_or(SketchCompilerError::InvalidExecutionLimits)?;
+        if maximum < minimum {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.limits.maximum_transfer_bytes = maximum;
+        Ok(self)
+    }
+    pub fn maximum_transfer_bytes(self) -> usize {
+        self.limits.maximum_transfer_bytes
+    }
+    /// Sets the maximum quiet interval for one pending blob transfer.
+    ///
+    /// This is reset only by bytes moving through that blob's own bounded
+    /// stream; it is independent of the logical sketch wall-clock deadline.
+    pub fn with_progress_idle_timeout(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Self, SketchCompilerError> {
+        if timeout.is_zero() {
+            return Err(SketchCompilerError::InvalidExecutionLimits);
+        }
+        self.limits.progress_idle_timeout = timeout;
+        Ok(self)
+    }
+    pub fn progress_idle_timeout(self) -> Duration {
+        self.limits.progress_idle_timeout
+    }
+}
+impl Default for SketchBlobLimits {
+    fn default() -> Self {
+        Self::new(64 * 1024, 1024 * 1024, 4 * 1024 * 1024, 128, 128, 128)
+            .expect("valid default blob limits")
     }
 }
 
@@ -677,6 +789,66 @@ impl AdmittedSketch {
         runtime: crate::async_engine::RuntimeHandle,
         cancellation: crate::async_engine::CancellationToken,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(runtime, cancellation, RootGrants::default())
+            .await
+    }
+
+    /// Runs with one exact host-authorized output destination. The guest can
+    /// discover only its opaque handle, never the path. Like the other
+    /// in-process entry point, this is not a substitute for worker containment.
+    pub async fn execute_threaded_root_with_output(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        destination: std::path::PathBuf,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(
+            runtime,
+            cancellation,
+            RootGrants {
+                output: Some(destination),
+                compiler: None,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                archive: None,
+                #[cfg(feature = "tauri-webview")]
+                webview: None,
+            },
+        )
+        .await
+    }
+
+    /// Run with host-authorized URL and exact-output capabilities. The UI host
+    /// must be driven on its creating thread using the same supplied runtime.
+    /// This in-process entry is not a replacement for killable containment.
+    #[cfg(feature = "tauri-webview")]
+    pub async fn execute_threaded_root_with_webview(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        client: crate::webview::ExternalWebviewClient,
+        url: crate::webview::WebviewUrlGrant,
+        destination: std::path::PathBuf,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
+        self.execute_threaded_root_with_grant(
+            runtime,
+            cancellation,
+            RootGrants {
+                output: Some(destination),
+                webview: Some((client, url)),
+                compiler: None,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                archive: None,
+            },
+        )
+        .await
+    }
+
+    async fn execute_threaded_root_with_grant(
+        self: &Arc<Self>,
+        runtime: crate::async_engine::RuntimeHandle,
+        cancellation: crate::async_engine::CancellationToken,
+        grants: RootGrants,
+    ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
         }
@@ -690,9 +862,11 @@ impl AdmittedSketch {
         let logical = registration.logical();
         let blocking_runtime = runtime.clone();
         let blocking = runtime.launch_blocking(move || {
-            blocking_runtime.block_on_wasm(
-                sketch.execute_threaded_root_async(blocking_runtime.clone(), logical),
-            )
+            blocking_runtime.block_on_wasm(sketch.execute_threaded_root_async(
+                blocking_runtime.clone(),
+                logical,
+                grants,
+            ))
         });
         let outcome = match blocking.await {
             Ok(outcome) => outcome,
@@ -711,6 +885,7 @@ impl AdmittedSketch {
         &self,
         runtime: crate::async_engine::RuntimeHandle,
         logical_epoch: Arc<LogicalEpoch>,
+        grants: RootGrants,
     ) -> Result<ThreadedRootOutcome, SketchExecutionError> {
         if self.profile != SketchAdmissionProfile::ThreadedRustV1 {
             return Err(SketchExecutionError::ThreadedProfileRequired);
@@ -726,9 +901,111 @@ impl AdmittedSketch {
         // A logical root owns exactly one operation/resource authority.  It
         // is shared explicitly with authorized child Stores, never with a
         // cached Store or a different root execution.
-        let operations = OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
-            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let operations = OperationHub::with_blob_limits(
+            MAX_PENDING_OPERATIONS_V1,
+            MAX_RESOURCES_V1,
+            self.execution_ledger.limits.blob_limits.limits,
+        )
+        .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        let mut grants = grants;
+        let compiler = grants.compiler.take();
+        let output = grants.output.take();
+        // Consult the concrete private cache before Store construction. A hit
+        // restores the embedding-selected exact path now, and deliberately
+        // withholds output authority from the guest.
+        if compiler
+            .as_ref()
+            .is_some_and(|grant| grant.cache.is_some())
+            && output.is_none()
+        {
+            return Err(SketchExecutionError::OutputGrantRejected);
+        }
+        let cache_hit = compiler
+            .as_ref()
+            .and_then(|grant| grant.cache.as_ref())
+            .map(|cache| {
+                compiler_cache::restore_cached_output_if_hit(
+                    &cache.store,
+                    &operations,
+                    0,
+                    cache.key,
+                    output.as_deref().expect("compiler cache has output"),
+                )
+                .map_err(|error| match error {
+                    compiler_cache::CacheRestoreError::Cache => {
+                        SketchExecutionError::CompilerArtifactCacheFailed
+                    }
+                    compiler_cache::CacheRestoreError::Output => {
+                        SketchExecutionError::OutputGrantRejected
+                    }
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        // Grant before constructing or instantiating the root Store: even a
+        // module start section sees only the already-authorized resource. A
+        // cache hit gets no output token because the host restored it above.
+        let initial_output = (!cache_hit)
+            .then_some(output.as_deref())
+            .flatten()
+            .map(|path| operations.grant_exact_output_wire(0, path))
+            .transpose()
+            .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
+        let cache_write = (!cache_hit)
+            .then(|| {
+                compiler.as_ref().and_then(|grant| {
+                    grant.cache.as_ref().map(|cache| (cache.clone(), output.clone()))
+                })
+            })
+            .flatten();
+        let initial_compiler = compiler
+            .map(
+                |RootCompilerGrant {
+                     spec,
+                     deadline,
+                     cache,
+                 }| {
+                    operations
+                        .grant_compiler_with_cache(
+                            0,
+                            spec,
+                            deadline,
+                            cache.map(|cache| (cache.key, cache_hit)),
+                        )
+                        .map(|token| token.wire())
+                },
+            )
+            .transpose()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        let initial_archive = grants
+            .archive
+            .map(|input| {
+                operations
+                    .grant_encrypted_input(0, input)
+                    .map(|token| token.wire())
+            })
+            .transpose()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        #[cfg(feature = "tauri-webview")]
+        let (webviews, initial_url) = match grants.webview {
+            Some((client, url)) => {
+                let context = crate::tauri::sketch::SketchWebviews::new(
+                    client,
+                    Arc::clone(&operations),
+                    &runtime,
+                )
+                .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+                let token = url
+                    .bind(&operations, 0)
+                    .map_err(|_| SketchExecutionError::WebviewGrantRejected)?;
+                (Some(context), Some(token.wire()))
+            }
+            None => (None, None),
+        };
+        #[cfg(feature = "tauri-webview")]
+        let webview_cleanup = webviews.clone();
         let mut store = Store::new(
             &self.engine,
             ThreadStoreState {
@@ -738,6 +1015,14 @@ impl AdmittedSketch {
                 epoch: Arc::clone(&logical_epoch),
                 operations,
                 store_owner: 0,
+                initial_output,
+                initial_compiler,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                initial_archive,
+                #[cfg(feature = "tauri-webview")]
+                webviews,
+                #[cfg(feature = "tauri-webview")]
+                initial_url,
             },
         );
         install_epoch_deadline(&mut store);
@@ -750,34 +1035,41 @@ impl AdmittedSketch {
         // drain every accepted native child.
         let mut validation_getter = None;
         let mut _instance_observation = None;
-        let outcome = if store.set_fuel(root.root_fuel).is_err() {
-            Err(SketchExecutionError::PrelinkFailed)
-        } else {
-            let instance = match prepared.prelink.instantiate_async(&mut store).await {
-                Ok(instance) => instance,
-                Err(error) => return map_root_error(&error, &logical_epoch),
-            };
-            _instance_observation = Some(CounterObservation::new(
-                Arc::clone(&prepared.controller.execution_ledger),
-                LedgerCounter::Instances,
-            ));
-            let start = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
-                Ok(start) => start,
-                Err(_) => return Err(SketchExecutionError::Trapped),
-            };
-            if self.validation {
-                validation_getter = Some(
-                    instance
-                        .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
-                        .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
-                );
+        let outcome = async {
+            logical_epoch.bind_operations(&operation_cleanup)?;
+            if let Some(error) = epoch_error(&logical_epoch) {
+                return Err(error);
             }
-            start
-                .call_async(&mut store, ())
-                .await
-                .map(|_| ThreadedRootOutcome::Started)
-                .or_else(|error| map_root_error(&error, &logical_epoch))
-        };
+            if store.set_fuel(root.root_fuel).is_err() {
+                Err(SketchExecutionError::PrelinkFailed)
+            } else {
+                let instance = match prepared.prelink.instantiate_async(&mut store).await {
+                    Ok(instance) => instance,
+                    Err(error) => return map_root_error(&error, &logical_epoch),
+                };
+                _instance_observation = Some(CounterObservation::new(
+                    Arc::clone(&prepared.controller.execution_ledger),
+                    LedgerCounter::Instances,
+                ));
+                let start = match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                    Ok(start) => start,
+                    Err(_) => return Err(SketchExecutionError::Trapped),
+                };
+                if self.validation {
+                    validation_getter = Some(
+                        instance
+                            .get_typed_func::<(), i32>(&mut store, VALIDATION_REPORT)
+                            .map_err(|_| SketchExecutionError::ValidationReportInvalid)?,
+                    );
+                }
+                start
+                    .call_async(&mut store, ())
+                    .await
+                    .map(|_| ThreadedRootOutcome::Started)
+                    .or_else(|error| map_root_error(&error, &logical_epoch))
+            }
+        }
+        .await;
         let outcome = if matches!(&outcome, Err(SketchExecutionError::OutOfFuel)) {
             outcome
         } else {
@@ -786,9 +1078,25 @@ impl AdmittedSketch {
         // Joining happens after the root Store has returned from Wasm and the
         // workers mutex is not held. A child failure is part of the semantic
         // execution result rather than a detached native-thread panic.
-        let children = prepared.controller.join_completed();
-        let rejections = prepared.controller.take_thread_spawn_rejections();
+        // Revoke before joining: a surviving child may be suspended on an
+        // operation whose producer exited with the root. Instantiation/start
+        // errors must reach this same finalization path.
         operation_cleanup.close_all(operations::Terminal::Closed);
+        let children = prepared.controller.join_completed();
+        let output_cleanup = operation_cleanup.join_output_jobs().await;
+        let process_cleanup = operation_cleanup.join_process_jobs().await;
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        let archive_cleanup = operation_cleanup.join_archive_jobs().await;
+        operation_cleanup.join_clock_jobs().await;
+        #[cfg(feature = "tauri-webview")]
+        let webview_cleanup = match webview_cleanup {
+            Some(context) => context
+                .shutdown()
+                .await
+                .map_err(|_| SketchExecutionError::WebviewCleanupFailed),
+            None => Ok(()),
+        };
+        let rejections = prepared.controller.take_thread_spawn_rejections();
         #[cfg(test)]
         if let Ok(mut snapshot) = prepared.controller.operation_snapshot.lock() {
             *snapshot = Some(operation_cleanup.snapshot());
@@ -812,7 +1120,22 @@ impl AdmittedSketch {
             .controller
             .last_root_remaining_fuel
             .store(store.get_fuel().unwrap_or(0), Ordering::Release);
-        resolve_threaded_result(outcome, children, report, rejections)
+        let result = resolve_threaded_result(outcome, children, report, rejections)?;
+        output_cleanup.map_err(|_| SketchExecutionError::OutputCleanupFailed)?;
+        process_cleanup.map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        archive_cleanup.map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
+        #[cfg(feature = "tauri-webview")]
+        webview_cleanup?;
+        if let Some((cache, Some(output))) = cache_write {
+            let bytes = std::fs::read(output)
+                .map_err(|_| SketchExecutionError::CompilerArtifactCacheFailed)?;
+            cache
+                .store
+                .put(cache.key, &bytes)
+                .map_err(|_| SketchExecutionError::CompilerArtifactCacheFailed)?;
+        }
+        Ok(result)
     }
     fn prepare_threaded_root_with_permit(
         &self,
@@ -888,10 +1211,19 @@ impl AdmittedSketch {
                     cancellation: crate::async_engine::CancellationSource::new().token(),
                     deadline: Instant::now() + self.epoch_broker.limits.wall_clock_deadline,
                     winner: AtomicU8::new(EPOCH_COMPLETED),
+                    operations: Mutex::new(None),
                 }),
                 operations: OperationHub::new(MAX_PENDING_OPERATIONS_V1, MAX_RESOURCES_V1)
                     .map_err(|_| SketchExecutionError::PrelinkFailed)?,
                 store_owner: 0,
+                initial_output: None,
+                initial_compiler: None,
+                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                initial_archive: None,
+                #[cfg(feature = "tauri-webview")]
+                webviews: None,
+                #[cfg(feature = "tauri-webview")]
+                initial_url: None,
             },
         );
         linker
@@ -1003,6 +1335,7 @@ pub struct ThreadSpawnRejectionSummary {
     epoch: u32,
 }
 impl ThreadSpawnRejectionSummary {
+    #[cfg(feature = "wasm-sketch-worker")]
     pub(crate) const fn from_worker_counts(
         capacity: u32,
         closing: u32,
@@ -1051,6 +1384,11 @@ pub enum SketchExecutionError {
     ContainmentRequired,
     SharedMemoryUnavailable,
     PrelinkFailed,
+    OutputGrantRejected,
+    OutputCleanupFailed,
+    CompilerArtifactCacheFailed,
+    WebviewGrantRejected,
+    WebviewCleanupFailed,
     NonzeroExit {
         code: i32,
     },
@@ -1082,6 +1420,11 @@ impl SketchExecutionError {
             Self::ContainmentRequired => "containment-required",
             Self::SharedMemoryUnavailable => "shared-memory-unavailable",
             Self::PrelinkFailed => "prelink-failed",
+            Self::OutputGrantRejected => "output-grant-rejected",
+            Self::OutputCleanupFailed => "output-cleanup-failed",
+            Self::CompilerArtifactCacheFailed => "compiler-artifact-cache-failed",
+            Self::WebviewGrantRejected => "webview-grant-rejected",
+            Self::WebviewCleanupFailed => "webview-cleanup-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
             Self::ChildNonzeroExit { .. } => "child-nonzero-exit",
             Self::ChildTrapped => "child-trapped",
@@ -1251,6 +1594,40 @@ impl Drop for RootExecutionPermit {
 #[cfg(test)]
 mod execution_ledger_tests {
     use super::*;
+
+    #[test]
+    fn blob_limits_validate_and_survive_compiler_configuration() {
+        for (chunk, blob, sketch) in [(0, 4, 8), (8, 4, 8), (4, 8, 4)] {
+            assert!(SketchBlobLimits::new(chunk, blob, sketch, 1, 1, 1).is_err());
+        }
+        // Zero count limits intentionally disable the corresponding admission.
+        let blobs = SketchBlobLimits::new(4, 8, 16, 0, 2, 3).unwrap();
+        assert!(blobs.with_maximum_transfer_bytes(23).is_err());
+        assert_eq!(
+            blobs
+                .with_maximum_transfer_bytes(24)
+                .unwrap()
+                .maximum_transfer_bytes(),
+            24
+        );
+        assert!(blobs
+            .with_progress_idle_timeout(Duration::ZERO)
+            .is_err());
+        assert_eq!(
+            blobs
+                .with_progress_idle_timeout(Duration::from_millis(7))
+                .unwrap()
+                .progress_idle_timeout(),
+            Duration::from_millis(7)
+        );
+        let compiler = SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(SketchExecutionLimits::default().with_blob_limits(blobs))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(compiler.execution_limits().blob_limits(), blobs);
+    }
 
     #[test]
     fn fuel_limits_require_a_complete_nonzero_root_and_child_partition() {
@@ -1607,6 +1984,31 @@ impl Drop for LogicalRootPermit {
     }
 }
 
+#[derive(Default)]
+struct RootGrants {
+    compiler: Option<RootCompilerGrant>,
+    output: Option<std::path::PathBuf>,
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    archive: Option<crate::operations::archive_input::EncryptedInput>,
+    #[cfg(feature = "tauri-webview")]
+    webview: Option<(
+        crate::webview::ExternalWebviewClient,
+        crate::webview::WebviewUrlGrant,
+    )>,
+}
+
+struct RootCompilerGrant {
+    spec: crate::SpawnSpec,
+    deadline: std::time::Duration,
+    cache: Option<RootCompilerArtifactCache>,
+}
+
+#[derive(Clone)]
+struct RootCompilerArtifactCache {
+    key: [u8; 32],
+    store: compiler_cache::CompilerArtifactStore,
+}
+
 struct ThreadStoreState {
     controller: Arc<ThreadController>,
     runtime: Option<crate::async_engine::RuntimeHandle>,
@@ -1616,6 +2018,52 @@ struct ThreadStoreState {
     epoch: Arc<LogicalEpoch>,
     operations: Arc<OperationHub>,
     store_owner: u64,
+    initial_output: Option<u64>,
+    initial_compiler: Option<u64>,
+    #[cfg(all(test, feature = "archive-auth-test-support"))]
+    initial_archive: Option<u64>,
+    #[cfg(feature = "tauri-webview")]
+    initial_url: Option<u64>,
+    #[cfg(feature = "tauri-webview")]
+    webviews: Option<Arc<crate::tauri::sketch::SketchWebviews>>,
+}
+
+fn read_blob_stream_chunk(
+    operations: &OperationHub,
+    store_owner: u64,
+    stream: u64,
+    destination: &mut [u8],
+) -> Result<usize, operations::HubError> {
+    // Keep the quota-accounted native chunk scoped to this host callback. Its
+    // Drop releases capacity before a subsequent guest call can observe it.
+    let copied = {
+        let chunk = operations.read_blob_chunk(
+            store_owner,
+            crate::operations::OpaqueToken::from_wire(stream),
+            destination
+                .len()
+                .min(operations.maximum_blob_chunk_bytes()),
+            false,
+        )?;
+        let copied = chunk.len();
+        destination[..copied].copy_from_slice(&chunk);
+        copied
+    };
+    Ok(copied)
+}
+
+fn write_blob_stream_chunk(
+    operations: &OperationHub,
+    store_owner: u64,
+    stream: u64,
+    source: &[u8],
+) -> Result<usize, operations::HubError> {
+    let source = &source[..source.len().min(operations.maximum_blob_chunk_bytes())];
+    operations.blob_write(
+        store_owner,
+        crate::operations::OpaqueToken::from_wire(stream),
+        source,
+    )
 }
 
 impl generated_v1::KernalApiV1Imports for ThreadStoreState {
@@ -1666,16 +2114,421 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         Ok(())
     }
 
+    fn stream_read(
+        &mut self,
+        stream: u64,
+        destination: &mut [u8],
+    ) -> wasmtime::Result<generated_v1::StreamTransfer> {
+        // The generated linker validates the entire guest destination before
+        // reaching this method.
+        Ok(read_blob_stream_chunk(&self.operations, self.store_owner, stream, destination)
+            .map(generated_v1::StreamTransfer::Transferred)
+            .unwrap_or(generated_v1::StreamTransfer::Rejected))
+    }
+
+    fn stream_write(
+        &mut self,
+        stream: u64,
+        source: &[u8],
+    ) -> wasmtime::Result<generated_v1::StreamTransfer> {
+        // `source` is a bounded local copy made by the generated linker; no
+        // guest pointer or guest-memory borrow reaches OperationHub.
+        Ok(write_blob_stream_chunk(&self.operations, self.store_owner, stream, source)
+            .map(generated_v1::StreamTransfer::Transferred)
+            .unwrap_or(generated_v1::StreamTransfer::Rejected))
+    }
+
+    fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32> {
+        // Closing follows the same atomic Store-scoped kind, owner, and
+        // generation validation as the legacy Blob abandon opcode.
+        Ok(match self.operations.abandon_blob_wire(self.store_owner, stream) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        })
+    }
+
+    fn resource_release_encrypted_archive(
+        &mut self,
+        archive: generated_v1::resources::EncryptedArchive,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_encrypted_input(self.store_owner, archive.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = archive;
+            Ok(1)
+        }
+    }
+
+    fn resource_release_authenticated_archive(
+        &mut self,
+        archive: generated_v1::resources::AuthenticatedArchive,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_authenticated_archive(self.store_owner, archive.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = archive;
+            Ok(1)
+        }
+    }
+
+    fn resource_release_archive_entry(
+        &mut self,
+        entry: generated_v1::resources::ArchiveEntry,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_archive_entry(self.store_owner, entry.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = entry;
+            Ok(1)
+        }
+    }
+
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
+        if let Some(result) = compiler_dispatch::dispatch(self, kind, arg0, arg1) {
+            return Ok(result);
+        }
+        if let Some(result) = hash_dispatch::dispatch(
+            &self.operations,
+            self.store_owner,
+            &self.controller.memory,
+            kind,
+            arg0,
+            arg1,
+        ) {
+            return Ok(result);
+        }
+        if kind == crate::operations::OP_ARCHIVE_NEXT_ENTRY {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                if arg1 != 0 {
+                    return Ok(0);
+                }
+                let Some(runtime) = self.runtime.clone() else {
+                    return Ok(0);
+                };
+                return Ok(self
+                    .operations
+                    .submit_archive_next_entry(
+                        runtime,
+                        self.store_owner,
+                        crate::operations::OpaqueToken::from_wire(arg0),
+                    )
+                    .map(|token| token.wire())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ARCHIVE_ENTRY_METADATA {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                let capacity = (arg1 >> 32) as usize;
+                let Some(cells) =
+                    shared_range(&self.controller.memory, arg1 as u32 as i32, capacity)
+                else {
+                    return Ok(0x80);
+                };
+                return Ok(self
+                    .operations
+                    .read_archive_entry_metadata(self.store_owner, arg0, capacity, |bytes| {
+                        for (cell, byte) in cells.iter().zip(bytes) {
+                            // SAFETY: shared_range validates the shared byte cells;
+                            // atomic stores remain safe under concurrent guest access.
+                            unsafe { AtomicU8::from_ptr(cell.get()) }
+                                .store(*byte, Ordering::Relaxed);
+                        }
+                    })
+                    .map(|count| (count as u64) << 8 | 1)
+                    .unwrap_or(0x80));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0x80);
+        }
+        if kind == crate::operations::OP_ARCHIVE_ENTRY_OPEN {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                if arg1 != 0 {
+                    return Ok(0);
+                }
+                let Some(runtime) = self.runtime.clone() else {
+                    return Ok(0);
+                };
+                return Ok(self
+                    .operations
+                    .submit_archive_entry_open(
+                        runtime,
+                        self.store_owner,
+                        crate::operations::OpaqueToken::from_wire(arg0),
+                    )
+                    .map(|token| token.wire())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ARCHIVE_ENTRY_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_archive_entry(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_AUTHENTICATE {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                let Ok(offset) = i32::try_from(arg1) else {
+                    return Ok(0);
+                };
+                let Some(cells) = shared_range(&self.controller.memory, offset, 12) else {
+                    return Ok(0);
+                };
+                let mut nonce = [0; 12];
+                for (byte, cell) in nonce.iter_mut().zip(cells) {
+                    // SAFETY: the validated shared range owns these byte cells;
+                    // atomic loads avoid racing guest threads during the copy.
+                    *byte = unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed);
+                }
+                let Some(runtime) = self.runtime.clone() else {
+                    return Ok(0);
+                };
+                return Ok(self
+                    .operations
+                    .submit_encrypted_authentication(
+                        runtime,
+                        self.store_owner,
+                        crate::operations::OpaqueToken::from_wire(arg0),
+                        nonce,
+                    )
+                    .map(|token| token.wire())
+                    .unwrap_or(0));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ARCHIVE_AUTHENTICATION_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_archive_authentication(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_AUTHENTICATED_ARCHIVE_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_authenticated_archive(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_GRANT {
+            if arg0 != 0 || arg1 != 0 {
+                return Ok(0);
+            }
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            let granted = self.initial_archive.take().unwrap_or(0);
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            let granted = 0;
+            return Ok(granted);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_HEADER {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            {
+                let offset = arg1 as u32 as i32;
+                let capacity = (arg1 >> 32) as usize;
+                let Some(cells) = shared_range(&self.controller.memory, offset, capacity) else {
+                    return Ok(0x80);
+                };
+                return Ok(self
+                    .operations
+                    .read_encrypted_header(self.store_owner, arg0, capacity, |bytes| {
+                        for (cell, byte) in cells.iter().zip(bytes) {
+                            // SAFETY: shared_range pins the shared byte cells;
+                            // host accesses shared guest memory atomically.
+                            unsafe { AtomicU8::from_ptr(cell.get()) }
+                                .store(*byte, Ordering::Relaxed);
+                        }
+                    })
+                    .map(|count| (count as u64) << 8 | 1)
+                    .unwrap_or(0x80));
+            }
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0x80);
+        }
+        if kind == crate::operations::OP_ENCRYPTED_INPUT_ABANDON {
+            #[cfg(all(test, feature = "archive-auth-test-support"))]
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_encrypted_input(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+            #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+            return Ok(0);
+        }
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("submit", Some(kind));
+        }
+        if kind == crate::operations::OP_WEBVIEW_URL_GRANT {
+            #[cfg(feature = "tauri-webview")]
+            if arg0 == 0 && arg1 == 0 {
+                return Ok(self.initial_url.unwrap_or(0));
+            }
+            return Ok(0);
+        }
+        #[cfg(feature = "tauri-webview")]
+        if let Some(webviews) = &self.webviews {
+            let kind = if kind == crate::operations::OP_SYNTHETIC_RESOURCE_CLOSE
+                && self
+                    .operations
+                    .external_webview_wire(self.store_owner, arg0)
+            {
+                crate::operations::OP_WEBVIEW_CLOSE
+            } else {
+                kind
+            };
+            if matches!(
+                kind,
+                crate::operations::OP_WEBVIEW_OPEN
+                    | crate::operations::OP_WEBVIEW_LOAD
+                    | crate::operations::OP_WEBVIEW_CAPTURE
+                    | crate::operations::OP_WEBVIEW_CLOSE
+            ) {
+                return Ok(webviews
+                    .submit(self.store_owner, kind, arg0, arg1)
+                    .unwrap_or(0));
+            }
+        }
+        if kind == crate::operations::OP_OUTPUT_GRANT {
+            return Ok(if arg0 == 0 && arg1 == 0 {
+                self.initial_output.unwrap_or(0)
+            } else {
+                0
+            });
+        }
+        if kind == crate::operations::OP_BLOB_ABANDON {
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_blob_wire(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+        }
+        if kind == crate::operations::OP_TRANSFER_ABANDON {
+            return Ok(u64::from(
+                arg1 == 0
+                    && self
+                        .operations
+                        .abandon_transfer_wire(self.store_owner, arg0)
+                        .is_ok(),
+            ));
+        }
         let Some(runtime) = self.runtime.clone() else {
             return Ok(0);
         };
+        if kind == crate::operations::OP_BLOB_READ_COLLECT {
+            let offset = arg1 as u32 as i32;
+            let capacity = (arg1 >> 32) as usize;
+            let Some(cells) = shared_range(&self.controller.memory, offset, capacity) else {
+                return Ok(0x80);
+            };
+            return Ok(self
+                .operations
+                .collect_blob_read_wire(self.store_owner, arg0, capacity, |bytes| {
+                    for (cell, byte) in cells.iter().zip(bytes) {
+                        // SAFETY: pinned shared bytes, accessed atomically.
+                        unsafe { AtomicU8::from_ptr(cell.get()) }.store(*byte, Ordering::Relaxed);
+                    }
+                })
+                .unwrap_or(0x80));
+        }
+        if kind == crate::operations::OP_BLOB_WRITE {
+            let offset = arg1 as u32 as i32;
+            let length = (arg1 >> 32) as usize;
+            let Some(cells) = shared_range(&self.controller.memory, offset, length) else {
+                return Ok(0);
+            };
+            return Ok(self
+                .operations
+                .submit_blob_write_wire(self.store_owner, arg0, length, || {
+                    cells
+                        .iter()
+                        .map(|cell| {
+                            // SAFETY: shared_range returns pinned byte cells;
+                            // all host access uses atomics, as in write_shared.
+                            unsafe { AtomicU8::from_ptr(cell.get()) }.load(Ordering::Relaxed)
+                        })
+                        .collect()
+                })
+                .unwrap_or(0));
+        }
+        if matches!(
+            kind,
+            crate::operations::OP_BLOB_READ
+                | crate::operations::OP_CLOCK_SLEEP
+                | crate::operations::OP_BLOB_SEAL
+                | crate::operations::OP_OUTPUT_COMMIT
+        ) {
+            // Expected admission failures are guest-visible rejection, not
+            // Wasmtime traps. Match the bounded-write submission contract.
+            return Ok(self
+                .operations
+                .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
+                .unwrap_or(0));
+        }
         self.operations
             .submit_wire(runtime, self.store_owner, kind, arg0, arg1)
             .map_err(|_| wasmtime::Error::msg("operation rejected"))
     }
 
     fn operation_poll(&mut self, operation: u64) -> wasmtime::Result<u64> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("poll", None);
+        }
         Ok(self.operations.poll_wire(self.store_owner, operation))
     }
 
@@ -1683,15 +2536,29 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         &mut self,
         operation: u64,
     ) -> wasmtime::Result<Arc<crate::async_engine::Notify>> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("yield", None);
+        }
         // The generated future calls this only after submit/poll. The async
         // owner driver will replace this scalar acknowledgement with its
         // parked Wasmtime yield glue; no Caller escapes this boundary.
+        let Some(runtime) = self.runtime.clone() else {
+            return self
+                .operations
+                .suspend_wire(self.store_owner, operation)
+                .map_err(|_| wasmtime::Error::msg("operation cannot suspend"));
+        };
         self.operations
-            .suspend_wire(self.store_owner, operation)
+            .suspend_stream_wire(runtime, self.store_owner, operation)
             .map_err(|_| wasmtime::Error::msg("operation cannot suspend"))
     }
 
     fn operation_cancel(&mut self, operation: u64) -> wasmtime::Result<i32> {
+        #[cfg(feature = "tauri-webview-test-support")]
+        if let Some(webviews) = &self.webviews {
+            webviews.trace_abi("cancel", None);
+        }
         Ok(i32::from(
             self.operations
                 .cancel_wire(self.store_owner, operation)
@@ -1733,6 +2600,44 @@ struct LogicalEpoch {
     cancellation: crate::async_engine::CancellationToken,
     deadline: Instant,
     winner: AtomicU8,
+    operations: Mutex<Option<Weak<OperationHub>>>,
+}
+impl LogicalEpoch {
+    fn bind_operations(&self, operations: &Arc<OperationHub>) -> Result<(), SketchExecutionError> {
+        let mut bound = self
+            .operations
+            .lock()
+            .map_err(|_| SketchExecutionError::PrelinkFailed)?;
+        *bound = Some(Arc::downgrade(operations));
+        drop(bound);
+        // Also cover interruption before the root finished creating grants.
+        self.wake_interrupted_operations();
+        Ok(())
+    }
+
+    fn wake_interrupted_operations(&self) {
+        let terminal = match self.winner.load(Ordering::Acquire) {
+            EPOCH_CANCELLED => operations::Terminal::Cancelled,
+            EPOCH_DEADLINE_EXCEEDED => operations::Terminal::TimedOut,
+            _ => return,
+        };
+        let operations = self
+            .operations
+            .lock()
+            .ok()
+            .and_then(|bound| bound.clone())
+            .and_then(|bound| bound.upgrade());
+        if let Some(operations) = operations {
+            // Epoch interrupts executing Wasm, but cannot wake an async host
+            // import parked on operation_yield. Revoke its shared authority
+            // and cancel producers so both root and child waiters can drain.
+            if operations.try_close_all(terminal) {
+                if let Ok(mut bound) = self.operations.lock() {
+                    *bound = None;
+                }
+            }
+        }
+    }
 }
 struct EpochEntry {
     logical: Arc<LogicalEpoch>,
@@ -1766,6 +2671,7 @@ impl EpochBroker {
             cancellation,
             deadline: Instant::now() + self.limits.wall_clock_deadline,
             winner: AtomicU8::new(EPOCH_PENDING),
+            operations: Mutex::new(None),
         });
         self.register_entry(runtime, logical, true)
     }
@@ -1874,6 +2780,10 @@ impl EpochBroker {
             };
             if entries.is_empty() {
                 return;
+            }
+            // Never take operation-hub locks while holding registration state.
+            for entry in &entries {
+                entry.logical.wake_interrupted_operations();
             }
             self.engine.increment_epoch();
             // Released after this tick published every terminal winner, so a
@@ -2119,11 +3029,53 @@ mod epoch_broker_tests {
     }
 
     #[test]
+    fn interrupted_epochs_wake_host_operations_before_or_after_binding() {
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (winner, status) in [(EPOCH_CANCELLED, 2), (EPOCH_DEADLINE_EXCEEDED, 3)] {
+            for interrupt_before_binding in [false, true] {
+                let epoch = LogicalEpoch {
+                    cancellation: crate::async_engine::CancellationSource::new().token(),
+                    deadline: Instant::now(),
+                    winner: AtomicU8::new(EPOCH_PENDING),
+                    operations: Mutex::new(None),
+                };
+                let hub = OperationHub::new(2, 1).unwrap();
+                let (operation, _) = hub.submit(0, None, 0, 0).unwrap();
+                let wake = hub.suspend_wire(0, operation.wire()).unwrap();
+                if interrupt_before_binding {
+                    epoch.winner.store(winner, Ordering::Release);
+                    epoch.wake_interrupted_operations();
+                }
+                epoch.bind_operations(&hub).unwrap();
+                if !interrupt_before_binding {
+                    assert_eq!(hub.poll_wire(0, operation.wire()), 0);
+                    epoch.winner.store(winner, Ordering::Release);
+                    epoch.wake_interrupted_operations();
+                }
+                runtime.run(async {
+                    crate::async_engine::timeout(Duration::from_secs(1), wake.notified())
+                        .await
+                        .expect("interrupted host operation must wake");
+                });
+                assert_eq!(hub.poll_wire(0, operation.wire()), status);
+                assert!(hub.submit(0, None, 0, 0).is_err());
+                assert_eq!(hub.snapshot().pending_operations, 0);
+                assert!(epoch.operations.lock().unwrap().is_none());
+                epoch.wake_interrupted_operations();
+            }
+        }
+    }
+
+    #[test]
     fn cancellation_wins_a_same_tick_deadline_without_reclassifying_fuel() {
         let epoch = LogicalEpoch {
             cancellation: crate::async_engine::CancellationSource::new().token(),
             deadline: Instant::now(),
             winner: AtomicU8::new(EPOCH_CANCELLED),
+            operations: Mutex::new(None),
         };
         assert_eq!(epoch_error(&epoch), Some(SketchExecutionError::Cancelled));
         let fuel = wasmtime::Error::new(wasmtime::Trap::OutOfFuel);
@@ -2330,6 +3282,8 @@ fn define_closed_imports(
                 let generation = caller.data().fuel_generation;
                 let epoch = Arc::clone(&caller.data().epoch);
                 let operations = Arc::clone(&caller.data().operations);
+                #[cfg(feature = "tauri-webview")]
+                let webviews = caller.data().webviews.clone();
                 if epoch.winner.load(Ordering::Acquire) != EPOCH_PENDING {
                     if let Ok(mut workers) = controller.workers.lock() {
                         workers.epoch_rejections = workers.epoch_rejections.saturating_add(1);
@@ -2404,6 +3358,14 @@ fn define_closed_imports(
                                 epoch: Arc::clone(&epoch),
                                 operations,
                                 store_owner: u64::try_from(tid).unwrap_or(u64::MAX),
+                                initial_output: None,
+                                initial_compiler: None,
+                                #[cfg(all(test, feature = "archive-auth-test-support"))]
+                                initial_archive: None,
+                                #[cfg(feature = "tauri-webview")]
+                                webviews,
+                                #[cfg(feature = "tauri-webview")]
+                                initial_url: None,
                             },
                         );
                         install_epoch_deadline(&mut store);
@@ -2571,9 +3533,56 @@ fn define_closed_imports(
     Ok(())
 }
 
+#[cfg(all(test, feature = "archive-auth-test-support"))]
+#[path = "archive_input_guest_tests.rs"]
+mod archive_input_guest_tests;
+
 #[cfg(test)]
 mod threaded_root_observation_tests {
     use super::*;
+
+    #[test]
+    fn bounded_blob_stream_controls_use_one_scoped_registry_authority() {
+        let hub = OperationHub::new(4, 4).expect("hub");
+        let stream = hub.create_blob(7).expect("stream");
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ping").expect("write"),
+            4
+        );
+
+        let mut destination = [0; 4];
+        assert_eq!(
+            read_blob_stream_chunk(&hub, 7, stream.wire(), &mut destination).expect("read"),
+            4
+        );
+        assert_eq!(&destination, b"ping");
+        assert_eq!(hub.snapshot().native_transfer_capacity, 0);
+
+        assert_eq!(hub.abandon_blob_wire(7, stream.wire()), Ok(()));
+        assert!(write_blob_stream_chunk(&hub, 7, stream.wire(), b"next").is_err());
+    }
+
+    #[test]
+    fn blob_stream_controls_short_transfer_to_the_configured_chunk_quota() {
+        let limits = operations::BlobLimits::new(2, 8, 16).expect("limits");
+        let hub = OperationHub::with_blob_limits(4, 4, limits).expect("hub");
+        let stream = hub.create_blob(7).expect("stream");
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ping").expect("write"),
+            2
+        );
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ng").expect("write"),
+            2
+        );
+
+        let mut destination = [0; 4];
+        assert_eq!(
+            read_blob_stream_chunk(&hub, 7, stream.wire(), &mut destination).expect("read"),
+            2
+        );
+        assert_eq!(&destination[..2], b"pi");
+    }
 
     #[test]
     fn compiler_owned_ledger_reserves_the_exact_threaded_contract_and_releases_once() {
@@ -2801,6 +3810,7 @@ mod threaded_root_observation_tests {
             .expect("root records lifecycle cleanup");
         assert_eq!(operations.pending_operations, 0);
         assert_eq!(operations.live_resources, 0);
+        assert_eq!(operations.active_clocks, 0);
     }
 
     #[test]
@@ -3253,7 +4263,23 @@ mod threaded_root_observation_tests {
         replace_metadata_byte(&mut schema_skew, b"schema_revision = 1\n", b'2');
         let mut capability_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(&mut capability_skew, b"capabilities=0\n", b'1');
+        let operation_skew = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=11\n", "operation_protocol_revision=12\n")
+            .into_bytes();
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
+        let previous_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=11\n", "operation_protocol_revision=10\n")
+            .into_bytes();
+        assert!(
+            previous_operations
+                .windows(b"operation_protocol_revision=10\n".len())
+                .any(|window| window == b"operation_protocol_revision=10\n")
+        );
+        let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=11\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -3261,6 +4287,21 @@ mod threaded_root_observation_tests {
         };
 
         let cases = [
+            (
+                "previous operation protocol",
+                threaded_fixture_with_abi_metadata(Some(&previous_operations)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "future operation protocol",
+                threaded_fixture_with_abi_metadata(Some(&operation_skew)),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
+            (
+                "legacy unversioned operation protocol",
+                threaded_fixture_with_abi_metadata(Some(legacy_operations.as_bytes())),
+                SketchModuleError::MetadataMismatch { name: ABI_METADATA },
+            ),
             (
                 "absent",
                 absent,
@@ -3321,6 +4362,18 @@ mod threaded_root_observation_tests {
             return;
         };
         let bytes = std::fs::read(path).expect("read threaded artifact");
+        let transfer_limits = SketchExecutionLimits::default()
+            .with_fuel_limits(
+                SketchFuelLimits::new(1_700_000_000_000, 100_000_000_000, 100_000_000_000)
+                    .expect("finite transfer fuel"),
+            )
+            .expect("transfer limits")
+            .with_blob_limits(
+                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 2, 2, 4)
+                    .unwrap()
+                    .with_maximum_transfer_bytes(3 * 1024 * 1024)
+                    .unwrap(),
+            );
         let manifest = threaded_artifact_manifest_for_test(&bytes).expect("artifact manifest");
         assert_eq!(
             manifest,
@@ -3329,7 +4382,12 @@ mod threaded_root_observation_tests {
                 "/tests/fixtures/threaded_rust_artifact_manifest_v1.txt"
             ))
         );
-        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");
+        let compiler = SketchCompiler::new(
+            SketchCompilerConfig::default()
+                .with_execution_limits(transfer_limits)
+                .expect("transfer configuration"),
+        )
+        .expect("compiler");
         let sketch = compiler
             .admit(
                 &bytes,
@@ -3350,10 +4408,15 @@ mod threaded_root_observation_tests {
             .enable_all()
             .build()
             .expect("runtime");
+        let output_directory = tempfile::tempdir().expect("output directory");
+        let output_path = output_directory.path().join("exact-output");
+        std::fs::write(&output_path, b"original").expect("existing output");
         let outcome = runtime.run(async {
             sketch
-                .execute_threaded_root(
+                .execute_threaded_root_with_output(
                     crate::async_engine::RuntimeHandle::current().expect("handle"),
+                    crate::async_engine::CancellationSource::new().token(),
+                    output_path.clone(),
                 )
                 .await
         });
@@ -3395,10 +4458,52 @@ mod threaded_root_observation_tests {
             .expect("root records lifecycle cleanup after the real artifact exits");
         assert_eq!(operations.pending_operations, 0);
         assert_eq!(operations.live_resources, 0);
+        assert_eq!(operations.active_clocks, 0);
         // One create, two child uses, and one close must each prove a real
-        // Pending -> async yield wake -> one terminal poll transition.
-        assert_eq!(operations.suspends, 4);
-        assert_eq!(operations.resumes, 4);
+        // Pending -> async yield wake -> one terminal poll transition. The
+        // two guest-owned bounded streams add ten terminal operations; their
+        // individual submissions may complete before or after waiter
+        // registration, so only the suspension count remains a range.
+        // Output rejection, successful output completion, and the clock may
+        // win before waiter registration; each adds at most one suspension,
+        // but exactly one consumed result. The rejected unsealed commit must
+        // leave both authorities usable by the subsequent successful retry.
+        // The 128 additional blob creates each require the ordinary deferred
+        // create transition; their synchronous drops add no suspension.
+        assert!(
+            (8 + 128 + 4..=11 + 128 + 10).contains(&operations.suspends),
+            "{operations:?}"
+        );
+        // Each of the 128 create/drop iterations consumes one create result;
+        // synchronous Drop itself allocates and consumes no operation slot.
+        // The two child streams consume 46 results: create, sixteen fills,
+        // one scheduler yield, one resumed capacity write, one cancelled
+        // write, one read, seal, and close each. The cancellation itself
+        // still has one terminal result, even though it never publishes bytes.
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128 + 46);
+        assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
+        assert_eq!(
+            std::fs::read_dir(output_directory.path()).unwrap().count(),
+            1
+        );
+        // Each guest child reaches its independent 1 MiB blob capacity before
+        // a bounded read releases its awaited write. Scheduling can interleave
+        // the two children at any chunk boundary, but the two-blob policy
+        // remains a hard ceiling.
+        assert!(
+            (1024 * 1024..=2 * 1024 * 1024).contains(&operations.peak_buffered_blob_bytes),
+            "{operations:?}"
+        );
+        // The pressure phase overlaps full blobs, pending inputs, and bounded
+        // pull results. The policy's 3 MiB combined-transfer cap applies to
+        // every scheduling interleaving; measure allocations, not payload.
+        assert!(
+            (2 * 1024 * 1024..=3 * 1024 * 1024)
+                .contains(&operations.peak_retained_transfer_capacity),
+            "{operations:?}"
+        );
+        assert_eq!(operations.retained_transfer_capacity, 0);
+        assert_eq!(operations.buffered_blob_bytes, 0);
         assert_eq!(
             *prepared
                 .controller
@@ -3416,8 +4521,8 @@ mod threaded_root_observation_tests {
                 2,
                 2,
                 2,
-                12,
-                0,
+                14,
+                2,           // bounded streams completed by guest children
             ]),
             "root and both children must publish the shared atomic result"
         );
@@ -3889,6 +4994,55 @@ mod threaded_root_observation_tests {
         ])
     }
 
+    #[test]
+    fn instantiation_trap_revokes_output_and_records_final_cleanup() {
+        let bytes = threaded_code_fixture([
+            empty_body(),
+            i32_zero_body(),
+            empty_body(),
+            i32_zero_body(),
+            vec![0, 0x00, 0x0b], // unreachable in the module start section
+        ]);
+        let compiler = SketchCompiler::new(SketchCompilerConfig::default()).unwrap();
+        let sketch = compiler
+            .admit(
+                &bytes,
+                SketchModulePolicy::threaded_rust_v1(bytes.len() + 1, THREADED_RUST_MAX_PAGES)
+                    .unwrap(),
+            )
+            .unwrap();
+        let runtime = crate::async_engine::RuntimeBuilder::current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("unchanged");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = runtime.run(sketch.execute_threaded_root_with_output(
+            runtime.handle(),
+            crate::async_engine::CancellationSource::new().token(),
+            destination.clone(),
+        ));
+        assert_eq!(result, Err(SketchExecutionError::Trapped));
+        let prepared = sketch
+            .prepared_root
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        let snapshot = prepared
+            .controller
+            .operation_snapshot
+            .lock()
+            .unwrap()
+            .expect("instantiation failures must finalize the hub");
+        assert_eq!(snapshot.live_resources, 0);
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
     fn root_fuel_fixture() -> Vec<u8> {
         threaded_code_fixture([
             infinite_loop_body(),
@@ -4090,6 +5244,12 @@ fn capture_threaded_smoke_report(
     }
     Some(report)
 }
+
+mod compiler_dispatch;
+mod compiler_cache;
+#[cfg(feature = "wasm-component-compiler-experiment")]
+mod component_compiler;
+mod hash_dispatch;
 
 #[cfg(test)]
 mod validation_report_tests {
@@ -4321,6 +5481,7 @@ mod result_precedence_tests {
             cancellation: crate::async_engine::CancellationSource::new().token(),
             deadline: Instant::now() + Duration::from_secs(1),
             winner: AtomicU8::new(EPOCH_PENDING),
+            operations: Mutex::new(None),
         };
         assert_eq!(
             map_root_error(&error, &epoch),
@@ -5013,29 +6174,22 @@ fn preflight_threaded_rust(
     if memory_export != Some((ExternalKind::Memory, 0)) {
         return Err(SketchModuleError::MemoryExportMismatch);
     }
-    let required = [
-        (ABI_MODULE, ABI_YIELD),
-        (THREAD_MODULE, THREAD_SPAWN),
-        ("wasi_snapshot_preview1", "clock_time_get"),
-        ("wasi_snapshot_preview1", "environ_get"),
-        ("wasi_snapshot_preview1", "environ_sizes_get"),
-        ("wasi_snapshot_preview1", "fd_write"),
-        ("wasi_snapshot_preview1", "proc_exit"),
-        ("wasi_snapshot_preview1", "sched_yield"),
-    ];
-    // The legacy generated artifact contains only `kernel_yield`; the
-    // lifecycle is an all-or-nothing additive declaration.  This preserves
-    // old admitted artifacts while preventing a guest from presenting a
-    // partial submit/poll/yield protocol.
+    // Every present import already passed the exact name/signature allowlist
+    // above. Do not require dead stdlib imports from the smoke application's
+    // particular link graph: a screenshot guest need not spawn a child, read
+    // a compatibility clock, or use the legacy authority-free yield.
+    // Require either the legacy kernel boundary or the complete generated
+    // lifecycle, and continue rejecting partial submit/poll/yield protocols.
     let lifecycle = [
         (ABI_MODULE, "operation_submit"),
         (ABI_MODULE, "operation_poll"),
         (ABI_MODULE, "operation_yield"),
     ];
     let lifecycle_present = lifecycle.iter().filter(|pair| seen.contains(*pair)).count();
-    if !required.iter().all(|pair| seen.contains(pair))
+    let cancellation_present = usize::from(seen.contains(&(ABI_MODULE, "operation_cancel")));
+    if (lifecycle_present == 0 && !seen.contains(&(ABI_MODULE, ABI_YIELD)))
         || !matches!(lifecycle_present, 0 | 3)
-        || seen.len() != required.len() + lifecycle_present
+        || (cancellation_present != 0 && lifecycle_present != 3)
     {
         return Err(SketchModuleError::MissingRequiredImport {
             module: "threaded-rust-v1",
@@ -5173,10 +6327,10 @@ fn threaded_import_signature(
             params: generated_v1_contract::KERNEL_YIELD_PARAMS,
             results: generated_v1_contract::KERNEL_YIELD_RESULTS,
         },
-        // These are the closed scalar lifecycle imports generated from the
-        // admitted v1 manifest.  Resource operations remain opcode variants
-        // of `operation_submit`; admission deliberately grants no additional
-        // resource or native-backend import surface.
+        // These are the closed scalar imports generated from the admitted v1
+        // manifest. Blob exposes bounded caller-memory stream controls while
+        // its established operation opcodes remain available to the guest
+        // facade for capacity-awaited transfer futures.
         (ABI_MODULE, "operation_submit") => Signature {
             params: &[ValType::I32, ValType::I64, ValType::I64],
             results: &[ValType::I64],
@@ -5186,6 +6340,20 @@ fn threaded_import_signature(
             results: &[ValType::I64],
         },
         (ABI_MODULE, "operation_yield") | (ABI_MODULE, "operation_cancel") => Signature {
+            params: &[ValType::I64],
+            results: I32,
+        },
+        (ABI_MODULE, "resource_release_encrypted_archive")
+        | (ABI_MODULE, "resource_release_authenticated_archive")
+        | (ABI_MODULE, "resource_release_archive_entry") => Signature {
+            params: &[ValType::I64],
+            results: I32,
+        },
+        (ABI_MODULE, "stream_read") | (ABI_MODULE, "stream_write") => Signature {
+            params: &[ValType::I64, ValType::I32, ValType::I32],
+            results: I32,
+        },
+        (ABI_MODULE, "stream_close") => Signature {
             params: &[ValType::I64],
             results: I32,
         },

@@ -2,6 +2,8 @@
 /target/
 /src/wasm/generated/v1/guest/target/
 /tools/wasm-abi-generator/target/
+/benchmarks/wasm-sketch/component-guest/target/
+/benchmarks/wasm-sketch/component-tools/target/
 /guests/threaded-smoke/target/
 /.extern-repos/
 *.egg-info/
@@ -12,3 +14,6 @@ __pycache__/
 # guest manifest. Only the checked-in target config belongs to the repository.
 /guests/threaded-smoke/.cargo/*
 !/guests/threaded-smoke/.cargo/config.toml
+/examples/wasm-tauri-screenshot/guest/target/
+/examples/wasm-tauri-screenshot/guest/.cargo/*
+!/examples/wasm-tauri-screenshot/guest/.cargo/config.toml

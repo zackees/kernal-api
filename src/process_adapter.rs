@@ -310,6 +310,14 @@ impl ProcessSessionAdapter {
         output.next_output().await.map(output_event)
     }
 
+    pub(crate) async fn shutdown_output(&self) -> io::Result<()> {
+        // A parked next_output owns this mutex. Wake its producer before
+        // waiting for the lane; acquiring the mutex first would deadlock.
+        self.control.request_output_shutdown();
+        let mut output = self.output.lock().await;
+        output.shutdown().await.map_err(process_error_to_io)
+    }
+
     pub(crate) async fn wait(&self) -> io::Result<ProcessSessionExit> {
         self.control
             .wait()

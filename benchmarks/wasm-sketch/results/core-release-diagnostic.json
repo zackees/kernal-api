@@ -1,0 +1,228 @@
+{
+  "schema": 1,
+  "status": "complete-diagnostic-only",
+  "candidate": "core-threaded-v1",
+  "revision": "1fdbaf039289d287b4c22802e5575fddf34e5a13",
+  "host": "Linux-6.18.48-x86_64-with-glibc2.42",
+  "samples": [
+    {
+      "label": "cold",
+      "wall_ns": 17198015677,
+      "build_ns": 16968752228,
+      "metadata_ns": 2937558,
+      "admission_command_ns": 225539099,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 96602,
+        "admission_ns": 221702869,
+        "executed": false
+      },
+      "source_sha256": "a30337171dc59a630b67bb4f52ec0d59393da97d1f5b27e78820039d8394b6a9",
+      "module_sha256": "98724049835ad642d90fb293fc9a20d2616184b747cd11c745ed90f4f7a21f5a"
+    },
+    {
+      "label": "noop",
+      "wall_ns": 607632990,
+      "build_ns": 373966929,
+      "metadata_ns": 3487243,
+      "admission_command_ns": 229242756,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 83657,
+        "admission_ns": 225812070,
+        "executed": false
+      },
+      "source_sha256": "a30337171dc59a630b67bb4f52ec0d59393da97d1f5b27e78820039d8394b6a9",
+      "module_sha256": "98724049835ad642d90fb293fc9a20d2616184b747cd11c745ed90f4f7a21f5a"
+    },
+    {
+      "label": "edit-1",
+      "wall_ns": 1361603971,
+      "build_ns": 1142691239,
+      "metadata_ns": 3022118,
+      "admission_command_ns": 215140722,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 100099,
+        "admission_ns": 211902707,
+        "executed": false
+      },
+      "source_sha256": "7d2d8402b4ba91dd9ca86788d81ea4c843fdadd5fe33ce590df683091dc868c3",
+      "module_sha256": "b816fbafa094107437fa40f47bfd43bdc462940d9751e938fd155c76bd3089c4"
+    },
+    {
+      "label": "edit-2",
+      "wall_ns": 1372678820,
+      "build_ns": 1143217063,
+      "metadata_ns": 2806372,
+      "admission_command_ns": 225854498,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 84869,
+        "admission_ns": 222755384,
+        "executed": false
+      },
+      "source_sha256": "015cf7dbcb15d51586359a3791af75cac2a01dff16f156d7cd4a48b24a2372f9",
+      "module_sha256": "627aa7df236d04fc017f7f9675f7327893c30ed91265a2c2463f56a7a548120c"
+    },
+    {
+      "label": "edit-3",
+      "wall_ns": 1365910398,
+      "build_ns": 1136995833,
+      "metadata_ns": 3431840,
+      "admission_command_ns": 224625753,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 84940,
+        "admission_ns": 221156574,
+        "executed": false
+      },
+      "source_sha256": "6aed1d83caf0dad33d58a5478ce722c6954df03856897a1970f4af77a68985ac",
+      "module_sha256": "639820ffaae47bf4f1c546a76c023bc38e726698458d7e7edcb11c16eb75ca26"
+    },
+    {
+      "label": "edit-4",
+      "wall_ns": 1403101610,
+      "build_ns": 1169403625,
+      "metadata_ns": 2911690,
+      "admission_command_ns": 229870291,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 87725,
+        "admission_ns": 226388218,
+        "executed": false
+      },
+      "source_sha256": "44c97bbb644d558404a885774f18609f38b5119f9648f434bb14879ba2b3f588",
+      "module_sha256": "9483afdad4e49b075c430c00674f45504e58941b9b230eb17be1a3b5a0828a30"
+    },
+    {
+      "label": "edit-5",
+      "wall_ns": 1376787693,
+      "build_ns": 1146644765,
+      "metadata_ns": 3138278,
+      "admission_command_ns": 226247526,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 83718,
+        "admission_ns": 222880789,
+        "executed": false
+      },
+      "source_sha256": "4791108531f9444b29a86166c9d38d58c046a897f9dad3a8d66dc39c0a6a69fe",
+      "module_sha256": "52625ef457c83c402b376cbd5414f6de561d220a6c37c990c9555442fd492220"
+    },
+    {
+      "label": "edit-6",
+      "wall_ns": 1383648110,
+      "build_ns": 1161402770,
+      "metadata_ns": 3077152,
+      "admission_command_ns": 218473370,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 91602,
+        "admission_ns": 215346864,
+        "executed": false
+      },
+      "source_sha256": "7a4702b2a3a183c41a9f48be3615af16bb474ddb21f015ee77369cd895189675",
+      "module_sha256": "c131f1cae08e2eed5cfb214d7c35d042c8c86c97c707985bac077104c72560f6"
+    },
+    {
+      "label": "edit-7",
+      "wall_ns": 1380095104,
+      "build_ns": 1154275309,
+      "metadata_ns": 3022580,
+      "admission_command_ns": 221942407,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 83858,
+        "admission_ns": 219019305,
+        "executed": false
+      },
+      "source_sha256": "33fcd02c121c4a265f79a0c1a47b4e7affcaef3faabd23eed1e9267e535a75cc",
+      "module_sha256": "251acb9d7bb9d64c78900ebd0406ff4fba16de230a75db1d4ebe895576074f83"
+    },
+    {
+      "label": "edit-8",
+      "wall_ns": 1415240622,
+      "build_ns": 1184837037,
+      "metadata_ns": 2827743,
+      "admission_command_ns": 226889069,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 86643,
+        "admission_ns": 223961889,
+        "executed": false
+      },
+      "source_sha256": "47c5290e42810058867d2ef120dd104037d36fb7e435e18c81a5daefdb5a3c0b",
+      "module_sha256": "cfb18ae92a2c3b350762325f08fe0af89a81024afc32f182a234127ac147c296"
+    },
+    {
+      "label": "edit-9",
+      "wall_ns": 1380380083,
+      "build_ns": 1155686320,
+      "metadata_ns": 2970722,
+      "admission_command_ns": 221027612,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 83387,
+        "admission_ns": 217985266,
+        "executed": false
+      },
+      "source_sha256": "af485828a8fb755cf960e8031f4b0af006c1a197ba9d54187c2a94cc9c29c587",
+      "module_sha256": "6a671f6d31c3d3165612f2ccf3ad44822cc9c518446daba143e64edacce68fe7"
+    },
+    {
+      "label": "edit-10",
+      "wall_ns": 1394159480,
+      "build_ns": 1172438149,
+      "metadata_ns": 2791254,
+      "admission_command_ns": 218178161,
+      "admission": {
+        "schema": 1,
+        "profile": "threaded-rust-v1",
+        "module_bytes": 165011,
+        "compiler_setup_ns": 85972,
+        "admission_ns": 214926731,
+        "executed": false
+      },
+      "source_sha256": "acbb6196282ee849aad91907fa3e5bacb2738f61e84455db5ffea75bddec929e",
+      "module_sha256": "dd8f8dffc0779e6d00e768bd02eff0c0952f18f4abf208cfa1d0a637481fc010"
+    }
+  ],
+  "admission_sha256": "551d92baef086115a6abe95fd7ac294528fc8ef732b7462521802c59322e8dbd",
+  "embedder_sha256": "dfdf70fdda9a51decbc220771061c1a9dbb6ed78809383afa67969aee854236b",
+  "cache_hit_rate": null,
+  "peak_compiler_rss_bytes": null,
+  "limitations": [
+    "cache and compiler RSS are not collected",
+    "no Component Model or execution comparison"
+  ],
+  "edit_summary": {
+    "p50_ns": 1380237593.5,
+    "p95_ns": 1415240622
+  },
+  "evidence_directory": "/tmp/kernal-core-measure.jRFiVV/release-run",
+  "admission_build_profile": "release",
+  "reference_host_isolation": "shared development host; no quiet-host guarantee"
+}

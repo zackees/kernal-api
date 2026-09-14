@@ -12,6 +12,7 @@ struct Guard<R> {
     metadata: u64,
     stream: u64,
     entries: u64,
+    max_entry_bytes: u64,
     ended: bool,
 }
 
@@ -28,6 +29,7 @@ impl<R: Read> Guard<R> {
                 .max_output_bytes
                 .saturating_add(limits.max_metadata_bytes),
             entries: limits.max_entries,
+            max_entry_bytes: limits.max_entry_bytes,
             ended: false,
         }
     }
@@ -136,6 +138,9 @@ impl<R: Read> Guard<R> {
             }
             self.pending = Cursor::new(record);
         } else {
+            if size > self.max_entry_bytes {
+                return Err(invalid("tar entry exceeds byte limit"));
+            }
             if size > self.stream {
                 return Err(invalid("tar member exceeds decompression limit"));
             }
@@ -289,7 +294,7 @@ pub(super) fn extract_tar(
             .write(true)
             .create_new(true)
             .open(&output)?;
-        copy_bounded(&mut entry, &mut file, &mut remaining)?;
+        copy_entry_bounded(&mut entry, &mut file, &mut remaining, limits.max_entry_bytes)?;
         file.flush()?;
         #[cfg(unix)]
         {

@@ -17,6 +17,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::time::Instant;
 
 use tauri_runtime::{
     window::{PendingWindow, WindowBuilder},
@@ -29,6 +30,8 @@ use wry::{NewWindowResponse, PageLoadEvent, WebView, WebViewBuilder};
 #[cfg(target_os = "linux")]
 #[path = "tauri/linux_webkitgtk.rs"]
 mod linux_webkitgtk;
+#[cfg(feature = "wasm-sketch-host")]
+pub(crate) mod sketch;
 
 #[cfg(not(any(
     target_os = "linux",
@@ -53,6 +56,13 @@ use wry::WebViewExtUnix as _;
 
 use crate::async_engine::{self, OneshotReceiver, OneshotSender, RuntimeHandle};
 use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
+
+pub(crate) mod capture;
+#[cfg(feature = "tauri-webview-test-support")]
+mod trace;
+pub use capture::{ViewportCaptureLimits, WebviewSnapshot, WebviewSnapshotChunk};
+#[cfg(feature = "tauri-webview-test-support")]
+pub use trace::WebviewTestTraceEvent;
 
 static NEXT_LABEL: AtomicU64 = AtomicU64::new(1);
 static NEXT_WEBVIEW_STORE: AtomicU64 = AtomicU64::new(1);
@@ -167,8 +177,6 @@ impl NativeWebviewLoop {
     pub(crate) fn new(
         async_runtime: RuntimeHandle,
     ) -> Result<(Self, NativeWebviewBackend), NativeWebviewError> {
-        #[cfg(target_os = "linux")]
-        linux_webkitgtk::prepare_renderer_environment();
         let runtime = Wry::new(Default::default())
             .map_err(|error| NativeWebviewError::HostFailure(error.to_string()))?;
         let backend = NativeWebviewBackend {
@@ -209,11 +217,12 @@ impl NativeWebviewBackend {
     pub(crate) async fn open(
         &self,
         request: NativeWebviewRequest,
+        lease: crate::operations::NativeOpenLease,
     ) -> Result<NativeWebview, NativeWebviewError> {
         let (created_sender, created_receiver) = async_engine::oneshot_channel();
         let backend = self.clone();
         self.async_runtime
-            .launch_blocking(move || backend.create_on_wry_thread(request, created_sender))
+            .launch_blocking(move || backend.create_on_wry_thread(request, created_sender, lease))
             .detach();
 
         created_receiver.await.map_err(|_| {
@@ -225,6 +234,7 @@ impl NativeWebviewBackend {
         &self,
         request: NativeWebviewRequest,
         created_sender: OneshotSender<Result<NativeWebview, NativeWebviewError>>,
+        lease: crate::operations::NativeOpenLease,
     ) {
         let (completion, load_waiter) = LoadCompletion::new(request.url.clone());
         let (terminal, terminal_waiter) = TerminalCompletion::new();
@@ -277,6 +287,7 @@ impl NativeWebviewBackend {
         let closed_on_close = Arc::clone(&closed);
         dispatcher.on_window_event(move |event| {
             if matches!(event, tauri_runtime::window::WindowEvent::Destroyed) {
+                capture::cancel_for_view(native_id);
                 let removed = UI_WEBVIEWS.with(|webviews| webviews.borrow_mut().remove(&native_id));
                 drop(removed);
                 completion_on_close.finish(Err(NativeWebviewError::WindowClosed));
@@ -285,16 +296,23 @@ impl NativeWebviewBackend {
             }
         });
 
+        // The native getter synchronously routes to the event loop. Query on
+        // this creation worker, never inside the UI closure below. Script-free
+        // routes do not need a scale query or bootstrap context.
+        let bootstrap_source = request.bootstrap.as_ref().map(|script| {
+            script.for_origin(&request.url, dispatcher.scale_factor().unwrap_or(1.0))
+        });
         let window_for_ui = dispatcher.clone();
         let completion_for_ui = Arc::clone(&completion);
         let terminal_for_ui = Arc::clone(&terminal);
         let created_sender_for_ui = Arc::clone(&created_sender);
         if let Err(error) = dispatcher.run_on_main_thread(move || {
+            let _lease = lease;
             let result = build_isolated_webview(
                 &window_for_ui,
                 request.url,
                 request.permissions,
-                request.bootstrap,
+                bootstrap_source,
                 completion_for_ui,
                 terminal_for_ui,
             );
@@ -351,7 +369,7 @@ pub(crate) struct NativeWebview {
     window: WryWindowDispatcher<()>,
     native_id: u64,
     completion: Arc<LoadCompletion>,
-    load_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
+    load_waiter: Option<OneshotReceiver<Result<Instant, NativeWebviewError>>>,
     terminal_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
     close_waiter: Option<OneshotReceiver<()>>,
     close_requested: AtomicBool,
@@ -362,7 +380,7 @@ impl NativeWebview {
     /// A resource can have one generated operation waiting at a time.
     pub(crate) fn wait_until_loaded(
         &mut self,
-    ) -> Result<OneshotReceiver<Result<(), NativeWebviewError>>, NativeWebviewError> {
+    ) -> Result<OneshotReceiver<Result<Instant, NativeWebviewError>>, NativeWebviewError> {
         self.load_waiter
             .take()
             .ok_or_else(|| NativeWebviewError::HostFailure("load waiter already consumed".into()))
@@ -402,6 +420,7 @@ impl NativeWebview {
             }
             let native_id = self.native_id;
             let _ = self.window.run_on_main_thread(move || {
+                capture::cancel_for_view(native_id);
                 let removed = UI_WEBVIEWS.with(|webviews| webviews.borrow_mut().remove(&native_id));
                 drop(removed);
             });
@@ -420,7 +439,7 @@ impl Drop for NativeWebview {
 
 struct LoadCompletion {
     target: Url,
-    sender: Mutex<Option<OneshotSender<Result<(), NativeWebviewError>>>>,
+    sender: Mutex<Option<OneshotSender<Result<Instant, NativeWebviewError>>>>,
 }
 
 struct TerminalCompletion {
@@ -478,7 +497,12 @@ impl CloseCompletion {
 }
 
 impl LoadCompletion {
-    fn new(target: Url) -> (Arc<Self>, OneshotReceiver<Result<(), NativeWebviewError>>) {
+    fn new(
+        target: Url,
+    ) -> (
+        Arc<Self>,
+        OneshotReceiver<Result<Instant, NativeWebviewError>>,
+    ) {
         let (sender, receiver) = async_engine::oneshot_channel();
         (
             Arc::new(Self {
@@ -490,6 +514,7 @@ impl LoadCompletion {
     }
 
     fn finish(&self, result: Result<(), NativeWebviewError>) {
+        let result = result.map(|()| Instant::now());
         let sender = self
             .sender
             .lock()
@@ -509,7 +534,7 @@ fn build_isolated_webview(
     dispatcher: &WryWindowDispatcher<()>,
     target: Url,
     permissions: WebviewPermissions,
-    bootstrap: Option<WebviewPageBootstrap>,
+    bootstrap_source: Option<String>,
     completion: Arc<LoadCompletion>,
     terminal: Arc<TerminalCompletion>,
 ) -> Result<WebView, NativeWebviewError> {
@@ -520,8 +545,7 @@ fn build_isolated_webview(
     let completion_for_popup = Arc::clone(&completion);
     let terminal_for_popup = Arc::clone(&terminal);
     let completion_for_load = Arc::clone(&completion);
-    let bootstrap_origin = bootstrap.as_ref().map(|_| target.origin());
-    let bootstrap_source = bootstrap.as_ref().map(|script| script.for_origin(&target));
+    let bootstrap_origin = bootstrap_source.as_ref().map(|_| target.origin());
     let builder = WebViewBuilder::new()
         // Deliberately do not call `with_ipc_handler`: Wry documents that it
         // exposes `window.ipc.postMessage` to page JavaScript.
@@ -633,6 +657,14 @@ fn is_allowed_url(url: &Url) -> bool {
 /// No native backend, runtime, or window value is exposed through this type.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WebviewError {
+    #[error("the native viewport capture queue is full")]
+    CaptureBusy,
+    #[error("viewport capture exceeds its pixel limit or has invalid dimensions")]
+    CapturePixelLimit,
+    #[error("viewport capture exceeds its encoded-byte or blob quota")]
+    CaptureByteLimit,
+    #[error("native viewport capture or PNG encoding failed")]
+    CaptureFailed,
     #[error("webview URL is malformed or not an HTTP(S) URL")]
     InvalidUrl,
     #[error("webview navigation was rejected: {0}")]
@@ -645,6 +677,9 @@ pub enum WebviewError {
     WindowClosed,
     #[error("the webview host failed: {0}")]
     HostFailure(String),
+    /// Another timed or untimed terminal wait is currently pending.
+    #[error("a terminal webview wait is already active")]
+    TerminalWaitInProgress,
 }
 
 /// Semantic permissions for one external webview.
@@ -694,6 +729,13 @@ pub enum PageBootstrapError {
 /// a block in the main frame's ordinary page world, not an isolated privileged
 /// world. No native IPC or guest ABI capability is installed. Runtime syntax
 /// errors follow normal page error reporting; they are not host-open errors.
+///
+/// The block reserves the lexical binding `kernalWindow`: a frozen object with
+/// `initialScaleFactor`, the native window's creation-time scale (physical
+/// pixels per logical pixel). This finite positive snapshot is independent of
+/// browser zoom, defaults to 1 on unavailable/invalid native data, and does not
+/// update after moving between displays. It exposes no native methods or IPC.
+/// Source must not redeclare `kernalWindow` in the same block.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebviewPageBootstrap {
     source: String,
@@ -718,13 +760,18 @@ impl WebviewPageBootstrap {
         &self.source
     }
 
-    fn for_origin(&self, target: &Url) -> String {
+    fn for_origin(&self, target: &Url, native_scale: f64) -> String {
         // WebView2 injects into subframes regardless of Wry's main-only flag.
         // Guard in page code too, including against initial about:blank.
         // The origin is URL-canonicalized and JS-string escaped; source is
         // deliberately trusted caller code, never a remote page's input.
+        let scale = if native_scale.is_finite() && native_scale > 0.0 {
+            native_scale
+        } else {
+            1.0
+        };
         format!(
-            "if (window === window.top && location.origin === \"{}\") {{\n{}\n}}\n",
+            "if (window === window.top && location.origin === \"{}\") {{\nconst kernalWindow = Object.freeze({{ initialScaleFactor: {scale} }});\n{}\n}}\n",
             target.origin().ascii_serialization().escape_default(),
             self.source
         )
@@ -798,6 +845,40 @@ pub struct ExternalWebviewClient {
     store: u64,
 }
 
+/// One host-validated HTTP(S) URL to authorize before guest instantiation.
+/// This grants no filesystem, arbitrary navigation, or network API authority.
+#[derive(Clone)]
+pub struct WebviewUrlGrant {
+    url: Arc<str>,
+}
+
+impl WebviewUrlGrant {
+    #[cfg(feature = "wasm-sketch-worker")]
+    pub(crate) fn worker_url(&self) -> &str {
+        &self.url
+    }
+
+    /// Validate without creating a window or starting native work. Both the
+    /// input and canonical URL must fit the fixed 16 KiB authority bound.
+    pub fn new(url: &str) -> Result<Self, WebviewError> {
+        if url.len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
+            return Err(WebviewError::InvalidUrl);
+        }
+        let request =
+            NativeWebviewRequest::parse(url, WebviewPermissions::deny_all()).map_err(map_native)?;
+        if request.url.as_str().len() > crate::operations::MAX_WEBVIEW_URL_BYTES {
+            return Err(WebviewError::InvalidUrl);
+        }
+        Ok(Self {
+            url: Arc::from(request.url.as_str()),
+        })
+    }
+
+    pub(crate) fn bind(&self, hub: &OperationHub, store: u64) -> Result<OpaqueToken, HubError> {
+        hub.grant_webview_url(store, Arc::clone(&self.url))
+    }
+}
+
 /// Opaque, generation-safe external-webview resource.
 ///
 /// It is intentionally non-cloneable: dropping it revokes the generation and
@@ -807,6 +888,17 @@ pub struct WebviewHandle {
     store: u64,
     resource: OpaqueToken,
     terminal_operation: OpaqueToken,
+    terminal_wait_active: AtomicBool,
+}
+
+// The hub terminal operation is single-consumer. Admission belongs to the
+// borrowed future so cancellation releases it without revoking the window.
+struct TerminalWaitGuard<'a>(&'a AtomicBool);
+
+impl Drop for TerminalWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Acceptance-only semantic counters for the process-main-thread smoke test.
@@ -816,6 +908,18 @@ pub struct WebviewHandle {
 #[cfg(feature = "tauri-webview-test-support")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WebviewTestObservation {
+    /// Kernel clock producers not yet drained.
+    pub active_clocks: usize,
+    /// Exact-output jobs not yet joined.
+    pub active_output_jobs: usize,
+    /// Queued UI captures and native callbacks still holding admission.
+    pub active_native_captures: usize,
+    /// Native creation requests retained after semantic cancellation.
+    pub active_native_opens: usize,
+    /// Encoded image resources retained by the shared hub.
+    pub live_blobs: usize,
+    /// Hub and native chunk allocations still charged to the transfer quota.
+    pub retained_transfer_capacity: usize,
     /// Private physical WebView backings retained by the facade.
     pub native_backings: usize,
     /// Live generation-safe semantic resources in the shared hub.
@@ -825,6 +929,8 @@ pub struct WebviewTestObservation {
 }
 
 struct WebviewService {
+    #[cfg(feature = "tauri-webview-test-support")]
+    trace: Arc<trace::Recorder>,
     runtime: RuntimeHandle,
     backend: NativeWebviewBackend,
     hub: Arc<OperationHub>,
@@ -838,6 +944,44 @@ struct WebviewService {
     closing: Mutex<BTreeSet<OpaqueToken>>,
 }
 
+// Own the semantic reservation across the native creation await. Native
+// creation separately closes its window if the oneshot receiver disappears;
+// that physical cleanup cannot reclaim this hub's operation or resource.
+struct PendingWebviewOpen {
+    service: Arc<WebviewService>,
+    store: u64,
+    resource: OpaqueToken,
+    operation: OpaqueToken,
+    transferred: bool,
+}
+
+struct PendingUrlGrant {
+    hub: Arc<OperationHub>,
+    resource: OpaqueToken,
+}
+
+impl Drop for PendingUrlGrant {
+    fn drop(&mut self) {
+        let _ = self.hub.close_resource(self.resource);
+    }
+}
+
+impl Drop for PendingWebviewOpen {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.service
+                .hub
+                .finish_external_operation(self.operation, Terminal::Cancelled);
+            let _ = self
+                .service
+                .hub
+                .observe_terminal(self.store, self.operation);
+            self.service
+                .revoke_with_terminal(self.resource, Terminal::Cancelled);
+        }
+    }
+}
+
 impl ExternalWebviewHost {
     /// Create the private event loop and one root semantic instance.
     pub fn new(runtime: RuntimeHandle) -> Result<Self, WebviewError> {
@@ -847,6 +991,8 @@ impl ExternalWebviewHost {
             event_loop,
             client: ExternalWebviewClient {
                 service: Arc::new(WebviewService {
+                    #[cfg(feature = "tauri-webview-test-support")]
+                    trace: Arc::new(trace::Recorder::new()),
                     runtime,
                     backend,
                     hub,
@@ -870,6 +1016,12 @@ impl ExternalWebviewHost {
 }
 
 impl ExternalWebviewClient {
+    /// Return bounded acceptance events and the number omitted at capacity.
+    /// A proof must reject a nonzero omitted count instead of assuming a full trace.
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub fn test_trace(&self) -> (Vec<WebviewTestTraceEvent>, usize) {
+        self.service.trace.snapshot()
+    }
     /// Create an independently authorized logical instance over the same
     /// host. Handles from one instance cannot be used by another.
     pub fn new_instance(&self) -> Result<Self, WebviewError> {
@@ -881,19 +1033,38 @@ impl ExternalWebviewClient {
 
     /// Validate and asynchronously create an isolated external webview.
     pub async fn open_webview(&self, url: &str) -> Result<WebviewHandle, WebviewError> {
-        self.open_webview_with_permissions(url, WebviewPermissions::deny_all())
-            .await
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_webview(&grant).await
     }
 
-    /// Validate and asynchronously create an isolated external webview with
-    /// the supplied facade-owned permission policy.
+    /// Create an isolated native webview with explicitly supplied permissions.
     pub async fn open_webview_with_permissions(
         &self,
         url: &str,
         permissions: WebviewPermissions,
     ) -> Result<WebviewHandle, WebviewError> {
-        let request = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
-        self.open_request(request).await
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_permissions(&grant, permissions)
+            .await
+    }
+
+    /// Open a prevalidated host URL. The temporary registry grant is scoped
+    /// to this instance and revoked on completion, error, or future drop.
+    pub async fn open_granted_webview(
+        &self,
+        grant: &WebviewUrlGrant,
+    ) -> Result<WebviewHandle, WebviewError> {
+        self.open_granted_with_permissions(grant, WebviewPermissions::deny_all())
+            .await
+    }
+
+    async fn open_granted_with_permissions(
+        &self,
+        grant: &WebviewUrlGrant,
+        permissions: WebviewPermissions,
+    ) -> Result<WebviewHandle, WebviewError> {
+        self.open_granted_with_request(grant, permissions, None, None)
+            .await
     }
 
     /// Open an isolated external page with validated window presentation.
@@ -907,9 +1078,9 @@ impl ExternalWebviewClient {
         window: WebviewWindowOptions,
         permissions: WebviewPermissions,
     ) -> Result<WebviewHandle, WebviewError> {
-        let mut request = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
-        request.window = Some(window);
-        self.open_request(request).await
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_request(&grant, permissions, Some(window), None)
+            .await
     }
 
     /// Open with explicit caller-owned main-frame document-start JavaScript.
@@ -926,25 +1097,43 @@ impl ExternalWebviewClient {
         permissions: WebviewPermissions,
         bootstrap: WebviewPageBootstrap,
     ) -> Result<WebviewHandle, WebviewError> {
-        let mut request = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
-        if request.url.origin().ascii_serialization().len() > 4096 {
+        let preview = NativeWebviewRequest::parse(url, permissions).map_err(map_native)?;
+        if preview.url.origin().ascii_serialization().len() > 4096 {
             return Err(WebviewError::InvalidUrl);
         }
-        request.window = Some(window);
-        request.bootstrap = Some(bootstrap);
-        self.open_request(request).await
+        let grant = WebviewUrlGrant::new(url)?;
+        self.open_granted_with_request(&grant, permissions, Some(window), Some(bootstrap))
+            .await
     }
 
-    async fn open_request(
+    async fn open_granted_with_request(
         &self,
-        request: NativeWebviewRequest,
+        grant: &WebviewUrlGrant,
+        permissions: WebviewPermissions,
+        window: Option<WebviewWindowOptions>,
+        bootstrap: Option<WebviewPageBootstrap>,
     ) -> Result<WebviewHandle, WebviewError> {
-        let (resource, operation) = self
+        let grant = PendingUrlGrant {
+            hub: Arc::clone(&self.service.hub),
+            resource: grant.bind(&self.service.hub, self.store).map_err(map_hub)?,
+        };
+        let (resource, operation, url) = self
             .service
             .hub
-            .begin_external_webview_open(self.store)
+            .begin_granted_webview_open(self.store, grant.resource)
             .map_err(map_hub)?;
-        let mut native = match self.service.backend.open(request).await {
+        let mut pending = PendingWebviewOpen {
+            service: Arc::clone(&self.service),
+            store: self.store,
+            resource,
+            operation,
+            transferred: false,
+        };
+        let mut request = NativeWebviewRequest::parse(&url, permissions).map_err(map_native)?;
+        request.window = window;
+        request.bootstrap = bootstrap;
+        let lease = self.service.hub.acquire_native_open().map_err(map_hub)?;
+        let mut native = match self.service.backend.open(request, lease).await {
             Ok(native) => native,
             Err(error) => {
                 self.service
@@ -960,7 +1149,9 @@ impl ExternalWebviewClient {
             .lock()
             .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?
             .insert(resource, native);
-        self.service.hub.finish_external_open(operation, resource);
+        if !self.service.hub.finish_external_open(operation, resource) {
+            self.service.revoke(resource);
+        }
         let service = Arc::clone(&self.service);
         self.service
             .runtime
@@ -985,11 +1176,13 @@ impl ExternalWebviewClient {
                     .hub
                     .begin_external_webview_wait(self.store, resource)
                     .map_err(map_hub)?;
+                pending.transferred = true;
                 Ok(WebviewHandle {
                     service: Arc::clone(&self.service),
                     store: self.store,
                     resource,
                     terminal_operation,
+                    terminal_wait_active: AtomicBool::new(false),
                 })
             }
             Ok(Some(result)) => Err(map_terminal(result.terminal)),
@@ -1011,6 +1204,12 @@ impl ExternalWebviewClient {
         let snapshot = self.service.hub.snapshot();
         let native_backings = self.service.native.lock().map_or(0, |native| native.len());
         WebviewTestObservation {
+            active_clocks: snapshot.active_clocks,
+            active_output_jobs: snapshot.active_output_jobs,
+            active_native_captures: snapshot.active_native_captures,
+            active_native_opens: snapshot.active_native_opens,
+            live_blobs: snapshot.live_blobs,
+            retained_transfer_capacity: snapshot.retained_transfer_capacity,
             native_backings,
             live_resources: snapshot.live_resources,
             pending_operations: snapshot.pending_operations,
@@ -1075,7 +1274,7 @@ impl WebviewHandle {
                 .map_err(map_native)?
         };
         let terminal = match async_engine::timeout(timeout, receiver).await {
-            Ok(Ok(Ok(()))) => Terminal::Completed,
+            Ok(Ok(Ok(_loaded_at))) => Terminal::Completed,
             Ok(Ok(Err(error))) => terminal_for_native(&error),
             Ok(Err(_)) => Terminal::Closed,
             Err(_) => Terminal::TimedOut,
@@ -1101,7 +1300,31 @@ impl WebviewHandle {
     /// This is useful when an allowed top-level document finishes and then
     /// attempts a prohibited redirect or popup. It is itself a hub-owned
     /// operation, so callback completion never needs to retain a Store.
+    /// Only one terminal wait may be active; overlapping timed or untimed
+    /// waits return [`WebviewError::TerminalWaitInProgress`] without expiring
+    /// the window. Dropping the future releases that admission.
     pub async fn wait_until_terminal(&self, timeout: Duration) -> Result<(), WebviewError> {
+        self.wait_terminal(Some(timeout)).await
+    }
+
+    /// Await user closure, cancellation, or a terminal host/security event
+    /// without imposing a lifetime deadline on an interactive window.
+    ///
+    /// Owns no timer and does not poll periodically. Dropping this borrowed
+    /// future leaves the window alive; a subsequent wait observes retained
+    /// terminal state, including an event that arrived between waits. Dropping
+    /// or cancelling the handle still revokes the window. As with the timed
+    /// variant, normal user closure is reported as [`WebviewError::WindowClosed`].
+    /// Overlapping terminal waits return [`WebviewError::TerminalWaitInProgress`].
+    pub async fn wait_for_terminal(&self) -> Result<(), WebviewError> {
+        self.wait_terminal(None).await
+    }
+
+    async fn wait_terminal(&self, timeout: Option<Duration>) -> Result<(), WebviewError> {
+        self.terminal_wait_active
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| WebviewError::TerminalWaitInProgress)?;
+        let _admission = TerminalWaitGuard(&self.terminal_wait_active);
         // A cancellation or window callback may have completed this operation
         // before the caller first awaits it. Poll first; if completion wins
         // the short race before suspension, consume that typed terminal below
@@ -1120,12 +1343,16 @@ impl WebviewHandle {
             .wait_external_operation(self.store, self.terminal_operation)
         {
             Ok(wake) => {
-                if async_engine::timeout(timeout, wake.notified())
-                    .await
-                    .is_err()
-                {
-                    self.service
-                        .revoke_with_terminal(self.resource, Terminal::TimedOut);
+                if let Some(timeout) = timeout {
+                    if async_engine::timeout(timeout, wake.notified())
+                        .await
+                        .is_err()
+                    {
+                        self.service
+                            .revoke_with_terminal(self.resource, Terminal::TimedOut);
+                    }
+                } else {
+                    wake.notified().await;
                 }
             }
             // Completion can race the poll above; the final observe below
@@ -1244,11 +1471,11 @@ impl WebviewService {
     }
 
     fn revoke_with_terminal(&self, resource: OpaqueToken, terminal: Terminal) {
+        let _ = self.hub.revoke_external_resource(resource, terminal);
         if let Some(native) = self.take_native(resource) {
             let _ = native.close();
             drop(native);
         }
-        let _ = self.hub.revoke_external_resource(resource, terminal);
     }
 
     fn mark_explicitly_closing(&self, resource: OpaqueToken) {
@@ -1323,7 +1550,54 @@ fn map_hub(error: HubError) -> WebviewError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_exposes_native_scale_snapshot_before_caller_source() {
+        let target = Url::parse("http://127.0.0.1:8080/").unwrap();
+        let bootstrap =
+            WebviewPageBootstrap::new("window.scale = kernalWindow.initialScaleFactor;").unwrap();
+        for scale in [1.0, 1.25, 2.0] {
+            let wrapped = bootstrap.for_origin(&target, scale);
+            assert!(wrapped.contains(&format!("const kernalWindow = Object.freeze({{ initialScaleFactor: {scale} }});\nwindow.scale")));
+        }
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let wrapped = bootstrap.for_origin(&target, invalid);
+            assert!(wrapped.contains("initialScaleFactor: 1 }"));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn prevalidated_url_grant_is_bounded_and_rejects_ambient_authority() {
+        for url in [
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "javascript:alert(1)",
+            "tauri://localhost",
+            "https:///bad",
+            "https://user@example.test/",
+        ] {
+            assert!(matches!(
+                WebviewUrlGrant::new(url),
+                Err(WebviewError::InvalidUrl)
+            ));
+        }
+        let huge = format!(
+            "https://example.test/{}",
+            "a".repeat(crate::operations::MAX_WEBVIEW_URL_BYTES)
+        );
+        assert!(matches!(
+            WebviewUrlGrant::new(&huge),
+            Err(WebviewError::InvalidUrl)
+        ));
+        let grant = WebviewUrlGrant::new("HTTPS://EXAMPLE.TEST:443/exact?q=1").unwrap();
+        let hub = OperationHub::new(4, 4).unwrap();
+        let token = grant.bind(&hub, 7).unwrap();
+        let (_, _, url) = hub.begin_granted_webview_open(7, token).unwrap();
+        assert_eq!(&*url, "https://example.test/exact?q=1");
+        hub.close_all(Terminal::Cancelled);
+        assert_eq!(hub.snapshot().live_resources, 0);
+    }
 
     #[test]
     fn bootstrap_navigation_is_origin_scoped_without_changing_default_route() {
@@ -1351,7 +1625,7 @@ mod tests {
             None
         ));
         let bootstrap = WebviewPageBootstrap::new("window.marker = 1; // comment").unwrap();
-        let wrapped = bootstrap.for_origin(&target);
+        let wrapped = bootstrap.for_origin(&target, 1.0);
         assert!(wrapped.starts_with(
             "if (window === window.top && location.origin === \"http://127.0.0.1:8080\") {\n"
         ));

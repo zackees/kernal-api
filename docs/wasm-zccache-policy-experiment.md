@@ -274,6 +274,14 @@ The extension2 archive matrix remains a separate credential-dependent proof.
 Merely scheduling this matrix is not platform evidence; each native result
 must succeed before it is counted toward #13.
 
+That evidence is now available for the bounded compiler/cache fixture: GitHub
+Actions [run 34814345315](https://github.com/zackees/kernal-api/actions/runs/34814345315)
+completed the `Native compiler cache` proof successfully on Linux, macOS, and
+Windows for both x86-64 and ARM64. The run builds the compiler-only guest from
+fresh metadata and runs the exact miss-to-hit proof on each native host. It
+does not turn the separate extension2 archive proof, controlled performance
+comparison, or final binding selection into completed work.
+
 The facade documents that session kill/drop terminates and reaps only the
 direct child. Post-exit drain grace reports abandoned descendant-held pipes;
 it is not process-tree containment. Tests must distinguish direct-child

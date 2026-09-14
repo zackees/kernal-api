@@ -3,8 +3,11 @@
 use std::fs;
 use std::io::ErrorKind;
 
+#[cfg(unix)]
 use kernal_api::platform::fs::{
     canonical_context_path, context_path_metadata_no_follow, read_context_link,
+};
+use kernal_api::platform::fs::{
     read_context_regular_file_bounded, ContextPathKind, MAX_CONTEXT_REGULAR_FILE_BYTES,
 };
 

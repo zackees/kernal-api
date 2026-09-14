@@ -653,14 +653,22 @@ This is paired correctness evidence for the shared compiler policy, not a
 matched timing/RSS measurement, a selection decision, or Component parity for
 the Core candidate's exact-output artifact authority.
 
+At `79785d5`, the existing six-host compiler-policy CI matrix builds a fresh
+encoded Component candidate and runs those same normal and cache-hit Component
+executions alongside the Core proof in each lane. This is parent CI evidence
+for the Component build and its common-policy executions on the supported host
+matrix; it remains distinct from exact-output parity, a total-RSS bound, and a
+runtime selection decision.
+
 The candidate remains incomplete for #13: hostile incoming hash lists are still
 canonically allocated before the host length check; the fixed 32-byte compiler
 cache key crosses the Component ABI as four scalar words. Cancellation coverage
 and public blob parity are not complete. Unlike the Core fixture, the Component
 candidate has no exact-output authority and therefore does not persist or move
-compiler artifacts. Nor is it six-host parent acceptance, a total-RSS bound,
-or the matched measurements needed to choose the final runtime. Fixture source
-pins remain migration-only, not published-dependency acceptance.
+compiler artifacts. The six-host parent CI proof above is not exhaustive
+acceptance, a total-RSS bound, or the matched measurements needed to choose the
+final runtime. Fixture source pins remain migration-only, not
+published-dependency acceptance.
 
 Local regression gates also pass: 116 operation tests, four native semantic
 guest-adapter tests, the revision-8 Core compiler and 64-MiB hash artifacts,

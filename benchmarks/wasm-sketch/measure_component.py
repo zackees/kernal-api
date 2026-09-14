@@ -79,7 +79,9 @@ def main() -> None:
         )
     subprocess.run(["tar", "-xf", str(archive), "-C", str(source)], check=True)
     guest = source / "benchmarks/wasm-sketch/component-guest"
-    guest_source = guest / "src/lib.rs"
+    # The default candidate dispatches through lib.rs into this portable
+    # 64-MiB policy; edit the actual compiled runtime anchor, not module glue.
+    guest_source = guest / "src/legacy.rs"
     target = output / "target"
     artifact = target / "wasm32-unknown-unknown/release/kernal_component_probe.wasm"
     records: list[dict[str, object]] = []

@@ -161,7 +161,7 @@ Its exact artifact snapshot changed only compiler-assigned function/type indices
 resolved import/export signatures, memory limits, and the complete internal type
 signature multiset were compared and remained identical before snapshot update.
 This is public bulk-operation evidence, not yet an exclusively public-host-call
-fixture or the outstanding zccache/extension2 experiment.
+fixture or the outstanding zccache experiment.
 The same artifact also passes both worker containment/output tests in 19.22
 seconds and `cargo_built_threaded_guest_forced_output_cleanup` in 10.98 seconds.
 The latter observes a partial staged file before cancellation, requires forced
@@ -187,9 +187,9 @@ guest-capable release remains required before release acceptance.
 Acceptance needs a real guest consuming the exact published facade version,
 with semantic public handles/errors and no direct generated-binding imports;
 then rerun module admission, bounded transfer/backpressure/cancellation, and
-native containment proofs through that surface. The representative zccache and
-extension2 experiments and comparative timing gates remain separate required
-work, not consequences of the fixture passing.
+native containment proofs through that surface. The representative zccache
+experiment and comparative timing gates remain separate required work, not
+consequences of the fixture passing.
 
 Worker exact-output success is now wired through
 `SketchWorkerConfig::with_output_destination`. The private

@@ -16,9 +16,13 @@ name = "kernal-compiler-guest-proof"
 path = "src/main.rs"
 required-features = ["guest-proof"]
 
+[[bin]]
+name = "kernal-hash-guest-proof"
+path = "src/hash_main.rs"
+required-features = ["guest-proof"]
+
 [dependencies]
-# This fixture intentionally excludes extension2 and its private source pin:
-# it is the independently runnable Core compiler/cache proof for #13.
+# Independently runnable Core compiler/cache and public-facade hash proofs for #13.
 zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }
 zccache-hash = { git = "https://github.com/zackees/zccache", rev = "2543136ea8b648b295d2f7115a19656ff0854531", default-features = false }
 kernal-api = { version = "=0.1.2", path = "../../..", default-features = false }

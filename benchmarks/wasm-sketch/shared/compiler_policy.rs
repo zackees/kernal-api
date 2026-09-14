@@ -2,6 +2,8 @@
 use kernal_api::guest::{
     Blake3Hasher, CompilerCacheStatus, CompilerGrant, CompilerOutputEvent, OperationError,
 };
+#[cfg(feature = "compiler-artifact-output")]
+use kernal_api::guest::{Blob, OutputFile};
 
 // Keep the representative parser in this guest path rather than validating it
 // only through the separate hash probe. Both runtime candidates include this
@@ -37,6 +39,15 @@ async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
             CompilerCacheStatus::Miss => {}
         }
     }
+    // The Core fixture persists only the verified compiler payload through an
+    // embedding-selected exact destination. The Component candidate shares
+    // this policy but deliberately has no output world, so it remains a
+    // separate experiment rather than gaining a hidden storage capability.
+    #[cfg(feature = "compiler-artifact-output")]
+    let (output, artifact) = (
+        OutputFile::granted()?.ok_or(OperationError::Rejected)?,
+        Blob::create().await?,
+    );
     let mut process = grant.spawn().await?;
     if process.read_output(&mut []).await != Err(OperationError::Rejected) {
         return Err(OperationError::Failed);
@@ -81,6 +92,11 @@ async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
                 .unwrap_or(remaining.len());
             hasher.update(&remaining[..end]).await?;
             counts[stream] += end;
+            // Persist the same verified marker runs, not host textual output
+            // or a second whole-output buffer. Each bounded write waits for
+            // existing blob capacity accounting before another read.
+            #[cfg(feature = "compiler-artifact-output")]
+            artifact.write_chunk(&remaining[..end])?.wait().await?;
             remaining = &remaining[end..];
         }
     }
@@ -103,7 +119,13 @@ async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
     if exit.code != Some(0) || !exit.success || process.wait().await? != exit {
         return Err(OperationError::Failed);
     }
-    process.close().await
+    process.close().await?;
+    #[cfg(feature = "compiler-artifact-output")]
+    {
+        artifact.seal().await?;
+        output.write_blob(&artifact).await?;
+    }
+    Ok(())
 }
 
 /// Assemble the actual zccache request protocol through the public bounded

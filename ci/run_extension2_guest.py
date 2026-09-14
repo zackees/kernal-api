@@ -12,6 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 TEST = "wasm::archive_input_guest_tests::authenticated_input_actual_guest_streams_large_zip_and_rejects_bad_tag_or_nonce"
+COMPILER_TEST = "wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes"
 
 
 def run(arguments: list[str], *, env: dict[str, str] | None = None) -> str:
@@ -141,6 +142,37 @@ def main() -> None:
         for line in output.splitlines()
     ):
         raise ValueError("the streaming proof did not execute exactly once")
+    compiler_messages = run(
+        [
+            "soldr", "--no-cache", "cargo", "build", "--locked", "--manifest-path",
+            "benchmarks/wasm-sketch/extension2-guest/Cargo.toml", "--features", "guest-proof",
+            "--bin", "kernal-compiler-guest-proof", "--target", "wasm32-wasip1-threads",
+            "--release", "-j1", "--target-dir", str(guest_dir), "--message-format=json",
+        ],
+        env=guest_env,
+    )
+    compiler_raw = executable(compiler_messages, "kernal-compiler-guest-proof", test=False)
+    compiler_admitted = compiler_raw.with_suffix(".admitted.wasm")
+    shutil.copyfile(compiler_raw, compiler_admitted)
+    run([str(generator), "--embed-threaded-metadata", str(compiler_admitted)])
+    compiler_messages = run(
+        [
+            "soldr", "--no-cache", "cargo", "test", "--locked", "--no-default-features",
+            "--features", "wasm-sketch-host", "--lib", "--no-run", "--target",
+            args.native_target, "--target-dir", str(args.target_dir / "compiler-guest-host"),
+            "--message-format=json", "-j1",
+        ]
+    )
+    compiler_harness = executable(compiler_messages, "kernal_api", test=True)
+    if f"{COMPILER_TEST}: test" not in run([str(compiler_harness), "--list", "--ignored"]).splitlines():
+        raise ValueError("compiler guest proof is missing from the native test harness")
+    compiler_output = run(
+        [str(compiler_harness), COMPILER_TEST, "--exact", "--ignored", "--nocapture"],
+        env=dict(os.environ, KERNAL_COMPILER_GUEST_WASM=str(compiler_admitted)),
+    )
+    print(compiler_output, end="", flush=True)
+    if not any(line.startswith("test result: ok. 1 passed; 0 failed; 0 ignored;") for line in compiler_output.splitlines()):
+        raise ValueError("the compiler guest proof did not execute exactly once")
 
 
 if __name__ == "__main__":

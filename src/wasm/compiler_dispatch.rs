@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
-    fn compiler_actual_guest_spawns_drains_hashes_waits_and_closes() {
+    fn compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes() {
         execute_actual_guest(false);
     }
 
@@ -305,7 +305,22 @@ mod tests {
             std::env::var_os("KERNAL_COMPILER_GUEST_WASM").expect("compiler guest artifact"),
         )
         .unwrap();
+        // The miss persists two verified 2 MiB streams as one exact artifact.
+        // This fixture's larger storage and transfer bounds are explicit; the
+        // ordinary sketch defaults remain unchanged.
+        let blobs = SketchBlobLimits::new(
+            64 * 1024,
+            4 * 1024 * 1024,
+            8 * 1024 * 1024,
+            128,
+            128,
+            128,
+        )
+        .unwrap()
+        .with_maximum_transfer_bytes(24 * 1024 * 1024)
+        .unwrap();
         let execution = SketchExecutionLimits::default()
+            .with_blob_limits(blobs)
             .with_fuel_limits(SketchFuelLimits::new(501_600_000, 500_000_000, 100_000).unwrap())
             .unwrap();
         let compiler = SketchCompiler::new(
@@ -332,6 +347,8 @@ mod tests {
         } else {
             compiler_helper_spec()
         };
+        let output_root = tempfile::tempdir().unwrap();
+        let output = output_root.path().join("compiler-artifact");
         assert_eq!(
             runtime.run(sketch.execute_threaded_root_with_grant(
                 runtime.handle(),
@@ -342,11 +359,20 @@ mod tests {
                         deadline: Duration::from_secs(15),
                         cache: Some((CACHE_KEY, cache_hit)),
                     }),
+                    output: (!cache_hit).then_some(output.clone()),
                     ..RootGrants::default()
                 },
             )),
             Ok(ThreadedRootOutcome::Started)
         );
+        if cache_hit {
+            assert!(!output.exists(), "cache hit must not publish an artifact");
+        } else {
+            let bytes = std::fs::read(&output).unwrap();
+            assert_eq!(bytes.len(), 4 * 1024 * 1024);
+            assert_eq!(bytes.iter().filter(|byte| **byte == 0xf1).count(), 2 * 1024 * 1024);
+            assert_eq!(bytes.iter().filter(|byte| **byte == 0xf2).count(), 2 * 1024 * 1024);
+        }
         let snapshot = sketch
             .root_execution_observation_for_test()
             .unwrap()

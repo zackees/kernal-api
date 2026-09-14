@@ -13,6 +13,9 @@ crate-type = ["cdylib"]
 [features]
 compiler-proof = ["kernal-api/wasm-component-compiler-experiment"]
 lowering-trap-proof = ["kernal-api/wasm-component-compiler-experiment"]
+# Declared only because the shared policy is compiled by both candidates. The
+# Component WIT world does not expose exact output, so this remains disabled.
+compiler-artifact-output = []
 
 [dependencies]
 zccache-compiler = { git = "https://github.com/zackees/zccache", rev = "c6ddfa974a4920a127eac81773db6a5c56cd30a7", default-features = false }

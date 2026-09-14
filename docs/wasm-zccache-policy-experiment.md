@@ -697,12 +697,13 @@ the newer real cache-hit restore fixture, so fresh six-host evidence is still
 required for that path. The existing matrix remains distinct from exact-output
 parity, a total-RSS bound, and a runtime selection decision.
 
-The candidate remains incomplete for #13: hostile incoming hash lists are still
-canonically allocated before the host length check; the fixed 32-byte compiler
-cache key crosses the Component ABI as four scalar words. Cancellation coverage
-and public blob parity are not complete. The Component guest has no exact-output
-authority, and therefore cannot persist or move a compiler artifact on a cache
-miss; cache-hit restoration is host-only through the shared exact-output path.
+The candidate remains incomplete for #13: hash input now uses bounded
+scalar-only frames rather than an attacker-sized canonical list, while the
+fixed 32-byte compiler cache key crosses the Component ABI as four scalar
+words. Cancellation coverage and public blob parity are not complete. The
+Component guest has no exact-output authority, and therefore cannot persist or
+move a compiler artifact on a cache miss; cache-hit restoration is host-only
+through the shared exact-output path.
 The six-host parent CI proof above is not exhaustive acceptance, a total-RSS
 bound, or the matched measurements needed to choose the final runtime. Fixture
 source pins remain migration-only, not published-dependency acceptance.

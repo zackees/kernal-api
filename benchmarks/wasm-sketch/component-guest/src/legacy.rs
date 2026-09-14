@@ -34,7 +34,90 @@ impl bindings::Guest for Sketch {
     async fn hash_reject_overflow() -> Result<Vec<u8>, ()> {
         use hash_wire::kernal::hash_experiment::hashes;
         let hash = hashes::create().map_err(|_| ())?;
-        if hash.update(&vec![0; 65537]) != Err(hashes::Error::Rejected) {
+        let chunk = |used, last| hashes::InputChunk {
+            word_0: 0,
+            word_1: 0,
+            word_2: 0,
+            word_3: 0,
+            word_4: 0,
+            word_5: 0,
+            word_6: 0,
+            word_7: 0,
+            word_8: 0,
+            word_9: 0,
+            word_10: 0,
+            word_11: 0,
+            word_12: 0,
+            word_13: 0,
+            word_14: 0,
+            word_15: 0,
+            word_16: 0,
+            word_17: 0,
+            word_18: 0,
+            word_19: 0,
+            word_20: 0,
+            word_21: 0,
+            word_22: 0,
+            word_23: 0,
+            word_24: 0,
+            word_25: 0,
+            word_26: 0,
+            word_27: 0,
+            word_28: 0,
+            word_29: 0,
+            word_30: 0,
+            word_31: 0,
+            used,
+            last,
+        };
+        let update_result = {
+            let (mut writer, reader) = hash_wire::wit_stream::new::<hashes::InputChunk>();
+            let mut update = std::pin::pin!(hash.update(reader));
+            if std::future::poll_fn(|context| {
+                std::task::Poll::Ready(match std::future::Future::poll(update.as_mut(), context) {
+                    std::task::Poll::Pending => false,
+                    std::task::Poll::Ready(_) => true,
+                })
+            })
+            .await
+            {
+                return Err(());
+            }
+            let mut chunks: Vec<_> = (0..256).map(|_| chunk(256, false)).collect();
+            chunks.push(chunk(1, true));
+            // A dropped stream may report that all frames were accepted by the
+            // transport before the host reports the semantic rejection. The
+            // update future is therefore the authoritative result here.
+            let _undelivered = writer.write_all(chunks).await;
+            drop(writer);
+            update.await
+        };
+        if update_result != Err(hashes::Error::Rejected) {
+            return Err(());
+        }
+        let trailing_result = {
+            let (mut writer, reader) = hash_wire::wit_stream::new::<hashes::InputChunk>();
+            let mut update = std::pin::pin!(hash.update(reader));
+            if std::future::poll_fn(|context| {
+                std::task::Poll::Ready(match std::future::Future::poll(update.as_mut(), context) {
+                    std::task::Poll::Pending => false,
+                    std::task::Poll::Ready(_) => true,
+                })
+            })
+            .await
+            {
+                return Err(());
+            }
+            let mut chunks: Vec<_> = (0..255).map(|_| chunk(256, false)).collect();
+            chunks.push(chunk(256, true));
+            // A terminal frame followed in the same write batch must reject
+            // rather than commit the terminal frame's staged bytes.
+            chunks.push(chunk(1, false));
+            let _undelivered = writer.write_all(chunks).await;
+            drop(writer);
+            update.await
+        };
+        if trailing_result != Err(hashes::Error::Rejected) {
             return Err(());
         }
         hashes::finish(hash).map_err(|_| ())

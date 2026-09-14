@@ -20,13 +20,17 @@ slow-consumer cases; the five ordinary unit tests pass separately.
 
 Run `actual_component_shared_public_hash` with `--ignored` and
 `KERNAL_COMPONENT_PROBE` pointing to the newly encoded component. The full
-stream/trap runner also executes this hash control. Fuel is now 500 million
+stream/trap runner also executes this hash control. Fuel is now 5 billion
 units for the combined control; this is not a matched performance measurement.
 
-Canonical list lifting occurs before the host rejects updates above 64 KiB.
-There is no claimed 64 KiB pre-lift allocation bound or concurrent aggregate
-memory proof. The hash-only table caps live handles at 64; the legacy private
-blob table remains separate. Blob facade parity, full zccache policy, six-host
+Hash input now uses 256-byte scalar-only frames with an explicit final frame.
+The host reserves 64 KiB before it lifts a frame, stages the complete input,
+and commits only after that final frame; cancellation, malformed frames,
+overflow, or teardown reject without mutating the hasher. This avoids an
+attacker-sized canonical list allocation, but it is not a matched performance
+result: the 64 MiB shared-policy control requires a 5 billion fuel diagnostic
+ceiling. The hash-only table caps live handles at 64; the legacy private blob
+table remains separate. Blob facade parity, full zccache policy, six-host
 Component validation, and candidate selection remain incomplete. Remove the
 temporary candidate selection before releasing a single supported backend.
 

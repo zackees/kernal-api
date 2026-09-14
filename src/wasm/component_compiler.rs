@@ -8,7 +8,9 @@ use crate::operations::{
 #[cfg(test)]
 use crate::operations::BlobLimits;
 use std::sync::Arc;
-use wasmtime::component::{Accessor, HasData, Resource, ResourceTable};
+use wasmtime::component::{
+    Accessor, HasData, Resource, ResourceTable, Source, StreamConsumer, StreamResult,
+};
 
 #[cfg(test)]
 mod tests {
@@ -799,22 +801,181 @@ impl hashes::HostHasher for State {
         self.table.delete(hash)?;
         Ok(())
     }
-    fn update(
-        &mut self,
-        hash: Resource<Hash>,
-        bytes: Vec<u8>,
-    ) -> wasmtime::Result<Result<(), hashes::Error>> {
-        // Canonical input lifting precedes this bound, as in the older hash
-        // candidate; hostile incoming list allocation is still an open gap.
-        if bytes.len() > 65536 {
-            return Ok(Err(hashes::Error::Rejected));
+}
+
+const MAX_HASH_UPDATE_BYTES: usize = 64 * 1024;
+const HASH_INPUT_CHUNK_BYTES: usize = 256;
+
+/// Receives scalar-only frames, so the guest cannot force canonical lifting of
+/// a nested, attacker-sized list. `last` is the sole success signal: a dropped
+/// reader, cancellation, malformed frame, or oversized input never commits.
+struct HashInputConsumer {
+    bytes: Vec<u8>,
+    lease: Option<ComponentResourceLease>,
+    result: Option<
+        crate::async_engine::OneshotSender<Result<(Vec<u8>, ComponentResourceLease), ()>>,
+    >,
+}
+
+enum HashInputFrame {
+    Continue,
+    Complete,
+    Rejected,
+}
+
+impl HashInputConsumer {
+    fn reject(&mut self) {
+        if let Some(result) = self.result.take() {
+            let _ = result.send(Err(()));
         }
-        let hash = self.table.get(&hash)?;
-        let operation = match self.hub.submit_hash_update(0, hash.0.token, &bytes) {
+    }
+
+    fn accept(&mut self) {
+        if let Some(result) = self.result.take() {
+            let lease = self.lease.take().expect("hash input lease is present");
+            let _ = result.send(Ok((std::mem::take(&mut self.bytes), lease)));
+        }
+    }
+
+    fn receive(&mut self, chunk: hashes::InputChunk) -> HashInputFrame {
+        let used = usize::from(chunk.used);
+        if used > HASH_INPUT_CHUNK_BYTES
+            || (!chunk.last && used == 0)
+            || self.bytes.len() + used > MAX_HASH_UPDATE_BYTES
+        {
+            self.reject();
+            return HashInputFrame::Rejected;
+        }
+        let words = [
+            chunk.word_0, chunk.word_1, chunk.word_2, chunk.word_3, chunk.word_4, chunk.word_5,
+            chunk.word_6, chunk.word_7, chunk.word_8, chunk.word_9, chunk.word_10, chunk.word_11,
+            chunk.word_12, chunk.word_13, chunk.word_14, chunk.word_15, chunk.word_16,
+            chunk.word_17, chunk.word_18, chunk.word_19, chunk.word_20, chunk.word_21,
+            chunk.word_22, chunk.word_23, chunk.word_24, chunk.word_25, chunk.word_26,
+            chunk.word_27, chunk.word_28, chunk.word_29, chunk.word_30, chunk.word_31,
+        ];
+        let mut remaining = used;
+        for word in words {
+            let bytes = word.to_le_bytes();
+            let count = remaining.min(bytes.len());
+            self.bytes.extend_from_slice(&bytes[..count]);
+            remaining -= count;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if chunk.last {
+            return HashInputFrame::Complete;
+        }
+        HashInputFrame::Continue
+    }
+}
+
+impl Drop for HashInputConsumer {
+    fn drop(&mut self) {
+        // Store teardown and a producer that vanishes without its explicit
+        // terminator are both rejection, never an implicit EOF commit.
+        self.reject();
+    }
+}
+
+impl<T: Send + 'static> StreamConsumer<T> for HashInputConsumer {
+    type Item = hashes::InputChunk;
+
+    fn poll_consume(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        mut store: wasmtime::StoreContextMut<T>,
+        mut source: Source<'_, Self::Item>,
+        finish: bool,
+    ) -> std::task::Poll<wasmtime::Result<StreamResult>> {
+        if finish {
+            self.reject();
+            return std::task::Poll::Ready(Ok(StreamResult::Cancelled));
+        }
+        // A valid non-terminal frame carries at least one byte; a terminal
+        // frame may carry zero for an empty update. Bound work before lifting.
+        if source.remaining(&mut store) > MAX_HASH_UPDATE_BYTES - self.bytes.len() + 1 {
+            self.reject();
+            return std::task::Poll::Ready(Ok(StreamResult::Dropped));
+        }
+        while source.remaining(&mut store) != 0 {
+            let mut chunk = Vec::with_capacity(1);
+            source.read(&mut store, &mut chunk)?;
+            let chunk = chunk.pop().expect("source reported a frame");
+            match self.receive(chunk) {
+                HashInputFrame::Continue => {}
+                HashInputFrame::Complete => {
+                    if source.remaining(&mut store) != 0 {
+                        self.reject();
+                    } else {
+                        self.accept();
+                    }
+                    return std::task::Poll::Ready(Ok(StreamResult::Dropped));
+                }
+                HashInputFrame::Rejected => {
+                    if source.remaining(&mut store) != 0 {
+                        self.reject();
+                    }
+                    return std::task::Poll::Ready(Ok(StreamResult::Dropped));
+                }
+            }
+        }
+        std::task::Poll::Ready(Ok(StreamResult::Completed))
+    }
+}
+
+impl hashes::HostHasherWithStore for wasmtime::component::HasSelf<State> {
+    async fn update<T: Send>(
+        accessor: &Accessor<T, Self>,
+        hash: Resource<Hash>,
+        mut chunks: wasmtime::component::StreamReader<hashes::InputChunk>,
+    ) -> wasmtime::Result<Result<(), hashes::Error>> {
+        let (sender, receiver) = crate::async_engine::oneshot_channel();
+        let start: Result<_, hashes::Error> = accessor.with(|mut access| {
+            let (token, hub) = match access.get().table.get(&hash) {
+                Ok(hash) => (hash.0.token, Arc::clone(&access.get().hub)),
+                Err(error) => {
+                    chunks.close(access)?;
+                    return Err(error.into());
+                }
+            };
+            let lease = match access.get().budget.acquire(MAX_HASH_UPDATE_BYTES) {
+                Ok(scratch) => scratch,
+                Err(_) => {
+                    chunks.close(access)?;
+                    return Ok::<
+                        Result<(Arc<OperationHub>, OpaqueToken), hashes::Error>,
+                        wasmtime::Error,
+                    >(Err(hashes::Error::Rejected));
+                }
+            };
+            chunks.pipe(
+                access,
+                HashInputConsumer {
+                    bytes: Vec::with_capacity(MAX_HASH_UPDATE_BYTES),
+                    lease: Some(lease),
+                    result: Some(sender),
+                },
+            )?;
+            Ok::<
+                Result<(Arc<OperationHub>, OpaqueToken), hashes::Error>,
+                wasmtime::Error,
+            >(Ok((hub, token)))
+        })?;
+        let (hub, token) = match start {
+            Ok(start) => start,
+            Err(error) => return Ok(Err(error)),
+        };
+        let (bytes, _scratch) = match receiver.await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(())) | Err(_) => return Ok(Err(hashes::Error::Rejected)),
+        };
+        let operation = match hub.submit_hash_update(0, token, &bytes) {
             Ok(token) => token,
             Err(_) => return Ok(Err(hashes::Error::Rejected)),
         };
-        Ok(if self.hub.poll_wire(0, operation.wire()) == 1 {
+        Ok(if hub.poll_wire(0, operation.wire()) == 1 {
             Ok(())
         } else {
             Err(hashes::Error::Failed)

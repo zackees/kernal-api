@@ -5,7 +5,25 @@ abi_version = 1
 namespace = "kernal-api:v1"
 
 [[resources]]
+name = "ArchiveEntry"
+kind = "opaque_host_handle"
+ownership = "owned"
+abi = "i64"
+
+[[resources]]
+name = "AuthenticatedArchive"
+kind = "opaque_host_handle"
+ownership = "owned"
+abi = "i64"
+
+[[resources]]
 name = "Blob"
+kind = "opaque_host_handle"
+ownership = "owned"
+abi = "i64"
+
+[[resources]]
+name = "EncryptedArchive"
 kind = "opaque_host_handle"
 ownership = "owned"
 abi = "i64"
@@ -47,10 +65,37 @@ results = [{ semantic = "i32", abi = "i32" }]
 
 [[imports]]
 namespace = "kernal-api:v1"
+name = "resource_release_archive_entry"
+direction = "guest-to-host"
+generated = true
+resource_control = "release"
+params = [{ semantic = "ArchiveEntry", abi = "i64", kind = "resource" }]
+results = [{ semantic = "i32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "resource_release_authenticated_archive"
+direction = "guest-to-host"
+generated = true
+resource_control = "release"
+params = [{ semantic = "AuthenticatedArchive", abi = "i64", kind = "resource" }]
+results = [{ semantic = "i32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
 name = "resource_release_blob"
 direction = "guest-to-host"
 generated = true
 resource_control = "release"
 params = [{ semantic = "Blob", abi = "i64", kind = "resource" }]
+results = [{ semantic = "i32", abi = "i32" }]
+
+[[imports]]
+namespace = "kernal-api:v1"
+name = "resource_release_encrypted_archive"
+direction = "guest-to-host"
+generated = true
+resource_control = "release"
+params = [{ semantic = "EncryptedArchive", abi = "i64", kind = "resource" }]
 results = [{ semantic = "i32", abi = "i32" }]
 

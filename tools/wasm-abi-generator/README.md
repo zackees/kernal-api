@@ -17,7 +17,7 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=9`, independently of the
+The metadata also binds `operation_protocol_revision=10`, independently of the
 scalar import signatures. Revision 1 included opcodes 1–19 and scoped
 transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
 header copy, and abandonment (20–22). Revision 3 adds authentication and scoped
@@ -37,8 +37,10 @@ destination and writes directly to validated shared memory without another
 host payload copy. EOF, abandonment, read failure, and exhaustion are distinct.
 Revision 9 adds generated `resource_release_blob`: it is not an opcode, but a
 Store-scoped owned-Blob release control delegated to the same `OperationHub`
-registry as the existing blob-abandon path. Revision-8 guests must be rebuilt,
-not relabeled, before they can import that control.
+registry as the existing blob-abandon path. Revision 10 applies the same
+generated release model to encrypted-input, authenticated-archive, and
+archive-entry authorities. Revision-9 guests must be rebuilt, not relabeled,
+before they can import the archive controls.
 Rebuild guest code before embedding the new
 metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.
@@ -58,10 +60,12 @@ The tool pins `zackees/fp-bindgen` at `df94a6988dac3ade189466adbaaa58be4524393e`
 It is a development tool outside the published package, so ordinary
 `kernal-api` builds do not resolve the generator or its dependency graph.
 
-That revision declares the generated `Blob` guest wrapper as an owned resource.
-Its `resource_release_blob` control calls the existing `OperationHub` registry,
-which atomically validates Store scope and generation before revoking the blob.
-It does not introduce a second guest resource registry or a raw-token public API.
+That revision declares the generated `Blob`, `EncryptedArchive`,
+`AuthenticatedArchive`, and `ArchiveEntry` guest wrappers as owned resources.
+Each generated release control calls the existing `OperationHub` registry,
+which atomically validates Store scope, kind, and generation before revoking
+the resource. It does not introduce a second guest resource registry or a
+raw-token public API.
 
 The generated scalar contract provides `kernel_yield` and operation
 submit/poll/yield/cancel imports. Semantic resource operations are closed

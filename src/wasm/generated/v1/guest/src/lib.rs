@@ -18,6 +18,32 @@ pub enum ExportInstallError {
 
 pub mod resources {
     #[derive(Debug, Eq, Hash, PartialEq)]
+    pub struct ArchiveEntry(::core::option::Option<u64>);
+
+    impl ArchiveEntry {
+        pub(crate) fn from_abi(raw: u64) -> Self { Self(::core::option::Option::Some(raw)) }
+        pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> { ::core::result::Result::Ok(Self::from_abi(raw as u64)) }
+        pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> { self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed { resource: "ArchiveEntry" }) }
+        pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> { self.release() }
+        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "ArchiveEntry" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_resource_release_archive_entry(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "ArchiveEntry", status }) } }
+    }
+
+    impl ::core::ops::Drop for ArchiveEntry { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
+
+    #[derive(Debug, Eq, Hash, PartialEq)]
+    pub struct AuthenticatedArchive(::core::option::Option<u64>);
+
+    impl AuthenticatedArchive {
+        pub(crate) fn from_abi(raw: u64) -> Self { Self(::core::option::Option::Some(raw)) }
+        pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> { ::core::result::Result::Ok(Self::from_abi(raw as u64)) }
+        pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> { self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed { resource: "AuthenticatedArchive" }) }
+        pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> { self.release() }
+        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "AuthenticatedArchive" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_resource_release_authenticated_archive(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "AuthenticatedArchive", status }) } }
+    }
+
+    impl ::core::ops::Drop for AuthenticatedArchive { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
+
+    #[derive(Debug, Eq, Hash, PartialEq)]
     pub struct Blob(::core::option::Option<u64>);
 
     impl Blob {
@@ -29,6 +55,19 @@ pub mod resources {
     }
 
     impl ::core::ops::Drop for Blob { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
+
+    #[derive(Debug, Eq, Hash, PartialEq)]
+    pub struct EncryptedArchive(::core::option::Option<u64>);
+
+    impl EncryptedArchive {
+        pub(crate) fn from_abi(raw: u64) -> Self { Self(::core::option::Option::Some(raw)) }
+        pub(crate) fn decode_i64(raw: i64) -> ::core::result::Result<Self, super::AbiError> { ::core::result::Result::Ok(Self::from_abi(raw as u64)) }
+        pub(crate) fn encode_i64(&self) -> ::core::result::Result<i64, super::AbiError> { self.0.map(|raw| raw as i64).ok_or(super::AbiError::ResourceClosed { resource: "EncryptedArchive" }) }
+        pub fn close(mut self) -> ::core::result::Result<(), super::AbiError> { self.release() }
+        fn release(&mut self) -> ::core::result::Result<(), super::AbiError> { let raw = self.0.take().ok_or(super::AbiError::ResourceClosed { resource: "EncryptedArchive" })?; let status = unsafe { super::raw_imports::__kernal_api_v1_import_resource_release_encrypted_archive(raw as i64) }; if status == 0 { ::core::result::Result::Ok(()) } else { ::core::result::Result::Err(super::AbiError::ResourceReleaseRejected { resource: "EncryptedArchive", status }) } }
+    }
+
+    impl ::core::ops::Drop for EncryptedArchive { fn drop(&mut self) { if self.0.is_some() { let _ = self.release(); } } }
 
  }
 
@@ -70,8 +109,14 @@ mod raw_imports {
         #[link_name = "operation_yield"]
         pub(super) fn __kernal_api_v1_import_operation_yield(operation: i64) -> i32;
 
+        #[link_name = "resource_release_archive_entry"]
+        pub(super) fn __kernal_api_v1_import_resource_release_archive_entry(resource: i64) -> i32;
+        #[link_name = "resource_release_authenticated_archive"]
+        pub(super) fn __kernal_api_v1_import_resource_release_authenticated_archive(resource: i64) -> i32;
         #[link_name = "resource_release_blob"]
         pub(super) fn __kernal_api_v1_import_resource_release_blob(resource: i64) -> i32;
+        #[link_name = "resource_release_encrypted_archive"]
+        pub(super) fn __kernal_api_v1_import_resource_release_encrypted_archive(resource: i64) -> i32;
 
     }
 }
@@ -256,25 +301,26 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 /// canonical Store-scoped registry through `resource_release_blob`.
 pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
-pub struct EncryptedArchive { token: u64 }
+pub struct EncryptedArchive { resource: resources::EncryptedArchive }
 impl EncryptedArchive {
     pub fn granted() -> Result<Option<Self>, OperationError> {
         let token = imports::operation_submit(20, 0, 0).map_err(|_| OperationError::Failed)?;
-        Ok(if token == 0 { None } else { Some(Self { token }) })
+        Ok(if token == 0 { None } else { Some(Self { resource: resources::EncryptedArchive::from_abi(token) }) })
     }
     pub fn read_header(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
         let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        let result = imports::operation_submit(21, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let result = imports::operation_submit(21, self.token()?, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
         let copied = (result >> 8) as usize;
         if result as u8 != 1 || copied > destination.len() || copied > 16 * 1024 + 12 { return Err(OperationError::Rejected); }
         Ok(copied)
     }
-    pub fn abandon(&self) { let _ = imports::operation_submit(22, self.token, 0); }
+    pub fn abandon(self) { let _ = self.resource.close(); }
     pub fn authenticate(&self, nonce: &[u8; 12]) -> Result<ArchiveAuthentication, OperationError> {
         let pointer = u32::try_from(nonce.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        Ok(ArchiveAuthentication { inner: OperationFuture::submit(23, self.token, u64::from(pointer))? })
+        Ok(ArchiveAuthentication { inner: OperationFuture::submit(23, self.token()?, u64::from(pointer))? })
     }
+    fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) }
 }
 pub struct ArchiveAuthentication { inner: OperationFuture }
 impl ArchiveAuthentication {
@@ -282,7 +328,7 @@ impl ArchiveAuthentication {
         loop {
             if let Some(token) = self.inner.poll()? {
                 if token == 0 { return Err(OperationError::Failed); }
-                return Ok(AuthenticatedArchive { token });
+                return Ok(AuthenticatedArchive { resource: resources::AuthenticatedArchive::from_abi(token) });
             }
             self.inner.yield_now()?;
         }
@@ -291,24 +337,21 @@ impl ArchiveAuthentication {
 impl Drop for ArchiveAuthentication {
     fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
 }
-pub struct AuthenticatedArchive { token: u64 }
+pub struct AuthenticatedArchive { resource: resources::AuthenticatedArchive }
 impl AuthenticatedArchive {
     pub fn next_entry(&self) -> Result<ArchiveNextEntry, OperationError> {
-        Ok(ArchiveNextEntry { inner: OperationFuture::submit(26, self.token, 0)? })
+        Ok(ArchiveNextEntry { inner: OperationFuture::submit(26, self.token()?, 0)? })
     }
-    pub fn close(&self) -> Result<(), OperationError> {
-        if imports::operation_submit(25, self.token, 0).map_err(|_| OperationError::Failed)? == 1 {
-            Ok(())
-        } else { Err(OperationError::Rejected) }
-    }
-    pub fn abandon(&self) { let _ = self.close(); }
+    pub fn close(self) -> Result<(), OperationError> { self.resource.close().map_err(|_| OperationError::Rejected) }
+    pub fn abandon(self) { let _ = self.resource.close(); }
+    fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) }
 }
 pub struct ArchiveNextEntry { inner: OperationFuture }
 impl ArchiveNextEntry {
     pub async fn wait(self) -> Result<Option<ArchiveEntry>, OperationError> {
         loop {
             if let Some(token) = self.inner.poll()? {
-                return Ok(if token == 0 { None } else { Some(ArchiveEntry { token }) });
+                return Ok(if token == 0 { None } else { Some(ArchiveEntry { resource: resources::ArchiveEntry::from_abi(token) }) });
             }
             self.inner.yield_now()?;
         }
@@ -317,15 +360,15 @@ impl ArchiveNextEntry {
 impl Drop for ArchiveNextEntry {
     fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
 }
-pub struct ArchiveEntry { token: u64 }
+pub struct ArchiveEntry { resource: resources::ArchiveEntry }
 impl ArchiveEntry {
     pub fn open(&self) -> Result<ArchiveEntryOpen, OperationError> {
-        Ok(ArchiveEntryOpen { inner: OperationFuture::submit(29, self.token, 0)? })
+        Ok(ArchiveEntryOpen { inner: OperationFuture::submit(29, self.token()?, 0)? })
     }
     pub fn metadata(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
         let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        let result = imports::operation_submit(27, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let result = imports::operation_submit(27, self.token()?, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
         let count = (result >> 8) as usize;
         if result as u8 != 1 || count > destination.len() || !(12..=4108).contains(&count) {
             return Err(OperationError::Rejected);
@@ -333,9 +376,7 @@ impl ArchiveEntry {
         Ok(count)
     }
 }
-impl Drop for ArchiveEntry {
-    fn drop(&mut self) { let _ = imports::operation_submit(28, self.token, 0); }
-}
+impl ArchiveEntry { fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) } }
 pub struct ArchiveEntryOpen { inner: OperationFuture }
 impl ArchiveEntryOpen {
     pub async fn wait(self) -> Result<BlobHandle, OperationError> {

@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 const CAPABILITIES: u32 = 0;
 // Revision 7 adds host-granted compiler spawn/output/exit/close (35-47).
 // Bump when operation meaning changes, even if scalar signatures do not.
-// Revision 9 adds the generated, Store-scoped Blob release control.
-const OPERATION_PROTOCOL_REVISION: u32 = 9;
+// Revision 10 lowers every archive authority as an owned, Store-scoped
+// resource. Bump when operation meaning changes, even if scalar signatures do
+// not.
+const OPERATION_PROTOCOL_REVISION: u32 = 10;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -28,14 +30,25 @@ fn binding_declarations() -> (FunctionList, FunctionList, TypeMap) {
     imports.add_function("fn operation_yield(operation: u64) -> i32;");
     imports.add_function("fn operation_cancel(operation: u64) -> i32;");
 
-    // Blob ownership is still enforced solely by OperationHub.  This
-    // declaration makes the generated Core-Wasm guest wrapper release it via
-    // that canonical scope/generation registry instead of a handwritten raw
-    // scalar abandon call.
+    // Ownership remains enforced solely by OperationHub. These declarations
+    // make generated Core-Wasm wrappers use canonical Store-scoped release
+    // controls instead of handwritten raw scalar abandon calls.
     let mut types = TypeMap::new();
     types.insert(
         TypeIdent::from("Blob"),
         Type::Resource(Resource::owned("Blob")),
+    );
+    types.insert(
+        TypeIdent::from("EncryptedArchive"),
+        Type::Resource(Resource::owned("EncryptedArchive")),
+    );
+    types.insert(
+        TypeIdent::from("AuthenticatedArchive"),
+        Type::Resource(Resource::owned("AuthenticatedArchive")),
+    );
+    types.insert(
+        TypeIdent::from("ArchiveEntry"),
+        Type::Resource(Resource::owned("ArchiveEntry")),
     );
     (imports, FunctionList::new(), types)
 }
@@ -260,25 +273,26 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
 /// canonical Store-scoped registry through `resource_release_blob`.
 pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
-pub struct EncryptedArchive { token: u64 }
+pub struct EncryptedArchive { resource: resources::EncryptedArchive }
 impl EncryptedArchive {
     pub fn granted() -> Result<Option<Self>, OperationError> {
         let token = imports::operation_submit(20, 0, 0).map_err(|_| OperationError::Failed)?;
-        Ok(if token == 0 { None } else { Some(Self { token }) })
+        Ok(if token == 0 { None } else { Some(Self { resource: resources::EncryptedArchive::from_abi(token) }) })
     }
     pub fn read_header(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
         let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        let result = imports::operation_submit(21, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let result = imports::operation_submit(21, self.token()?, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
         let copied = (result >> 8) as usize;
         if result as u8 != 1 || copied > destination.len() || copied > 16 * 1024 + 12 { return Err(OperationError::Rejected); }
         Ok(copied)
     }
-    pub fn abandon(&self) { let _ = imports::operation_submit(22, self.token, 0); }
+    pub fn abandon(self) { let _ = self.resource.close(); }
     pub fn authenticate(&self, nonce: &[u8; 12]) -> Result<ArchiveAuthentication, OperationError> {
         let pointer = u32::try_from(nonce.as_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        Ok(ArchiveAuthentication { inner: OperationFuture::submit(23, self.token, u64::from(pointer))? })
+        Ok(ArchiveAuthentication { inner: OperationFuture::submit(23, self.token()?, u64::from(pointer))? })
     }
+    fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) }
 }
 pub struct ArchiveAuthentication { inner: OperationFuture }
 impl ArchiveAuthentication {
@@ -286,7 +300,7 @@ impl ArchiveAuthentication {
         loop {
             if let Some(token) = self.inner.poll()? {
                 if token == 0 { return Err(OperationError::Failed); }
-                return Ok(AuthenticatedArchive { token });
+                return Ok(AuthenticatedArchive { resource: resources::AuthenticatedArchive::from_abi(token) });
             }
             self.inner.yield_now()?;
         }
@@ -295,24 +309,21 @@ impl ArchiveAuthentication {
 impl Drop for ArchiveAuthentication {
     fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
 }
-pub struct AuthenticatedArchive { token: u64 }
+pub struct AuthenticatedArchive { resource: resources::AuthenticatedArchive }
 impl AuthenticatedArchive {
     pub fn next_entry(&self) -> Result<ArchiveNextEntry, OperationError> {
-        Ok(ArchiveNextEntry { inner: OperationFuture::submit(26, self.token, 0)? })
+        Ok(ArchiveNextEntry { inner: OperationFuture::submit(26, self.token()?, 0)? })
     }
-    pub fn close(&self) -> Result<(), OperationError> {
-        if imports::operation_submit(25, self.token, 0).map_err(|_| OperationError::Failed)? == 1 {
-            Ok(())
-        } else { Err(OperationError::Rejected) }
-    }
-    pub fn abandon(&self) { let _ = self.close(); }
+    pub fn close(self) -> Result<(), OperationError> { self.resource.close().map_err(|_| OperationError::Rejected) }
+    pub fn abandon(self) { let _ = self.resource.close(); }
+    fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) }
 }
 pub struct ArchiveNextEntry { inner: OperationFuture }
 impl ArchiveNextEntry {
     pub async fn wait(self) -> Result<Option<ArchiveEntry>, OperationError> {
         loop {
             if let Some(token) = self.inner.poll()? {
-                return Ok(if token == 0 { None } else { Some(ArchiveEntry { token }) });
+                return Ok(if token == 0 { None } else { Some(ArchiveEntry { resource: resources::ArchiveEntry::from_abi(token) }) });
             }
             self.inner.yield_now()?;
         }
@@ -321,15 +332,15 @@ impl ArchiveNextEntry {
 impl Drop for ArchiveNextEntry {
     fn drop(&mut self) { let _ = imports::operation_submit(24, self.inner.operation, 0); }
 }
-pub struct ArchiveEntry { token: u64 }
+pub struct ArchiveEntry { resource: resources::ArchiveEntry }
 impl ArchiveEntry {
     pub fn open(&self) -> Result<ArchiveEntryOpen, OperationError> {
-        Ok(ArchiveEntryOpen { inner: OperationFuture::submit(29, self.token, 0)? })
+        Ok(ArchiveEntryOpen { inner: OperationFuture::submit(29, self.token()?, 0)? })
     }
     pub fn metadata(&self, destination: &mut [u8]) -> Result<usize, OperationError> {
         let length = u32::try_from(destination.len()).map_err(|_| OperationError::Rejected)?;
         let pointer = u32::try_from(destination.as_mut_ptr() as usize).map_err(|_| OperationError::Rejected)?;
-        let result = imports::operation_submit(27, self.token, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
+        let result = imports::operation_submit(27, self.token()?, (u64::from(length) << 32) | u64::from(pointer)).map_err(|_| OperationError::Failed)?;
         let count = (result >> 8) as usize;
         if result as u8 != 1 || count > destination.len() || !(12..=4108).contains(&count) {
             return Err(OperationError::Rejected);
@@ -337,9 +348,7 @@ impl ArchiveEntry {
         Ok(count)
     }
 }
-impl Drop for ArchiveEntry {
-    fn drop(&mut self) { let _ = imports::operation_submit(28, self.token, 0); }
-}
+impl ArchiveEntry { fn token(&self) -> Result<u64, OperationError> { self.resource.encode_i64().map(|raw| raw as u64).map_err(|_| OperationError::Closed) } }
 pub struct ArchiveEntryOpen { inner: OperationFuture }
 impl ArchiveEntryOpen {
     pub async fn wait(self) -> Result<BlobHandle, OperationError> {
@@ -482,16 +491,35 @@ impl Contract {
             .get("resources")
             .and_then(toml::Value::as_array)
             .ok_or("missing resources")?;
-        if resources.len() != 1 {
+        const OWNED_RESOURCES: [(&str, &str); 4] = [
+            ("Blob", "resource_release_blob"),
+            ("EncryptedArchive", "resource_release_encrypted_archive"),
+            ("AuthenticatedArchive", "resource_release_authenticated_archive"),
+            ("ArchiveEntry", "resource_release_archive_entry"),
+        ];
+        if resources.len() != OWNED_RESOURCES.len() {
             return Err("unexpected resource declaration".into());
         }
-        let blob = resources[0].as_table().ok_or("resource must be a table")?;
-        if blob.get("name").and_then(toml::Value::as_str) != Some("Blob")
-            || blob.get("kind").and_then(toml::Value::as_str) != Some("opaque_host_handle")
-            || blob.get("ownership").and_then(toml::Value::as_str) != Some("owned")
-            || blob.get("abi").and_then(toml::Value::as_str) != Some("i64")
+        let resource_names = resources
+            .iter()
+            .map(|resource| {
+                let resource = resource.as_table().ok_or("resource must be a table")?;
+                if resource.get("kind").and_then(toml::Value::as_str) != Some("opaque_host_handle")
+                    || resource.get("ownership").and_then(toml::Value::as_str) != Some("owned")
+                    || resource.get("abi").and_then(toml::Value::as_str) != Some("i64")
+                {
+                    return Err("unexpected owned resource declaration".into());
+                }
+                resource
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .ok_or("owned resource missing name")
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        if resource_names
+            != OWNED_RESOURCES.iter().map(|(resource, _)| *resource).collect()
         {
-            return Err("unexpected Blob resource declaration".into());
+            return Err("unexpected owned resource set".into());
         }
         let imports = root
             .get("imports")
@@ -502,6 +530,7 @@ impl Contract {
         }
         let namespace = string("namespace")?;
         let mut import_names = std::collections::BTreeSet::new();
+        let mut releases = std::collections::BTreeSet::new();
         for import in imports {
             let import = import.as_table().ok_or("import must be a table")?;
             if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
@@ -517,13 +546,23 @@ impl Contract {
             if !import_names.insert(name) {
                 return Err("duplicate import name".into());
             }
-            let generated_blob_release = name == "resource_release_blob";
-            if generated_blob_release
+            let generated_release = OWNED_RESOURCES
+                .iter()
+                .find_map(|(resource, release)| (*release == name).then_some(*resource));
+            if generated_release.is_some()
                 && (import.get("generated").and_then(toml::Value::as_bool) != Some(true)
                     || import.get("resource_control").and_then(toml::Value::as_str)
                         != Some("release"))
             {
-                return Err("invalid Blob release control".into());
+                return Err("invalid generated resource release control".into());
+            }
+            if import.get("generated").is_some() || import.get("resource_control").is_some() {
+                if generated_release.is_none() {
+                    return Err("unexpected generated resource control".into());
+                }
+            }
+            if generated_release.is_some() {
+                releases.insert(name);
             }
             for field in ["params", "results"] {
                 let values = import
@@ -540,16 +579,24 @@ impl Contract {
                             | (Some("i32" | "u32"), Some("i32"))
                             | (Some("u64"), Some("i64"))
                     );
-                    let blob_release_shape = generated_blob_release
+                    let resource_release_shape = generated_release.is_some()
                         && field == "params"
-                        && semantic == Some("Blob")
+                        && semantic == generated_release
                         && abi == Some("i64")
                         && value.get("kind").and_then(toml::Value::as_str) == Some("resource");
-                    if !(scalar_shape || blob_release_shape) {
+                    if !(scalar_shape || resource_release_shape) {
                         return Err("unsupported semantic/ABI value shape".into());
                     }
                 }
             }
+        }
+        if releases
+            != OWNED_RESOURCES
+                .iter()
+                .map(|(_, release)| *release)
+                .collect()
+        {
+            return Err("missing generated resource release control".into());
         }
         if root
             .get("exports")
@@ -676,9 +723,30 @@ mod tests {
         POLL_RESPONSE.get()
     }
     static BLOB_RELEASE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    static ENCRYPTED_ARCHIVE_RELEASE: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(-1);
+    static AUTHENTICATED_ARCHIVE_RELEASE: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(-1);
+    static ARCHIVE_ENTRY_RELEASE: std::sync::atomic::AtomicI64 =
+        std::sync::atomic::AtomicI64::new(-1);
     #[no_mangle]
     extern "C" fn resource_release_blob(blob: i64) -> i32 {
         BLOB_RELEASE.store(blob, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    #[no_mangle]
+    extern "C" fn resource_release_encrypted_archive(archive: i64) -> i32 {
+        ENCRYPTED_ARCHIVE_RELEASE.store(archive, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    #[no_mangle]
+    extern "C" fn resource_release_authenticated_archive(archive: i64) -> i32 {
+        AUTHENTICATED_ARCHIVE_RELEASE.store(archive, std::sync::atomic::Ordering::SeqCst);
+        0
+    }
+    #[no_mangle]
+    extern "C" fn resource_release_archive_entry(entry: i64) -> i32 {
+        ARCHIVE_ENTRY_RELEASE.store(entry, std::sync::atomic::Ordering::SeqCst);
         0
     }
     #[test]
@@ -689,13 +757,37 @@ mod tests {
     }
 
     #[test]
-    fn generated_encrypted_input_grant_and_abandon_are_scoped_scalar_submissions() {
+    fn generated_encrypted_input_grant_and_abandon_use_the_owned_release_control() {
+        ENCRYPTED_ARCHIVE_RELEASE.store(-1, std::sync::atomic::Ordering::SeqCst);
         let input = generated_guest::EncryptedArchive::granted()
             .unwrap()
             .unwrap();
         assert_eq!(SUBMISSION.get(), (20, 0, 0));
         input.abandon();
-        assert_eq!(SUBMISSION.get(), (22, 1, 0));
+        assert_eq!(
+            ENCRYPTED_ARCHIVE_RELEASE.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn generated_archive_resources_release_through_distinct_controls() {
+        AUTHENTICATED_ARCHIVE_RELEASE.store(-1, std::sync::atomic::Ordering::SeqCst);
+        ARCHIVE_ENTRY_RELEASE.store(-1, std::sync::atomic::Ordering::SeqCst);
+        generated_guest::resources::AuthenticatedArchive::from_abi(52)
+            .close()
+            .unwrap();
+        generated_guest::resources::ArchiveEntry::from_abi(53)
+            .close()
+            .unwrap();
+        assert_eq!(
+            AUTHENTICATED_ARCHIVE_RELEASE.load(std::sync::atomic::Ordering::SeqCst),
+            52
+        );
+        assert_eq!(
+            ARCHIVE_ENTRY_RELEASE.load(std::sync::atomic::Ordering::SeqCst),
+            53
+        );
     }
 
     #[test]
@@ -827,7 +919,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=9\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=10\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=9\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=10\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -2081,6 +2081,69 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
             Ok(()) => 0,
             Err(_) => 1,
         })
+    }
+
+    fn resource_release_encrypted_archive(
+        &mut self,
+        archive: generated_v1::resources::EncryptedArchive,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_encrypted_input(self.store_owner, archive.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = archive;
+            Ok(1)
+        }
+    }
+
+    fn resource_release_authenticated_archive(
+        &mut self,
+        archive: generated_v1::resources::AuthenticatedArchive,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_authenticated_archive(self.store_owner, archive.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = archive;
+            Ok(1)
+        }
+    }
+
+    fn resource_release_archive_entry(
+        &mut self,
+        entry: generated_v1::resources::ArchiveEntry,
+    ) -> wasmtime::Result<i32> {
+        #[cfg(all(test, feature = "archive-auth-test-support"))]
+        {
+            Ok(match self
+                .operations
+                .abandon_archive_entry(self.store_owner, entry.0)
+            {
+                Ok(()) => 0,
+                Err(_) => 1,
+            })
+        }
+        #[cfg(not(all(test, feature = "archive-auth-test-support")))]
+        {
+            let _ = entry;
+            Ok(1)
+        }
     }
 
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
@@ -4093,22 +4156,23 @@ mod threaded_root_observation_tests {
         replace_metadata_byte(&mut schema_skew, b"schema_revision = 1\n", b'2');
         let mut capability_skew = ABI_METADATA_VALUE.to_vec();
         replace_metadata_byte(&mut capability_skew, b"capabilities=0\n", b'1');
-        let mut operation_skew = ABI_METADATA_VALUE.to_vec();
-        replace_metadata_byte(
-            &mut operation_skew,
-            b"operation_protocol_revision=9\n",
-            b'8',
-        );
+        let operation_skew = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=10\n", "operation_protocol_revision=11\n")
+            .into_bytes();
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
-        let mut previous_operations = ABI_METADATA_VALUE.to_vec();
-        replace_metadata_byte(
-            &mut previous_operations,
-            b"operation_protocol_revision=9\n",
-            b'8',
+        let previous_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
+            .unwrap()
+            .replace("operation_protocol_revision=10\n", "operation_protocol_revision=9\n")
+            .into_bytes();
+        assert!(
+            previous_operations
+                .windows(b"operation_protocol_revision=9\n".len())
+                .any(|window| window == b"operation_protocol_revision=9\n")
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=9\n", "");
+            .replace("operation_protocol_revision=10\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -6172,7 +6236,10 @@ fn threaded_import_signature(
             params: &[ValType::I64],
             results: I32,
         },
-        (ABI_MODULE, "resource_release_blob") => Signature {
+        (ABI_MODULE, "resource_release_blob")
+        | (ABI_MODULE, "resource_release_encrypted_archive")
+        | (ABI_MODULE, "resource_release_authenticated_archive")
+        | (ABI_MODULE, "resource_release_archive_entry") => Signature {
             params: &[ValType::I64],
             results: I32,
         },

@@ -188,11 +188,12 @@ for this exact sealed archive guest proof; it does not turn the earlier local
 timing into a cross-host performance comparison or satisfy the separate
 Component/facade selection gates below.
 
-The current generator is protocol revision 9. It replaces the handwritten
-guest Blob drop submission with fp-bindgen's generated `resource_release_blob`
-control, delegated to the existing `OperationHub` scope/generation registry.
-The revision-8 runs above are historical evidence only; revision-9 guests must
-be rebuilt and separately exercised before being counted as current-host proof.
+The current generator is protocol revision 10. It replaces the handwritten
+guest Blob, encrypted-input, authenticated-archive, and archive-entry release
+submissions with fp-bindgen-generated owned-resource controls, delegated to
+the existing `OperationHub` scope/kind/generation registry. The revision-8
+runs above are historical evidence only; revision-10 guests must be rebuilt
+and separately exercised before being counted as current-host proof.
 
 ### Bounded stream progress deadlines
 

@@ -830,7 +830,7 @@ mod tests {
 
     #[cfg(feature = "fs")]
     #[test]
-    fn created_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
+    fn direct_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("private");
         ensure_owner_private_directory(&directory).unwrap();
@@ -846,8 +846,54 @@ mod tests {
         let read = crate::platform::fs::read_private_regular_file_bounded(&child, 6);
         assert!(
             matches!(read.as_deref(), Ok(bytes) if bytes == b"marker"),
-            "inherited child private-file read failed: {read:?}; child DACL bytes: {:02x?}",
+            "direct child private-file read failed: {read:?}; child DACL bytes: {:02x?}",
             file_security_descriptor(&child).unwrap().dacl().unwrap().bytes().unwrap(),
+        );
+
+        apply_protected_dacl_sddl(&child, "D:P(A;;GR;;;WD)").unwrap();
+        assert_eq!(
+            crate::platform::fs::read_private_regular_file_bounded(&child, 6)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn inherited_private_child_is_accepted_but_explicitly_permissive_child_is_rejected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("private");
+        ensure_owner_private_directory(&directory).unwrap();
+        let child = directory.join("inherited-marker");
+        // Unlike `create_private_file`, ordinary creation must let Windows
+        // materialize the parent DACL's inheritable ACEs on the child.
+        fs::write(&child, b"marker").unwrap();
+
+        let descriptor = file_security_descriptor(&child).unwrap();
+        let dacl = descriptor.dacl().unwrap().bytes().unwrap();
+        let current_sid = current_user_sid_bytes().unwrap();
+        let owner_sid = descriptor.owner_sid_bytes().unwrap();
+        assert!(
+            dacl_is_exact_user_system_file_policy(&dacl, &current_sid),
+            "inherited child DACL is not current-user/SYSTEM private; \
+             current SID: {current_sid:02x?}; owner SID: {owner_sid:02x?}; \
+             ACE flags: {:02x?}; DACL bytes: {dacl:02x?}",
+            dacl_ace_flags(&dacl),
+        );
+        assert!(
+            dacl_ace_flags(&dacl).iter().all(|flags| flags & 0x10 != 0),
+            "ordinary child did not retain inherited ACE flags: {:02x?}",
+            dacl_ace_flags(&dacl),
+        );
+
+        let read = crate::platform::fs::read_private_regular_file_bounded(&child, 6);
+        assert!(
+            matches!(read.as_deref(), Ok(bytes) if bytes == b"marker"),
+            "inherited child private-file read failed: {read:?}; \
+             current SID: {current_sid:02x?}; owner SID: {owner_sid:02x?}; \
+             ACE flags: {:02x?}; DACL bytes: {dacl:02x?}",
+            dacl_ace_flags(&dacl),
         );
 
         apply_protected_dacl_sddl(&child, "D:P(A;;GR;;;WD)").unwrap();
@@ -877,5 +923,29 @@ mod tests {
         assert!(dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
         dacl[9] = 1;
         assert!(!dacl_is_exact_user_system_file_policy(&dacl, &user_sid));
+    }
+
+    fn dacl_ace_flags(dacl: &[u8]) -> Vec<u8> {
+        if dacl.len() < 8 {
+            return Vec::new();
+        }
+        let count = u16::from_le_bytes([dacl[4], dacl[5]]) as usize;
+        let mut flags = Vec::with_capacity(count);
+        let mut offset: usize = 8;
+        for _ in 0..count {
+            let Some(header_end) = offset.checked_add(4) else {
+                return Vec::new();
+            };
+            if header_end > dacl.len() {
+                return Vec::new();
+            }
+            let ace_size = u16::from_le_bytes([dacl[offset + 2], dacl[offset + 3]]) as usize;
+            if ace_size < 4 || offset.checked_add(ace_size).is_none_or(|end| end > dacl.len()) {
+                return Vec::new();
+            }
+            flags.push(dacl[offset + 1]);
+            offset += ace_size;
+        }
+        (offset == dacl.len()).then_some(flags).unwrap_or_default()
     }
 }

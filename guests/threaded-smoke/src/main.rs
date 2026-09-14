@@ -32,7 +32,7 @@ struct ResultRecord {
     map_total: AtomicU32,
     tls_total: AtomicU32,
     result: AtomicU32,
-    reserved: AtomicU32,
+    threaded_streams: AtomicU32,
 }
 
 impl ResultRecord {
@@ -49,7 +49,7 @@ impl ResultRecord {
             map_total: AtomicU32::new(0),
             tls_total: AtomicU32::new(0),
             result: AtomicU32::new(0),
-            reserved: AtomicU32::new(0),
+            threaded_streams: AtomicU32::new(0),
         }
     }
 
@@ -63,6 +63,7 @@ impl ResultRecord {
         map_total: u32,
         tls_total: u32,
         result: u32,
+        threaded_streams: u32,
     ) {
         self.ready.store(0, Ordering::Relaxed);
         // Shared-memory linker initialization is a once-only module-start
@@ -79,7 +80,8 @@ impl ResultRecord {
         self.map_total.store(map_total, Ordering::Relaxed);
         self.tls_total.store(tls_total, Ordering::Relaxed);
         self.result.store(result, Ordering::Relaxed);
-        self.reserved.store(0, Ordering::Relaxed);
+        self.threaded_streams
+            .store(threaded_streams, Ordering::Relaxed);
         // The host's acquire load synchronizes every prior record field.
         self.ready.store(1, Ordering::Release);
     }
@@ -252,6 +254,7 @@ pub extern "C" fn kernal_api_run() -> u32 {
     }
     let counter = Arc::new(AtomicU32::new(0));
     let totals = Arc::new(Mutex::new(0_u32));
+    let threaded_streams = Arc::new(AtomicU32::new(0));
     // Use an explicit deterministic hasher: the closed threaded P1 surface
     // intentionally owns no ambient `random_get` authority.
     let map = Arc::new(
@@ -274,6 +277,7 @@ pub extern "C" fn kernal_api_run() -> u32 {
         let map = Arc::clone(&map);
         let tx = tx.clone();
         let resource = resource;
+        let threaded_streams = Arc::clone(&threaded_streams);
         workers.push(std::thread::spawn(move || {
             // Each native child crosses the kernel boundary too, proving the
             // supplied runtime handle is observed in every guest Store.
@@ -284,6 +288,30 @@ pub extern "C" fn kernal_api_run() -> u32 {
                     .expect("submit generated shared resource use"),
             )
             .expect("generated shared resource use");
+            let blob = guest::run(Blob::create()).expect("child blob create");
+            let sent = [key as u8; 64 * 1024];
+            // Each guest-native child owns this generation-scoped blob; its
+            // bounded stream work crosses the shared host operation authority
+            // without sharing a backend handle with the other child.
+            let mut write = blob.write_chunk(&sent).expect("child blob write");
+            while write.poll().expect("child write poll").is_none() {
+                write.yield_now().expect("child write yield");
+            }
+            let mut received = [0_u8; 64 * 1024];
+            let mut read = blob
+                .read_chunk(received.len() as u32)
+                .expect("child blob read");
+            let count = loop {
+                if let Some(count) = read.poll_into(&mut received).expect("child read collect") {
+                    break count;
+                }
+                read.yield_now().expect("child read yield");
+            };
+            assert_eq!(count, sent.len(), "child receives its bounded write");
+            assert_eq!(received, sent, "child stream preserves bytes");
+            guest::run(blob.seal()).expect("child blob seal");
+            guest::run(blob.close()).expect("child blob close");
+            threaded_streams.fetch_add(1, Ordering::SeqCst);
             counter.fetch_add(1, Ordering::SeqCst);
             *totals.lock().expect("mutex") += 1;
             map.insert(key, 1_u32);
@@ -309,8 +337,15 @@ pub extern "C" fn kernal_api_run() -> u32 {
     complete_operation(resource.close().expect("submit generated resource close"))
         .expect("generated resource close");
     kernal_api_v1_bindings::imports::kernel_yield().expect("generated kernel yield ABI");
-    let result =
-        joined + counter.load(Ordering::SeqCst) + mutex_total + channel_total + map_sum + tls_total;
+    let stream_total = threaded_streams.load(Ordering::SeqCst);
+    assert_eq!(stream_total, 2, "both guest threads completed a bounded stream");
+    let result = joined
+        + counter.load(Ordering::SeqCst)
+        + mutex_total
+        + channel_total
+        + map_sum
+        + tls_total
+        + stream_total;
     RESULT_RECORD.publish(
         joined,
         counter.load(Ordering::SeqCst),
@@ -319,6 +354,7 @@ pub extern "C" fn kernal_api_run() -> u32 {
         map_sum,
         tls_total,
         result,
+        stream_total,
     );
     publish_report_to_host();
     result

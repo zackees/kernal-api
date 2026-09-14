@@ -4149,7 +4149,7 @@ mod threaded_root_observation_tests {
             )
             .expect("transfer limits")
             .with_blob_limits(
-                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 1, 1, 1)
+                SketchBlobLimits::new(64 * 1024, 1024 * 1024, 2 * 1024 * 1024, 2, 2, 2)
                     .unwrap()
                     .with_maximum_transfer_bytes(2 * 1024 * 1024 + 128 * 1024)
                     .unwrap(),
@@ -4240,7 +4240,10 @@ mod threaded_root_observation_tests {
         assert_eq!(operations.live_resources, 0);
         assert_eq!(operations.active_clocks, 0);
         // One create, two child uses, and one close must each prove a real
-        // Pending -> async yield wake -> one terminal poll transition.
+        // Pending -> async yield wake -> one terminal poll transition. The
+        // two guest-owned bounded streams add ten terminal operations; their
+        // individual submissions may complete before or after waiter
+        // registration, so only the suspension count remains a range.
         // Output rejection, successful output completion, and the clock may
         // win before waiter registration; each adds at most one suspension,
         // but exactly one consumed result. The rejected unsealed commit must
@@ -4248,12 +4251,12 @@ mod threaded_root_observation_tests {
         // The 128 additional blob creates each require the ordinary deferred
         // create transition; their synchronous drops add no suspension.
         assert!(
-            (8 + 128..=11 + 128).contains(&operations.suspends),
+            (8 + 128 + 4..=11 + 128 + 10).contains(&operations.suspends),
             "{operations:?}"
         );
         // Each of the 128 create/drop iterations consumes one create result;
         // synchronous Drop itself allocates and consumes no operation slot.
-        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128);
+        assert_eq!(operations.resumes, 12 + 2 * 1024 + 37 + 1 + 1 + 128 + 10);
         assert_eq!(std::fs::read(&output_path).unwrap(), b"guest exact output");
         assert_eq!(
             std::fs::read_dir(output_directory.path()).unwrap().count(),
@@ -4285,8 +4288,8 @@ mod threaded_root_observation_tests {
                 2,
                 2,
                 2,
-                12,
-                0,
+                14,
+                2,           // bounded streams completed by guest children
             ]),
             "root and both children must publish the shared atomic result"
         );

@@ -19,9 +19,9 @@ cross-namespace assignment test in both directions, plus the focused behavior
 or wire test named below. Matching variants, debug output, or serialized happy
 paths are insufficient evidence of type identity.
 
-The source paths below refer to this checkout and the selected substrate
-revision in `_vender/running-process` during integration. Before release, the
-temporary path must be replaced by its published exact registry version.
+The source paths below refer to the selected published substrate release.
+The temporary sub-git used during integration was removed after 4.10.13 became
+available from crates.io.
 
 The inventory covered every module that originally imported `running_process`
 directly (`src/process_adapter.rs`, `src/daemon_frame_v1.rs`,
@@ -43,9 +43,9 @@ public items. Root convenience exports retain their existing names. The
 cross-namespace type/function identity and facade-policy checks passed locally
 on the selected release candidate.
 
-Substrate references use release-candidate revision
-[`6db662c`](https://github.com/zackees/running-process/commit/6db662c)
-(workspace version `4.10.13`, pending publication in running-process#1208). Line references are intentionally included so a
+Substrate references use the published 4.10.13 release, produced by
+[`running-process#1208`](https://github.com/zackees/running-process/pull/1208).
+Line references are intentionally included so a
 later substrate revision can be compared rather than assumed equivalent.
 
 | Facade surface | Current canonical/source comparison | Finding and proposed action | Gate/consumer risk | Closure evidence |
@@ -174,10 +174,7 @@ does not. The selected-versus-ambient runtime regression has been authored in
 `src/async_engine.rs`, but has not been executed. Audit writer queue pressure,
 flush acknowledgment, and shutdown ordering remain consumer validation gates.
 
-1. Await publication of the canonical independent-spawn API from
-   running-process#1208, then replace the temporary path with the exact
-   released version, remove the nested checkout, and retain the identity/policy
-   tests.
+1. Retain the exact published 4.10.13 dependency and the identity/policy tests.
 2. Define a substrate-owned frame-v1 compatibility contract that preserves raw
    unknown values and trace bytes. Migrate `daemon_frame_v1` only after golden
    wire tests demonstrate no protocol change.

@@ -15,8 +15,12 @@ fn generated_abi_metadata() -> Vec<u8> {
 fn compiler() -> SketchCompiler {
     SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler")
 }
+/// Fixtures embed the complete generated ABI contract, which grows with every
+/// operation revision, and the duplicate-metadata case embeds it twice. Keep
+/// the module ceiling well above that so each case reaches the admission check
+/// it names; `ModuleTooLarge` is exercised with its own tiny policy.
 fn policy() -> SketchModulePolicy {
-    SketchModulePolicy::new(4096, 16).expect("policy")
+    SketchModulePolicy::new(64 * 1024, 16).expect("policy")
 }
 fn leb(mut n: u64, o: &mut Vec<u8>) {
     loop {

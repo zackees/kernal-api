@@ -67,6 +67,7 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIn("ci.test_run_compiler_guest ci.test_native_proof_jobs", compiler)
         self.assertNotIn("run_extension2_guest", compiler)
         self.assertIn("compiler-cache", compiler)
+        self.assertIn("Component", compiler)
         self.assertIn("--test wasm_tauri_screenshot", screenshot)
 
 

@@ -177,6 +177,31 @@ Do not treat these diagnostic timings as the controlled reference-host gate
 or a binding selection. The existing execution tests separately cover the
 unchanged 64 MiB transfer workload.
 
+## Matched compiler-policy candidate runner
+
+```sh
+uv run --no-project benchmarks/wasm-sketch/measure_compiler_policy.py \
+  --output /absolute/new/compiler-policy-result-directory \
+  --admission /absolute/path/to/wasm-admission \
+  --embedder /absolute/path/to/kernal-api-wasm-abi-generator \
+  --encoder /absolute/path/to/engine-probe-kernal-component-tools \
+  --gnu-time /usr/bin/time
+```
+
+Unlike the two earlier diagnostics, this runner archives one revision and
+edits the identical request-key filename in `shared/compiler_policy.rs` for
+both compiler guests. Every cold/no-op/edit sample builds the Core guest then
+embeds metadata and admits it, and builds the Component guest then encodes,
+structurally validates, and engine-compiles it. It retains the source and both
+module hashes, logs, artifacts, and scoped build-command RSS readings; ten
+edits must produce ten distinct Core modules and ten distinct Components.
+
+This is a matched diagnostic, not the #13 selection gate. The adapters still
+differ (Core has exact-output authority; Component does not), and the runner
+does not execute every timed artifact, measure Soldr cache hits or
+compiler/process-tree RSS, or provide six-native-host acceptance. Results must
+retain those limitations rather than selecting a runtime from timing alone.
+
 The first complete run is retained in
 [results/component-debug-diagnostic.json](results/component-debug-diagnostic.json).
 Ten distinct compiled components measured 2.058s p50 and 2.359s p95 end-to-end;

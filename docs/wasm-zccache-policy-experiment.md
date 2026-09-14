@@ -510,10 +510,19 @@ KERNAL_COMPILER_GUEST_WASM="$PWD/target/extension2-stream/compiler.admitted.wasm
 The fixture lock now follows the same explicit migration-only process-substrate
 revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
-decision now exist. Artifact persistence/transfer, the six-host parent proof,
-matched candidate measurements, and final runtime selection remain unfinished.
-The revision-8 archive and screenshot artifacts have Linux x86-64 evidence
-only; the remaining five native targets still need fresh execution.
+decision now exist. Artifact persistence/transfer, matched candidate
+measurements, and final runtime selection remain unfinished.
+
+The revision-8 archive and screenshot artifacts now have fresh six-native-host
+evidence from [Actions run 34790621949](https://github.com/zackees/kernal-api/actions/runs/34790621949): Linux, macOS, and Windows on x86-64 and ARM64 all completed
+the actual streaming-archive and offline screenshot/admission lanes. The same
+run's native Windows test job failed only in the independently tracked
+compiler-session job-object restriction
+([running-process#1207](https://github.com/zackees/running-process/issues/1207));
+it did not fail an archive, screenshot, or containment proof.
+This is six-host evidence for those artifacts, not a claim that the separate
+compiler-policy guest execution, artifact-cache workflow, or full #13
+acceptance is complete.
 
 ## Component compiler candidate
 

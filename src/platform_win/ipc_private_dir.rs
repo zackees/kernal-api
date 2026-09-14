@@ -757,9 +757,6 @@ mod tests {
         // unrelated elevated-owner edge case.
         ensure_owner_private_directory(&directory).unwrap();
         let private_sddl = private_dir_sddl().unwrap();
-        let protected = file_security_descriptor(&directory).unwrap();
-        let protected_bytes = protected.dacl().unwrap().bytes().unwrap();
-
         apply_dacl_sddl(
             &directory,
             &private_sddl,
@@ -768,7 +765,9 @@ mod tests {
         .unwrap();
         let unprotected = file_security_descriptor(&directory).unwrap();
         assert!(!unprotected.dacl_is_protected().unwrap());
-        assert_eq!(unprotected.dacl().unwrap().bytes().unwrap(), protected_bytes);
+        // Clearing protection causes Windows to materialize inheritable ACEs
+        // from the parent, so the byte representation need not remain equal.
+        // The policy decision is the protection bit and its subsequent repair.
         assert!(!owner_private_directory(&directory).unwrap());
         assert_eq!(
             ensure_owner_private_directory(&directory).unwrap(),

@@ -474,11 +474,17 @@ request-key derivation, cache decision, and controlled miss in one path. It
 then checks one-shot grant retrieval and rejection of an undersized read, drains
 2 MiB from each native stream in at most 64-KiB chunks, hashes fixture marker
 runs without a second guest payload buffer, observes both EOFs and exhaustion,
-checks repeatable successful exit, and awaits close. Text emitted by the native
-self-executing test harness is intentionally excluded from the marker hashes.
-The Linux x86-64 host observes zero live resources, pending operations, retained
-process jobs, and transfer bytes afterward. This is a process-capability proof,
-not an artifact-cache workflow or a measurement of total RSS.
+checks repeatable successful exit, and awaits close. On a cache miss, the
+Core-only fixture seals its verified marker runs into a bounded 4-MiB `Blob`
+and publishes that blob through the one exact output destination granted by the
+embedding host. The host asserts that the published file contains exactly 2 MiB
+of each marker; text emitted by the native self-executing test harness never
+enters either hash or artifact. A cache hit receives no output grant and must
+not publish a file. The Component candidate deliberately has no corresponding
+WIT capability. The Linux x86-64 host observes zero live resources, pending
+operations, retained process jobs, and transfer bytes afterward. This is
+bounded exact-output transfer evidence, not an artifact-cache workflow or a
+measurement of total RSS.
 
 Focused regressions cover invalid/foreign collection followed by successful
 retry, actual out-of-range shared-memory destinations, ready-result revocation
@@ -506,15 +512,17 @@ target/extension2-abi/debug/kernal-api-wasm-abi-generator \
 KERNAL_COMPILER_GUEST_WASM="$PWD/target/extension2-stream/compiler.admitted.wasm" \
   soldr --no-cache cargo test --locked --no-default-features \
   --features wasm-sketch-host --lib -j1 \
-  wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_waits_and_closes \
+  wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes \
   -- --exact --ignored --nocapture
 ```
 
 The fixture lock now follows the same explicit migration-only process-substrate
 revision as the parent; it is not a published dependency acceptance claim.
 The Component compiler adaptation and one exact zccache request-key hit/miss
-decision now exist. Artifact persistence/transfer, matched candidate
-measurements, and the remaining #13 acceptance evidence remain unfinished. The
+decision now exist. The Core fixture also transfers one verified compiler
+artifact through the existing exact-output authority; it does not yet retain,
+address, or retrieve that artifact from a zccache backend. Matched candidate
+measurements and the remaining #13 acceptance evidence remain unfinished. The
 Core-Wasm/Wasmtime threaded substrate is the recorded v1 decision; this does
 not turn the Component candidate into a runtime fallback or close #13 before
 the outstanding evidence exists.

@@ -3,6 +3,9 @@ use kernal_api::guest::{self as kernel, EncryptedArchive, OperationError};
 use kernal_extension2_guest_proof::policy;
 
 async fn header() -> Result<(EncryptedArchive, [u8; 12]), OperationError> {
+    if !policy::validates_real_extension2_preview_policy() {
+        return Err(OperationError::Rejected);
+    }
     let encrypted = EncryptedArchive::granted()?.ok_or(OperationError::Rejected)?;
     if EncryptedArchive::granted()?.is_some() {
         return Err(OperationError::Rejected);

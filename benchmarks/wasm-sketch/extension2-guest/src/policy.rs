@@ -7,6 +7,23 @@ use std::collections::BTreeSet;
 pub const MAX_HEADER: usize = 16 * 1024 + 12;
 pub const PAYLOAD_BYTES: u64 = 17 * 1024 * 1024;
 
+/// Exercise the unchanged portable extension2 preview-feed policy before this
+/// guest consumes any archive authority.  The feed is a deterministic fixture;
+/// no network capability is granted to the guest.
+pub fn validates_real_extension2_preview_policy() -> bool {
+    const FEED_URL: &str = "https://techwatchproject.github.io/extension/manifest.dev.json";
+    let commit = "a".repeat(40);
+    let digest = "b".repeat(64);
+    let feed = format!(
+        r#"{{"schemaVersion":1,"addonId":"{{92875af4-bd83-4876-92d9-7c6d716b002f}}","previews":[{{"version":"4.8.7","commit":"{commit}","commitTimestamp":42,"url":"preview/tw-orange-preview-v1-4.8.7-{commit}-{digest}.zip.aes","sha256":"{digest}","size":1234,"algorithm":"AES-128-GCM","keyId":"0123456789abcdef","testSuites":["unit","playwright"]}}]}}"#,
+    );
+    if tw_orange_preview_policy::validate_preview_feed_json(feed.as_bytes(), FEED_URL).is_err() {
+        return false;
+    }
+    let hostile = feed.replace("preview/tw-orange", "https://attacker.test/preview/tw-orange");
+    tw_orange_preview_policy::validate_preview_feed_json(hostile.as_bytes(), FEED_URL).is_err()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Header {
@@ -163,5 +180,10 @@ mod tests {
             assert!(count.accept(&format!("empty-{i}"), 0));
         }
         assert!(!count.accept("one-too-many", 0));
+    }
+
+    #[test]
+    fn real_extension2_preview_policy_accepts_only_its_official_encrypted_asset() {
+        assert!(validates_real_extension2_preview_policy());
     }
 }

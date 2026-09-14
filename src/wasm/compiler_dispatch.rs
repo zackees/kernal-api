@@ -377,6 +377,8 @@ mod tests {
                         }),
                     }),
                     output: Some(output.clone()),
+                    #[cfg(all(test, feature = "archive-auth-test-support"))]
+                    archive: None,
                 },
             )),
             Ok(ThreadedRootOutcome::Started)

@@ -341,9 +341,11 @@ Native pending and completed-uncollected abandonment tests cover the new
 scoped authentication-future Drop operation. No plaintext crosses this guest
 proof: it authenticates and closes an opaque archive without reading entries.
 
-Generated inventory/entry operations, entry-copy job accounting, progress deadlines, killable
-worker execution, and current six-native runs still remain. This does not
-interrupt blocked filesystem calls or claim process RSS bounds.
+The generated inventory/entry operations and bounded entry-copy accounting now
+execute through the full guest proof below. Killable-worker execution, a
+current six-native run, stream-progress integration beyond the Blob policy,
+and process-RSS evidence still remain. This does not interrupt blocked
+filesystem calls or claim process RSS bounds.
 
 ## Native portability gate
 
@@ -458,9 +460,10 @@ while the registered archive holds the full budget, and rejection of token
 reuse after consumption. Bad-tag and per-entry-limit cases finish with zero
 live resources and zero charged storage as well.
 
-This is a synthetic native registry proof, not guest execution or a measured
-RSS bound. Async cancellation, generated guest calls, real extension2 policy,
-and six-native-target execution remain required.
+This is a synthetic native registry proof, not by itself guest execution or a
+measured RSS bound. The separately pinned guest proof executes generated calls
+and the portable extension2 feed policy; worker containment and current
+six-native-target execution remain required.
 Removing the budget-identity guard caused the rejection regression to return
 a live token instead of `WrongRights` for a foreign-budget file. The guard
 was restored before final validation. The six-native CI step now enables the
@@ -506,6 +509,30 @@ It starts with sixteen charged bytes and requires zero resources/storage after
 the rejected handoff. A separate test verifies finalization's foreign-owner and
 resource-quota checks, also with nonzero staged data.
 
-All of this remains test-gated. It is not generated guest execution, an async
-dispatcher, real extension2 policy, or proof that filesystem calls can be
-interrupted. The latest implementation still needs its six-native-target runs.
+All of this remains test-gated. The separate guest proof exercises the
+generated dispatcher and the pinned portable extension2 policy, but this native
+section alone is not that proof and does not establish filesystem interruption.
+The latest implementation still needs its current six-native-target runs.
+
+## Fresh current-source Linux evidence
+
+With read access to the exact locked
+`TechWatchProject/extension2` revision `cffb98b2a1fa933a8ce126deeebba9c2efa55be0`,
+the isolated runner rebuilt the `guest-proof` Rust 1.95
+`wasm32-wasip1-threads` artifact, embedded fresh ABI metadata, and ran it on
+Linux x86-64. The pinned `tw-orange-preview-policy` crate compiled from that
+revision; the native authenticated filter passed 29 tests (with four
+artifact-dependent tests intentionally ignored), and the exact ignored
+17 MiB guest-stream test completed before the runner advanced to its companion
+compiler proof. The companion freshly built cache-hit test
+`compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler`
+passed explicitly (one test, 7.90 s).
+
+This fresh configuration also exposed a feature-combination compile failure:
+the compiler fixture's explicit `RootGrants` initializer omitted the
+test-gated archive field. The initializer now supplies `archive: None` under
+the same feature predicate; the exact archive-auth native harness subsequently
+compiled before the proof ran. This is Linux current-source evidence only. It
+does not claim worker containment for this archive flow, process-RSS accounting,
+the complete upstream extension2 application, or current success on all six
+native targets.

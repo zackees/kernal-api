@@ -265,6 +265,15 @@ spawn; revocation between reservation and attachment must reclaim a spawned
 session. Output delivery retains its aggregate in-flight byte budget in
 addition to native queue limits.
 
+The `wasm-compiler-native` CI matrix runs that exact compiler-cache proof on
+each required native host without first fetching the private extension2 policy
+source. `ci/run_compiler_guest.py` builds the separate compiler-only guest,
+embeds fresh ABI metadata, builds one native host harness, and runs the
+miss-to-hit test.
+The extension2 archive matrix remains a separate credential-dependent proof.
+Merely scheduling this matrix is not platform evidence; each native result
+must succeed before it is counted toward #13.
+
 The facade documents that session kill/drop terminates and reaps only the
 direct child. Post-exit drain grace reports abandoned descendant-held pipes;
 it is not process-tree containment. Tests must distinguish direct-child

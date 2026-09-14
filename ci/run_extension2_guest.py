@@ -12,7 +12,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 TEST = "wasm::archive_input_guest_tests::authenticated_input_actual_guest_streams_large_zip_and_rejects_bad_tag_or_nonce"
-COMPILER_TEST = "wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_persists_waits_and_closes"
+COMPILER_TEST = "wasm::compiler_dispatch::tests::compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler"
 
 
 def run(arguments: list[str], *, env: dict[str, str] | None = None) -> str:
@@ -145,7 +145,7 @@ def main() -> None:
     compiler_messages = run(
         [
             "soldr", "--no-cache", "cargo", "build", "--locked", "--manifest-path",
-            "benchmarks/wasm-sketch/extension2-guest/Cargo.toml", "--features", "guest-proof",
+            "benchmarks/wasm-sketch/compiler-guest/Cargo.toml", "--features", "guest-proof",
             "--bin", "kernal-compiler-guest-proof", "--target", "wasm32-wasip1-threads",
             "--release", "-j1", "--target-dir", str(guest_dir), "--message-format=json",
         ],

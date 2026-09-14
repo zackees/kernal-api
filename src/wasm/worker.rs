@@ -1345,6 +1345,8 @@ fn metadata(sketch: &AdmittedSketch, deadline: std::time::Instant) -> ExecuteMet
             blobs.maximum_pending_writes() as u64,
             blobs.maximum_transfer_bytes() as u64,
         ],
+        blob_progress_idle_timeout_secs: blobs.progress_idle_timeout().as_secs(),
+        blob_progress_idle_timeout_nanos: u64::from(blobs.progress_idle_timeout().subsec_nanos()),
         max_wasm_stack_bytes: config.max_wasm_stack_bytes() as u64,
         reserved_memory_bytes: limits.maximum_reserved_shared_memory_bytes(),
         maximum_active_roots: limits.maximum_active_root_executions() as u64,

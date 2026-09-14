@@ -224,7 +224,7 @@ succeeded, and `worker-output-cleanup` when discard failed without publication.
 The RED/GREEN regression checks both error codes and actual final bytes;
 all 22 worker unit tests pass. This injection tests error classification, not
 a native filesystem driver's cleanup failure or eventual cleanup retry.
-The private protocol is now version 6, with an optional staging destination
+The private protocol was version 6 when the optional staging destination was
 bounded to 65,536 encoded bytes. Unix bytes and Windows UTF-16 are preserved
 without lossy Unicode conversion; relative, NUL-containing, foreign-encoding,
 oversized, and truncated inputs are rejected. The worker grants the staged
@@ -493,12 +493,13 @@ Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
 the host.
 
-The worker supervisor sends all seven limits, and the worker validates them
-through the same public constructor before compiler construction. Private
-worker protocol version 6 rejects older peers rather than silently using
-default limits; rebuild the worker executable together with the host. This
-changes no guest ABI import signature or guest artifact. Pending inputs and
-completed reads still have separate byte budgets. Hosts can additionally set
+The worker supervisor sends all seven capacity limits plus the exact
+seconds/nanoseconds representation of the Blob transfer idle budget, and the
+worker validates them through the same public constructor before compiler
+construction. Private worker protocol version 7 rejects older peers rather
+than silently using default limits; rebuild the worker executable together with
+the host. This changes no guest ABI import signature or guest artifact. Pending
+inputs and completed reads still have separate byte budgets. Hosts can additionally set
 `SketchBlobLimits::with_maximum_transfer_bytes` for combined hub-owned blob,
 pending-input, and completed-read backing capacities. Its default is three
 times the sketch-storage budget plus one chunk; the minimum configurable

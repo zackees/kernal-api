@@ -470,8 +470,15 @@ Pending-write rejection occurs before copying input; cancellation frees the
 pending-I/O count even before the terminal result is collected. The separate
 operation-table limit still accounts for that uncollected result. Focused
 tests cover count reuse after cancellation/close and eight simultaneous host
-submissions competing for one pending-write slot. This is host concurrency,
-not yet the required concurrent guest-thread proof.
+submissions competing for one pending-write slot. The real threaded guest now
+also makes each of its two child Stores create, write, read, seal, and close a
+separate 64 KiB blob through the public generated operation API. Its supplied
+artifact proof grants exactly two live blobs, pending reads, and pending writes;
+it records both child-stream completions and verifies that every resource and
+operation counter drains to zero. This establishes independent guest-thread
+stream lifecycle use, but does not yet force those child streams through a
+capacity-awaited write or cancellation race; the existing root 64 MiB proof
+remains the backpressure evidence.
 All 42 hub tests pass. With the count limits enabled, the existing 64 MiB
 Cargo guest passed on Linux x86-64 in-process (5.87 seconds) and inside the
 killable worker (9.18 seconds), reusing the admitted artifact and rebuilding
@@ -570,7 +577,8 @@ on Linux x86-64. The admitted artifact was reused and the host rebuilt.
 - Configure and account total bytes, live blobs, pending reads/writes, and all
   in-flight allocations, including retained capacity and completed results.
 - Complete ordering and progress-timeout behavior under multiple producers and
-  consumers; exercise scheduler races through real guest threads.
+  consumers; extend the real child-stream proof with forced capacity and
+  cancellation scheduler races.
 - Complete output commit cancellation coverage. Dispatch now uses the caller's
   blocking lane, reserves exclusive blob consumption, and checks the operation
   terminal winner at final replacement under the hub lock. A stalled filesystem

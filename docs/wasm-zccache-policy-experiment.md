@@ -468,7 +468,10 @@ joined during root cleanup on the caller-supplied runtime.
 
 The fresh Cargo-built `kernal-compiler-guest-proof` executes the shared
 `benchmarks/wasm-sketch/shared/compiler_policy.rs` through these public methods.
-It checks one-shot grant retrieval and rejection of an undersized read, drains
+Before obtaining the one-shot grant, that policy runs the shared explicit-host
+Rustc parser fixture; the same actual guest therefore covers parser policy,
+request-key derivation, cache decision, and controlled miss in one path. It
+then checks one-shot grant retrieval and rejection of an undersized read, drains
 2 MiB from each native stream in at most 64-KiB chunks, hashes fixture marker
 runs without a second guest payload buffer, observes both EOFs and exhaustion,
 checks repeatable successful exit, and awaits close. Text emitted by the native

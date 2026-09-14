@@ -528,6 +528,17 @@ compiler proof. The companion freshly built cache-hit test
 `compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler`
 passed explicitly (one test, 7.90 s).
 
+After the revision-10 generated owned-resource migration, the same locked
+source was rebuilt again on Linux x86-64 with Rust 1.95. The fresh
+`wasm32-wasip1-threads` extension2 guest artifact was 243,672 bytes and the
+companion compiler guest artifact was 140,587 bytes after their matching
+revision-10 metadata was embedded. The runner-built native harnesses then
+passed the exact ignored 17 MiB authenticated stream proof and the exact
+compiler cache-hit proof again. This re-executes the public guest facade after
+the generated release controls were extended from `Blob` to encrypted input,
+authenticated archive, and archive entry resources; it is not evidence for a
+different stream protocol or a whole-extension2 migration.
+
 This fresh configuration also exposed a feature-combination compile failure:
 the compiler fixture's explicit `RootGrants` initializer omitted the
 test-gated archive field. The initializer now supplies `archive: None` under

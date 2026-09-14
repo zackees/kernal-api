@@ -48,7 +48,6 @@ class NativeProofJobsTests(unittest.TestCase):
             "uv run --no-project ci/run_extension2_guest.py --native-target",
             "uv run --no-project -m unittest ci.test_run_extension2_guest ci.test_native_proof_jobs",
             "kernal-api-archive-build",
-            "CARGO_NET_GIT_FETCH_WITH_CLI=true",
         ):
             self.assertIn(required, archive)
         self.assertNotIn("run_extension2_guest", screenshot)

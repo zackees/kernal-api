@@ -309,10 +309,6 @@ jobs:
         shell: pwsh
         run: |
           "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'kernal-api-archive-build')" >> $env:GITHUB_ENV
-          # The exact public extension2 policy pin is a git dependency. Use the
-          # authenticated git CLI transport rather than Cargo/libgit2 on fresh
-          # hosted runners, where libgit2 can spuriously request credentials.
-          "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> $env:GITHUB_ENV
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           toolchain: 1.95.0

@@ -59,6 +59,11 @@ class ProofRunnerTests(unittest.TestCase):
             staging,
             listing,
             result,
+            artifact("kernal-compiler-guest-proof"),
+            "",
+            artifact("kernal_api", test=True),
+            f"{proof.COMPILER_TEST}: test",
+            result,
         ]
         with (
             patch(
@@ -89,16 +94,21 @@ class ProofRunnerTests(unittest.TestCase):
         calls = self.invoke(
             f"{proof.TEST}: test", "test result: ok. 1 passed; 0 failed; 0 ignored;"
         )
-        command = calls[-1].args[0]
+        command = calls[-6].args[0]
         self.assertIn("--exact", command)
         self.assertIn("--ignored", command)
         self.assertIn(proof.TEST, command)
+        compiler_command = calls[-1].args[0]
+        self.assertIn(proof.COMPILER_TEST, compiler_command)
         self.assertTrue(
-            calls[-1]
+            calls[-6]
             .kwargs["env"]["KERNAL_EXTENSION2_STREAM_WASM"]
             .endswith(".admitted.wasm")
         )
-        staging = calls[-3].args[0]
+        self.assertTrue(
+            calls[-1].kwargs["env"]["KERNAL_COMPILER_GUEST_WASM"].endswith(".admitted.wasm")
+        )
+        staging = calls[-8].args[0]
         self.assertEqual(
             staging, [str(Path.cwd() / "kernal_api"), "authenticated_", "--nocapture"]
         )
@@ -107,7 +117,7 @@ class ProofRunnerTests(unittest.TestCase):
             for call in calls
             if call.args[0][:4] == ["soldr", "--no-cache", "cargo", "test"]
         ]
-        self.assertEqual(len(native_builds), 1)
+        self.assertEqual(len(native_builds), 2)
 
     def test_staging_must_execute_before_actual_guest(self):
         for result in (

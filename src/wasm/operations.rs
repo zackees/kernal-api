@@ -1431,6 +1431,10 @@ impl OperationHub {
         Ok(token)
     }
 
+    pub(crate) fn maximum_blob_chunk_bytes(&self) -> usize {
+        self.blob_limits.maximum_chunk_bytes
+    }
+
     /// Append exactly one quota-accounted chunk. A full blob or sketch budget
     /// rejects before copying, which is the synchronous reservation half of
     /// the generated capacity-awaited write operation.

@@ -121,7 +121,7 @@ fn generated_v1_manifest_matches_the_closed_admission_contract() {
     // the accepted threaded guest ABI.
     assert_eq!(
         ABI_METADATA_VALUE,
-        format!("capabilities=0\noperation_protocol_revision=10\n{GENERATED_V1_MANIFEST}")
+        format!("capabilities=0\noperation_protocol_revision=11\n{GENERATED_V1_MANIFEST}")
             .as_bytes()
     );
 }
@@ -2028,6 +2028,44 @@ struct ThreadStoreState {
     webviews: Option<Arc<crate::tauri::sketch::SketchWebviews>>,
 }
 
+fn read_blob_stream_chunk(
+    operations: &OperationHub,
+    store_owner: u64,
+    stream: u64,
+    destination: &mut [u8],
+) -> Result<usize, operations::HubError> {
+    // Keep the quota-accounted native chunk scoped to this host callback. Its
+    // Drop releases capacity before a subsequent guest call can observe it.
+    let copied = {
+        let chunk = operations.read_blob_chunk(
+            store_owner,
+            crate::operations::OpaqueToken::from_wire(stream),
+            destination
+                .len()
+                .min(operations.maximum_blob_chunk_bytes()),
+            false,
+        )?;
+        let copied = chunk.len();
+        destination[..copied].copy_from_slice(&chunk);
+        copied
+    };
+    Ok(copied)
+}
+
+fn write_blob_stream_chunk(
+    operations: &OperationHub,
+    store_owner: u64,
+    stream: u64,
+    source: &[u8],
+) -> Result<usize, operations::HubError> {
+    let source = &source[..source.len().min(operations.maximum_blob_chunk_bytes())];
+    operations.blob_write(
+        store_owner,
+        crate::operations::OpaqueToken::from_wire(stream),
+        source,
+    )
+}
+
 impl generated_v1::KernalApiV1Imports for ThreadStoreState {
     fn kernel_yield(&mut self) -> wasmtime::Result<()> {
         // The facade handle is deliberately supplied by the caller. This
@@ -2076,17 +2114,34 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         Ok(())
     }
 
-    fn resource_release_blob(
+    fn stream_read(
         &mut self,
-        blob: generated_v1::resources::Blob,
-    ) -> wasmtime::Result<i32> {
-        // Generated guest Drop reaches the same Store-scoped authority path
-        // used by explicit blob abandonment.  It validates kind, owner, and
-        // generation under OperationHub's single registry mutex.
-        Ok(match self
-            .operations
-            .abandon_blob_wire(self.store_owner, blob.0)
-        {
+        stream: u64,
+        destination: &mut [u8],
+    ) -> wasmtime::Result<generated_v1::StreamTransfer> {
+        // The generated linker validates the entire guest destination before
+        // reaching this method.
+        Ok(read_blob_stream_chunk(&self.operations, self.store_owner, stream, destination)
+            .map(generated_v1::StreamTransfer::Transferred)
+            .unwrap_or(generated_v1::StreamTransfer::Rejected))
+    }
+
+    fn stream_write(
+        &mut self,
+        stream: u64,
+        source: &[u8],
+    ) -> wasmtime::Result<generated_v1::StreamTransfer> {
+        // `source` is a bounded local copy made by the generated linker; no
+        // guest pointer or guest-memory borrow reaches OperationHub.
+        Ok(write_blob_stream_chunk(&self.operations, self.store_owner, stream, source)
+            .map(generated_v1::StreamTransfer::Transferred)
+            .unwrap_or(generated_v1::StreamTransfer::Rejected))
+    }
+
+    fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32> {
+        // Closing follows the same atomic Store-scoped kind, owner, and
+        // generation validation as the legacy Blob abandon opcode.
+        Ok(match self.operations.abandon_blob_wire(self.store_owner, stream) {
             Ok(()) => 0,
             Err(_) => 1,
         })
@@ -3487,6 +3542,49 @@ mod threaded_root_observation_tests {
     use super::*;
 
     #[test]
+    fn bounded_blob_stream_controls_use_one_scoped_registry_authority() {
+        let hub = OperationHub::new(4, 4).expect("hub");
+        let stream = hub.create_blob(7).expect("stream");
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ping").expect("write"),
+            4
+        );
+
+        let mut destination = [0; 4];
+        assert_eq!(
+            read_blob_stream_chunk(&hub, 7, stream.wire(), &mut destination).expect("read"),
+            4
+        );
+        assert_eq!(&destination, b"ping");
+        assert_eq!(hub.snapshot().native_transfer_capacity, 0);
+
+        assert_eq!(hub.abandon_blob_wire(7, stream.wire()), Ok(()));
+        assert!(write_blob_stream_chunk(&hub, 7, stream.wire(), b"next").is_err());
+    }
+
+    #[test]
+    fn blob_stream_controls_short_transfer_to_the_configured_chunk_quota() {
+        let limits = operations::BlobLimits::new(2, 8, 16).expect("limits");
+        let hub = OperationHub::with_blob_limits(4, 4, limits).expect("hub");
+        let stream = hub.create_blob(7).expect("stream");
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ping").expect("write"),
+            2
+        );
+        assert_eq!(
+            write_blob_stream_chunk(&hub, 7, stream.wire(), b"ng").expect("write"),
+            2
+        );
+
+        let mut destination = [0; 4];
+        assert_eq!(
+            read_blob_stream_chunk(&hub, 7, stream.wire(), &mut destination).expect("read"),
+            2
+        );
+        assert_eq!(&destination[..2], b"pi");
+    }
+
+    #[test]
     fn compiler_owned_ledger_reserves_the_exact_threaded_contract_and_releases_once() {
         let limits = SketchExecutionLimits::new(THREADED_RUST_RESERVATION_BYTES, 1)
             .expect("exact one-session limit");
@@ -4167,21 +4265,21 @@ mod threaded_root_observation_tests {
         replace_metadata_byte(&mut capability_skew, b"capabilities=0\n", b'1');
         let operation_skew = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=10\n", "operation_protocol_revision=11\n")
+            .replace("operation_protocol_revision=11\n", "operation_protocol_revision=12\n")
             .into_bytes();
         let malformed = b"capabilities=0\nnot a TOML ABI contract".to_vec();
         let previous_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=10\n", "operation_protocol_revision=9\n")
+            .replace("operation_protocol_revision=11\n", "operation_protocol_revision=10\n")
             .into_bytes();
         assert!(
             previous_operations
-                .windows(b"operation_protocol_revision=9\n".len())
-                .any(|window| window == b"operation_protocol_revision=9\n")
+                .windows(b"operation_protocol_revision=10\n".len())
+                .any(|window| window == b"operation_protocol_revision=10\n")
         );
         let legacy_operations = String::from_utf8(ABI_METADATA_VALUE.to_vec())
             .unwrap()
-            .replace("operation_protocol_revision=10\n", "");
+            .replace("operation_protocol_revision=11\n", "");
         let duplicate = {
             let mut bytes = threaded_yield_fixture();
             custom(ABI_METADATA, ABI_METADATA_VALUE, &mut bytes);
@@ -6229,10 +6327,10 @@ fn threaded_import_signature(
             params: generated_v1_contract::KERNEL_YIELD_PARAMS,
             results: generated_v1_contract::KERNEL_YIELD_RESULTS,
         },
-        // These are the closed scalar lifecycle imports generated from the
-        // admitted v1 manifest. Blob transfer operations remain opcode
-        // variants of `operation_submit`; the generated owned Blob wrapper
-        // has one explicit release control, delegated to OperationHub.
+        // These are the closed scalar imports generated from the admitted v1
+        // manifest. Blob exposes bounded caller-memory stream controls while
+        // its established operation opcodes remain available to the guest
+        // facade for capacity-awaited transfer futures.
         (ABI_MODULE, "operation_submit") => Signature {
             params: &[ValType::I32, ValType::I64, ValType::I64],
             results: &[ValType::I64],
@@ -6245,10 +6343,17 @@ fn threaded_import_signature(
             params: &[ValType::I64],
             results: I32,
         },
-        (ABI_MODULE, "resource_release_blob")
-        | (ABI_MODULE, "resource_release_encrypted_archive")
+        (ABI_MODULE, "resource_release_encrypted_archive")
         | (ABI_MODULE, "resource_release_authenticated_archive")
         | (ABI_MODULE, "resource_release_archive_entry") => Signature {
+            params: &[ValType::I64],
+            results: I32,
+        },
+        (ABI_MODULE, "stream_read") | (ABI_MODULE, "stream_write") => Signature {
+            params: &[ValType::I64, ValType::I32, ValType::I32],
+            results: I32,
+        },
+        (ABI_MODULE, "stream_close") => Signature {
             params: &[ValType::I64],
             results: I32,
         },

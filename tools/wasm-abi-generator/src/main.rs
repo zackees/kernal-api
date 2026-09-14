@@ -7,9 +7,9 @@ const CAPABILITIES: u32 = 0;
 // Revision 7 adds host-granted compiler spawn/output/exit/close (35-47).
 // Bump when operation meaning changes, even if scalar signatures do not.
 // Revision 10 lowers every archive authority as an owned, Store-scoped
-// resource. Bump when operation meaning changes, even if scalar signatures do
-// not.
-const OPERATION_PROTOCOL_REVISION: u32 = 10;
+// resource. Revision 11 lowers Blob as a bounded caller-memory stream.
+// Bump when operation meaning changes, even if scalar signatures do not.
+const OPERATION_PROTOCOL_REVISION: u32 = 11;
 const METADATA_SECTION: &str = "kernal-api.abi";
 
 #[test]
@@ -30,13 +30,13 @@ fn binding_declarations() -> (FunctionList, FunctionList, TypeMap) {
     imports.add_function("fn operation_yield(operation: u64) -> i32;");
     imports.add_function("fn operation_cancel(operation: u64) -> i32;");
 
-    // Ownership remains enforced solely by OperationHub. These declarations
-    // make generated Core-Wasm wrappers use canonical Store-scoped release
-    // controls instead of handwritten raw scalar abandon calls.
+    // Ownership remains enforced solely by OperationHub. Blob's generated
+    // Core-Wasm wrapper exposes bounded caller-memory stream controls; the
+    // archive authorities retain canonical Store-scoped release controls.
     let mut types = TypeMap::new();
     types.insert(
         TypeIdent::from("Blob"),
-        Type::Resource(Resource::owned("Blob")),
+        Type::Resource(Resource::stream("Blob")),
     );
     types.insert(
         TypeIdent::from("EncryptedArchive"),
@@ -268,9 +268,9 @@ pub fn clock_sleep(milliseconds: u32) -> Result<OperationFuture, OperationError>
     OperationFuture::submit(12, u64::from(milliseconds), 0)
 }
 
-/// Opaque host-owned bulk resource. No buffer or native path is carried here.
-/// Generated owned-handle lifecycle delegates release to OperationHub's
-/// canonical Store-scoped registry through `resource_release_blob`.
+/// Opaque host-owned bulk stream. No buffer or native path is carried here.
+/// Generated bounded stream controls delegate ownership and close to
+/// OperationHub's canonical Store-scoped registry.
 pub struct BlobHandle { resource: resources::Blob }
 /// Optional host-owned encrypted input. No source path or key crosses the ABI.
 pub struct EncryptedArchive { resource: resources::EncryptedArchive }
@@ -405,6 +405,14 @@ impl BlobHandle {
     }
     /// Revoke this resource synchronously without allocating an operation.
     pub fn abandon(self) { let _ = self.resource.close(); }
+    /// Transfer one bounded chunk synchronously through caller memory.
+    pub fn read(&mut self, destination: &mut [u8]) -> Result<usize, OperationError> {
+        self.resource.read(destination).map_err(|_| OperationError::Rejected)
+    }
+    /// Transfer one bounded chunk synchronously through caller memory.
+    pub fn write(&mut self, source: &[u8]) -> Result<usize, OperationError> {
+        self.resource.write(source).map_err(|_| OperationError::Rejected)
+    }
     pub fn create() -> Result<OperationFuture, OperationError> { OperationFuture::submit(5, 0, 0) }
     pub fn from_create_payload(token: u64) -> Self { Self { resource: resources::Blob::from_abi(token) } }
     pub fn read_chunk(&self, maximum_bytes: u32) -> Result<BlobReadFuture, OperationError> {
@@ -491,34 +499,49 @@ impl Contract {
             .get("resources")
             .and_then(toml::Value::as_array)
             .ok_or("missing resources")?;
-        const OWNED_RESOURCES: [(&str, &str); 4] = [
-            ("Blob", "resource_release_blob"),
+        const RESOURCES: [(&str, &str); 4] = [
+            ("Blob", "stream"),
             ("EncryptedArchive", "resource_release_encrypted_archive"),
-            ("AuthenticatedArchive", "resource_release_authenticated_archive"),
+            (
+                "AuthenticatedArchive",
+                "resource_release_authenticated_archive",
+            ),
             ("ArchiveEntry", "resource_release_archive_entry"),
         ];
-        if resources.len() != OWNED_RESOURCES.len() {
+        if resources.len() != RESOURCES.len() {
             return Err("unexpected resource declaration".into());
         }
         let resource_names = resources
             .iter()
             .map(|resource| {
                 let resource = resource.as_table().ok_or("resource must be a table")?;
-                if resource.get("kind").and_then(toml::Value::as_str) != Some("opaque_host_handle")
-                    || resource.get("ownership").and_then(toml::Value::as_str) != Some("owned")
-                    || resource.get("abi").and_then(toml::Value::as_str) != Some("i64")
-                {
-                    return Err("unexpected owned resource declaration".into());
-                }
-                resource
+                let name = resource
                     .get("name")
                     .and_then(toml::Value::as_str)
-                    .ok_or("owned resource missing name")
+                    .ok_or("resource missing name")?;
+                if !RESOURCES.iter().any(|(expected, _)| *expected == name) {
+                    return Err("unexpected resource name".into());
+                }
+                let expected_ownership = if name == "Blob" { "stream" } else { "owned" };
+                if resource.get("kind").and_then(toml::Value::as_str) != Some("opaque_host_handle")
+                    || resource.get("ownership").and_then(toml::Value::as_str)
+                        != Some(expected_ownership)
+                    || resource.get("abi").and_then(toml::Value::as_str) != Some("i64")
+                {
+                    return Err::<&str, String>("unexpected resource declaration".into());
+                }
+                if name == "Blob"
+                    && resource
+                        .get("max_chunk_bytes")
+                        .and_then(toml::Value::as_integer)
+                        != Some(64 * 1024)
+                {
+                    return Err("invalid stream resource chunk bound".into());
+                }
+                Ok::<&str, String>(name)
             })
             .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
-        if resource_names
-            != OWNED_RESOURCES.iter().map(|(resource, _)| *resource).collect()
-        {
+        if resource_names != RESOURCES.iter().map(|(resource, _)| *resource).collect() {
             return Err("unexpected owned resource set".into());
         }
         let imports = root
@@ -530,7 +553,7 @@ impl Contract {
         }
         let namespace = string("namespace")?;
         let mut import_names = std::collections::BTreeSet::new();
-        let mut releases = std::collections::BTreeSet::new();
+        let mut controls = std::collections::BTreeSet::new();
         for import in imports {
             let import = import.as_table().ok_or("import must be a table")?;
             if import.get("namespace").and_then(toml::Value::as_str) != Some(namespace.as_str()) {
@@ -546,30 +569,49 @@ impl Contract {
             if !import_names.insert(name) {
                 return Err("duplicate import name".into());
             }
-            let generated_release = OWNED_RESOURCES
+            let generated_release = RESOURCES
                 .iter()
                 .find_map(|(resource, release)| (*release == name).then_some(*resource));
-            if generated_release.is_some()
-                && (import.get("generated").and_then(toml::Value::as_bool) != Some(true)
-                    || import.get("resource_control").and_then(toml::Value::as_str)
-                        != Some("release"))
+            let stream_control = matches!(name, "stream_read" | "stream_write" | "stream_close");
+            if (generated_release.is_some() || stream_control)
+                && import.get("generated").and_then(toml::Value::as_bool) != Some(true)
             {
-                return Err("invalid generated resource release control".into());
+                return Err("invalid generated resource control".into());
+            }
+            let expected_control = match name {
+                "stream_read" => Some("transfer_read"),
+                "stream_write" => Some("transfer_write"),
+                "stream_close" => Some("close"),
+                _ => generated_release.map(|_| "release"),
+            };
+            if import.get("resource_control").and_then(toml::Value::as_str) != expected_control {
+                return Err("invalid generated resource control".into());
+            }
+            if stream_control
+                && import
+                    .get("max_chunk_bytes")
+                    .and_then(toml::Value::as_integer)
+                    != Some(64 * 1024)
+            {
+                return Err("invalid stream chunk bound".into());
             }
             if import.get("generated").is_some() || import.get("resource_control").is_some() {
-                if generated_release.is_none() {
+                if generated_release.is_none() && !stream_control {
                     return Err("unexpected generated resource control".into());
                 }
             }
             if generated_release.is_some() {
-                releases.insert(name);
+                controls.insert(name);
+            }
+            if stream_control {
+                controls.insert(name);
             }
             for field in ["params", "results"] {
                 let values = import
                     .get(field)
                     .and_then(toml::Value::as_array)
                     .ok_or_else(|| format!("missing import {field}"))?;
-                for value in values {
+                for (index, value) in values.iter().enumerate() {
                     let value = value.as_table().ok_or("ABI value must be a table")?;
                     let semantic = value.get("semantic").and_then(toml::Value::as_str);
                     let abi = value.get("abi").and_then(toml::Value::as_str);
@@ -584,19 +626,46 @@ impl Contract {
                         && semantic == generated_release
                         && abi == Some("i64")
                         && value.get("kind").and_then(toml::Value::as_str) == Some("resource");
-                    if !(scalar_shape || resource_release_shape) {
+                    let stream_shape = match (name, field, index) {
+                        ("stream_read" | "stream_write", "params", 0) => {
+                            semantic == Some("stream")
+                                && abi == Some("i64")
+                                && value.get("kind").and_then(toml::Value::as_str)
+                                    == Some("resource")
+                        }
+                        ("stream_read" | "stream_write", "params", 1) => {
+                            semantic == Some("guest_ptr") && abi == Some("i32")
+                        }
+                        ("stream_read" | "stream_write", "params", 2) => {
+                            semantic == Some("chunk_len") && abi == Some("i32")
+                        }
+                        ("stream_close", "params", 0) => {
+                            semantic == Some("stream")
+                                && abi == Some("i64")
+                                && value.get("kind").and_then(toml::Value::as_str)
+                                    == Some("resource")
+                        }
+                        _ => false,
+                    };
+                    if !(scalar_shape || resource_release_shape || stream_shape) {
                         return Err("unsupported semantic/ABI value shape".into());
                     }
                 }
             }
         }
-        if releases
-            != OWNED_RESOURCES
-                .iter()
-                .map(|(_, release)| *release)
-                .collect()
+        if controls
+            != [
+                "stream_read",
+                "stream_write",
+                "stream_close",
+                "resource_release_encrypted_archive",
+                "resource_release_authenticated_archive",
+                "resource_release_archive_entry",
+            ]
+            .into_iter()
+            .collect()
         {
-            return Err("missing generated resource release control".into());
+            return Err("missing generated resource control".into());
         }
         if root
             .get("exports")
@@ -722,7 +791,7 @@ mod tests {
     extern "C" fn operation_poll(_operation: i64) -> i64 {
         POLL_RESPONSE.get()
     }
-    static BLOB_RELEASE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+    static BLOB_CLOSE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
     static ENCRYPTED_ARCHIVE_RELEASE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(-1);
     static AUTHENTICATED_ARCHIVE_RELEASE: std::sync::atomic::AtomicI64 =
@@ -730,9 +799,17 @@ mod tests {
     static ARCHIVE_ENTRY_RELEASE: std::sync::atomic::AtomicI64 =
         std::sync::atomic::AtomicI64::new(-1);
     #[no_mangle]
-    extern "C" fn resource_release_blob(blob: i64) -> i32 {
-        BLOB_RELEASE.store(blob, std::sync::atomic::Ordering::SeqCst);
+    extern "C" fn stream_close(blob: i64) -> i32 {
+        BLOB_CLOSE.store(blob, std::sync::atomic::Ordering::SeqCst);
         0
+    }
+    #[no_mangle]
+    extern "C" fn stream_read(_: i64, _: i32, length: i32) -> i32 {
+        length
+    }
+    #[no_mangle]
+    extern "C" fn stream_write(_: i64, _: i32, length: i32) -> i32 {
+        length
     }
     #[no_mangle]
     extern "C" fn resource_release_encrypted_archive(archive: i64) -> i32 {
@@ -750,10 +827,10 @@ mod tests {
         0
     }
     #[test]
-    fn generated_blob_abandon_delegates_to_the_owned_resource_release_control() {
-        BLOB_RELEASE.store(-1, std::sync::atomic::Ordering::SeqCst);
+    fn generated_blob_abandon_delegates_to_the_stream_close_control() {
+        BLOB_CLOSE.store(-1, std::sync::atomic::Ordering::SeqCst);
         generated_guest::BlobHandle::from_create_payload(42).abandon();
-        assert_eq!(BLOB_RELEASE.load(std::sync::atomic::Ordering::SeqCst), 42);
+        assert_eq!(BLOB_CLOSE.load(std::sync::atomic::Ordering::SeqCst), 42);
     }
 
     #[test]
@@ -919,7 +996,7 @@ mod tests {
         let contract = Contract::parse(MANIFEST).unwrap();
         assert_eq!(
             contract.metadata,
-            format!("capabilities=0\noperation_protocol_revision=10\n{MANIFEST}")
+            format!("capabilities=0\noperation_protocol_revision=11\n{MANIFEST}")
         );
         let changed = MANIFEST.replace("abi_version = 1", "abi_version = 2");
         assert_ne!(

@@ -17,7 +17,7 @@ compilation. Embedding parses real section boundaries, leaves an already
 matching artifact unchanged, and rejects mismatched or duplicate sections.
 Changes to the ABI therefore require no manual edits to the guest artifact.
 
-The metadata also binds `operation_protocol_revision=10`, independently of the
+The metadata also binds `operation_protocol_revision=11`, independently of the
 scalar import signatures. Revision 1 included opcodes 1–19 and scoped
 transfer/blob abandonment. Revision 2 adds encrypted-input grant, bounded
 header copy, and abandonment (20–22). Revision 3 adds authentication and scoped
@@ -39,8 +39,11 @@ Revision 9 adds generated `resource_release_blob`: it is not an opcode, but a
 Store-scoped owned-Blob release control delegated to the same `OperationHub`
 registry as the existing blob-abandon path. Revision 10 applies the same
 generated release model to encrypted-input, authenticated-archive, and
-archive-entry authorities. Revision-9 guests must be rebuilt, not relabeled,
-before they can import the archive controls.
+archive-entry authorities. Revision 11 replaces Blob's release-only control
+with generated `stream_read`, `stream_write`, and `stream_close` imports.
+Each transfers at most 64 KiB through validated caller memory; the host never
+retains a guest pointer or buffer. Revision-10 guests must be rebuilt, not
+relabeled, before they can import the stream controls.
 Rebuild guest code before embedding the new
 metadata; never relabel an older binary. Bump this revision when operation
 semantics change even if the scalar function signatures remain identical.
@@ -103,7 +106,7 @@ the exact pre-1.0 client pin must not pair these guards with an older host.
 Opcode 19 is synchronous `blob_abandon(blob_token, 0)`. It remains the
 registry's low-level scoped release path: it validates Store ownership and blob
 kind under the same lock that revokes the generation, closes borrowing
-operations, and releases stored bytes. The revision-9 generated guest wrapper
-now calls `resource_release_blob`, whose host implementation delegates to that
-same path and maps its success to the generated release status. Pending futures
-retain typed terminal results until collection or their own abandonment.
+operations, and releases stored bytes. The revision-11 generated guest wrapper
+calls `stream_close`, while `stream_read` and `stream_write` delegate bounded
+chunks to that same Store-scoped authority. Pending futures retain typed
+terminal results until collection or their own abandonment.

@@ -42,7 +42,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 [[package]]
 name = "fp-bindgen"
 version = "3.0.0"
-source = "git+https://github.com/zackees/fp-bindgen.git?rev=4d8168e#4d8168e4196f495218a08338004f1889b9747fc3"
+source = "git+https://github.com/zackees/fp-bindgen.git?rev=b8ad400#b8ad400f14e68f9a1f4b2aca15c29b92e3e7986d"
 dependencies = [
  "Inflector",
  "fp-bindgen-macros",
@@ -55,7 +55,7 @@ dependencies = [
 [[package]]
 name = "fp-bindgen-macros"
 version = "3.0.0"
-source = "git+https://github.com/zackees/fp-bindgen.git?rev=4d8168e#4d8168e4196f495218a08338004f1889b9747fc3"
+source = "git+https://github.com/zackees/fp-bindgen.git?rev=b8ad400#b8ad400f14e68f9a1f4b2aca15c29b92e3e7986d"
 dependencies = [
  "proc-macro-error",
  "proc-macro2",

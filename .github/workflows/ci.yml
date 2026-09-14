@@ -372,7 +372,7 @@ jobs:
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
           ./tests/screenshot-target-repair.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
-      - name: Run actual compiler-cache guest proof from one native build
+      - name: Run actual Core and Component compiler-policy guest proofs from one native build
         shell: pwsh
         run: |
           & uv run --no-project -m unittest ci.test_run_compiler_guest ci.test_native_proof_jobs

@@ -3,6 +3,13 @@ use kernal_api::guest::{
     Blake3Hasher, CompilerCacheStatus, CompilerGrant, CompilerOutputEvent, OperationError,
 };
 
+// Keep the representative parser in this guest path rather than validating it
+// only through the separate hash probe. Both runtime candidates include this
+// file, so a compiler miss now exercises the same explicit-host Rustc policy
+// before it derives the cache key or asks the host to spawn.
+#[path = "rustc_policy.rs"]
+mod rustc_policy;
+
 pub async fn proof() -> Result<(), OperationError> {
     proof_with_cache(true).await
 }
@@ -16,6 +23,9 @@ pub async fn output_lowering_proof() -> Result<(), OperationError> {
 }
 
 async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
+    if !rustc_policy::proof() {
+        return Err(OperationError::Failed);
+    }
     let grant = CompilerGrant::granted()?.ok_or(OperationError::Rejected)?;
     if CompilerGrant::granted()?.is_some() {
         return Err(OperationError::Failed);

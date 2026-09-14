@@ -913,14 +913,6 @@ impl AdmittedSketch {
         // Consult the concrete private cache before Store construction. A hit
         // restores the embedding-selected exact path now, and deliberately
         // withholds output authority from the guest.
-        let cached = compiler
-            .as_ref()
-            .and_then(|grant| grant.cache.as_ref())
-            .map(|cache| cache.store.get(cache.key))
-            .transpose()
-            .map_err(|_| SketchExecutionError::CompilerArtifactCacheFailed)?
-            .flatten();
-        let cache_hit = cached.is_some();
         if compiler
             .as_ref()
             .is_some_and(|grant| grant.cache.is_some())
@@ -928,11 +920,28 @@ impl AdmittedSketch {
         {
             return Err(SketchExecutionError::OutputGrantRejected);
         }
-        if let Some(bytes) = cached.as_deref() {
-            operations
-                .restore_cached_output(0, output.as_deref().expect("cache hit has output"), bytes)
-                .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
-        }
+        let cache_hit = compiler
+            .as_ref()
+            .and_then(|grant| grant.cache.as_ref())
+            .map(|cache| {
+                compiler_cache::restore_cached_output_if_hit(
+                    &cache.store,
+                    &operations,
+                    0,
+                    cache.key,
+                    output.as_deref().expect("compiler cache has output"),
+                )
+                .map_err(|error| match error {
+                    compiler_cache::CacheRestoreError::Cache => {
+                        SketchExecutionError::CompilerArtifactCacheFailed
+                    }
+                    compiler_cache::CacheRestoreError::Output => {
+                        SketchExecutionError::OutputGrantRejected
+                    }
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
         // Grant before constructing or instantiating the root Store: even a
         // module start section sees only the already-authorized resource. A
         // cache hit gets no output token because the host restored it above.

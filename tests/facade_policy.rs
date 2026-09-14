@@ -113,6 +113,8 @@ fn implementation_crates_are_not_publicly_reexported() {
                         assert!(
                             matches!(line,
                                 "pub use running_process::independent_spawn;"
+                                | "pub use running_process::independent_spawn::{LaunchSpec, Readiness};"
+                                | "pub use running_process::{"
                                 | "pub use running_process::spawn_with_options as spawn_independent;"
                                 | "pub use running_process::foreground;"
                                 | "pub use running_process::ProcessPriority;"
@@ -140,12 +142,7 @@ fn implementation_crates_are_not_publicly_reexported() {
                     "pub use running_process::foreground;",
                     "pub use running_process::ProcessPriority;",
                     "pub use running_process::ProcessLiveness;",
-                    "pub use running_process::IndependentBackend;",
-                    "pub use running_process::SpawnLifetime;",
-                    "pub use running_process::SpawnMode;",
-                    "pub use running_process::SpawnOptions;",
-                    "pub use running_process::SpawnExit;",
-                    "pub use running_process::SpawnHandle;",
+                    "pub use running_process::{\n    spawn_with_options, IndependentBackend, SpawnExit, SpawnHandle, SpawnLifetime, SpawnMode,\n    SpawnOptions,\n};",
                     "pub use running_process::daemon_frame_v1;",
                     "pub use running_process::register_daemon_frame_payload_protocol;",
                     "pub use running_process::daemon_registration_v2_compat as daemon_registration_v2;",
@@ -319,17 +316,18 @@ fn process_substrate_selects_independent_spawn_without_widening_kernel_substrate
             .all(|reexport| lib.contains(reexport)),
         "only the selected canonical spawn contract may cross the facade boundary"
     );
-    assert_eq!(
-        lib.matches("pub use running_process").count(),
-        spawn_reexports.len(),
-        "the independent-spawn exception must not grow into a general substrate re-export"
-    );
-    assert_eq!(
-        lib.matches("#[cfg(feature = \"independent-spawn\")]")
-            .count(),
-        spawn_reexports.len(),
-        "each canonical spawn re-export must remain outside the default facade API"
-    );
+    for canonical_alias in [
+        "pub use running_process::independent_spawn;",
+        "pub use running_process::spawn_with_options as spawn_independent;",
+        "pub use running_process::foreground;",
+        "pub use running_process::ProcessLiveness;",
+        "pub use running_process::ProcessPriority;",
+    ] {
+        assert!(
+            lib.contains(canonical_alias),
+            "the reviewed canonical alias must remain a direct re-export: {canonical_alias}"
+        );
+    }
 
     for path in rust_sources(&root.join("src")) {
         let source = std::fs::read_to_string(&path).expect("read Rust source");

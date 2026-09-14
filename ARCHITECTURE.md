@@ -26,7 +26,7 @@ have an async runtime to do that work. It must never depend on `kernal-api`.
 `kernal-api` is the higher semantic facade used by applications. It depends on
 `running-process`, selects shared implementation versions, adds facilities such
 as hashing and profiling, and turns backend behavior into stable application
-contracts. The bounded process adapter uses the exact published
+contracts. The bounded process adapter has landed and uses the exact published
 `running-process` 4.10.13 release with `default-features = false`; its
 lightweight `kernel-substrate` and opt-in `independent-spawn` capabilities are
 selected explicitly. First-party applications eventually depend on `kernal-api`

@@ -5,8 +5,8 @@ target architecture builds on `running-process`, the trusted low-level
 native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
-`running-process` phase-1 adapter uses the exact published 4.10.13 registry
-release unconditionally. Its canonical independent-spawn contract is the narrow
+`running-process` phase-1 adapter has landed and uses the exact published 4.10.13
+registry release unconditionally. Its canonical independent-spawn contract is the narrow
 backend-type exception: selected options, launch payload, readiness, handle,
 and entry point are re-exported unchanged behind the explicit
 `independent-spawn` feature so live control retains Rust type identity.

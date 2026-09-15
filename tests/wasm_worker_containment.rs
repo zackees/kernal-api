@@ -178,6 +178,19 @@ fn run_case_with_outer_bound(
     expected: SketchWorkerTerminal,
     outer_bound: Duration,
 ) {
+    run_case_checking(bytes, deadline, fuel, cancel, outer_bound, |terminal| {
+        assert_eq!(terminal, &expected);
+    });
+}
+
+fn run_case_checking(
+    bytes: Vec<u8>,
+    deadline: Duration,
+    fuel: SketchFuelLimits,
+    cancel: bool,
+    outer_bound: Duration,
+    check: impl FnOnce(&SketchWorkerTerminal),
+) {
     let compiler = compiler(deadline, fuel);
     let sketch = admit(&compiler, bytes);
     let config = worker_config();
@@ -201,7 +214,7 @@ fn run_case_with_outer_bound(
             async_engine::sleep(Duration::from_millis(500)).await;
             source.cancel();
         }
-        assert_eq!(task.await.expect("contained task"), expected);
+        check(&task.await.expect("contained task"));
         assert_clean(&compiler, &sketch).await;
     });
 }
@@ -232,18 +245,30 @@ fn cargo_built_threaded_guest_deadline_stops_and_releases_parent_state() {
     let path = std::env::var_os("KERNAL_API_THREADED_ARTIFACT_WASM")
         .expect("explicit artifact proof must supply its Cargo-built Wasm");
     // The artifact spends longer than this deadline in its two child stream
-    // pressure paths. The worker must communicate the deadline, terminate the
-    // child execution, and release every parent lease/protocol task instead of
-    // relying on the in-process epoch path.
-    run_case_with_outer_bound(
+    // pressure paths. Where the epoch deadline lands decides the terminal
+    // (#274): the child usually misses it and the parent forces containment,
+    // but it can also stop cooperatively and report the deadline itself. Both
+    // are deadline stops; either way every parent lease and protocol task must
+    // be released. Forced cleanup is proven deterministically by
+    // cargo_built_threaded_guest_forced_output_cleanup.
+    run_case_checking(
         std::fs::read(path).expect("read real threaded guest"),
         CONTAINMENT_DEADLINE,
         long_fuel(),
         false,
-        SketchWorkerTerminal::ForcedContainment {
-            trigger: SketchWorkerStopReason::DeadlineExceeded,
-        },
         Duration::from_secs(30),
+        |terminal| {
+            assert!(
+                matches!(
+                    terminal,
+                    SketchWorkerTerminal::Stopped(SketchWorkerStopReason::DeadlineExceeded)
+                        | SketchWorkerTerminal::ForcedContainment {
+                            trigger: SketchWorkerStopReason::DeadlineExceeded,
+                        }
+                ),
+                "the deadline must stop the guest, cooperatively or by force: {terminal:?}"
+            );
+        },
     );
 }
 

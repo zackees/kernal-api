@@ -48,6 +48,10 @@ COMPONENT_ENCODER_OUTPUT = (
     "Wasmtime 45 component compilation passed; not instantiated or executed\n"
 )
 THREADED_TEST = "supplied_threaded_artifact_admits_and_executes_the_public_profile"
+# Without --module the default CLI builds and admits its own guest through
+# Soldr, which compiles. CI's screenshot-cli-guest-build job runs it on Linux;
+# the native hosts skip it and run every other screenshot proof.
+GUEST_BUILDING_SCREENSHOT_TEST = "default_screenshot_cli_uses_containment_and_commits_output"
 PARENT_DEATH_TEST = "failure_proof::d4_parent_death_kills_exact_worker"
 
 
@@ -412,10 +416,14 @@ def require_listed(harness: Path, test: str, *, ignored: bool, env: dict[str, st
         raise ValueError(f"{test} is missing from the native test harness")
 
 
-def with_display(arguments: list) -> list:
-    if platform.system() == "Linux":
-        return ["dbus-run-session", "--", "xvfb-run", "-a", *arguments]
-    return list(arguments)
+def with_display(arguments: list, env: dict[str, str]) -> list:
+    if platform.system() != "Linux":
+        return list(arguments)
+    # xvfb-run is a /bin/sh script, and dash drops environment variables whose
+    # names are not shell identifiers -- every NEXTEST_BIN_EXE_<name-with-dash>
+    # (PR #271's first run). Hand them to `env` as arguments after the wrapper.
+    assignments = [f"{name}={value}" for name, value in sorted(env.items()) if name.startswith("NEXTEST_BIN_EXE_")]
+    return ["dbus-run-session", "--", "xvfb-run", "-a", "env", *assignments, *arguments]
 
 
 def run_compiler(root: Path, manifest: dict, guest_dir: Path, work: Path) -> None:
@@ -454,12 +462,19 @@ def run_screenshot(root: Path, manifest: dict, guest_dir: Path, work: Path) -> N
     screenshot = role_test(root, manifest, "screenshot")
     screenshot_env = role_env(root, manifest, "screenshot", base)
     stream([screenshot], env=screenshot_env)
-    output = stream(with_display([screenshot, "--ignored", "--nocapture", "--test-threads=1"]), env=screenshot_env)
+    output = stream(
+        with_display(
+            [screenshot, "--ignored", "--nocapture", "--test-threads=1", "--skip", GUEST_BUILDING_SCREENSHOT_TEST],
+            screenshot_env,
+        ),
+        env=screenshot_env,
+    )
     require_passed(output, "the native screenshot proof")
     # The host-only graph admits the same guests without the worker binary.
+    admission_env = role_env(root, manifest, "screenshot-admission", base)
     stream(
-        with_display([role_test(root, manifest, "screenshot-admission"), "--ignored", "--test-threads=1"]),
-        env=role_env(root, manifest, "screenshot-admission", base),
+        with_display([role_test(root, manifest, "screenshot-admission"), "--ignored", "--test-threads=1"], admission_env),
+        env=admission_env,
     )
 
     output = stream([role_test(root, manifest, "compiler-host"), THREADED_TEST], env=base)

@@ -4,6 +4,8 @@ import re
 import unittest
 from pathlib import Path
 
+from ci import native_proof
+
 WORKFLOW = Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml"
 HOSTS = {
     ("ubuntu-24.04", "x86_64-unknown-linux-gnu"),
@@ -73,6 +75,16 @@ class NativeProofJobsTests(unittest.TestCase):
         guests = self.job("native-proof-guests")
         self.assertIn("ci.test_native_proof ci.test_native_proof_jobs", guests)
         self.assertIn("tests/screenshot-target-repair.ps1", guests)
+
+    def test_guest_building_screenshot_cli_runs_only_on_linux(self):
+        # The one screenshot proof that compiles its own guest is skipped on
+        # the native hosts, so it must still run somewhere: here, on Linux.
+        job = self.job("screenshot-cli-guest-build")
+        self.assertIn("runs-on: ubuntu-latest", job)
+        self.assertIn(f"{native_proof.GUEST_BUILDING_SCREENSHOT_TEST} --exact --ignored", job)
+        self.assertIn('grep -F "test result: ok. 1 passed; 0 failed;"', job)
+        source = (WORKFLOW.parents[2] / "ci/native_proof.py").read_text(encoding="utf-8")
+        self.assertIn('"--skip", GUEST_BUILDING_SCREENSHOT_TEST', source)
 
     def test_threaded_script_lane_compiles_only_on_linux(self):
         job = self.job("threaded-rust-artifact")

@@ -236,9 +236,21 @@ class RunTests(unittest.TestCase):
         self.run_suite("screenshot", host, system="Linux")
         ignored = [(arguments, env) for arguments, env in host.calls if "--ignored" in arguments and "--list" not in arguments]
         screenshot, screenshot_env = ignored[0]
-        self.assertEqual(screenshot[:4], ["dbus-run-session", "--", "xvfb-run", "-a"])
+        self.assertEqual(screenshot[:5], ["dbus-run-session", "--", "xvfb-run", "-a", "env"])
         self.assertTrue(screenshot_env["NEXTEST_BIN_EXE_kernal-wasm-worker"].endswith("screenshot/kernal-wasm-worker"))
         self.assertTrue(screenshot_env["NEXTEST_BIN_EXE_kernal-api-wasm-tauri"].endswith("screenshot/kernal-api-wasm-tauri"))
+        # dash (xvfb-run's /bin/sh) drops hyphenated variable names, so the
+        # binaries must reach the harness as `env` arguments.
+        harness = next(index for index, argument in enumerate(screenshot) if argument.endswith("wasm_tauri_screenshot"))
+        assignments = screenshot[5:harness]
+        self.assertEqual(
+            sorted(assignment.split("=", 1)[0] for assignment in assignments),
+            ["NEXTEST_BIN_EXE_kernal-api-wasm-tauri", "NEXTEST_BIN_EXE_kernal-wasm-worker"],
+        )
+        for assignment in assignments:
+            name, value = assignment.split("=", 1)
+            self.assertEqual(value, screenshot_env[name])
+        self.assertEqual(screenshot[screenshot.index("--skip") + 1], proof.GUEST_BUILDING_SCREENSHOT_TEST)
         containment_env = next(env for arguments, env in host.calls if "cargo_built_threaded_guest_" in arguments)
         self.assertTrue(containment_env["NEXTEST_BIN_EXE_kernal-wasm-worker"].endswith("worker-containment/kernal-wasm-worker"))
         parent_death = [arguments for arguments, _ in host.calls if proof.PARENT_DEATH_TEST in arguments and "--list" not in arguments]
@@ -248,7 +260,9 @@ class RunTests(unittest.TestCase):
     def test_screenshot_suite_needs_no_virtual_display_off_linux(self):
         host = FakeHost()
         self.run_suite("screenshot", host, system="Windows")
-        self.assertFalse(any(arguments[0] == "dbus-run-session" for arguments, _ in host.calls))
+        self.assertFalse(any(arguments[0] in {"dbus-run-session", "env"} for arguments, _ in host.calls))
+        ignored = next(arguments for arguments, _ in host.calls if "--ignored" in arguments and "--nocapture" in arguments)
+        self.assertEqual(ignored[ignored.index("--skip") + 1], proof.GUEST_BUILDING_SCREENSHOT_TEST)
 
 
 class WasmTargetRepairTests(unittest.TestCase):

@@ -362,7 +362,9 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Intel macOS needs more than 30 minutes for the screenshot, threaded-root,
+    # and worker-containment native builds in this job.
+    timeout-minutes: 60
     env:
       NATIVE_TARGET: ${{ matrix.target }}
       GDK_BACKEND: x11

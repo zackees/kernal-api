@@ -27,11 +27,11 @@ class NativeProofJobsTests(unittest.TestCase):
         return match.group(1)
 
     def test_all_native_proof_jobs_retain_all_six_native_hosts(self):
-        # Each proof keeps its own explicit deadline; the compiler proof's cold
-        # component-tool build needs longer than the screenshot proof.
+        # Each proof keeps its own explicit deadline, sized for the slowest
+        # native host (Windows and Intel macOS need more than 30 minutes).
         for name, timeout in (
             ("wasm-compiler-native", 60),
-            ("wasm-tauri-screenshot-native", 30),
+            ("wasm-tauri-screenshot-native", 60),
         ):
             with self.subTest(job=name):
                 job = self.job(name)

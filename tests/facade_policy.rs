@@ -54,6 +54,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use console_api",
         "pub use console_subscriber",
         "pub use crash_handler",
+        "pub use embed_resource",
         "pub use framehop",
         "pub use globset",
         "pub use interprocess",
@@ -986,6 +987,7 @@ fn published_documentation_renders_every_public_module() {
         "daemon-registration",
         "daemon-registration-v2",
         "window-icon",
+        "windows-app-resources",
     ] {
         assert!(
             readme.contains(&format!("`{feature}`")),

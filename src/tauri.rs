@@ -620,6 +620,7 @@ fn build_isolated_webview(
         if let Some(source) = bootstrap_source.as_ref() {
             linux_webkitgtk::install_page_bootstrap(&webview.webview(), source)?;
         }
+        linux_webkitgtk::enable_offscreen_canvas_webgl(&webview.webview());
         linux_webkitgtk::configure_permissions(&webview.webview(), permissions);
         webview.load_url(target.as_str()).map_err(host_failure)?;
         Ok(webview)

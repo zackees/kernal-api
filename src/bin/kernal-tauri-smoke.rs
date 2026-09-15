@@ -45,6 +45,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if scenario == SmokeScenario::Bootstrap {
             return bootstrap_server(&accept, deadline, address.port());
         }
+        if scenario == SmokeScenario::OffscreenWebgl {
+            return offscreen_webgl_server(&accept, deadline);
+        }
         if scenario == SmokeScenario::Timeout {
             let (mut stream, _) = accept().map_err(socket_stage("accept document connection"))?;
             // Accepted sockets inherit the listener's nonblocking mode on the
@@ -143,6 +146,13 @@ async fn lifecycle(
     url: &str,
     scenario: SmokeScenario,
 ) -> Result<(), WebviewError> {
+    if scenario == SmokeScenario::OffscreenWebgl {
+        // The page reports synchronously while loading, so the server has the
+        // proof before the load finishes.
+        let webview = client.open_webview(url).await?;
+        webview.wait_until_loaded(Duration::from_secs(30)).await?;
+        return webview.close().await;
+    }
     if scenario == SmokeScenario::Bootstrap {
         let window = WebviewWindowOptions::new("kernal-api bootstrap proof", 800, 600)
             .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
@@ -443,6 +453,7 @@ enum SmokeScenario {
     Timeout,
     Cancel,
     WindowClose,
+    OffscreenWebgl,
 }
 
 impl SmokeScenario {
@@ -458,8 +469,9 @@ impl SmokeScenario {
             Some("timeout") => Ok(Self::Timeout),
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
+            Some("offscreen-webgl") => Ok(Self::OffscreenWebgl),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use bootstrap, capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use bootstrap, capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, window-close, or offscreen-webgl"
             )
             .into()),
         }
@@ -471,7 +483,8 @@ impl SmokeScenario {
             | Self::Bootstrap
             | Self::Capture
             | Self::CaptureCancel
-            | Self::OpenCancel => "",
+            | Self::OpenCancel
+            | Self::OffscreenWebgl => "",
             Self::Timeout | Self::Cancel | Self::WindowClose => "",
             // WebKit requires a genuine user activation before it invokes the
             // new-window callback. The Linux Xvfb proof clicks this link with
@@ -559,6 +572,58 @@ document.body.append(frame);
         report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
     }
     Ok(())
+}
+
+fn offscreen_webgl_server(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    // Page scripts probe for WebGL on an OffscreenCanvas while loading, before
+    // handing canvases to workers. WebKitGTK refuses those contexts unless the
+    // facade enables them.
+    let (mut document, request) = accept_http_request(accept, deadline)
+        .map_err(socket_stage("read offscreen WebGL document"))?;
+    if !request.starts_with("GET /finished HTTP/1.") {
+        return Err(std::io::Error::other(format!(
+            "unexpected offscreen WebGL document: {request:?}"
+        )));
+    }
+    let page = r#"<!doctype html><body><script>
+let reason = 'none';
+const canvas = new OffscreenCanvas(1, 1);
+canvas.addEventListener('webglcontextcreationerror', (event) => {
+  reason = event.statusMessage || 'empty';
+});
+let context = null;
+try { context = canvas.getContext('webgl2'); } catch (error) { reason = String(error); }
+const request = new XMLHttpRequest();
+request.open('GET', `/_offscreen?webgl2=${Number(Boolean(context))}&reason=${encodeURIComponent(reason)}`, false);
+request.send();
+</script>"#;
+    write!(
+        document,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
+        page.len()
+    )
+    .map_err(socket_stage("write offscreen WebGL document"))?;
+    drop(document);
+    let (mut report, request) = accept_http_request(accept, deadline)
+        .map_err(socket_stage("read offscreen WebGL report"))?;
+    let passed = request.starts_with("GET /_offscreen?webgl2=1&");
+    let status = if passed {
+        "204 No Content"
+    } else {
+        "400 Bad Request"
+    };
+    write!(report, "HTTP/1.0 {status}\r\nContent-Length: 0\r\n\r\n")
+        .map_err(socket_stage("write offscreen WebGL response"))?;
+    if passed {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "OffscreenCanvas WebGL2 is unavailable: {request:?}"
+        )))
+    }
 }
 
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {

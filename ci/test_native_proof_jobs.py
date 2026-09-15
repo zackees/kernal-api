@@ -81,7 +81,11 @@ class NativeProofJobsTests(unittest.TestCase):
         # the native hosts, so it must still run somewhere: here, on Linux.
         job = self.job("screenshot-cli-guest-build")
         self.assertIn("runs-on: ubuntu-latest", job)
-        self.assertIn(f"{native_proof.GUEST_BUILDING_SCREENSHOT_TEST} --exact --ignored", job)
+        self.assertLess(
+            job.index("rustup target add wasm32-wasip1-threads"),
+            job.index(f"{native_proof.GUEST_BUILDING_SCREENSHOT_TEST} --exact --ignored"),
+            "the CLI's guest build needs its Wasm target installed first",
+        )
         self.assertIn('grep -F "test result: ok. 1 passed; 0 failed;"', job)
         source = (WORKFLOW.parents[2] / "ci/native_proof.py").read_text(encoding="utf-8")
         self.assertIn('"--skip", GUEST_BUILDING_SCREENSHOT_TEST', source)

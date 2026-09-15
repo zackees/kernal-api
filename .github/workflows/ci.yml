@@ -548,6 +548,10 @@ jobs:
           prebuild-deps-flags: ""
       - name: Restore native pkg-config search path
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - name: Install the screenshot guest target
+        # The CLI builds its guest for wasm32-wasip1-threads (run 34925871627
+        # failed with E0463 without it).
+        run: soldr rustup target add wasm32-wasip1-threads
       - name: Build, admit, and run the real guest through the default screenshot CLI
         env:
           KERNAL_API_SCREENSHOT_PROOF_DIR: ${{ runner.temp }}/kernal-api-screenshot-proof

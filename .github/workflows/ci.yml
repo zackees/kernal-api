@@ -307,7 +307,9 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Cold --no-cache release builds of the Wasmtime component tools take
+    # 20-22 minutes on the fastest hosts and exceed 30 on Windows and Intel macOS.
+    timeout-minutes: 60
     env:
       NATIVE_TARGET: ${{ matrix.target }}
     steps:
@@ -328,6 +330,9 @@ jobs:
           if ($version -notcontains "host: $env:NATIVE_TARGET") { throw "Runner/toolchain is not native $env:NATIVE_TARGET" }
           ./tests/screenshot-target-repair.ps1
           ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly
+          # The Component compiler guest builds for wasm32-unknown-unknown; verify
+          # and repair that target's core/std libraries the same way.
+          ./examples/wasm-tauri-screenshot/build-guest.ps1 -PrepareTargetOnly -Target wasm32-unknown-unknown
       - name: Run actual Core and Component compiler-policy guest proofs from one native build
         shell: pwsh
         run: |
@@ -357,7 +362,9 @@ jobs:
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Intel macOS needs more than 30 minutes for the screenshot, threaded-root,
+    # and worker-containment native builds in this job.
+    timeout-minutes: 60
     env:
       NATIVE_TARGET: ${{ matrix.target }}
       GDK_BACKEND: x11

@@ -25,15 +25,6 @@ fn private_dir_sddl() -> io::Result<String> {
     ))
 }
 
-/// Protected, non-inheriting current-user-and-SYSTEM DACL for a private regular
-/// file.
-///
-/// A file created below `PRIVATE_DIR_SDDL` normally inherits effective owner
-/// and SYSTEM ACEs. The private-file creator instead pins the current token
-/// user's concrete SID on its still-open handle after assigning that user as
-/// owner. An `OWNER RIGHTS` ACE is not equivalent here: its stored SID does
-/// not prove which principal owns a file when the reader validates it later.
-
 #[cfg(feature = "ipc")]
 pub fn ensure_owner_private_directory(path: &Path) -> io::Result<OwnerPrivateDirectoryOutcome> {
     fs::create_dir_all(path)?;
@@ -379,6 +370,12 @@ pub(super) fn apply_current_user_owner(file: &File) -> io::Result<()> {
 }
 
 /// Bind the effective private-file DACL to an already-created file handle.
+///
+/// The DACL is protected and non-inheriting: current user and SYSTEM only. A
+/// file created below the private directory would normally inherit effective
+/// owner and SYSTEM ACEs; this instead pins the current token user's concrete
+/// SID. An `OWNER RIGHTS` ACE is not equivalent here: its stored SID does not
+/// prove which principal owns a file when the reader validates it later.
 ///
 /// The caller must first assign TokenUser as owner on this same handle. This
 /// avoids a path reopen and binds the concrete user SID rather than an
@@ -946,6 +943,10 @@ mod tests {
             flags.push(dacl[offset + 1]);
             offset += ace_size;
         }
-        (offset == dacl.len()).then_some(flags).unwrap_or_default()
+        if offset == dacl.len() {
+            flags
+        } else {
+            Vec::new()
+        }
     }
 }

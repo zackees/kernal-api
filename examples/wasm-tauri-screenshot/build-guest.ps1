@@ -1,9 +1,10 @@
 # PowerShell 7 counterpart of build-guest.sh. The caller owns build storage.
-param([switch]$TrapAfterCapture, [switch]$BlockAfterCapture, [switch]$PrepareTargetOnly)
+param([switch]$TrapAfterCapture, [switch]$BlockAfterCapture, [switch]$PrepareTargetOnly, [string]$Target = 'wasm32-wasip1-threads')
 $ErrorActionPreference = 'Stop'
 $repoDirectory = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $guestDirectory = Join-Path $PSScriptRoot 'guest'
-$target = 'wasm32-wasip1-threads'
+$target = $Target
+if (-not $PrepareTargetOnly -and $target -ne 'wasm32-wasip1-threads') { throw 'The screenshot guest builds only for wasm32-wasip1-threads' }
 
 if (-not $env:CARGO_TARGET_DIR -or -not [System.IO.Path]::IsPathFullyQualified($env:CARGO_TARGET_DIR)) {
     throw 'CARGO_TARGET_DIR must name absolute caller-managed writable storage'

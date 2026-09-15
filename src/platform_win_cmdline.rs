@@ -52,7 +52,9 @@
             return Err(std::io::Error::last_os_error());
         }
 
-        let result = query_cmdline(handle as *mut c_void);
+        // winapi's `c_void` is `std::ffi::c_void` only when its `std` feature is
+        // unified in; `cast` is correct (and lint-clean) either way.
+        let result = query_cmdline(handle.cast());
         unsafe { CloseHandle(handle) };
         result
     }

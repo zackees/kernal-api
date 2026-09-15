@@ -20,7 +20,6 @@ fn build_guest() -> Result<PathBuf, Box<dyn std::error::Error>> {
         .current_dir(guest)
         .env("SOLDR_LINKER", "default")
         .args([
-            "--no-cache",
             "cargo",
             "build",
             "--locked",

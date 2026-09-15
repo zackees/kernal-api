@@ -281,10 +281,10 @@ session. Output delivery retains its aggregate in-flight byte budget in
 addition to native queue limits.
 
 The `wasm-compiler-native` CI matrix runs that exact compiler-cache proof on
-each required native host. `ci/run_compiler_guest.py` builds the separate
-compiler-only guest,
-embeds fresh ABI metadata, builds one native host harness, and runs the
-miss-to-hit test.
+each required native host. `ci/native_proof.py guests` builds the separate
+compiler-only guest once on Linux and embeds fresh ABI metadata;
+`ci/native_proof.py build` compiles each host's harness on Linux, and
+`ci/native_proof.py run compiler` executes the miss-to-hit test on that host.
 Merely scheduling this matrix is not platform evidence; each native result
 must succeed before it is counted toward #13.
 

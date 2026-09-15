@@ -9,7 +9,7 @@ $probe = $ast.Find({ param($node) $node -is [System.Management.Automation.Langua
 $repair = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text.StartsWith('if (-not (Test-ScreenshotTargetLibraries))') }, $true)
 if (-not $probe -or -not $repair) { throw 'Builder repair block not found' }
 $prepareOnly = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.IfStatementAst] -and $node.Extent.Text -eq 'if ($PrepareTargetOnly) { return }' }, $true)
-$build = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text.StartsWith('& soldr --no-cache cargo build') }, $true)
+$build = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.Extent.Text.StartsWith('& soldr cargo build') }, $true)
 if (-not $prepareOnly -or -not $build -or $prepareOnly.Extent.StartOffset -lt $repair.Extent.EndOffset -or $prepareOnly.Extent.EndOffset -gt $build.Extent.StartOffset) {
     throw 'PrepareTargetOnly must return after verified repair and before any build'
 }

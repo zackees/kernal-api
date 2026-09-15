@@ -77,7 +77,7 @@ for arbitrary untrusted Wasm. Worker launch failure never falls back to it.
 Build the actual guest on a Unix host with the pinned target installed:
 
 ```sh
-soldr --no-cache rustup target add wasm32-wasip1-threads
+soldr rustup target add wasm32-wasip1-threads
 CARGO_TARGET_DIR="$PWD/target/screenshot-proof" bash examples/wasm-tauri-screenshot/build-guest.sh
 CARGO_TARGET_DIR="$PWD/target/screenshot-proof" bash examples/wasm-tauri-screenshot/build-guest.sh --trap-after-capture
 ```
@@ -95,7 +95,7 @@ KERNAL_API_SCREENSHOT_ARTIFACT_WASM="$PWD/target/screenshot-proof/kernal-api-was
 PowerShell 7 uses the equivalent checked-in entry point and absolute storage:
 
 ```powershell
-soldr --no-cache rustup target add wasm32-wasip1-threads
+soldr rustup target add wasm32-wasip1-threads
 $env:CARGO_TARGET_DIR = Join-Path (Get-Location).Path 'target/screenshot-proof'
 ./examples/wasm-tauri-screenshot/build-guest.ps1
 $env:KERNAL_API_SCREENSHOT_ARTIFACT_WASM = Join-Path $env:CARGO_TARGET_DIR 'kernal-api-wasm-tauri-guest/wasm32-wasip1-threads/release/kernal-api-wasm-tauri-guest.admitted.wasm'

@@ -286,6 +286,7 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- offscreen-webgl
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib webkit_settings_enable_offscreen_canvas_webgl -- --ignored --test-threads=1
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
 
   # Compiler/cache and screenshot builds need independent cold-build deadlines.

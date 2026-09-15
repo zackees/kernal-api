@@ -255,9 +255,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "WebKitGTK needs a display connection; CI runs this in the Xvfb webview lane"]
     fn webkit_settings_enable_offscreen_canvas_webgl() {
-        // `Settings::new` asserts GTK initialization, which needs a display, but
-        // a WebKitSettings object itself does not.
+        // `Settings::new` also asserts gtk-rs initialization, which this test
+        // avoids; WebKitGTK itself still aborts without a display connection.
         // SAFETY: `webkit_settings_new` returns a new owned reference, which
         // `from_glib_full` adopts exactly once.
         let settings: webkit2gtk::Settings = unsafe {

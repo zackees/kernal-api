@@ -19,7 +19,7 @@ $previous = $env:KERNAL_API_THREADED_ARTIFACT_WASM
 # opinion of them.
 function Get-GuestTargetLibDir {
     param([string]$Target)
-    (soldr --no-cache rustc --print target-libdir --target $Target).Trim()
+    (soldr rustc --print target-libdir --target $Target).Trim()
 }
 
 function Test-GuestTargetMaterialized {
@@ -31,9 +31,8 @@ function Test-GuestTargetMaterialized {
 
 try {
     if (-not $ArtifactPath) {
-        # This is a temporary source-artifact characterization, not a cache
-        # benchmark. Keep every Rust invocation on Soldr while avoiding an
-        # incomplete cached cross-target materialization becoming a false pass.
+        # Keep every Rust invocation on Soldr, cache included; the target
+        # check below guards against an incomplete restored toolchain.
         #
         # A restored CI toolchain cache can leave rustup's `components` list
         # naming this target while its `manifest-rust-std-<target>` file is
@@ -49,17 +48,17 @@ try {
         # to succeed, after which `add` really downloads. The manifest is only
         # touched once the target's own libdir is already proven missing, so a
         # healthy toolchain is never disturbed.
-        soldr --no-cache rustup target add $target
+        soldr rustup target add $target
         if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
         }
         if (-not (Test-GuestTargetMaterialized $target)) {
-            $sysroot = (soldr --no-cache rustc --print sysroot).Trim()
+            $sysroot = (soldr rustc --print sysroot).Trim()
             $manifest = Join-Path $sysroot "lib/rustlib/manifest-rust-std-$target"
             Set-Content -LiteralPath $manifest -Value $null -NoNewline
-            soldr --no-cache rustup target remove $target
+            soldr rustup target remove $target
             $global:LASTEXITCODE = 0
-            soldr --no-cache rustup target add $target
+            soldr rustup target add $target
             if ($LASTEXITCODE -ne 0) {
                 exit $LASTEXITCODE
             }
@@ -73,7 +72,7 @@ try {
         $previousSoldrLinker = $env:SOLDR_LINKER
         try {
             $env:SOLDR_LINKER = 'default'
-            soldr --no-cache $subcommand build --locked --manifest-path Cargo.toml --target $target --release --target-dir $targetDirectory
+            soldr $subcommand build --locked --manifest-path Cargo.toml --target $target --release --target-dir $targetDirectory
             if ($LASTEXITCODE -ne 0) {
                 exit $LASTEXITCODE
             }
@@ -95,19 +94,19 @@ try {
         }
     }
     $env:KERNAL_API_THREADED_ARTIFACT_WASM = $artifact
-    soldr --no-cache $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
+    soldr $subcommand test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    soldr --no-cache $subcommand test --locked --features wasm-sketch-worker --test wasm_worker_containment cargo_built_threaded_guest_ -- --ignored --test-threads=1
+    soldr $subcommand test --locked --features wasm-sketch-worker --test wasm_worker_containment cargo_built_threaded_guest_ -- --ignored --test-threads=1
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment cargo_built_threaded_guest_forced_output_cleanup -- --ignored
+    soldr $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment cargo_built_threaded_guest_forced_output_cleanup -- --ignored
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     # This observes the externally launched worker after its parent exits;
     # it is deliberately separate from the in-process cancellation proofs.
     $parentDeathTest = 'failure_proof::d4_parent_death_kills_exact_worker'
-    $listed = @(soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment -- --list)
+    $listed = @(soldr $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment -- --list)
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if (@($listed | Where-Object { $_ -eq "${parentDeathTest}: test" }).Count -ne 1) { throw 'Expected exactly one registered parent-death containment test' }
-    $parentDeathOutput = @(soldr --no-cache $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment $parentDeathTest -- --exact --test-threads=1 2>&1)
+    $parentDeathOutput = @(soldr $subcommand test --locked --features wasm-sketch-worker-test-support --test wasm_worker_containment $parentDeathTest -- --exact --test-threads=1 2>&1)
     $parentDeathOutput | Write-Output
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     if (@($parentDeathOutput | Where-Object { $_ -match 'test result: ok\. 1 passed; 0 failed; 0 ignored;' }).Count -ne 1) { throw 'Parent-death containment did not run exactly one non-ignored test' }

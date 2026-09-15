@@ -1,4 +1,4 @@
-"""Keep the real six-host proofs on independent job deadlines."""
+"""Keep native proofs compiled on Linux and executed on all six native hosts."""
 
 import re
 import unittest
@@ -13,6 +13,10 @@ HOSTS = {
     ("windows-2025", "x86_64-pc-windows-msvc"),
     ("windows-11-arm", "aarch64-pc-windows-msvc"),
 }
+TARGETS = {target for _, target in HOSTS}
+RUN_JOBS = {"wasm-compiler-native": "compiler", "wasm-tauri-screenshot-native": "screenshot"}
+# Anything that would compile Rust on the host running it.
+COMPILES = re.compile(r"\bsoldr\b|\bcargo\b|\brustup\b|\brustc\b|build-guest|build-threaded-smoke")
 
 
 class NativeProofJobsTests(unittest.TestCase):
@@ -26,32 +30,61 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIsNotNone(match, f"missing independent job {name}")
         return match.group(1)
 
-    def test_all_native_proof_jobs_retain_all_six_native_hosts(self):
-        # Each proof keeps its own explicit deadline, sized for the slowest
-        # native host (Windows and Intel macOS need more than 30 minutes).
-        for name, timeout in (
-            ("wasm-compiler-native", 60),
-            ("wasm-tauri-screenshot-native", 60),
-        ):
+    def test_every_native_proof_binary_compiles_on_linux(self):
+        build = self.job("native-proof-build")
+        builders = re.findall(r"- builder: (\S+)\s+target: (\S+)", build)
+        self.assertEqual({target for _, target in builders}, TARGETS)
+        self.assertEqual(len(builders), len(TARGETS))
+        for builder, target in builders:
+            self.assertTrue(builder.startswith("ubuntu-"), f"{target} compiles on {builder}")
+        self.assertIn("runs-on: ${{ matrix.builder }}", build)
+        self.assertIn("ci/native_proof.py build --target", build)
+        self.assertIn("fail-fast: false", build)
+        guests = self.job("native-proof-guests")
+        self.assertIn("runs-on: ubuntu-", guests)
+        self.assertIn("ci/native_proof.py guests", guests)
+
+    def test_native_hosts_only_execute_prebuilt_binaries(self):
+        for name, suite in RUN_JOBS.items():
             with self.subTest(job=name):
                 job = self.job(name)
                 pairs = re.findall(r"- os: (\S+)\s+target: (\S+)", job)
                 self.assertEqual(set(pairs), HOSTS)
                 self.assertEqual(len(pairs), len(HOSTS))
                 self.assertIn("fail-fast: false", job)
-                self.assertIn(f"timeout-minutes: {timeout}", job)
+                self.assertRegex(job, r"timeout-minutes: \d+")
                 self.assertNotIn("continue-on-error:", job)
-                self.assertNotIn("needs:", job)
+                self.assertIn("needs: [native-proof-guests, native-proof-build]", job)
+                # One target's failed build must not skip the other hosts.
+                self.assertIn("if: ${{ !cancelled() }}", job)
+                self.assertIn(f"ci/native_proof.py run {suite}", job)
+                for line in job.split("steps:", 1)[1].splitlines():
+                    code = line.split("#", 1)[0]
+                    self.assertIsNone(COMPILES.search(code), f"{name} compiles on its native host: {line.strip()}")
 
     def test_compiler_and_screenshot_proofs_keep_separate_budgets(self):
         compiler = self.job("wasm-compiler-native")
         screenshot = self.job("wasm-tauri-screenshot-native")
-        self.assertNotIn("--lib authenticated_", screenshot)
-        self.assertIn("ci/run_compiler_guest.py --native-target", compiler)
-        self.assertIn("ci.test_run_compiler_guest ci.test_native_proof_jobs", compiler)
-        self.assertIn("compiler-cache", compiler)
         self.assertIn("Component", compiler)
-        self.assertIn("--test wasm_tauri_screenshot", screenshot)
+        self.assertNotIn("run compiler", screenshot)
+        self.assertNotIn("run screenshot", compiler)
+
+    def test_proof_runner_checks_run_once_on_linux(self):
+        guests = self.job("native-proof-guests")
+        self.assertIn("ci.test_native_proof ci.test_native_proof_jobs", guests)
+        self.assertIn("tests/screenshot-target-repair.ps1", guests)
+
+    def test_threaded_script_lane_compiles_only_on_linux(self):
+        job = self.job("threaded-rust-artifact")
+        self.assertIn("runs-on: ubuntu-latest", job)
+        self.assertNotRegex(job, r"macos|windows")
+
+    def test_ci_never_disables_the_soldr_cache(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertNotIn("--no-cache", text)
+        # The umbrella switch; individual layers such as dylints' build-cache
+        # may still be tuned.
+        self.assertNotRegex(text, r"(?m)^\s+cache: false\b")
 
 
 if __name__ == "__main__":

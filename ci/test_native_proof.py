@@ -1,0 +1,338 @@
+"""Fail-closed tests for the Linux-built, natively executed proof runner."""
+
+import json
+import shutil
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from ci import native_proof as proof
+
+PASSED_ONCE = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+
+
+def compiler_artifact(name, path, *, test=False, kind="bin"):
+    return json.dumps(
+        {
+            "reason": "compiler-artifact",
+            "target": {"name": name, "kind": [kind]},
+            "profile": {"test": test},
+            "executable": str(path),
+            "filenames": [str(path)],
+        }
+    )
+
+
+def temporary_directory(case):
+    path = Path(tempfile.mkdtemp())
+    case.addCleanup(shutil.rmtree, path, True)
+    return path
+
+
+class FakeCargo:
+    """Answers Soldr invocations with artifacts that exist on disk."""
+
+    def __init__(self, root, host):
+        self.root = root
+        self.host = host
+        self.calls = []
+
+    def __call__(self, arguments, *, env=None, cwd=proof.REPO):
+        arguments = [str(argument) for argument in arguments]
+        self.calls.append(arguments)
+        if arguments[:3] == ["soldr", "rustc", "-vV"]:
+            return f"release: 1.95.0\nhost: {self.host}\n"
+        out = self.root / f"call-{len(self.calls)}"
+        out.mkdir(parents=True)
+
+        def executable(name):
+            path = out / name
+            path.write_text(name)
+            return path
+
+        lines = ["not a Cargo message"]
+        if "benchmarks/wasm-sketch/component-tools/Cargo.toml" in arguments:
+            lines.append(compiler_artifact("kernal-component-tools", executable("kernal-component-tools")))
+            return "\n".join(lines)
+        role = next(role for role in proof.ROLES if arguments[-len(role.cargo):] == list(role.cargo))
+        # The library itself is never selected as a test harness.
+        lines.append(json.dumps({"reason": "compiler-artifact", "target": {"name": "kernal_api", "kind": ["lib"]}, "profile": {"test": False}, "executable": None}))
+        lines.append(compiler_artifact(role.test_target, executable(f"{role.test_target}-0123"), test=True, kind="test"))
+        lines.extend(compiler_artifact(binary, executable(binary)) for binary in role.bins)
+        return "\n".join(lines)
+
+
+def make_bundle(root, target):
+    staging = root / "staging"
+    manifest = {"target": target, "roles": {}, "component_tools": "component-tools/kernal-component-tools"}
+    files = [manifest["component_tools"]]
+    for role in proof.ROLES:
+        entry = {"test": f"{role.name}/{role.test_target}", "bins": {binary: f"{role.name}/{binary}" for binary in role.bins}}
+        manifest["roles"][role.name] = entry
+        files += [entry["test"], *entry["bins"].values()]
+    for relative in files:
+        (staging / relative).parent.mkdir(parents=True, exist_ok=True)
+        (staging / relative).write_text(relative)
+    (staging / proof.MANIFEST).write_text(json.dumps(manifest))
+    archive = root / "bundle.tar"
+    proof.pack(staging, archive)
+    guest_dir = root / "guests"
+    guest_dir.mkdir()
+    for name in proof.GUESTS.values():
+        (guest_dir / name).write_bytes(b"\0asm")
+    return archive, guest_dir
+
+
+class FakeHost:
+    """A native host whose harnesses list every proof and pass once."""
+
+    def __init__(self, result=PASSED_ONCE):
+        self.result = result
+        self.calls = []
+
+    def capture(self, arguments, *, env=None, cwd=proof.REPO):
+        arguments = [str(argument) for argument in arguments]
+        self.calls.append((arguments, env))
+        if "--list" in arguments:
+            tests = (proof.COMPILER_TEST, *proof.COMPONENT_TESTS, proof.PARENT_DEATH_TEST)
+            return "".join(f"{test}: test\n" for test in tests)
+        if arguments[0].endswith("kernal-component-tools"):
+            Path(arguments[2]).write_bytes(b"c" * 17)
+            return proof.COMPONENT_ENCODER_OUTPUT.format(bytes=17)
+        raise AssertionError(f"unexpected capture: {arguments}")
+
+    def stream(self, arguments, *, env=None, cwd=proof.REPO):
+        self.calls.append(([str(argument) for argument in arguments], env))
+        return self.result
+
+
+class HostTripleTests(unittest.TestCase):
+    def test_maps_every_native_proof_host(self):
+        cases = {
+            ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
+            ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
+            ("Darwin", "x86_64"): "x86_64-apple-darwin",
+            ("Darwin", "arm64"): "aarch64-apple-darwin",
+            ("Windows", "AMD64"): "x86_64-pc-windows-msvc",
+            ("Windows", "ARM64"): "aarch64-pc-windows-msvc",
+        }
+        for (system, machine), triple in cases.items():
+            self.assertEqual(proof.host_triple(system, machine), triple)
+        self.assertEqual(set(cases.values()), set(proof.TARGETS))
+
+    def test_sees_through_an_emulated_interpreter(self):
+        self.assertEqual(
+            proof.host_triple("Windows", "AMD64", processor_identifier="ARMv8 (64-bit) Family 8"),
+            "aarch64-pc-windows-msvc",
+        )
+        self.assertEqual(proof.host_triple("Darwin", "x86_64", translated=True), "aarch64-apple-darwin")
+        with self.assertRaises(ValueError):
+            proof.host_triple("FreeBSD", "amd64")
+
+
+class SelectionTests(unittest.TestCase):
+    def test_executable_selection_is_fail_closed(self):
+        worker = Path.cwd() / "worker"
+        one = compiler_artifact("worker", worker)
+        self.assertEqual(proof.select_executable(one, "worker", test=False, kind="bin"), worker)
+        for messages, test in ((one + "\n" + one, False), (one, True), (compiler_artifact("worker", "relative/worker"), False)):
+            with self.assertRaisesRegex(ValueError, "exactly one"):
+                proof.select_executable(messages, "worker", test=test)
+
+
+class BuildTests(unittest.TestCase):
+    def build(self, target, host):
+        root = temporary_directory(self)
+        fake = FakeCargo(root / "cargo", host)
+        archive = root / "out" / "bundle.tar"
+        with patch.object(proof, "capture", side_effect=fake):
+            proof.build(target, archive, root / "work")
+        extracted = root / "extracted"
+        with proof.tarfile.open(archive) as tar:
+            tar.extractall(extracted)
+        manifest = json.loads((extracted / proof.MANIFEST).read_text())
+        return [call for call in fake.calls if call[:2] == ["soldr", "cargo"]], manifest, extracted
+
+    def test_cross_build_compiles_every_role_for_the_target_and_packs_it(self):
+        cargo, manifest, extracted = self.build("aarch64-pc-windows-msvc", "x86_64-unknown-linux-gnu")
+        self.assertEqual(len(cargo), len(proof.ROLES) + 1)
+        for command in cargo:
+            self.assertIn("--locked", command)
+            self.assertNotIn("--no-cache", command)
+            self.assertEqual(command[command.index("--target") + 1], "aarch64-pc-windows-msvc")
+        for command in cargo[:-1]:
+            self.assertIn("--no-run", command)
+        self.assertEqual(manifest["target"], "aarch64-pc-windows-msvc")
+        self.assertEqual(set(manifest["roles"]), {role.name for role in proof.ROLES})
+        self.assertEqual(set(manifest["roles"]["screenshot"]["bins"]), {"kernal-wasm-worker", "kernal-api-wasm-tauri"})
+        staged = [manifest["component_tools"]]
+        for entry in manifest["roles"].values():
+            staged += [entry["test"], *entry["bins"].values()]
+        for relative in staged:
+            self.assertTrue((extracted / relative).is_file(), relative)
+        # Each containment graph ships the worker it was compiled with.
+        self.assertNotEqual(
+            (extracted / manifest["roles"]["worker-containment"]["bins"]["kernal-wasm-worker"]).read_text(),
+            "",
+        )
+        self.assertEqual(len(set(staged)), len(staged))
+
+    def test_native_linux_build_links_the_host_abi(self):
+        cargo, manifest, _ = self.build("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")
+        self.assertEqual(manifest["target"], "aarch64-unknown-linux-gnu")
+        self.assertFalse(any("--target" in command for command in cargo))
+
+    def test_refuses_to_cross_build_a_linux_target(self):
+        root = temporary_directory(self)
+        fake = FakeCargo(root, "x86_64-unknown-linux-gnu")
+        with patch.object(proof, "capture", side_effect=fake), self.assertRaisesRegex(ValueError, "own architecture"):
+            proof.build("aarch64-unknown-linux-gnu", root / "bundle.tar", root / "work")
+        self.assertEqual(fake.calls, [["soldr", "rustc", "-vV"]])
+
+
+class RunTests(unittest.TestCase):
+    target = "x86_64-apple-darwin"
+
+    def run_suite(self, suite, host, *, system="Darwin", detected=None):
+        root = temporary_directory(self)
+        archive, guest_dir = make_bundle(root, self.target)
+        work = root / "work"
+        with (
+            patch.object(proof, "detect_host_triple", return_value=detected or self.target),
+            patch.object(proof.platform, "system", return_value=system),
+            patch.object(proof, "capture", side_effect=host.capture),
+            patch.object(proof, "stream", side_effect=host.stream),
+        ):
+            proof.run_suite(suite, self.target, archive, guest_dir, work)
+        return work
+
+    def test_compiler_suite_executes_prebuilt_proofs_without_a_toolchain(self):
+        host = FakeHost()
+        work = self.run_suite("compiler", host)
+        commands = [arguments for arguments, _ in host.calls]
+        self.assertFalse(any(command[0] in {"soldr", "cargo", "rustc"} for command in commands))
+        core = next(env for arguments, env in host.calls if proof.COMPILER_TEST in arguments and "--list" not in arguments)
+        self.assertTrue(core["KERNAL_COMPILER_GUEST_WASM"].endswith(proof.GUESTS["compiler"]))
+        component_runs = [
+            env for arguments, env in host.calls
+            if "--list" not in arguments and any(test in arguments for test in proof.COMPONENT_TESTS)
+        ]
+        self.assertEqual(len(component_runs), 2)
+        for env in component_runs:
+            self.assertEqual(env["KERNAL_COMPONENT_COMPILER_WASM"], str(work / "compiler-policy.component.wasm"))
+
+    def test_rejects_a_zero_executed_compiler_proof(self):
+        host = FakeHost("test result: ok. 0 passed; 0 failed; 0 ignored;\n")
+        with self.assertRaisesRegex(ValueError, "exactly once"):
+            self.run_suite("compiler", host)
+
+    def test_refuses_a_foreign_host(self):
+        with self.assertRaisesRegex(ValueError, "not native"):
+            self.run_suite("compiler", FakeHost(), detected="aarch64-apple-darwin")
+
+    def test_screenshot_suite_supplies_each_graphs_own_binaries(self):
+        host = FakeHost()
+        self.run_suite("screenshot", host, system="Linux")
+        ignored = [(arguments, env) for arguments, env in host.calls if "--ignored" in arguments and "--list" not in arguments]
+        screenshot, screenshot_env = ignored[0]
+        self.assertEqual(screenshot[:4], ["dbus-run-session", "--", "xvfb-run", "-a"])
+        self.assertTrue(screenshot_env["NEXTEST_BIN_EXE_kernal-wasm-worker"].endswith("screenshot/kernal-wasm-worker"))
+        self.assertTrue(screenshot_env["NEXTEST_BIN_EXE_kernal-api-wasm-tauri"].endswith("screenshot/kernal-api-wasm-tauri"))
+        containment_env = next(env for arguments, env in host.calls if "cargo_built_threaded_guest_" in arguments)
+        self.assertTrue(containment_env["NEXTEST_BIN_EXE_kernal-wasm-worker"].endswith("worker-containment/kernal-wasm-worker"))
+        parent_death = [arguments for arguments, _ in host.calls if proof.PARENT_DEATH_TEST in arguments and "--list" not in arguments]
+        self.assertEqual(len(parent_death), 1)
+        self.assertIn("--exact", parent_death[0])
+
+    def test_screenshot_suite_needs_no_virtual_display_off_linux(self):
+        host = FakeHost()
+        self.run_suite("screenshot", host, system="Windows")
+        self.assertFalse(any(arguments[0] == "dbus-run-session" for arguments, _ in host.calls))
+
+
+class WasmTargetRepairTests(unittest.TestCase):
+    def repair(self, effects, *, healthy=False):
+        root = temporary_directory(self)
+        libdir = root / "lib"
+        sysroot = root / "sysroot"
+        (sysroot / "lib" / "rustlib").mkdir(parents=True)
+        calls = []
+
+        def materialize():
+            libdir.mkdir(exist_ok=True)
+            (libdir / "libcore-0.rlib").touch()
+            (libdir / "libstd-0.rlib").touch()
+
+        if healthy:
+            materialize()
+
+        def capture(arguments, *, env=None, cwd=proof.REPO):
+            arguments = [str(argument) for argument in arguments]
+            calls.append(arguments)
+            if "target-libdir" in arguments:
+                return f"{libdir}\n"
+            if "sysroot" in arguments:
+                return f"{sysroot}\n"
+            if arguments[:3] == ["soldr", "rustup", "target"]:
+                if effects.pop(0):
+                    materialize()
+                return ""
+            raise AssertionError(arguments)
+
+        with patch.object(proof, "capture", side_effect=capture):
+            proof.ensure_wasm_target(proof.THREADS)
+        manifest = sysroot / "lib" / "rustlib" / f"manifest-rust-std-{proof.THREADS}"
+        return [call[3] for call in calls if call[:3] == ["soldr", "rustup", "target"]], manifest
+
+    def test_healthy_toolchain_is_not_mutated(self):
+        self.assertEqual(self.repair([], healthy=True)[0], [])
+
+    def test_missing_target_is_installed(self):
+        self.assertEqual(self.repair([True])[0], ["add"])
+
+    def test_stale_bookkeeping_is_repaired_through_an_empty_manifest(self):
+        rustup, manifest = self.repair([False, False, True])
+        self.assertEqual(rustup, ["add", "remove", "add"])
+        self.assertTrue(manifest.is_file())
+
+    def test_unrepairable_target_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "still lacks"):
+            self.repair([False, False, False])
+
+
+class GuestTests(unittest.TestCase):
+    def test_builds_every_guest_once_with_the_cache_enabled(self):
+        root = temporary_directory(self)
+        out = root / "out"
+        calls = []
+
+        def capture(arguments, *, env=None, cwd=proof.REPO):
+            arguments = [str(argument) for argument in arguments]
+            calls.append(arguments)
+            built = root / f"built-{len(calls)}.wasm"
+            built.write_bytes(b"\0asm")
+            if arguments[:2] == ["bash", "examples/wasm-tauri-screenshot/build-guest.sh"]:
+                return f"cargo noise\n{built}\n"
+            if "--embed-threaded-metadata" in arguments:
+                return ""
+            name = arguments[arguments.index("--bin") + 1] if "--bin" in arguments else (
+                "kernal_component_probe" if "component-guest" in " ".join(arguments) else "kernal-api-threaded-smoke"
+            )
+            return compiler_artifact(name, built)
+
+        with (
+            patch.object(proof, "ensure_wasm_target") as ensure,
+            patch.object(proof, "capture", side_effect=capture),
+        ):
+            proof.guests(out, root / "work")
+        self.assertEqual([call.args[0] for call in ensure.call_args_list], [proof.THREADS, proof.UNKNOWN])
+        self.assertEqual(sorted(path.name for path in out.iterdir()), sorted(proof.GUESTS.values()))
+        self.assertFalse(any("--no-cache" in call for call in calls))
+        self.assertEqual(sum("--embed-threaded-metadata" in call for call in calls), 2)
+        with self.assertRaisesRegex(ValueError, "not empty"):
+            proof.guests(out, root / "work")
+
+
+if __name__ == "__main__":
+    unittest.main()

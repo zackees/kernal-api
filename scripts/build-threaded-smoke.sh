@@ -12,7 +12,7 @@ artifact="${1:-}"
 # installed, so this is a question about files rather than about rustup's
 # opinion of them.
 guest_target_libdir() {
-  soldr --no-cache rustc --print target-libdir --target "$target"
+  soldr rustc --print target-libdir --target "$target"
 }
 
 guest_target_is_materialized() {
@@ -24,10 +24,8 @@ if [[ $# -eq 0 ]]; then
   target_directory="${CARGO_TARGET_DIR%/}/kernal-api-threaded-smoke"
   built_artifact="$target_directory/$target/release/kernal-api-threaded-smoke.wasm"
   artifact="$target_directory/$target/release/kernal-api-threaded-smoke.admitted.wasm"
-  # Keep the guest build on Soldr's front door, but disable its cache for this
-  # temporary output. Soldr's cached cross-target materialization is tracked
-  # separately; a cache failure must not turn this admission characterization
-  # into a false green or tempt us to use ambient Cargo.
+  # Keep the guest build on Soldr's front door, cache included; never fall
+  # back to ambient Cargo.
   #
   # A restored CI toolchain cache can leave rustup's `components` list naming
   # this target while its `manifest-rust-std-<target>` file is gone. rustup
@@ -42,12 +40,12 @@ if [[ $# -eq 0 ]]; then
   # succeed, after which `add` really downloads. The manifest is only touched
   # once the target's own libdir is already proven missing, so a healthy
   # toolchain is never disturbed.
-  soldr --no-cache rustup target add "$target"
+  soldr rustup target add "$target"
   if ! guest_target_is_materialized; then
-    sysroot="$(soldr --no-cache rustc --print sysroot)"
+    sysroot="$(soldr rustc --print sysroot)"
     : >"$sysroot/lib/rustlib/manifest-rust-std-$target"
-    soldr --no-cache rustup target remove "$target"
-    soldr --no-cache rustup target add "$target"
+    soldr rustup target remove "$target"
+    soldr rustup target add "$target"
     if ! guest_target_is_materialized; then
       echo "error: $target has no libcore in $(guest_target_libdir) after reinstall" >&2
       exit 1
@@ -55,7 +53,7 @@ if [[ $# -eq 0 ]]; then
   fi
   (
     cd "$guest_dir"
-    SOLDR_LINKER=default soldr --no-cache "$subcommand" build --locked --manifest-path Cargo.toml --target "$target" --release --target-dir "$target_directory"
+    SOLDR_LINKER=default soldr "$subcommand" build --locked --manifest-path Cargo.toml --target "$target" --release --target-dir "$target_directory"
   )
   # Keep Cargo's output pristine: changing the generated ABI contract must
   # not require recompiling an otherwise unchanged guest to replace metadata.
@@ -64,14 +62,14 @@ if [[ $# -eq 0 ]]; then
 fi
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
-  soldr --no-cache "$subcommand" test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
+  soldr "$subcommand" test --locked --features wasm-sketch-host --lib supplied_threaded_artifact_admits_and_executes_the_public_profile
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
-  soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker \
+  soldr "$subcommand" test --locked --features wasm-sketch-worker \
     --test wasm_worker_containment cargo_built_threaded_guest_ -- --ignored --test-threads=1
 
 KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
-  soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker-test-support \
+  soldr "$subcommand" test --locked --features wasm-sketch-worker-test-support \
     --test wasm_worker_containment cargo_built_threaded_guest_forced_output_cleanup -- --ignored
 
 # This is an external process-lifecycle proof, not an in-process cancellation
@@ -82,12 +80,12 @@ case "$(uname -s)" in
     parent_death_test="failure_proof::d4_parent_death_kills_exact_worker"
     # Cargo treats an empty test filter as success. Verify this exact native
     # proof remains registered before claiming a parent-death result.
-    soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker-test-support \
+    soldr "$subcommand" test --locked --features wasm-sketch-worker-test-support \
       --test wasm_worker_containment -- --list | grep -Fx "${parent_death_test}: test"
     result_file="$(mktemp)"
     trap 'rm -f "$result_file"' EXIT
     KERNAL_API_THREADED_ARTIFACT_WASM="$artifact" \
-      soldr --no-cache "$subcommand" test --locked --features wasm-sketch-worker-test-support \
+      soldr "$subcommand" test --locked --features wasm-sketch-worker-test-support \
         --test wasm_worker_containment "$parent_death_test" \
         -- --exact --test-threads=1 2>&1 | tee "$result_file"
     grep -F "test result: ok. 1 passed; 0 failed; 0 ignored;" "$result_file"

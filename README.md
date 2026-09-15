@@ -101,6 +101,11 @@ Optional features keep consumers from linking tooling they do not use:
   substrate gates its own copy. **Source break:** `platform::window_icon`,
   `set_window_icon_impl` and `window_icon_support_impl` were available on the
   default feature set before this release and now require `window-icon`
+- `windows-app-resources` for a Windows executable's icon, version
+  information and Common-Controls manifest. Enable it on a build-dependency
+  and call `windows_resources::embed_windows_app_resources` from `build.rs`:
+  Cargo only links a build script's resources into the package that runs it.
+  It does nothing for non-Windows targets
 - `wasm-sketch-host` for opt-in core-Wasm sketch admission; the real threaded
   Rust artifact fixture remains source-only under `guests/threaded-smoke`
 - `full` for diagnostic executables that need the entire non-daemon surface

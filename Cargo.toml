@@ -128,6 +128,13 @@ websocket = ["http-server", "dep:futures-util", "dep:tokio-tungstenite"]
 # surface this crate owns; the graph reduction follows when the substrate
 # gates its own copy.
 window-icon = ["dep:png", "dep:x11rb"]
+# Build-script capability: compile an application's Windows icon, version
+# information and Common-Controls manifest and link them into the calling
+# package's binaries. Enable it on a build-dependency and call
+# `windows_resources::embed_windows_app_resources` from `build.rs`; Cargo only
+# links build-script resources into the package that runs the script, so this
+# cannot be done from a normal dependency. It is not part of `full`.
+windows-app-resources = ["dep:embed-resource"]
 # Untrusted external web content is an explicit, heavyweight native capability.
 # The private implementation uses tauri-runtime-wry directly because Tauri's
 # high-level WebviewWindowBuilder installs an IPC bridge even for an external
@@ -266,6 +273,7 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["sin
 getrandom = { version = "=0.4.3", optional = true }
 strsim = { version = "=0.11.1", optional = true }
 toml = { version = "=0.8.23", optional = true }
+embed-resource = { version = "=3.0.11", optional = true }
 shell-words = { version = "=1.1.1", optional = true }
 clap = { version = "=4.6.0", features = ["std", "string"], optional = true }
 tree-sitter = { version = "=0.26.11", optional = true }

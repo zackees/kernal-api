@@ -263,6 +263,7 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- offscreen-webgl
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib webkit_settings_enable_offscreen_canvas_webgl -- --ignored --test-threads=1
 
   # Compile the two external facade consumers. Each is its own `[workspace]`
   # that depends on this crate by path with `default-features = false`, so it

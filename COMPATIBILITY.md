@@ -125,6 +125,11 @@ the same client operation and no runtime fallback to a second HAL.
   copy. `platform::window_icon`, `set_window_icon_impl` and
   `window_icon_support_impl` were available on the default feature set before
   this release; enabling `window-icon` is required as of it.
+- `windows_resources` (feature `windows-app-resources`): build-script
+  embedding of a Windows executable's icon, version information and
+  Common-Controls v6 manifest. Applications call it from their own `build.rs`
+  with this crate as a build-dependency; the resource compiler and the
+  `embed-resource` backend stay private. Non-Windows targets are a no-op.
 - `daemon_identity`, `daemon_frame_v1`, `daemon_registration`,
   `daemon_registration_v2` (features of the same names, each opt-in and
   outside `full`): the frozen v1/v2 daemon wires -- identity/sidecar/probe/mux

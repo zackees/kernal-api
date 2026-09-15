@@ -206,6 +206,7 @@ jobs:
           - tokio-console
           - tauri-webview
           - window-icon
+          - windows-app-resources
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install native webview development packages

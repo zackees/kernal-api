@@ -635,7 +635,11 @@ jobs:
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           # Prepared compiler/SDK archives and compiled crates are cached per
-          # target; `soldr build` compiles the dev profile.
+          # target; `soldr build` compiles the dev profile. A Windows-hosted
+          # prepare yields no archive, and setup-soldr then fails the job, so
+          # those lanes stay uncached until they move to Linux with the static
+          # OpenSSL syslib (zackees/soldr#3246).
+          cache: ${{ !startsWith(matrix.os, 'windows') }}
           cache-key-suffix: supported-${{ matrix.target }}
           cross-targets: ${{ matrix.target }}
           prebuild-deps-flags: --target ${{ matrix.target }}

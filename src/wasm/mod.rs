@@ -4500,8 +4500,11 @@ mod threaded_root_observation_tests {
         // The pressure phase overlaps full blobs, pending inputs, and bounded
         // pull results. The policy's 3 MiB combined-transfer cap applies to
         // every scheduling interleaving; measure allocations, not payload.
+        // The floor is one child's full blob plus its two chunk allocations:
+        // the children may run back to back rather than overlap (CI observed
+        // 1_900_544 bytes on Linux x86-64; 2_293_760 when they overlapped).
         assert!(
-            (2 * 1024 * 1024..=3 * 1024 * 1024)
+            (1024 * 1024 + 2 * 64 * 1024..=3 * 1024 * 1024)
                 .contains(&operations.peak_retained_transfer_capacity),
             "{operations:?}"
         );

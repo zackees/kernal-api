@@ -159,6 +159,49 @@ class GuestScriptTests(unittest.TestCase):
         self.assertNotIn("set -e", text)
         self.assertNotRegex(text, r"^\s*exit [1-9]", "the guest script must not exit non-zero")
 
+    def exclusion_groups(self) -> dict[str, list[str]]:
+        """Parse the EXCLUDE_* groups the guest script declares."""
+        text = GUEST_SCRIPT.read_text(encoding="utf-8")
+        groups = {}
+        for match in re.finditer(r"^(EXCLUDE_[A-Z_]+)='([^']*)'", text, re.MULTILINE):
+            groups[match.group(1)] = match.group(2).split()
+        return groups
+
+    def test_every_exclusion_group_is_present_and_non_empty(self):
+        """A group emptied out would silently widen what the lane skips."""
+        groups = self.exclusion_groups()
+        expected = {
+            "EXCLUDE_CAP_PRIMITIVES",
+            "EXCLUDE_MACOS_TLS",
+            "EXCLUDE_MACOS_PATH",
+            "EXCLUDE_MACOS_RENAME",
+            "EXCLUDE_MACOS_FILENAME",
+            "EXCLUDE_ROOT",
+            "EXCLUDE_TTY",
+            "EXCLUDE_VM_TIMING",
+        }
+        self.assertEqual(set(groups), expected, "exclusion groups changed")
+        for name, entries in groups.items():
+            with self.subTest(group=name):
+                self.assertTrue(entries, f"{name} is empty")
+                for entry in entries:
+                    self.assertRegex(entry, r"^[a-z0-9_]+$", f"{name}: {entry}")
+
+    def test_exclusions_are_named_and_unique(self):
+        groups = self.exclusion_groups()
+        names = [n for entries in groups.values() for n in entries]
+        self.assertEqual(len(names), len(set(names)), "duplicate exclusion entries")
+        self.assertEqual(len(names), 23, "the documented exclusion count changed")
+
+    def test_every_exclusion_is_applied_to_the_guest_filter(self):
+        """Declaring a group but not using it would silently re-enable tests."""
+        text = GUEST_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES', text)
+        for group in self.exclusion_groups():
+            with self.subTest(group=group):
+                self.assertIn(f"${group}", text.split("EXCLUDED_TESTS=", 1)[1][:400])
+        self.assertIn("test(~$name)", text)
+
     def test_is_bash_3_compatible(self):
         """Recovery ships bash 3.2: no associative arrays, no ${v^^}."""
         text = code_only(GUEST_SCRIPT.read_text(encoding="utf-8"))
@@ -214,11 +257,15 @@ class VerifyGuestResultsTests(unittest.TestCase):
         )
         (self.collected / "nextest.log").write_text(log, encoding="utf-8")
 
+    # Above the collapse floor, so these fixtures exercise the coverage and
+    # exit-code assertions rather than tripping the count guard first.
+    REALISTIC_TOTAL = 950
+
     def passing_log(self):
         tests = [f"PASS [ 0.1s] kernal-api::snapshot::unwind::frame_pointer_tests::{name}"
                  for name in self.module.REQUIRED_X86_64_ONLY_TESTS]
         tests.append("PASS [ 0.1s] kernal-api::crash::tests::off_policy_is_inert")
-        self.write_log(total=100, passed=100, tests=tests)
+        self.write_log(total=self.REALISTIC_TOTAL, passed=self.REALISTIC_TOTAL, tests=tests)
 
     def test_accepts_a_run_that_proves_intel_coverage(self):
         self.passing_log()
@@ -228,8 +275,12 @@ class VerifyGuestResultsTests(unittest.TestCase):
         self.assertIn("x86_64-apple-darwin", report)
 
     def test_rejects_a_green_run_that_executed_no_intel_tests(self):
-        self.write_log(total=100, passed=100, tests=["PASS [ 0.1s] kernal-api::fs::tests::some_test",
-                                                     "PASS [ 0.1s] kernal-api::crash::tests::x"])
+        self.write_log(
+            total=self.REALISTIC_TOTAL,
+            passed=self.REALISTIC_TOTAL,
+            tests=["PASS [ 0.1s] kernal-api::fs::tests::some_test",
+                   "PASS [ 0.1s] kernal-api::crash::tests::x"],
+        )
         (self.collected / "nextest.rc").write_text("0\n", encoding="utf-8")
         ok, report = self.module.evaluate(self.collected)
         self.assertFalse(ok)

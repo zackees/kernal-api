@@ -35,10 +35,13 @@ REQUIRED_X86_64_ONLY_TESTS = (
 # enough to show the crash facade executed in the guest.
 REQUIRED_SUBSTRINGS = ("crash::",)
 
-# A floor, not a target: the named-test check above is the real assertion. This
-# only catches a partition that collapsed to almost nothing. Raised from the
-# measured count once the lane has a green track record.
-MINIMUM_TESTS_RUN = 50
+# A floor, not a target: the named-test check above is the real assertion. It
+# catches a partition that collapsed -- a filter that excluded far more than
+# the named guest limitations, or an archive that lost its test binaries.
+# Measured for x86_64-apple-darwin: 973 selected by the policy filter, 23 of
+# them excluded by name in recovery-guest.sh, so ~950 is expected. The floor
+# sits below that to absorb test-count drift without absorbing a collapse.
+MINIMUM_TESTS_RUN = 900
 
 STAGE_FAILURE = "stage-failure.txt"
 NEXTEST_RC = "nextest.rc"

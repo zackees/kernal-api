@@ -114,7 +114,15 @@ fn context_metadata_and_link_read_do_not_follow_final_symlinks() {
             .kind(),
         ErrorKind::InvalidInput
     );
-    assert_eq!(canonical_context_path(&link).unwrap(), target);
+    // Canonicalize both sides: macOS resolves its temp directory through the
+    // `/var` -> `/private/var` symlink, so `target` as constructed and `target`
+    // as canonicalized differ in spelling while denoting the same file. The
+    // property under test is that the link resolves to the target, not how the
+    // platform spells the path on the way there.
+    assert_eq!(
+        canonical_context_path(&link).unwrap(),
+        target.canonicalize().unwrap()
+    );
 
     let dangling = directory.path().join("dangling");
     symlink("absent", &dangling).unwrap();

@@ -157,7 +157,31 @@ fn invalid_utf8_file_names_fail_instead_of_colliding() {
     use std::os::unix::ffi::OsStringExt;
     let dir = tempfile::tempdir().unwrap();
     let name = std::ffi::OsString::from_vec(vec![b'a', 0xff]);
-    fs::write(dir.path().join(name), "content").unwrap();
-    let error = blake3_tree(dir.path(), &[], &[], TreeHashOptions::default()).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    match fs::write(dir.path().join(name), "content") {
+        Ok(()) => {
+            // Linux and other byte-oriented filesystems accept the name, so the
+            // hash is what must refuse to collide two distinct entries.
+            let error = blake3_tree(dir.path(), &[], &[], TreeHashOptions::default()).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        Err(error) => {
+            // APFS enforces UTF-8 file names and rejects this one with EILSEQ,
+            // so the precondition of this test -- a directory holding an
+            // invalid-UTF-8 name -- cannot be constructed at all. The invariant
+            // still holds, enforced a step earlier by the filesystem rather
+            // than by the hash.
+            //
+            // Assert on the raw OS error rather than `ErrorKind`: Rust maps
+            // EILSEQ to `Uncategorized`, which would also match a great many
+            // unrelated failures.
+            assert!(
+                error.raw_os_error().is_some(),
+                "expected the filesystem to refuse the name, got {error}"
+            );
+            // The rejection is about the NAME, not the directory. Without this
+            // check the branch would pass on any unrelated failure, including
+            // an unusable temporary directory.
+            fs::write(dir.path().join("valid"), "content").unwrap();
+        }
+    }
 }

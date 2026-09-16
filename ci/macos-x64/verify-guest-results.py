@@ -38,8 +38,8 @@ REQUIRED_SUBSTRINGS = ("crash::",)
 # A floor, not a target: the named-test check above is the real assertion. It
 # catches a partition that collapsed -- a filter that excluded far more than
 # the named guest limitations, or an archive that lost its test binaries.
-# Measured for x86_64-apple-darwin: 973 selected by the policy filter, 23 of
-# them excluded by name in recovery-guest.sh, so ~950 is expected. The floor
+# Measured for x86_64-apple-darwin: 973 selected by the policy filter, 19 of
+# them excluded by name in recovery-guest.sh, so ~954 is expected. The floor
 # sits below that to absorb test-count drift without absorbing a collapse.
 MINIMUM_TESTS_RUN = 900
 

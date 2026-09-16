@@ -75,7 +75,7 @@ the stub never has to stand in for real source.
   constant. They assert on source text that is identical on every host and
   `rust-native (ubuntu-latest)` already runs them. This mirrors the exclusion
   the aarch64 lane carries in `ci.yml`.
-- **23 further tests**, excluded by name and grouped by cause in
+- **19 further tests**, excluded by name and grouped by cause in
   `recovery-guest.sh`. Each entry is named rather than pattern-matched, so the
   list stays reviewable, and each group carries the evidence observed in the
   guest. None of it is a blanket filter: a test that starts failing for a *new*
@@ -84,20 +84,26 @@ the stub never has to stand in for real source.
 | Group | N | Why it cannot pass here |
 |---|---|---|
 | `EXCLUDE_CAP_PRIMITIVES` | 12 | `cap-primitives` 4.0.3 panics converting a negative macOS `st_rdev` — `u64::try_from(stat.st_rdev).unwrap()` at `metadata_ext.rs:171`. The `dev` field two lines above guards the same signedness, so `dev_t` is known-signed here and only `rdev` was missed. Surfaces as `TryFromIntError(())`. No fixed 4.x exists. |
-| `EXCLUDE_MACOS_TLS` | 2 | macOS rejects the fixtures' certificates: *"The validity period in the certificate exceeds the maximum allowed"* (Security framework, −67901). |
-| `EXCLUDE_MACOS_PATH` | 1 | macOS canonicalizes to `/private/var` where the test expects `/var`. |
-| `EXCLUDE_MACOS_RENAME` | 2 | macOS returns `ENOTSUP` (45) for the atomic rename the readiness marker needs; Linux's exclusive-rename semantics have no direct macOS equivalent. |
-| `EXCLUDE_MACOS_FILENAME` | 1 | APFS rejects an invalid-UTF-8 file name with `EILSEQ` (92) at creation, so the test never reaches the collision it asserts about. |
+| `EXCLUDE_MACOS_RENAME` | 2 | The readiness marker's no-clobber publish returns `ENOTSUP` (45). `tempfile` asks for `renameatx_np(RENAME_EXCL)`, which real macOS supports, so this most likely reflects the guest's virtualized filesystem rather than macOS. Test-only: `persist_noclobber` has no production caller. |
 | `EXCLUDE_ROOT` | 1 | The guest runs as **root**, so a `chmod 000` file stays readable and the test observes `Ok` where it asserts a permission error. |
 | `EXCLUDE_TTY` | 1 | A Recovery guest gives the script no controlling terminal to save and restore. |
 | `EXCLUDE_VM_TIMING` | 3 | Two cores in a VM are not representative for wall-clock assertions; suspension windows and containment deadlines elapsed before the work did. |
 
-**The macOS groups are portability findings, not guest quirks** — they would
-fail on any macOS host, and they stayed invisible because every macOS *test*
-lane in this repository is gated off. This lane is the first to run the suite
-there. They are catalogued in issue #283; the file-name, path-canonicalization
-and TLS-policy ones are all fixable in the tests themselves, and the
-`cap-primitives` panic is an upstream bug.
+**Three macOS portability findings this lane surfaced have since been fixed in
+the tests themselves** and are no longer excluded: the TLS fixture's 3650-day
+validity (now 820 days, under macOS's 825-day ceiling), the `/var` →
+`/private/var` canonicalization comparison in `context_file_observation`, and
+the invalid-UTF-8 file name in `tree_hash`, which APFS rejects with `EILSEQ`
+before the hash can ever see it. All three stayed invisible only because every
+macOS *test* lane in this repository is gated off — this lane is the first to
+run the suite there.
+
+**The `EXCLUDE_MACOS_RENAME` group is not in that category.** `tempfile`'s
+`persist_noclobber` asks for `renameatx_np(RENAME_EXCL)`, which real macOS
+supports, so the `ENOTSUP` is most likely a property of the guest's virtualized
+filesystem rather than of macOS. It is excluded as a guest artifact pending a
+check on real hardware (issue #283). **`EXCLUDE_CAP_PRIMITIVES` is an upstream
+bug**, not a test defect.
 
 ## Coverage assertion
 

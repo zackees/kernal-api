@@ -157,7 +157,25 @@ fn invalid_utf8_file_names_fail_instead_of_colliding() {
     use std::os::unix::ffi::OsStringExt;
     let dir = tempfile::tempdir().unwrap();
     let name = std::ffi::OsString::from_vec(vec![b'a', 0xff]);
-    fs::write(dir.path().join(name), "content").unwrap();
-    let error = blake3_tree(dir.path(), &[], &[], TreeHashOptions::default()).unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    match fs::write(dir.path().join(name), "content") {
+        Ok(()) => {
+            // Linux and other byte-oriented filesystems accept the name, so the
+            // hash is what must refuse to collide two distinct entries.
+            let error =
+                blake3_tree(dir.path(), &[], &[], TreeHashOptions::default()).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        }
+        Err(error) => {
+            // APFS enforces UTF-8 file names and rejects this one with EILSEQ
+            // (surfaced as `InvalidInput`), so the name cannot exist to collide
+            // in the first place. The property still holds -- an invalid name
+            // never silently shares a digest with another -- it is enforced one
+            // step earlier, by the filesystem rather than by the hash.
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "unexpected error creating an invalid-UTF-8 name: {error}"
+            );
+        }
+    }
 }

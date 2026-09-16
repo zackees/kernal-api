@@ -172,10 +172,7 @@ class GuestScriptTests(unittest.TestCase):
         groups = self.exclusion_groups()
         expected = {
             "EXCLUDE_CAP_PRIMITIVES",
-            "EXCLUDE_MACOS_TLS",
-            "EXCLUDE_MACOS_PATH",
             "EXCLUDE_MACOS_RENAME",
-            "EXCLUDE_MACOS_FILENAME",
             "EXCLUDE_ROOT",
             "EXCLUDE_TTY",
             "EXCLUDE_VM_TIMING",
@@ -191,7 +188,7 @@ class GuestScriptTests(unittest.TestCase):
         groups = self.exclusion_groups()
         names = [n for entries in groups.values() for n in entries]
         self.assertEqual(len(names), len(set(names)), "duplicate exclusion entries")
-        self.assertEqual(len(names), 23, "the documented exclusion count changed")
+        self.assertEqual(len(names), 19, "the documented exclusion count changed")
 
     def test_every_exclusion_is_applied_to_the_guest_filter(self):
         """Declaring a group but not using it would silently re-enable tests."""

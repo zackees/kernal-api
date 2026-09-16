@@ -1046,3 +1046,65 @@ mod macos_tests {
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+/// A cheap digest of the images currently mapped into this process.
+///
+/// Deliberately far cheaper than [`enumerate_modules`], which is why it
+/// exists: this reads the mapping table and hashes it, but never opens or
+/// parses a module image -- the work that dominates enumeration. Callers use
+/// it to decide whether a cached inventory and unwinder are still valid
+/// (#131). Any change to the mapped set, its paths, its identities, or its
+/// address ranges changes the digest.
+pub(crate) fn loaded_image_signature() -> std::io::Result<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let images = linux_images()?;
+    images.len().hash(&mut hasher);
+    for image in &images {
+        image.path.hash(&mut hasher);
+        image.device_major.hash(&mut hasher);
+        image.device_minor.hash(&mut hasher);
+        image.inode.hash(&mut hasher);
+        for range in &image.mapped_ranges {
+            range.start.hash(&mut hasher);
+            range.end.hash(&mut hasher);
+        }
+        for range in &image.executable_ranges {
+            range.start.hash(&mut hasher);
+            range.end.hash(&mut hasher);
+        }
+    }
+    Ok(hasher.finish())
+}
+
+#[cfg(target_os = "macos")]
+/// A cheap digest of the images currently loaded into this process.
+///
+/// Deliberately far cheaper than [`enumerate_modules`], which is why it
+/// exists: it asks dyld for the loaded-image list and hashes what it returns,
+/// but never opens or parses a Mach-O -- the work that dominates enumeration.
+/// Callers use it to decide whether a cached inventory and unwinder are still
+/// valid (#131). The image header pointer is included so a dropped and
+/// re-loaded image at the same index is still seen as a change.
+pub(crate) fn loaded_image_signature() -> std::io::Result<u64> {
+    use std::ffi::CStr;
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let count = unsafe { _dyld_image_count() };
+    count.hash(&mut hasher);
+    for index in 0..count {
+        let name = unsafe { _dyld_get_image_name(index) };
+        let header = unsafe { _dyld_get_image_header(index) };
+        if name.is_null() || header.is_null() {
+            continue;
+        }
+        let path = unsafe { CStr::from_ptr(name) };
+        path.to_bytes().hash(&mut hasher);
+        (header as u64).hash(&mut hasher);
+        unsafe { _dyld_get_image_vmaddr_slide(index) }.hash(&mut hasher);
+    }
+    Ok(hasher.finish())
+}

@@ -529,15 +529,113 @@ fn build_unix_unwinder(modules: &[LoadedModule]) -> ArchUnwinder<Vec<u8>> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 /// Resolve every raw sample against the current process's ELF/Mach-O images.
+///
+/// One-shot: builds the module inventory and unwinder, uses them once, and
+/// drops them. A session that resolves repeatedly should hold a
+/// [`FrameResolver`] instead, which is the whole reason that type exists.
 pub fn resolve_frames_for_current_process(snapshot: &mut Snapshot) -> std::io::Result<()> {
-    let modules = super::modules::enumerate_modules()?;
-    let unwinder = build_unix_unwinder(&modules);
-    let mut cache = ArchCache::new();
-    for sample in &mut snapshot.threads {
-        sample.frames = unwind_sample(&unwinder, &mut cache, sample, &modules);
+    FrameResolver::new().resolve(snapshot)
+}
+
+/// A frame resolver that keeps its module inventory and unwinder between
+/// captures.
+///
+/// Building those costs far more than the capture they describe. Measured on
+/// a debug `--all-features` build, one `resolve_frames_for_current_process`
+/// spent ~736 ms: ~560 ms enumerating modules and ~176 ms constructing the
+/// unwinder. A session that called it per tick therefore sampled at whatever
+/// rate 736 ms per capture allows, no matter what `hz` asked for (#131).
+///
+/// The image set is not fixed for the life of a process -- `dlopen` adds one,
+/// `dlclose` removes one -- so reuse is conditional rather than unconditional:
+/// every call recomputes a cheap digest of the mapped images and rebuilds only
+/// when it changes. That check reads the mapping table and hashes it without
+/// opening or parsing a single image, so it costs a fraction of a rebuild
+/// rather than being a cheaper version of one.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub struct FrameResolver {
+    /// Set once the inventory has been built. Until then `signature` means
+    /// nothing and the first `refresh` builds unconditionally.
+    built: bool,
+    signature: u64,
+    modules: Vec<LoadedModule>,
+    unwinder: ArchUnwinder<Vec<u8>>,
+    /// How many times the inventory has been rebuilt. Exists so a test can
+    /// assert the cache's behaviour directly instead of inferring it from
+    /// timing or from a module count that legitimately excludes images
+    /// without resolvable unwind metadata.
+    #[cfg(test)]
+    rebuilds: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Default for FrameResolver {
+    fn default() -> Self {
+        Self::new()
     }
-    snapshot.frames_resolved = true;
-    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl FrameResolver {
+    /// Prepare a resolver. The inventory is built by the first [`Self::resolve`].
+    ///
+    /// Deliberately does no work: building here would bake in a signature
+    /// taken before the caller's own first capture, and the very next
+    /// `refresh` would see a different one and rebuild immediately --
+    /// paying for the inventory twice on the first tick, which is exactly
+    /// what the first version of this type did.
+    pub fn new() -> Self {
+        Self {
+            built: false,
+            signature: 0,
+            modules: Vec::new(),
+            unwinder: ArchUnwinder::new(),
+            #[cfg(test)]
+            rebuilds: 0,
+        }
+    }
+
+    /// Build the inventory, or rebuild it if the mapped images changed.
+    fn refresh(&mut self) -> std::io::Result<()> {
+        let signature = super::modules::loaded_image_signature()?;
+        if self.built && signature == self.signature {
+            return Ok(());
+        }
+        self.built = true;
+        self.modules = super::modules::enumerate_modules()?;
+        self.unwinder = build_unix_unwinder(&self.modules);
+        self.signature = signature;
+        #[cfg(test)]
+        {
+            self.rebuilds += 1;
+        }
+        Ok(())
+    }
+
+    /// Resolve every raw sample in `snapshot` against the current images.
+    pub fn resolve(&mut self, snapshot: &mut Snapshot) -> std::io::Result<()> {
+        self.refresh()?;
+        let mut cache = ArchCache::new();
+        for sample in &mut snapshot.threads {
+            sample.frames = unwind_sample(&self.unwinder, &mut cache, sample, &self.modules);
+        }
+        snapshot.frames_resolved = true;
+        Ok(())
+    }
+
+    /// How many times the inventory has been rebuilt since construction.
+    #[cfg(test)]
+    pub(crate) fn rebuild_count(&self) -> u64 {
+        self.rebuilds
+    }
+
+    /// The number of modules in the cached inventory.
+    ///
+    /// Exposed so a caller can observe that the cache is being reused rather
+    /// than rebuilt, and so tests can assert the invalidation story.
+    pub fn module_count(&self) -> usize {
+        self.modules.len()
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -638,6 +736,184 @@ mod tests {
                 .iter()
                 .map(|s| s.frames.len())
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod resolver_tests {
+    use super::*;
+    use crate::snapshot::{capture_all_threads, SnapshotConfig};
+
+    fn capture() -> Snapshot {
+        capture_all_threads(&SnapshotConfig::default()).expect("capture")
+    }
+
+    /// Serialize these tests. They observe a *process-wide* signal -- the
+    /// mapped image table -- and the invalidation tests change it deliberately,
+    /// so running them concurrently makes one test's rebuild look like
+    /// another's. Holding this for the body of each test keeps them
+    /// independent without changing what they assert.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The first resolve builds the inventory exactly once.
+    ///
+    /// Pins a real defect: an earlier version built in `new()`, so the first
+    /// `resolve` saw a signature taken before the caller's own capture, found
+    /// it different, and rebuilt immediately -- paying for the inventory twice
+    /// on the first tick in a session that only ever got one.
+    #[test]
+    fn builds_the_inventory_once_on_the_first_resolve() {
+        let _serial = serial();
+        let mut resolver = FrameResolver::new();
+        assert_eq!(resolver.rebuild_count(), 0, "construction must do no work");
+        assert_eq!(resolver.module_count(), 0, "no inventory before the first resolve");
+        let mut snapshot = capture();
+        resolver.resolve(&mut snapshot).expect("resolve");
+        assert_eq!(
+            resolver.rebuild_count(),
+            1,
+            "the first resolve must build once, not twice"
+        );
+        assert!(resolver.module_count() > 0, "inventory must not be empty");
+    }
+
+    /// Resolving must work on every capture, not only the first.
+    #[test]
+    fn resolves_frames_across_repeated_captures() {
+        let _serial = serial();
+        let mut resolver = FrameResolver::new();
+        for round in 0..3 {
+            let mut snapshot = capture();
+            resolver.resolve(&mut snapshot).expect("resolve");
+            assert!(snapshot.frames_resolved, "round {round} left frames unresolved");
+        }
+    }
+
+    /// Once built, an unchanged image set is reused rather than rebuilt.
+    #[test]
+    fn reuses_the_inventory_when_no_module_changes() {
+        let _serial = serial();
+        let mut resolver = FrameResolver::new();
+        let mut snapshot = capture();
+        resolver.resolve(&mut snapshot).expect("resolve");
+        let built = resolver.rebuild_count();
+        let modules = resolver.module_count();
+        assert!(built > 0);
+
+        let mut snapshot = capture();
+        resolver.resolve(&mut snapshot).expect("resolve");
+        assert_eq!(
+            resolver.rebuild_count(),
+            built,
+            "an unchanged image set must not rebuild"
+        );
+        assert_eq!(resolver.module_count(), modules);
+    }
+
+    /// A library to load for the invalidation tests: the first that opens and
+    /// is not already part of the process.
+    ///
+    /// By soname, which the loader resolves through its cache. That is how a
+    /// normal glibc host works and how CI resolves it; a host without a
+    /// populated cache (NixOS, for one) resolves none of these, and the tests
+    /// below say so and skip rather than pretend to have run. Hard-coding an
+    /// absolute path would only move the problem to every other host.
+    #[cfg(target_os = "linux")]
+    fn load_a_new_module() -> Option<*mut libc::c_void> {
+        const CANDIDATES: [&std::ffi::CStr; 8] = [
+            c"libbz2.so.1.0",
+            c"libexpat.so.1",
+            c"liblzma.so.5",
+            c"libncurses.so.6",
+            c"libpcre2-8.so.0",
+            c"libffi.so.8",
+            c"libxml2.so.2",
+            c"libreadline.so.8",
+        ];
+        let before = super::super::modules::loaded_image_signature().ok()?;
+        for candidate in CANDIDATES {
+            let handle = unsafe { libc::dlopen(candidate.as_ptr(), libc::RTLD_NOW) };
+            if handle.is_null() {
+                continue;
+            }
+            // `dlopen` on a library the process already holds returns a handle
+            // but changes nothing, so a candidate is only usable once the
+            // digest has actually moved. Checking here keeps the tests from
+            // asserting against a no-op.
+            if super::super::modules::loaded_image_signature().ok()? != before {
+                return Some(handle);
+            }
+            unsafe { libc::dlclose(handle) };
+        }
+        None
+    }
+
+    /// Skip with a visible note. A silent pass would read as coverage the run
+    /// did not have.
+    #[cfg(target_os = "linux")]
+    macro_rules! require_a_loadable_module {
+        () => {
+            match load_a_new_module() {
+                Some(handle) => handle,
+                None => {
+                    println!(
+                        "SKIP: no candidate library resolvable by soname on this host, so \
+                         mid-session module loading was not exercised"
+                    );
+                    return;
+                }
+            }
+        };
+    }
+
+    /// The digest must move when the mapped images move, or the cache would
+    /// serve a stale inventory forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signature_tracks_loaded_images() {
+        let _serial = serial();
+        let handle = require_a_loadable_module!();
+        let during = super::super::modules::loaded_image_signature().expect("signature");
+        unsafe { libc::dlclose(handle) };
+        let after = super::super::modules::loaded_image_signature().expect("signature");
+        assert_ne!(
+            during, after,
+            "unloading a module must change the digest as loading one does"
+        );
+    }
+
+    /// The cache must respond to a changed image set -- that is what makes
+    /// reuse safe rather than merely fast.
+    ///
+    /// Tolerant about the exact count on purpose: tests in this binary run in
+    /// parallel threads, and any of them that loads a library moves the
+    /// process-wide mapping table, which is precisely the signal being
+    /// watched. The digest halves are asserted exactly, because loading and
+    /// unloading a module the process did not already hold must move it; the
+    /// rebuild half asserts that a change produces at least one rebuild.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rebuilds_when_the_image_set_changes() {
+        let _serial = serial();
+        let mut resolver = FrameResolver::new();
+        let mut snapshot = capture();
+        resolver.resolve(&mut snapshot).expect("resolve");
+        let before = resolver.rebuild_count();
+
+        let handle = require_a_loadable_module!();
+        let mut snapshot = capture();
+        resolver.resolve(&mut snapshot).expect("resolve");
+        let after = resolver.rebuild_count();
+        unsafe { libc::dlclose(handle) };
+
+        assert!(
+            after > before,
+            "a module loaded mid-session must cause a rebuild: {before} -> {after}"
         );
     }
 }

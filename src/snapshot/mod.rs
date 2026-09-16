@@ -230,6 +230,52 @@ pub fn capture_and_resolve(config: &SnapshotConfig) -> Result<Snapshot, Snapshot
     }
 }
 
+/// A capture-and-resolve handle for callers that capture repeatedly.
+///
+/// [`capture_and_resolve`] is the one-shot form, and on Linux and macOS it
+/// rebuilds the module inventory and unwinder on every call. That is fine once
+/// and ruinous in a loop: measured on a debug `--all-features` build a single
+/// call spent ~736 ms there, which caps a sampling session's rate at whatever
+/// ~736 ms per capture allows regardless of the rate it requested (#131).
+///
+/// This type keeps that work between captures and rebuilds it only when the
+/// mapped images change, so a session samples at the cadence it asked for
+/// while still seeing a `dlopen`ed module. On Windows the inventory is
+/// enumerated per capture, as it was before, because that platform builds it
+/// from the toolhelp snapshot rather than from an executable's own images.
+pub struct SessionResolver {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    resolver: unwind::FrameResolver,
+    config: SnapshotConfig,
+}
+
+impl SessionResolver {
+    /// Prepare a resolver. The inventory is built by the first
+    /// [`Self::capture`], not here.
+    pub fn new(config: &SnapshotConfig) -> Self {
+        Self {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            resolver: unwind::FrameResolver::new(),
+            config: *config,
+        }
+    }
+
+    /// Capture every sibling thread and resolve each capture to frames.
+    pub fn capture(&mut self) -> Result<Snapshot, SnapshotError> {
+        let mut snapshot = capture_all_threads(&self.config)?;
+        #[cfg(windows)]
+        {
+            let modules = modules::enumerate_modules()?;
+            unwind::resolve_frames(&mut snapshot, &modules);
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.resolver.resolve(&mut snapshot)?;
+        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+        return Err(SnapshotError::Unsupported);
+        Ok(snapshot)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

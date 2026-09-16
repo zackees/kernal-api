@@ -1,6 +1,6 @@
 [package]
 name = "kernal-api-build"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 rust-version = "1.95.0"
 description = "Build-script companion to kernal-api: Windows executable resources"

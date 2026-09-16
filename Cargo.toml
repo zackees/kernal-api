@@ -470,6 +470,11 @@ targets = [
 ]
 
 [workspace]
+# The build-script companion is a separate package, not a feature: a
+# `dep-name/feature-name` entry in an application applies to every
+# dependency of that name, so a feature here would drag this crate's
+# runtime capabilities into the application's host build script.
+members = ["crates/kernal-api-build"]
 exclude = ["src/wasm/generated/v1/guest"]
 
 [workspace.metadata.dylint]

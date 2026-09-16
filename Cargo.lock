@@ -2877,6 +2877,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-api-build"
+version = "0.1.2"
+dependencies = [
+ "embed-resource",
+]
+
+[[package]]
 name = "keyboard-types"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

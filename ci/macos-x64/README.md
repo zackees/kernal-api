@@ -48,6 +48,19 @@ A Recovery guest has no toolchain of its own, so the archive must be
 self-contained. It is: every fixture these tests read is `include_str!`/
 `include_bytes!` and therefore already inside the test binaries.
 
+## Why the guest writes a stub `Cargo.toml`
+
+Replaying an archive makes nextest require a workspace root that contains a
+`Cargo.toml` (`ReuseWithWorkspaceRemap`), and it exits **96** without one —
+before running a single test. The guest has no source tree and does not need
+one, because nothing that runs reads it, so `recovery-guest.sh` writes a
+minimal empty-workspace manifest and points `--workspace-remap` at it. The stub
+satisfies nextest's root check and leaves config discovery empty, which is what
+the archive's own `cargo-metadata.json` already implies.
+
+The four source-inspection tests that *would* read the tree are excluded, so
+the stub never has to stand in for real source.
+
 ## What the guest does not run
 
 - **`#[ignore]`d tests** are skipped by nextest by default. That covers every

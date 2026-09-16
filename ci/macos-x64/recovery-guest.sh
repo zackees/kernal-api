@@ -57,6 +57,18 @@ chmod +x "$WORK/$NEXTEST_BIN"
 # one that built the archive rather than assuming it.
 "$WORK/$NEXTEST_BIN" nextest --version > "$COLLECT/nextest-version.txt" 2>&1 || true
 
+# Replaying an archive makes nextest require a workspace root containing a
+# Cargo.toml (`ReuseWithWorkspaceRemap`), and it exits 96 without one. The guest
+# has no source tree and does not need one: every fixture these tests read is
+# compiled into the binaries, and the four tests that do read the tree are
+# excluded above. The stub satisfies the root check and leaves config discovery
+# empty, which is what the archive's own cargo-metadata.json already implies.
+# Written with printf rather than a heredoc because this script arrives as
+# typed input, not as a file with a real shebang.
+WORKSPACE="$WORK/workspace"
+mkdir -p "$WORKSPACE"
+printf '%s\n' '[workspace]' 'members = []' > "$WORKSPACE/Cargo.toml"
+
 FILTER="$POLICY_FILTER"
 EXTRA_FILTER="$(cat "$WORK/filter.txt" 2>/dev/null || true)"
 if [ -n "$EXTRA_FILTER" ]; then
@@ -66,7 +78,7 @@ echo "$FILTER" > "$COLLECT/filter.txt"
 
 # --no-fail-fast: one guest boot is expensive, so a run must report every
 # failure it can find rather than stopping at the first.
-"$WORK/$NEXTEST_BIN" nextest run --archive-file "$WORK/$ARCHIVE" --workspace-remap "$WORK" --no-fail-fast -E "$FILTER" > "$COLLECT/nextest.log" 2>&1
+"$WORK/$NEXTEST_BIN" nextest run --archive-file "$WORK/$ARCHIVE" --workspace-remap "$WORKSPACE" --no-fail-fast -E "$FILTER" > "$COLLECT/nextest.log" 2>&1
 echo $? > "$COLLECT/nextest.rc"
 
 echo "--- nextest log tail ---"

@@ -141,6 +141,18 @@ class GuestScriptTests(unittest.TestCase):
             with self.subTest(binary=binary):
                 self.assertIn(binary, text)
 
+    def test_provides_the_workspace_root_nextest_requires(self):
+        """Replaying an archive needs a Cargo.toml at the remap root.
+
+        Without it nextest exits 96 before running a single test, and the
+        failure reads as a nextest setup error rather than a missing stub.
+        """
+        text = GUEST_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("Cargo.toml", text)
+        self.assertRegex(text, r'--workspace-remap "\$WORKSPACE"')
+        # The scratch directory has no manifest, so it cannot be the root.
+        self.assertNotRegex(text, r'--workspace-remap "\$WORK"')
+
     def test_never_exits_non_zero_so_evidence_always_returns(self):
         """A guest boot costs minutes; a failure must still report."""
         text = GUEST_SCRIPT.read_text(encoding="utf-8")

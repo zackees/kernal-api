@@ -239,11 +239,20 @@ impl ProfileSession {
     ///
     /// Returns raw metrics; call [`Self::resolve`] to attach names.
     pub fn run(&self) -> ProfileMetrics {
-        use crate::snapshot::{capture_and_resolve, SnapshotConfig};
+        use crate::snapshot::{SessionResolver, SnapshotConfig};
 
         let started = Instant::now();
         let period = Duration::from_nanos(self.request.period_nanos());
         let config = SnapshotConfig::default();
+        // One resolver for the session. Resolving per tick rebuilt the module
+        // inventory and unwinder on every capture, which capped the effective
+        // rate near a sample per second no matter what `hz` asked for (#131).
+        // It builds its inventory on the first tick rather than here, so a
+        // session that stops before sampling -- a ring that is already full --
+        // pays nothing for one it would never resolve against, and it still
+        // rebuilds when the mapped images change, so a module loaded
+        // mid-session is attributed rather than missed.
+        let mut resolver = SessionResolver::new(&config);
 
         let mut buffer_full = false;
         let mut threads_at_start = 0u64;
@@ -273,7 +282,7 @@ impl ProfileSession {
             // would silently be lower than the one reported in the metrics.
             next += period;
 
-            if let Ok(snapshot) = capture_and_resolve(&config) {
+            if let Ok(snapshot) = resolver.capture() {
                 pause_nanos = pause_nanos.saturating_add(snapshot.stats.pause_nanos);
                 threads_at_start = threads_at_start.max(u64::from(snapshot.stats.threads_total));
 

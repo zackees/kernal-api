@@ -671,6 +671,59 @@ fn backend_types_are_absent_from_public_type_positions() {
     }
 }
 
+/// A public declaration wrapped across line breaks must still be examined.
+///
+/// #147: the scan read `pub` lines one at a time, so a backend path on a
+/// continuation line was invisible to it. The resolving Dylint could not cover
+/// the gap either -- its job runs on Linux, so a `#[cfg(windows)]` body is
+/// never compiled and never linted. Both guards reported clean while a raw
+/// `winapi::` type sat in a public Windows signature.
+#[test]
+fn wrapped_public_signatures_are_scanned_across_line_breaks() {
+    let source = "\
+pub fn wrapped_backend_parameter(
+    record: &libc::timespec,
+) -> Option<u32> {
+    0
+}
+
+pub(crate) fn private_wrapped_backend_parameter(
+    record: &libc::timespec,
+) -> Option<u32> {
+    0
+}
+
+pub fn wrapped_backend_in_a_comment(
+    // libc::timespec is mentioned only here
+    record: u32,
+) -> Option<u32> {
+    0
+}
+";
+    let positions = public_type_positions(source);
+    let naming_backend: Vec<&(usize, String)> = positions
+        .iter()
+        .filter(|(_, position)| position.contains("libc::"))
+        .collect();
+
+    assert!(
+        !naming_backend.is_empty(),
+        "a backend path in a wrapped public signature must be scanned: {positions:?}"
+    );
+    // Exactly one: the `pub(crate)` declaration is not a public type position,
+    // and a comment is not a type position at all.
+    assert_eq!(
+        naming_backend.len(),
+        1,
+        "only the public signature should be reported: {naming_backend:?}"
+    );
+    assert!(
+        naming_backend[0].0 == 1,
+        "the position should be reported at the declaration's first line: {:?}",
+        naming_backend[0]
+    );
+}
+
 /// Split a single-line tuple-struct declaration into its header -- name,
 /// generics, and bounds -- and its parenthesized field list.
 fn tuple_struct_split(line: &str) -> Option<(&str, &str)> {
@@ -695,42 +748,60 @@ fn inline_brace_struct_split(line: &str) -> Option<(&str, &str)> {
 
 /// The one-based line number and type-bearing text of every public type
 /// position in `source`.
-fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
+///
+/// A declaration that continues past its first line is **joined before it is
+/// examined**. That is the whole point of the joining: a per-line scan cannot
+/// see a backend path sitting on a continuation line, and that is precisely the
+/// shape that let a raw `winapi::` type reach a public Windows signature while
+/// both guards reported clean (#147).
+fn public_type_positions(source: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = source.lines().collect();
     let mut positions = Vec::new();
     // Indentation of the `pub enum`/`pub struct` header whose body is open,
     // plus whether every field of that body is public. A `pub(crate)` field
     // does not begin with `pub `, so it is not a public type position; every
     // field of a public enum variant is as visible as the enum itself.
     let mut open: Option<(usize, bool)> = None;
-    for (index, raw) in source.lines().enumerate() {
-        let line = raw.trim_start();
-        let indent = raw.len() - line.len();
-        if line.starts_with("//") {
+    let mut index = 0;
+    while index < lines.len() {
+        let raw = lines[index];
+        let indent = raw.len() - raw.trim_start().len();
+        let line = strip_trailing_comment(raw.trim_start());
+        if line.is_empty() {
+            index += 1;
             continue;
         }
         if let Some((body_indent, fields_are_public)) = open {
             if line == "}" && indent == body_indent {
                 open = None;
             } else if fields_are_public || line.starts_with("pub ") {
-                positions.push((index + 1, line));
+                positions.push((index + 1, line.to_string()));
             }
+            index += 1;
             continue;
         }
         if !line.starts_with("pub ") {
+            index += 1;
+            continue;
+        }
+        let (joined, last) = joined_declaration(&lines, index);
+        let line = joined.as_str();
+        if line.is_empty() {
+            index = last + 1;
             continue;
         }
         // A `pub const`/`pub static` initializer is a value, not a type, and
         // the fields of a tuple struct carry their own visibility.
         let declaration = if line.starts_with("pub const") || line.starts_with("pub static") {
-            line.split('=').next().unwrap_or(line)
+            line.split('=').next().unwrap_or(line).to_string()
         } else if let Some((header, fields)) = tuple_struct_split(line) {
             if fields
                 .split(',')
                 .any(|field| field.trim_start().starts_with("pub "))
             {
-                line
+                line.to_string()
             } else {
-                header
+                header.to_string()
             }
         } else if let Some((header, fields)) = inline_brace_struct_split(line) {
             // `pub struct S { a: T }` written on one line never opens a body
@@ -740,22 +811,67 @@ fn public_type_positions(source: &str) -> Vec<(usize, &str)> {
                 .split(',')
                 .any(|field| field.trim_start().starts_with("pub "))
             {
-                line
+                line.to_string()
             } else {
-                header
+                header.to_string()
             }
         } else {
-            line
+            line.to_string()
         };
-        positions.push((index + 1, declaration));
-        if line.ends_with('{') {
-            let variant_fields_are_public = line.starts_with("pub enum");
-            if variant_fields_are_public || line.starts_with("pub struct") {
+        positions.push((index + 1, declaration.clone()));
+        if declaration.ends_with('{') {
+            let variant_fields_are_public = declaration.starts_with("pub enum");
+            if variant_fields_are_public || declaration.starts_with("pub struct") {
                 open = Some((indent, variant_fields_are_public));
             }
         }
+        index = last + 1;
     }
     positions
+}
+
+/// The code on `line`, without a trailing `//` comment.
+///
+/// Comments must not contribute type positions: a wrapped signature carrying a
+/// comment that names a backend crate would otherwise be reported as a
+/// violation of this policy by its own documentation.
+fn strip_trailing_comment(line: &str) -> &str {
+    match line.find("//") {
+        Some(index) => line[..index].trim_end(),
+        None => line,
+    }
+}
+
+/// The declaration beginning at `lines[start]`, joined across line breaks, and
+/// the index of its last line.
+///
+/// Ends at the `{` that opens a body or the `;` that closes the declaration,
+/// counting `(`/`[` nesting so a delimiter inside a parameter list does not end
+/// it early. A declaration never wraps past the end of the source.
+fn joined_declaration(lines: &[&str], start: usize) -> (String, usize) {
+    let mut joined = String::new();
+    let mut depth: usize = 0;
+    for (offset, raw) in lines[start..].iter().enumerate() {
+        let text = strip_trailing_comment(raw.trim());
+        if text.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push(' ');
+        }
+        joined.push_str(text);
+        for character in text.chars() {
+            match character {
+                '{' | ';' if depth == 0 => {
+                    return (joined.trim_end().to_string(), start + offset);
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    (joined.trim_end().to_string(), lines.len().saturating_sub(1))
 }
 
 #[test]

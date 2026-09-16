@@ -37,8 +37,15 @@ the integration tests and the two `required-features` worker binaries. A green
 `dylints` job means the whole crate is clean, not just the ungated core. The
 job runs on `ubuntu-latest`, so `cfg(windows)` and `cfg(target_os = "macos")`
 bodies remain unlinted by it; `tests/facade_policy.rs` scans those as text
-regardless of host. Narrowing the feature set is a coverage decision, not a
-knob: if it is ever narrowed, say here exactly which features remain covered.
+regardless of host. That scan joins a declaration wrapped across line breaks
+before matching it, so a backend path sitting on a continuation line is
+covered -- the gap that let a raw `winapi::` type reach a public signature
+until #147 closed it, since the resolving lint could not see a `cfg`-elided
+host either. It stays coarse in the ways a text scan must: it matches
+spellings rather than resolved types, so an alias that renames an owned crate
+is outside its reach, and that remains the lint's job where the lint runs.
+Narrowing the feature set is a coverage decision, not a knob: if it is ever
+narrowed, say here exactly which features remain covered.
 
 ## Platform-boundary status
 
@@ -75,6 +82,14 @@ backend's definition, so a client receives the backend type and inherits its
 versioning. Private and `pub(crate)` imports, and a `pub use` inside a module no
 client can reach, stay legal. `tests/facade_policy.rs` repeats the textual half
 of this check for hosts the Linux lint job never compiles.
+
+The owned set is not only third-party backends. It also carries the raw host
+bindings -- `libc`, `mach2`, `winapi`, `windows_sys` -- for the same reason:
+#77 collapsed the per-host bindings into this crate's private HAL, so a client
+that names one is speaking the host vocabulary the facade exists to absorb,
+and a `libc::termios` or a `windows_sys` handle in a public position here is
+the same leak as a backend type. Heavy private use inside the platform trees
+stays legal, exactly as it does for any other owned crate.
 
 The same coupling arrives from the other direction when this crate implements
 a backend's trait for one of its own exported types. `impl
@@ -122,10 +137,12 @@ then enable the strict ban for that client workspace. Temporary migration
 branches may carry both dependencies, but released code has no alternate
 runtime, network stack, process layer, or broker path behind a fallback.
 
-The `kernal_api::hash` BLAKE3 facade landed in #8 before any first-party
-client has migrated its content-hashing call sites. `blake3` is therefore not
-yet in the owned implementation set: enabling that direct-dependency ban now
-would block a client before its migration branch can consume the facade. Add
-it with normal, aliased, target, build, and test dependency fixtures when the
-first such client migration is ready; its released branch must not retain the
-legacy direct dependency.
+This document previously said that `blake3` was not yet in the owned
+implementation set, on the reasoning that the `kernal_api::hash` facade landed
+in #8 before any first-party client had migrated its content-hashing call
+sites. That is out of date and has been for some time: `blake3` is listed in
+`OWNED_IMPLEMENTATION_CRATES` (`dylints/kernal_api_boundary/src/lib.rs`), and
+the ban applies unconditionally -- `owned_crate_name` and
+`direct_owned_dependencies` consult that list with no per-client gate. A client
+that adds a direct `blake3` dependency is rejected today rather than pending a
+future migration.

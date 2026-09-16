@@ -70,6 +70,17 @@ impl PtySession {
     pub fn resize(&self, size: PtySize) -> io::Result<()> {
         self.master.resize(size)
     }
+
+    /// The externally meaningful process identifier for this session's child.
+    ///
+    /// A caller that must end a session from another thread uses this with
+    /// [`crate::platform::terminal::signal_pty_tree`]. The session itself is not
+    /// reachable then: this type is not `Sync`, and the thread that owns it is
+    /// typically parked inside [`PtySession::write`] on a full terminal input
+    /// queue, which is exactly the state that needs a way out.
+    pub fn pid(&self) -> Option<u32> {
+        self.master.preferred_pid(&self.child)
+    }
     pub fn try_wait(&mut self) -> io::Result<Option<u32>> {
         self.child.try_wait()
     }
@@ -125,6 +136,48 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "shell did not exit promptly");
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Signalling the reported pid is the documented escape from a write parked
+    /// on a full terminal input queue, so the pid must be one that ends the
+    /// child rather than merely identifying it.
+    #[cfg(unix)]
+    #[test]
+    fn reported_pid_terminates_the_session() {
+        let mut command = PtyCommand::new("/bin/sh");
+        command.arguments = vec!["-c".into(), "sleep 30".into()];
+        let (mut session, _reader) = PtySession::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("spawn a long-lived child in a PTY");
+
+        let pid = session
+            .pid()
+            .expect("a spawned session reports its child pid");
+        assert!(pid > 0, "pid must be a real identifier, got {pid}");
+        assert!(
+            session.try_wait().expect("poll child").is_none(),
+            "the child should still be running before it is signalled"
+        );
+
+        crate::platform::terminal::signal_pty_tree(pid, true).expect("signal the session tree");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if session.try_wait().expect("reap signalled child").is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "signalling the reported pid did not end the session"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }

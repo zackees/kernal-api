@@ -4,7 +4,7 @@ import kernal_api
 
 
 def test_python_and_rust_versions_are_explicit() -> None:
-    assert kernal_api.__version__ == "0.1.8"
+    assert kernal_api.__version__ == "0.1.9"
     assert kernal_api.RUST_MSRV == "1.95.0"
 
 

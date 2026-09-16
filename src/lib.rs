@@ -90,11 +90,6 @@ pub mod random;
 #[cfg(feature = "text-similarity")]
 pub mod text;
 
-/// Build-script embedding of a Windows executable's icon, version information
-/// and application manifest.
-#[cfg(feature = "windows-app-resources")]
-pub mod windows_resources;
-
 /// Bounded terminal key decoding and owned native polling.
 #[cfg(feature = "terminal-input")]
 pub mod keys;

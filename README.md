@@ -102,14 +102,30 @@ Optional features keep consumers from linking tooling they do not use:
   substrate gates its own copy. **Source break:** `platform::window_icon`,
   `set_window_icon_impl` and `window_icon_support_impl` were available on the
   default feature set before this release and now require `window-icon`
-- `windows-app-resources` for a Windows executable's icon, version
-  information and Common-Controls manifest. Enable it on a build-dependency
-  and call `windows_resources::embed_windows_app_resources` from `build.rs`:
-  Cargo only links a build script's resources into the package that runs it.
-  It does nothing for non-Windows targets
 - `wasm-sketch-host` for opt-in core-Wasm sketch admission; the real threaded
   Rust artifact fixture remains source-only under `guests/threaded-smoke`
 - `full` for diagnostic executables that need the entire non-daemon surface
+
+## Build-script companion
+
+`crates/kernal-api-build` is a separate package, published from this
+repository, for work that only an application's own `build.rs` can do.
+`kernal_api_build::embed_windows_app_resources` embeds a Windows executable's
+icon, version information and Common-Controls v6 manifest; on every other
+target it does nothing. Cargo links a build script's resources only into the
+binaries of the package that runs the script, so an application adds it as a
+build-dependency:
+
+```toml
+[build-dependencies]
+kernal-api-build = { git = "https://github.com/zackees/kernal-api.git", tag = "v0.1.7" }
+```
+
+It is deliberately not a feature of `kernal-api`: a `dep-name/feature-name`
+entry in an application's feature table applies to every dependency with that
+name, including the build-dependency, which would compile this crate's runtime
+capabilities for the host build script. This package depends only on the
+resource compiler.
 
 The four daemon slices are deliberately outside `full`, because each one
 carries a frozen wire that only an application already speaking it should

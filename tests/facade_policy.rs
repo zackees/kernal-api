@@ -10,6 +10,29 @@ fn http_parser_version_is_pinned_for_published_consumers() {
     assert!(manifest.contains("http-client = [\"dep:reqwest\", \"dep:bytes\", \"dep:hyper\"]"));
 }
 
+/// The build-script companion is released from this repository under the same
+/// tag, so a version bump that forgets it would ship a package claiming an
+/// older release.
+#[test]
+fn build_companion_version_matches_the_facade() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let version = |manifest: &str| {
+        manifest
+            .lines()
+            .find_map(|line| line.trim_end().strip_prefix("version = "))
+            .expect("manifest version")
+            .to_owned()
+    };
+    let facade = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    let companion = std::fs::read_to_string(root.join("crates/kernal-api-build/Cargo.toml"))
+        .expect("read companion manifest");
+    assert_eq!(
+        version(&companion),
+        version(&facade),
+        "crates/kernal-api-build must carry the same version as kernal-api"
+    );
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();
@@ -54,7 +77,6 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use console_api",
         "pub use console_subscriber",
         "pub use crash_handler",
-        "pub use embed_resource",
         "pub use framehop",
         "pub use globset",
         "pub use interprocess",
@@ -987,7 +1009,6 @@ fn published_documentation_renders_every_public_module() {
         "daemon-registration",
         "daemon-registration-v2",
         "window-icon",
-        "windows-app-resources",
     ] {
         assert!(
             readme.contains(&format!("`{feature}`")),

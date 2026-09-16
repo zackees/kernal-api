@@ -118,7 +118,7 @@ build-dependency:
 
 ```toml
 [build-dependencies]
-kernal-api-build = { git = "https://github.com/zackees/kernal-api.git", tag = "v0.1.10" }
+kernal-api-build = { git = "https://github.com/zackees/kernal-api.git", tag = "v0.1.11" }
 ```
 
 It is deliberately not a feature of `kernal-api`: a `dep-name/feature-name`

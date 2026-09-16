@@ -1,11 +1,22 @@
 //! Windows application resources for a binary's own build script.
 //!
-//! An executable's Explorer icon, version information and application
-//! manifest are resources linked into that executable. Cargo links a build
-//! script's resources only into the binaries of the package that runs it, so
-//! this capability is called from the application's `build.rs`: depend on this
-//! crate as a build-dependency with the `windows-app-resources` feature and
-//! call [`embed_windows_app_resources`]. On every other target it does nothing.
+//! An executable's Explorer icon, version information and application manifest
+//! are resources linked into that executable. Cargo links a build script's
+//! resources only into the binaries of the package that runs it, so an
+//! application depends on this package as a build-dependency and calls
+//! [`embed_windows_app_resources`] from its `build.rs`. On every other target
+//! the call does nothing.
+//!
+//! ```no_run
+//! use kernal_api_build::{embed_windows_app_resources, WindowsAppResources};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let resources = WindowsAppResources::new("Example Viewer", "example", env!("CARGO_PKG_VERSION"))?
+//!     .with_icon("icons/icon.ico");
+//! embed_windows_app_resources(&resources)?;
+//! # Ok(())
+//! # }
+//! ```
 //!
 //! The resource compiler is resolved privately: `rc.exe` from the Windows SDK
 //! on MSVC hosts, `llvm-rc` when cross-compiling to `*-pc-windows-msvc`, and
@@ -146,7 +157,7 @@ impl std::error::Error for WindowsResourceError {
 /// Compiles `resources` and links them into the calling package's binaries.
 ///
 /// Call this from `build.rs`. It does nothing unless the target OS is Windows.
-/// It prints the `cargo:rerun-if-changed` lines for the icon itself.
+/// It prints the `cargo:rerun-if-changed` line for the icon itself.
 pub fn embed_windows_app_resources(
     resources: &WindowsAppResources,
 ) -> Result<(), WindowsResourceError> {

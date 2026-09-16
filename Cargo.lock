@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "kernal-api"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "addr2line 0.24.2",
  "blake3",
@@ -2716,7 +2716,7 @@ dependencies = [
 
 [[package]]
 name = "kernal-api-build"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "embed-resource",
 ]

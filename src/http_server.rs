@@ -470,6 +470,12 @@ impl Server {
     /// Serve until cancelled or a listener error occurs. Connection tasks are
     /// owned by this future and cancelled on drop, including incomplete requests.
     ///
+    /// A connection that upgrades to a WebSocket outlives its HTTP exchange:
+    /// the connection task is held while the handed-off socket is in use, so it
+    /// counts against `max_connections` and is not subject to
+    /// `connection_timeout`, which bounds only the handshake. The upgraded
+    /// connection's lifetime belongs to the handler that received it.
+    ///
     /// # Errors
     /// Returns native listener errors; individual client failures are isolated.
     pub async fn serve<H, F>(self, handler: H) -> io::Result<()>
@@ -536,7 +542,26 @@ impl Server {
                         #[cfg(not(feature = "websocket"))]
                         let outcome = tokio::time::timeout(limits.connection_timeout, connection).await;
                         #[cfg(feature = "websocket")]
-                        upgrade_tasks.abort_all();
+                        {
+                            // A successful upgrade ends the HTTP connection while
+                            // the socket it handed off is still in use: with
+                            // `with_upgrades()`, hyper resolves this future as
+                            // soon as the `101` is written. The connection
+                            // budget therefore bounds the handshake, not the
+                            // lifetime of the upgraded connection, so remaining
+                            // upgrade tasks are drained and joined rather than
+                            // aborted. Aborting here killed every live upgrade
+                            // the moment it succeeded.
+                            upgrades_rx.close();
+                            while let Ok(task) = upgrades_rx.try_recv() {
+                                upgrade_tasks.spawn(task);
+                            }
+                            while let Some(result) = upgrade_tasks.join_next().await {
+                                if result.is_err() {
+                                    increment(&diagnostics.0.task_failures);
+                                }
+                            }
+                        }
                         match outcome {
                             Err(_) => increment(&diagnostics.0.connection_timeouts),
                             Ok(Err(_)) => increment(&diagnostics.0.connection_errors),

@@ -512,6 +512,11 @@ def main() -> None:
     build_parser.add_argument("--target", required=True, choices=TARGETS)
     build_parser.add_argument("--archive", type=Path, required=True)
     build_parser.add_argument("--work", type=Path, required=True)
+    target_parser = commands.add_parser(
+        "wasm-target",
+        help="Materialize a Wasm target, verifying it on disk rather than trusting rustup",
+    )
+    target_parser.add_argument("target", nargs="?", default=THREADS)
     run_parser = commands.add_parser("run")
     run_parser.add_argument("suite", choices=tuple(SUITES))
     run_parser.add_argument("--native-target", required=True, choices=TARGETS)
@@ -525,6 +530,8 @@ def main() -> None:
             parser.error(f"--{name} must be absolute caller-owned storage")
     if args.command == "guests":
         guests(args.out, args.work)
+    elif args.command == "wasm-target":
+        ensure_wasm_target(args.target)
     elif args.command == "build":
         build(args.target, args.archive, args.work)
     else:

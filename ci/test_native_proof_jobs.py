@@ -82,9 +82,20 @@ class NativeProofJobsTests(unittest.TestCase):
         job = self.job("screenshot-cli-guest-build")
         self.assertIn("runs-on: ubuntu-latest", job)
         self.assertLess(
-            job.index("rustup target add wasm32-wasip1-threads"),
+            job.index("native_proof.py wasm-target"),
             job.index(f"{native_proof.GUEST_BUILDING_SCREENSHOT_TEST} --exact --ignored"),
             "the CLI's guest build needs its Wasm target installed first",
+        )
+        # Materialize the target through the helper that verifies the
+        # libraries are on disk. A bare `rustup target add` installs nothing
+        # when a restored toolchain cache lists the target as present without
+        # its libraries, which failed this lane intermittently on unchanged
+        # commits until the two were told apart (#285).
+        self.assertIn("native_proof.py wasm-target wasm32-wasip1-threads", job)
+        self.assertNotRegex(
+            job,
+            r"run:\s*soldr rustup target add",
+            "install the Wasm target through ensure_wasm_target, not a bare rustup add",
         )
         self.assertIn('grep -F "test result: ok. 1 passed; 0 failed;"', job)
         source = (WORKFLOW.parents[2] / "ci/native_proof.py").read_text(encoding="utf-8")

@@ -79,9 +79,7 @@ jobs:
         # the extracted package with every advertised feature before publishing.
         # The generated sidecar manifest is the verified release input.
         # Allow exactly that staged release input into the package.
-        # `-p kernal-api`: the workspace also holds the build-script companion
-        # package, which is consumed from git and is not a registry artifact.
-        run: soldr cargo package -p kernal-api --locked --all-features --allow-dirty
+        run: soldr cargo package --locked --all-features --allow-dirty
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*

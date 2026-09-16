@@ -17,3 +17,7 @@ __pycache__/
 /examples/wasm-tauri-screenshot/guest/target/
 /examples/wasm-tauri-screenshot/guest/.cargo/*
 !/examples/wasm-tauri-screenshot/guest/.cargo/config.toml
+
+# macOS x86_64 guest lane: the staged share payload and the cross-built archive.
+/share/
+/kernal-x64.tar.zst

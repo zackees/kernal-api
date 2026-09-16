@@ -311,7 +311,8 @@ jobs:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Check the proof runner and the guest build scripts
         run: |
-          uv run --no-project -m unittest ci.test_native_proof ci.test_native_proof_jobs
+          uv run --no-project -m unittest \
+            ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1

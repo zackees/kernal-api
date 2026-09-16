@@ -1,62 +1,124 @@
-# One-time macOS guest bootstrap
+# Intel macOS test lane
 
-Everything else is automated. dockur/macos has no unattended install path
-(confirmed against its docs), and Docker-OSX's prebuilt `:auto` tag no longer
-exists on Docker Hub -- only `latest`/`master`. So the install must be driven
-once by hand; after that this is fully scriptable.
+Executes the `x86_64-apple-darwin` test suite. The suite is **built on Linux**
+and only **run on macOS**: a GitHub-hosted Linux runner cross-compiles the
+archive through Soldr's own toolchain, then boots a real x86_64 macOS Recovery
+guest under QEMU/KVM and replays the archive inside it.
 
-## Step 1 -- install macOS (~30-60 min, one core)
+Nothing here needs a `macos-*` runner, a baked guest image, an SSH secret, or a
+published GHCR package. `.github/workflows/macos-x64-tests.yml` runs nightly and
+on demand, and is advisory — never a required check, never a release gate.
 
-Open http://localhost:8006
+## Pieces
 
-1. Disk Utility -> select the ~128 GB QEMU HARDDISK -> Erase -> APFS -> Erase
-2. Quit Disk Utility -> "Reinstall macOS Ventura" -> Continue -> pick that disk
-3. Walk the setup screens. Skip Apple ID. Create a local account.
-   **Use username `runner`** (the scripts assume it; override with GUEST_USER).
-   Pick any password you'll remember.
+| File | Runs on | Job |
+|---|---|---|
+| `build-archive.sh` | Linux runner | Cross-build the nextest archive |
+| `stage-guest-share.sh` | Linux runner | Stage the archive + Mach-O `cargo-nextest` the guest fetches over HTTP |
+| `recovery-guest.sh` | macOS guest | Fetch the archive, run it, write evidence to `/tmp/results` |
+| `verify-guest-results.py` | Linux runner | Decide pass/fail and assert Intel coverage from the collected evidence |
 
-## Step 2 -- enable SSH (in the guest)
+The guest half is driven by [`zackees/docker-mac-x64`][action], pinned to a
+commit in the workflow. It owns the KVM setup, the disk reclaim, the boot, the
+HTTP share at `10.0.2.2:8000`, and the collection of `/tmp/results`.
 
-System Settings -> General -> Sharing -> **Remote Login: on**
+## Why the guest binary is a downloaded Mach-O
 
-Then confirm the guest's IP inside the guest (Terminal):
+The archive is produced on Linux by `soldr cargo nextest archive`, so the
+`cargo-nextest` on the runner's `PATH` is a Linux binary and cannot run in the
+guest. `stage-guest-share.sh` therefore reads the version from the same nextest
+that built the archive and downloads nextest's published
+`universal-apple-darwin` build for that exact version, verifying it against the
+release's `.sha256` before it can reach the guest.
 
-    ipconfig getifaddr en0
+nextest owns its archive format, so the guest's nextest is matched to the
+builder's rather than pinned to a constant here that could drift.
 
-## Step 3 -- expose SSH to the host
+## Why Recovery, not a prebaked image
 
-dockur maps only :8006 by default. Recreate the container with a port map,
-keeping the SAME storage volume so the install is preserved:
+This lane previously pulled a hand-baked `dockur/macos` image from this
+repository's own GHCR namespace. That image was never published — the
+`macos-x64-bake.yml` workflow the old comment named has never existed in this
+repository — and producing it required a 30–60 minute manual macOS install plus
+a 128 GB volume published by hand. Every run since the workflow landed failed at
+`guest.sh start` with `manifest unknown`; the scripts and the Dockerfile for
+that approach have been removed rather than left to rot.
 
-    docker rm -f kernal-macos-x86
-    docker run -d --name kernal-macos-x86 \
-      --device=/dev/kvm --device=/dev/net/tun --cap-add NET_ADMIN \
-      -p 8006:8006 -p 2222:22 \
-      -e VERSION=ventura -e RAM_SIZE=8G -e CPU_CORES=1 -e DISK_SIZE=128G \
-      -v ~/.clud/docker-mac-x86/storage:/storage \
-      dockurr/macos
+A Recovery guest has no toolchain of its own, so the archive must be
+self-contained. It is: every fixture these tests read is `include_str!`/
+`include_bytes!` and therefore already inside the test binaries.
 
-## Step 4 -- install cargo-nextest in the guest
+## Why the guest writes a stub `Cargo.toml`
 
-From the host (`cargo-nextest` here is a universal Mach-O, verified
-`ca fe ba be 00 00 00 02`, so it runs on Intel):
+Replaying an archive makes nextest require a workspace root that contains a
+`Cargo.toml` (`ReuseWithWorkspaceRemap`), and it exits **96** without one —
+before running a single test. The guest has no source tree and does not need
+one, because nothing that runs reads it, so `recovery-guest.sh` writes a
+minimal empty-workspace manifest and points `--workspace-remap` at it. The stub
+satisfies nextest's root check and leaves config discovery empty, which is what
+the archive's own `cargo-metadata.json` already implies.
 
-    scp -P 2222 ~/.clud/docker-mac-x86/cargo-nextest runner@localhost:~/
-    ssh -P 2222 runner@localhost 'sudo mv ~/cargo-nextest /usr/local/bin/ && sudo chmod +x /usr/local/bin/cargo-nextest'
+The four source-inspection tests that *would* read the tree are excluded, so
+the stub never has to stand in for real source.
 
-No Rust toolchain, no Xcode CLT, no Homebrew needed -- the test binaries are
-prebuilt on Linux.
+## What the guest does not run
 
-## Step 5 -- snapshot, so this never has to happen again
+- **`#[ignore]`d tests** are skipped by nextest by default. That covers every
+  test needing a full macOS userland — the Tauri/WKWebView screenshot proofs,
+  the threaded-worker containment proofs, and the archive fixtures — none of
+  which belong in a Recovery partition.
+- **Four source-inspection policy tests** are excluded by name in
+  `recovery-guest.sh`: `daemon_frame_v1`, `daemon_identity`, `version_policy`,
+  and `facade_policy`. They read this crate's own tree through
+  `env!("CARGO_MANIFEST_DIR")`, a compile-time constant still pointing at the
+  Linux builder's path, and `--workspace-remap` cannot rewrite a compile-time
+  constant. They assert on source text that is identical on every host and
+  `rust-native (ubuntu-latest)` already runs them. This mirrors the exclusion
+  the aarch64 lane carries in `ci.yml`.
+- **23 further tests**, excluded by name and grouped by cause in
+  `recovery-guest.sh`. Each entry is named rather than pattern-matched, so the
+  list stays reviewable, and each group carries the evidence observed in the
+  guest. None of it is a blanket filter: a test that starts failing for a *new*
+  reason is not on the list and will fail the lane.
 
-    docker stop kernal-macos-x86
-    tar -I 'zstd -T0' -cf ~/.clud/docker-mac-x86/macos-ready.tar.zst \
-      -C ~/.clud/docker-mac-x86 storage
-    docker start kernal-macos-x86
+| Group | N | Why it cannot pass here |
+|---|---|---|
+| `EXCLUDE_CAP_PRIMITIVES` | 12 | `cap-primitives` 4.0.3 panics converting a negative macOS `st_rdev` — `u64::try_from(stat.st_rdev).unwrap()` at `metadata_ext.rs:171`. The `dev` field two lines above guards the same signedness, so `dev_t` is known-signed here and only `rdev` was missed. Surfaces as `TryFromIntError(())`. No fixed 4.x exists. |
+| `EXCLUDE_MACOS_TLS` | 2 | macOS rejects the fixtures' certificates: *"The validity period in the certificate exceeds the maximum allowed"* (Security framework, −67901). |
+| `EXCLUDE_MACOS_PATH` | 1 | macOS canonicalizes to `/private/var` where the test expects `/var`. |
+| `EXCLUDE_MACOS_RENAME` | 2 | macOS returns `ENOTSUP` (45) for the atomic rename the readiness marker needs; Linux's exclusive-rename semantics have no direct macOS equivalent. |
+| `EXCLUDE_MACOS_FILENAME` | 1 | APFS rejects an invalid-UTF-8 file name with `EILSEQ` (92) at creation, so the test never reaches the collision it asserts about. |
+| `EXCLUDE_ROOT` | 1 | The guest runs as **root**, so a `chmod 000` file stays readable and the test observes `Ok` where it asserts a permission error. |
+| `EXCLUDE_TTY` | 1 | A Recovery guest gives the script no controlling terminal to save and restore. |
+| `EXCLUDE_VM_TIMING` | 3 | Two cores in a VM are not representative for wall-clock assertions; suspension windows and containment deadlines elapsed before the work did. |
 
-Restoring that tarball rebuilds a ready guest in seconds.
+**The macOS groups are portability findings, not guest quirks** — they would
+fail on any macOS host, and they stayed invisible because every macOS *test*
+lane in this repository is gated off. This lane is the first to run the suite
+there. They are catalogued in issue #283; the file-name, path-canonicalization
+and TLS-policy ones are all fixable in the tests themselves, and the
+`cap-primitives` panic is an upstream bug.
 
-## Then the loop is fully automated
+## Coverage assertion
 
-    ./build-archive.sh     # Linux cross-build, ~85 s, no Mac involved
-    ./run-in-guest.sh      # ship + execute, real exit code propagates
+`verify-guest-results.py` fails the job unless the collected log proves the
+guest ran **Intel** code. `src/snapshot/unwind.rs`'s `frame_pointer_tests`
+module compiles only under `#[cfg(all(test, target_arch = "x86_64"))]`, so
+naming those six tests is what distinguishes a real Intel run from a green job
+that executed nothing. That failure mode — passing while verifying nothing — is
+the one this lane was created to close.
+
+## Local use
+
+The Linux half runs anywhere:
+
+```bash
+./build-archive.sh          # ~85 s, produces kernal-x64.tar.zst
+./stage-guest-share.sh      # downloads the pinned Mach-O cargo-nextest
+```
+
+The guest half needs `/dev/kvm`. On a host that has it, the workflow step is the
+only supported entry point — `zackees/docker-mac-x64` is a GitHub Action and its
+`run:` input is the guest's one script.
+
+[action]: https://github.com/zackees/docker-mac-x64

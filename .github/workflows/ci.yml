@@ -726,11 +726,26 @@ jobs:
           soldr cargo check --locked
           --manifest-path tools/wasm-abi-generator/Cargo.toml
 
+  # A Dylint pass only sees what the compiler compiles. `cfg(windows)` and
+  # `cfg(target_os = "macos")` bodies are therefore invisible on a Linux host,
+  # which is how a raw `winapi::` type reached a public Windows signature while
+  # both guards reported clean (#147). One host per OS closes that: the lint
+  # runs where those bodies are compiled.
+  #
+  # This is the option #147 recommends, and it costs the two extra jobs the
+  # issue acknowledges. It runs counter to #270's direction of moving work off
+  # Apple and Windows runners, so it is a deliberate trade of runner minutes
+  # for coverage of the host-selected code rather than an oversight.
   dylints:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install native webview development packages
+        if: runner.os == 'Linux'
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
@@ -745,14 +760,21 @@ jobs:
           cargo-dylint-version: 6.0.3
           dylint-link-version: 6.0.3
       - name: Restore native pkg-config search path
+        if: runner.os == 'Linux'
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      # The lint harness shells out to `cargo` to build its fixtures, and that
+      # child inherits this PATH. The shim is what keeps it off the soldr
+      # wrapper and onto the pinned nightly. It ships as a script plus a `.cmd`,
+      # because Windows resolves a bare `cargo` through PATHEXT and would
+      # otherwise skip the extensionless script -- leaving this host quietly
+      # re-entering soldr while the job still reported green.
       - name: Select the pinned Dylint compiler
         shell: bash
         run: |
           rustc_path="$(soldr rustup which --toolchain nightly-2026-05-28 rustc)"
           echo "RUSTC=${rustc_path}" >> "${GITHUB_ENV}"
           echo "RUSTUP_TOOLCHAIN=nightly-2026-05-28" >> "${GITHUB_ENV}"
-          chmod +x ci/dylint-shim/cargo
+          chmod +x ci/dylint-shim/cargo ci/dylint-shim/cargo.cmd
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
       - name: Test facade boundary lint
         env:

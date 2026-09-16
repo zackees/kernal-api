@@ -260,19 +260,6 @@ impl SessionResolver {
         }
     }
 
-    /// How many times the cached inventory has been rebuilt.
-    #[cfg(test)]
-    pub(crate) fn rebuild_count(&self) -> u64 {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            self.resolver.rebuild_count()
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            0
-        }
-    }
-
     /// Capture every sibling thread and resolve each capture to frames.
     pub fn capture(&mut self) -> Result<Snapshot, SnapshotError> {
         let mut snapshot = capture_all_threads(&self.config)?;

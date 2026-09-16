@@ -726,21 +726,32 @@ jobs:
           soldr cargo check --locked
           --manifest-path tools/wasm-abi-generator/Cargo.toml
 
-  # A Dylint pass only sees what the compiler compiles. `cfg(windows)` and
-  # `cfg(target_os = "macos")` bodies are therefore invisible on a Linux host,
-  # which is how a raw `winapi::` type reached a public Windows signature while
-  # both guards reported clean (#147). One host per OS closes that: the lint
-  # runs where those bodies are compiled.
+  # A Dylint pass only sees what the compiler compiles, so `cfg(target_os =
+  # "macos")` bodies are invisible on a Linux host, which is how a raw host type
+  # reached a public signature while both guards reported clean (#147).
+  # `macos-15-intel` closes that half: the lint now runs where those bodies are
+  # compiled.
   #
-  # This is the option #147 recommends, and it costs the two extra jobs the
-  # issue acknowledges. It runs counter to #270's direction of moving work off
-  # Apple and Windows runners, so it is a deliberate trade of runner minutes
-  # for coverage of the host-selected code rather than an oversight.
+  # Windows is the other half, and is deliberately absent. `soldr cargo dylint`
+  # cannot run there at all: Soldr rejects its own managed `dylint-link` through
+  # a generic `--version`/`--help` probe that a working link wrapper cannot pass
+  # (it forwards the flags to `link.exe`), so the job exits 1 before compiling
+  # anything (zackees/soldr#3274). Verified on this branch -- `windows-2025`
+  # failed in 6m4s on that diagnostic while macOS passed.
+  #
+  # When that lands, add `windows-2025` back *and* a `ci/dylint-shim/cargo.cmd`
+  # beside the existing script: Windows resolves a bare `cargo` through PATHEXT
+  # and would skip the extensionless shim, silently re-entering soldr.
+  #
+  # This is the option #147 recommends, and it costs the extra job the issue
+  # acknowledges. It runs counter to #270's direction of moving work off Apple
+  # runners, so it is a deliberate trade of runner minutes for coverage of the
+  # host-selected code rather than an oversight.
   dylints:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15-intel, windows-2025]
+        os: [ubuntu-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -762,19 +773,13 @@ jobs:
       - name: Restore native pkg-config search path
         if: runner.os == 'Linux'
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      # The lint harness shells out to `cargo` to build its fixtures, and that
-      # child inherits this PATH. The shim is what keeps it off the soldr
-      # wrapper and onto the pinned nightly. It ships as a script plus a `.cmd`,
-      # because Windows resolves a bare `cargo` through PATHEXT and would
-      # otherwise skip the extensionless script -- leaving this host quietly
-      # re-entering soldr while the job still reported green.
       - name: Select the pinned Dylint compiler
         shell: bash
         run: |
           rustc_path="$(soldr rustup which --toolchain nightly-2026-05-28 rustc)"
           echo "RUSTC=${rustc_path}" >> "${GITHUB_ENV}"
           echo "RUSTUP_TOOLCHAIN=nightly-2026-05-28" >> "${GITHUB_ENV}"
-          chmod +x ci/dylint-shim/cargo ci/dylint-shim/cargo.cmd
+          chmod +x ci/dylint-shim/cargo
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
       - name: Test facade boundary lint
         env:

@@ -33,6 +33,29 @@ fn crash_handler_is_locked_at_exactly_one_version() {
     assert_eq!(versions, ["\"0.7.0\""]);
 }
 
+/// The build-script companion is released from this repository under the same
+/// tag, so a version bump that forgets it would ship a package claiming an
+/// older release.
+#[test]
+fn build_companion_version_matches_the_facade() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let version = |manifest: &str| {
+        manifest
+            .lines()
+            .find_map(|line| line.trim_end().strip_prefix("version = "))
+            .expect("manifest version")
+            .to_owned()
+    };
+    let facade = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    let companion = std::fs::read_to_string(root.join("crates/kernal-api-build/Cargo.toml"))
+        .expect("read companion manifest");
+    assert_eq!(
+        version(&companion),
+        version(&facade),
+        "crates/kernal-api-build must carry the same version as kernal-api"
+    );
+}
+
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();

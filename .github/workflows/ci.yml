@@ -661,10 +661,14 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-apple-darwin
             legacy_cargo: false
-          - os: windows-latest
+          # Windows compiles on Linux like the Apple targets (#273). The
+          # `--all-features` graph links vendored OpenSSL, which needed nmake
+          # until Soldr 0.9.17 shipped the static OpenSSL syslib for MSVC
+          # (zackees/soldr#3246, #3247) and handed it to `openssl-sys`.
+          - os: ubuntu-latest
             target: x86_64-pc-windows-msvc
             legacy_cargo: false
-          - os: windows-latest
+          - os: ubuntu-latest
             target: aarch64-pc-windows-msvc
             legacy_cargo: false
     runs-on: ${{ matrix.os }}
@@ -683,11 +687,10 @@ jobs:
         uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           # Prepared compiler/SDK archives and compiled crates are cached per
-          # target; `soldr build` compiles the dev profile. A Windows-hosted
-          # prepare yields no archive, and setup-soldr then fails the job, so
-          # those lanes stay uncached until they move to Linux with the static
-          # OpenSSL syslib (zackees/soldr#3246).
-          cache: ${{ !startsWith(matrix.os, 'windows') }}
+          # target; `soldr build` compiles the dev profile. Every lane here now
+          # prepares on Linux (#273), so the cache is unconditional: a
+          # Windows-hosted prepare yielded no archive and failed the job, which
+          # was the one exception this key used to carry.
           cache-key-suffix: supported-${{ matrix.target }}
           cross-targets: ${{ matrix.target }}
           prebuild-deps-flags: --target ${{ matrix.target }}

@@ -71,13 +71,15 @@ impl PtySession {
         self.master.resize(size)
     }
 
-    /// The externally meaningful process identifier for this session's child.
+    /// The externally meaningful process identifier for this session's child,
+    /// suitable for [`crate::platform::terminal::signal_pty_tree`].
     ///
-    /// A caller that must end a session from another thread uses this with
-    /// [`crate::platform::terminal::signal_pty_tree`]. The session itself is not
-    /// reachable then: this type is not `Sync`, and the thread that owns it is
-    /// typically parked inside [`PtySession::write`] on a full terminal input
-    /// queue, which is exactly the state that needs a way out.
+    /// This is informational and control-oriented, not an escape from a blocked
+    /// write. Signalling the process tree does **not** release a write parked on
+    /// a full terminal input queue: the kernel keeps that write blocked even
+    /// after every process holding the slave has been killed, so the parked
+    /// thread returns only when something finally drains the queue. Escaping
+    /// that state needs a non-blocking write on the master, not a signal.
     pub fn pid(&self) -> Option<u32> {
         self.master.preferred_pid(&self.child)
     }
@@ -139,9 +141,11 @@ mod tests {
         }
     }
 
-    /// Signalling the reported pid is the documented escape from a write parked
-    /// on a full terminal input queue, so the pid must be one that ends the
-    /// child rather than merely identifying it.
+    /// Signalling the reported pid must end the child, not merely identify it.
+    ///
+    /// This covers what the pid accessor actually promises. It deliberately does
+    /// not cover releasing a parked write: killing the tree does not do that,
+    /// and asserting otherwise would encode a false guarantee.
     #[cfg(unix)]
     #[test]
     fn reported_pid_terminates_the_session() {

@@ -355,4 +355,104 @@ mod tests {
         assert!(response.contains("sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"));
         serving.abort();
     }
+
+    /// A callback that does observable work must actually run.
+    ///
+    /// The switching-protocols response alone is not evidence of a live
+    /// connection: with `with_upgrades()`, hyper's connection future resolves
+    /// as soon as the `101` is written. An upgrade task that the server tears
+    /// down at that point still produces a successful handshake, so a client
+    /// sees an open socket followed by a close carrying no frames. This test
+    /// asserts the frame, which a do-nothing callback cannot.
+    #[tokio::test]
+    async fn upgrade_callback_delivers_a_frame_to_the_client() {
+        use futures_util::StreamExt;
+
+        let server = super::super::Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            super::super::Limits::default(),
+        )
+        .await
+        .unwrap();
+        let address = server.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(|request| async move {
+            match request.into_websocket() {
+                Ok(upgrade) => upgrade
+                    .on_upgrade(WebSocketLimits::default(), |mut socket| async move {
+                        let _ = socket.send(Message::Text("upgrade-alive".into())).await;
+                        // Stay alive so the client observes the frame instead of
+                        // racing an immediate close.
+                        let _ = socket.receive().await;
+                    })
+                    .unwrap(),
+                Err(_) => Response::new(400, Vec::new()).unwrap(),
+            }
+        }));
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = tokio_tungstenite::client_async("ws://localhost/ws", stream)
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("upgrade callback never delivered a frame")
+            .expect("connection closed before any frame arrived")
+            .expect("frame error");
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                assert_eq!(text.as_str(), "upgrade-alive");
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+        serving.abort();
+    }
+
+    /// `connection_timeout` bounds the handshake, not the upgraded connection.
+    ///
+    /// Wrapping the upgrade task back inside the connection budget would kill
+    /// every long-lived session at the budget, which for an interactive
+    /// terminal means an arbitrary mid-session disconnect.
+    #[tokio::test]
+    async fn upgraded_connection_outlives_the_connection_timeout() {
+        use futures_util::StreamExt;
+
+        let limits = super::super::Limits {
+            connection_timeout: std::time::Duration::from_millis(50),
+            ..super::super::Limits::default()
+        };
+        let server = super::super::Server::bind("127.0.0.1:0".parse().unwrap(), limits)
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let serving = tokio::spawn(server.serve(|request| async move {
+            match request.into_websocket() {
+                Ok(upgrade) => upgrade
+                    .on_upgrade(WebSocketLimits::default(), |mut socket| async move {
+                        // Far beyond the connection budget that already elapsed.
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let _ = socket.send(Message::Text("still-here".into())).await;
+                        let _ = socket.receive().await;
+                    })
+                    .unwrap(),
+                Err(_) => Response::new(400, Vec::new()).unwrap(),
+            }
+        }));
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut client, _) = tokio_tungstenite::client_async("ws://localhost/ws", stream)
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), client.next())
+            .await
+            .expect("upgraded connection was killed by the connection timeout")
+            .expect("connection closed before the frame arrived")
+            .expect("frame error");
+        match frame {
+            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                assert_eq!(text.as_str(), "still-here");
+            }
+            other => panic!("expected a text frame, got {other:?}"),
+        }
+        serving.abort();
+    }
 }

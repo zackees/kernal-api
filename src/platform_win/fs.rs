@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
+#[path = "fs/private_directory.rs"]
 mod private_directory;
 
 pub use private_directory::{create_dir_all_private, ensure_dir_private};

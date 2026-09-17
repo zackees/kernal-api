@@ -347,6 +347,39 @@ impl std::error::Error for ProcessIdentityActionError {
     }
 }
 
+/// Run a caller-owned command in the foreground and report its exit status.
+///
+/// Deliberately the *absence* of this facade's usual policy. Every other
+/// spawning operation here configures process groups, descriptor inheritance,
+/// consoles, owner-death behaviour or containment; this one configures nothing
+/// and inherits the caller's launch context exactly, which is what a tool a
+/// person is watching in their terminal needs. Standard streams keep whatever
+/// the command already specifies -- unset means inherited, as with
+/// [`std::process::Command::status`].
+///
+/// Use a contained or bounded operation when child ownership, timeouts or
+/// captured output matter; nothing here reaps, terminates, or drains for the
+/// caller.
+pub fn foreground_status(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::ExitStatus> {
+    command.status()
+}
+
+/// Run a caller-owned command in the foreground and collect what it wrote.
+///
+/// The capture half of [`foreground_status`], with the same absence of policy:
+/// stdout and stderr are captured unless the caller set them otherwise, and
+/// both streams are drained concurrently, exactly as
+/// [`std::process::Command::output`] does. Nothing bounds the output or the
+/// runtime -- reach for a bounded operation when a runaway child is a concern
+/// rather than an inherited terminal.
+pub fn foreground_output(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command.output()
+}
+
 /// Capture a process identity from the host's strongest native creation key.
 ///
 /// Callers must retain this value, not only its [`ProcessIdentity::pid`], for

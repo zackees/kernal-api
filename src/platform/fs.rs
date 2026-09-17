@@ -117,9 +117,11 @@ pub fn user_home_dir() -> Option<std::path::PathBuf> {
 
 #[cfg(feature = "fs")]
 pub use crate::{
+    fs_create_dir_all_private as create_dir_all_private,
     fs_create_private_file as create_private_file, fs_decode_path_bytes as decode_path_bytes,
-    fs_encode_path_bytes as encode_path_bytes, fs_file_identity as file_identity,
-    fs_is_lock_conflict as is_lock_conflict, fs_open_lock_file as open_lock_file,
+    fs_encode_path_bytes as encode_path_bytes, fs_ensure_dir_private as ensure_dir_private,
+    fs_file_identity as file_identity, fs_is_lock_conflict as is_lock_conflict,
+    fs_open_lock_file as open_lock_file, fs_open_shared_append as open_shared_append,
     fs_path_identity as path_identity, fs_replace_file as replace_file,
     fs_sync_directory as sync_directory, fs_user_config_dir as user_config_dir,
     fs_user_data_dir as user_data_dir, fs_user_run_data_root as user_run_data_root,
@@ -1150,6 +1152,76 @@ mod tests {
     use super::*;
 
     const PRODUCT: &str = "rp-fs-facade-test";
+
+    /// A directory this facade created is not writable by other users.
+    ///
+    /// Asserted through `ensure_dir_private`'s own report rather than against
+    /// mode bits or a DACL: the property is "already private", and each host
+    /// decides what that means. A caller that has just created the directory
+    /// must never be told it had to be repaired.
+    #[test]
+    fn a_freshly_created_private_directory_needs_no_tightening() {
+        let root = tempfile::tempdir().expect("temp root");
+        let nested = root.path().join("outer").join("inner");
+
+        create_dir_all_private(&nested).expect("create private directory");
+
+        assert!(nested.is_dir(), "the directory and its parents exist");
+        assert!(
+            !ensure_dir_private(&nested).expect("inspect a fresh private directory"),
+            "a directory this facade just created is already private"
+        );
+    }
+
+    /// Creating an existing private directory again is not an error.
+    ///
+    /// The operation composes like `create_dir_all`, so callers that always
+    /// create before use do not have to distinguish the first run from later
+    /// ones.
+    #[test]
+    fn creating_a_private_directory_twice_succeeds() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("twice");
+
+        create_dir_all_private(&path).expect("first create");
+        create_dir_all_private(&path).expect("second create");
+
+        assert!(path.is_dir());
+    }
+
+    /// Tightening reports a missing directory rather than inventing one.
+    #[test]
+    fn ensuring_a_missing_directory_is_private_reports_not_found() {
+        let root = tempfile::tempdir().expect("temp root");
+
+        let error = ensure_dir_private(&root.path().join("absent")).expect_err("missing directory");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// Appending keeps what an earlier handle wrote, and the bytes land in order.
+    ///
+    /// The shared-append contract is about not truncating and not excluding a
+    /// second opener; both handles here are live at once, which is the part
+    /// Windows would refuse under its default share mode.
+    #[test]
+    fn shared_append_preserves_earlier_bytes_and_admits_a_second_writer() {
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("log");
+
+        let mut first = open_shared_append(&path).expect("first append handle");
+        first.write_all(b"one\n").expect("first write");
+        let mut second = open_shared_append(&path).expect("second append handle");
+        second.write_all(b"two\n").expect("second write");
+        drop((first, second));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read back"),
+            "one\ntwo\n"
+        );
+    }
 
     /// Every role resolves to an absolute directory that names the product.
     ///

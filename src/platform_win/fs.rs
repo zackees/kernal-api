@@ -4,6 +4,28 @@ use std::fs::File;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
+#[path = "fs/private_directory.rs"]
+mod private_directory;
+
+pub use private_directory::{create_dir_all_private, ensure_dir_private};
+
+/// Open an append-only file without truncating the bytes already in it.
+///
+/// "Shared" is the Windows half of the contract: the default share mode on
+/// this host is exclusive, so a second appender -- or an operator's `type` --
+/// would be refused while the first handle lives. The Linux and macOS trees
+/// need no equivalent, because a POSIX open never claims that exclusion.
+pub fn open_shared_append(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+}
+
 /// Directory for `product`'s ephemeral runtime artifacts (pid files, run data).
 ///
 /// `LOCALAPPDATA` is per-user and non-roaming, which is what machine-local

@@ -274,6 +274,70 @@ pub fn sync_directory(directory: &Path) -> io::Result<()> {
     File::open(directory)?.sync_all()
 }
 
+/// Open an append-only file without truncating the bytes already in it.
+///
+/// A POSIX open claims no exclusion, so nothing here has to ask for sharing;
+/// the Windows tree does, which is why this capability is spelled the same on
+/// every host but implemented per tree.
+pub fn open_shared_append(path: &Path) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+/// Tighten a directory that group or others can write, reporting what it did.
+///
+/// `Ok(false)` means it was already private, `Ok(true)` that it was tightened,
+/// and `Err` that it is still exposed afterwards -- the three outcomes the
+/// Windows tree reports from its DACL, expressed here in mode bits.
+///
+/// A sticky directory is left alone. The sticky bit is this host's marker for
+/// a *shared* root -- `/tmp` and `/var/tmp` are `1777` by design -- so
+/// tightening one would be wrong for every other process on the machine, and
+/// as root it would succeed.
+pub fn ensure_dir_private(path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::metadata(path)?;
+    let full_mode = metadata.permissions().mode();
+    const STICKY: u32 = 0o1000;
+    if full_mode & STICKY != 0 {
+        return Ok(false);
+    }
+    if full_mode & 0o022 == 0 {
+        return Ok(false);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    // Read back rather than trusting the write: a filesystem that does not
+    // carry modes can report success and keep the old permissions.
+    let after = std::fs::metadata(path)?;
+    if after.permissions().mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is writable by others and could not be tightened",
+                path.display()
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+/// Create `path` and any missing parents owner-only from the moment they exist.
+///
+/// The mode goes to `mkdir(2)` itself, so no directory is ever briefly visible
+/// with a mode inherited from its parent -- the window the Windows tree has to
+/// close by passing a descriptor to `CreateDirectoryW`.
+pub fn create_dir_all_private(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+}
+
 /// Create a new file that only its owner can read, failing if it exists.
 ///
 /// `create_new` is part of the contract, not a convenience: a private file
@@ -433,4 +497,74 @@ pub fn read_context_regular_file_bounded(
         bytes,
         metadata: crate::platform::fs::context_regular_file_metadata(&after, identity)?,
     })
+}
+
+#[cfg(test)]
+mod private_directory_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
+    /// A group- or other-writable directory is tightened to owner-only.
+    ///
+    /// This is the mode-bit half of the contract, asserted where the mode bits
+    /// are the implementation: the facade test next to `ensure_dir_private`
+    /// can only state the host-neutral property.
+    #[test]
+    fn an_exposed_directory_is_tightened_to_owner_only() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("exposed");
+        std::fs::create_dir(&path).expect("create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).expect("expose");
+
+        assert!(ensure_dir_private(&path).expect("tighten"), "it was exposed");
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    /// An already-private directory is reported as such and left untouched.
+    #[test]
+    fn an_owner_only_directory_is_left_alone() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("private");
+        std::fs::create_dir(&path).expect("create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("tighten");
+
+        assert!(!ensure_dir_private(&path).expect("inspect"));
+        assert_eq!(mode_of(&path), 0o700);
+    }
+
+    /// A sticky directory is a shared root and is never tightened.
+    ///
+    /// `/tmp` is `1777` by design. Tightening one would break every other
+    /// process on the machine, and as root it would succeed -- so the sticky
+    /// bit is checked before the write, not after it fails.
+    #[test]
+    fn a_sticky_shared_root_is_not_tightened() {
+        let root = tempfile::tempdir().expect("temp root");
+        let path = root.path().join("shared");
+        std::fs::create_dir(&path).expect("create");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o1777)).expect("sticky");
+
+        assert!(!ensure_dir_private(&path).expect("inspect sticky"));
+        assert_eq!(mode_of(&path), 0o777, "the shared root keeps its mode");
+    }
+
+    /// Every directory the create path makes is owner-only, parents included.
+    ///
+    /// The mode goes to `mkdir(2)`, so this also asserts there is no window
+    /// where a parent exists with an inherited mode.
+    #[test]
+    fn created_directories_and_their_parents_are_owner_only() {
+        let root = tempfile::tempdir().expect("temp root");
+        let outer = root.path().join("outer");
+        let inner = outer.join("inner");
+
+        create_dir_all_private(&inner).expect("create");
+
+        assert_eq!(mode_of(&inner), 0o700);
+        assert_eq!(mode_of(&outer), 0o700);
+    }
 }

@@ -56,6 +56,7 @@ pub use process_owner_death::{
 pub(crate) mod host;
 pub use host::login_environment_block as host_login_environment_block;
 pub use host::{
+    cpu_compatibility_features as host_cpu_compatibility_features,
     boot_id as host_boot_id, current_process_privilege as host_current_process_privilege,
     current_user as host_current_user,
     environment_keys_are_case_insensitive as host_environment_keys_are_case_insensitive,
@@ -71,7 +72,10 @@ pub use host::{
 pub(crate) mod fs;
 #[cfg(feature = "fs")]
 pub use fs::{
-    create_private_file as fs_create_private_file, decode_path_bytes as fs_decode_path_bytes,
+    create_dir_all_private as fs_create_dir_all_private,
+    create_private_file as fs_create_private_file,
+    ensure_dir_private as fs_ensure_dir_private,
+    open_shared_append as fs_open_shared_append, decode_path_bytes as fs_decode_path_bytes,
     encode_path_bytes as fs_encode_path_bytes, file_identity as fs_file_identity,
     is_lock_conflict as fs_is_lock_conflict, lock_exclusive as fs_lock_exclusive,
     lock_shared as fs_lock_shared, open_lock_file as fs_open_lock_file,

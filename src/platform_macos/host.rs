@@ -338,6 +338,39 @@ fn encode_environment_block(entries: &[(OsString, OsString)]) -> Vec<u16> {
     block.push(0);
     block
 }
+/// Ordered compatibility-key feature subset this process can see.
+///
+/// Arch dispatch lives in the concrete host trees, not the neutral facade:
+/// `target_arch` is one of the selectors the platform-boundary rule bans
+/// outside them (#152). The three trees carry the same list on purpose --
+/// the probe is host-independent, and duplicating it is the price of keeping
+/// every `cfg` selector inside a selected tree.
+///
+/// Order and spellings are contractual: callers hash them, so an entry may be
+/// appended but never renamed or reordered.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn cpu_compatibility_features() -> Vec<&'static str> {
+    [
+        ("sse2", std::arch::is_x86_feature_detected!("sse2")),
+        ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
+        ("avx", std::arch::is_x86_feature_detected!("avx")),
+        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+        ("avx512f", std::arch::is_x86_feature_detected!("avx512f")),
+        ("fma", std::arch::is_x86_feature_detected!("fma")),
+        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
+        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
+    ]
+    .into_iter()
+    .filter_map(|(name, present)| present.then_some(name))
+    .collect()
+}
+
+/// No x86 compatibility-key features are reported on this architecture.
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+pub fn cpu_compatibility_features() -> Vec<&'static str> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

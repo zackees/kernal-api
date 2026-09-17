@@ -20,6 +20,19 @@ pub use crate::{
 
 pub use crate::host_login_environment_block as login_environment_block;
 
+/// Ordered compatibility-key feature subset this process can see.
+///
+/// On x86 and x86-64 this reports whichever of `sse2`, `sse4.2`, `avx`,
+/// `avx2`, `avx512f`, `fma`, `bmi1` and `bmi2` are detected, in that order.
+/// Every other architecture reports an empty list. This is neither a complete
+/// CPU inventory nor a host-architecture probe: it answers "which of the
+/// features a cache key cares about does this process have".
+///
+/// The order and the spellings are contractual -- [`cpu_identity_material`]
+/// hashes them, and so may callers -- so an entry may be added to the end but
+/// an existing one may not be renamed or reordered.
+pub use crate::host_cpu_compatibility_features as cpu_compatibility_features;
+
 /// Compile target of this executing binary, not the physical host hardware.
 ///
 /// Names follow Rust's target vocabulary (for example `windows`, `macos`,
@@ -43,6 +56,31 @@ pub const fn process_target() -> ProcessTarget {
         os: std::env::consts::OS,
         architecture: std::env::consts::ARCH,
     }
+}
+
+/// Whether this binary was compiled for Windows, in a constant expression.
+///
+/// A predicate over [`process_target`], not a probe: an x86-64 Windows binary
+/// running under emulation still reports `true`. Written against
+/// [`std::env::consts::OS`] rather than a `cfg!` so host selection stays in
+/// the one selector this crate has, and so the answer is the same fact
+/// [`process_target`] already reports.
+pub const fn target_is_windows() -> bool {
+    matches!(std::env::consts::OS.as_bytes(), b"windows")
+}
+
+/// Whether this binary was compiled for macOS, in a constant expression.
+///
+/// See [`target_is_windows`] for what this does and does not answer.
+pub const fn target_is_macos() -> bool {
+    matches!(std::env::consts::OS.as_bytes(), b"macos")
+}
+
+/// Whether this binary was compiled for Linux, in a constant expression.
+///
+/// See [`target_is_windows`] for what this does and does not answer.
+pub const fn target_is_linux() -> bool {
+    matches!(std::env::consts::OS.as_bytes(), b"linux")
 }
 
 /// Logical concurrency this host exposes to this process.
@@ -89,27 +127,12 @@ pub fn cpu_identity_material() -> String {
     material
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn append_cpu_feature_material(material: &mut String) {
-    for (name, present) in [
-        ("sse2", std::arch::is_x86_feature_detected!("sse2")),
-        ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
-        ("avx", std::arch::is_x86_feature_detected!("avx")),
-        ("avx2", std::arch::is_x86_feature_detected!("avx2")),
-        ("avx512f", std::arch::is_x86_feature_detected!("avx512f")),
-        ("fma", std::arch::is_x86_feature_detected!("fma")),
-        ("bmi1", std::arch::is_x86_feature_detected!("bmi1")),
-        ("bmi2", std::arch::is_x86_feature_detected!("bmi2")),
-    ] {
-        if present {
-            material.push_str("\0feature=");
-            material.push_str(name);
-        }
+    for name in cpu_compatibility_features() {
+        material.push_str("\0feature=");
+        material.push_str(name);
     }
 }
-
-#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-fn append_cpu_feature_material(_material: &mut String) {}
 
 /// Resolve a machine identity from the first readable of `machine_id_paths`,
 /// falling back to a boot-scoped id.
@@ -161,6 +184,84 @@ pub(crate) fn machine_id_from(machine_id_paths: &[&str], boot_id_path: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exactly one host predicate is true, and it agrees with `process_target`.
+    ///
+    /// Stated as a property rather than "on Linux this is true": the point is
+    /// that the three answers are consistent with the one fact the facade
+    /// already reports, on whichever host runs them.
+    #[test]
+    fn exactly_one_target_predicate_holds_and_matches_process_target() {
+        let predicates = [
+            ("windows", target_is_windows()),
+            ("macos", target_is_macos()),
+            ("linux", target_is_linux()),
+        ];
+
+        let named: Vec<_> = predicates
+            .iter()
+            .filter_map(|(name, holds)| holds.then_some(*name))
+            .collect();
+
+        assert_eq!(named.len(), 1, "one supported host answers: {named:?}");
+        assert_eq!(named[0], process_target().os);
+    }
+
+    /// The predicates are usable where a `cfg!` would be: in a const.
+    #[test]
+    fn target_predicates_are_constant_expressions() {
+        const WINDOWS: bool = target_is_windows();
+        const MACOS: bool = target_is_macos();
+        const LINUX: bool = target_is_linux();
+
+        assert_eq!([WINDOWS, MACOS, LINUX].iter().filter(|held| **held).count(), 1);
+    }
+
+    /// Reported features keep the documented order, without repeats.
+    ///
+    /// Callers may put these in a cache key, so the contract under test is the
+    /// ordering and spelling rather than which features this particular CPU
+    /// has -- an assertion on the latter would only restate the host.
+    #[test]
+    fn cpu_compatibility_features_are_ordered_and_unique() {
+        const DOCUMENTED: [&str; 8] = [
+            "sse2", "sse4.2", "avx", "avx2", "avx512f", "fma", "bmi1", "bmi2",
+        ];
+
+        let reported = cpu_compatibility_features();
+
+        let mut positions = reported
+            .iter()
+            .map(|name| DOCUMENTED.iter().position(|known| known == name));
+        assert!(
+            positions.all(|position| position.is_some()),
+            "every reported feature is one this facade documents: {reported:?}"
+        );
+        let indices: Vec<_> = reported
+            .iter()
+            .filter_map(|name| DOCUMENTED.iter().position(|known| known == name))
+            .collect();
+        assert!(
+            indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "documented order is preserved, with no repeats: {reported:?}"
+        );
+    }
+
+    /// The identity material still carries every reported feature.
+    ///
+    /// `cpu_identity_material` is hashed by callers, so extracting the feature
+    /// list into a public function must not change what it contains.
+    #[test]
+    fn identity_material_still_names_each_reported_feature() {
+        let material = cpu_identity_material();
+
+        for name in cpu_compatibility_features() {
+            assert!(
+                material.contains(&format!("\0feature={name}")),
+                "{name} is part of the identity material"
+            );
+        }
+    }
 
     /// Privilege detection is stable within one process.
     ///

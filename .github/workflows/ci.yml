@@ -42,15 +42,94 @@ jobs:
   # below set `CARGO_BUILD_JOBS` explicitly: this graph (Wasmtime, Cranelift,
   # Tauri, OpenSSL) built at the runner's own parallelism in 12 minutes before
   # this change, and a hosted runner has the memory for it.
+  # Linux goes first and gates everything else. It compiles the same sources
+  # every other target does, so a failure here is a failure everywhere, and
+  # holding Apple and Windows runners to rediscover it is the waste this
+  # ordering removes. The cost is latency on a green run: the other targets
+  # start after this replay passes.
+  test-archive-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+      - name: Install native webview development packages
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          libgtk-3-dev libwebkit2gtk-4.1-dev
+      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
+        with:
+          ci-tests: true
+          cache-key-suffix: test-archive-x86_64-unknown-linux-gnu
+          prebuild-deps-flags: ""
+      - name: Restore native pkg-config search path
+        run: |
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - name: Lint this target
+        run: >-
+          soldr cargo clippy
+          --locked --all-features --all-targets -- --deny warnings
+      - name: Archive every test binary for this target
+        run: >-
+          soldr cargo nextest archive
+          --locked --all-features
+          --archive-file kernal-tests-x86_64-unknown-linux-gnu.tar.zst
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernal-tests-x86_64-unknown-linux-gnu
+          path: kernal-tests-x86_64-unknown-linux-gnu.tar.zst
+          if-no-files-found: error
+          retention-days: 1
+
+  test-run-linux:
+    needs: test-archive-linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kernal-tests-x86_64-unknown-linux-gnu
+      - name: Install cargo-nextest
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run this host's prebuilt tests
+        # The Linux lane keeps the source-reading policy tests: here the
+        # builder and the runner agree on the path baked into
+        # `env!("CARGO_MANIFEST_DIR")`, so they read what they mean to.
+        run: |
+          set -euo pipefail
+          cargo-nextest nextest run \
+            --archive-file kernal-tests-x86_64-unknown-linux-gnu.tar.zst \
+            --workspace-remap . 2>&1 | tee nextest-output.txt
+      - name: Prove this host ran its own code
+        run: |
+          set -euo pipefail
+          grep -F "platform_linux::" nextest-output.txt > /dev/null \
+            || { echo "no platform_linux:: test ran: this host did not execute its own code"; exit 1; }
+
+  # Every other target, gated on Linux passing above.
   test-archive:
     name: Test archive (${{ matrix.target }})
+    needs: test-run-linux
     strategy:
-      fail-fast: false
+      # Fail fast, unlike the per-target proof matrices below. Every target
+      # here compiles the same sources, so the second failure teaches nothing
+      # the first did not -- and holding five more builders to learn it is what
+      # made a broken push saturate the account-wide pool. The sentinel job
+      # below then cancels the rest of the run.
+      fail-fast: true
       matrix:
         include:
-          - builder: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            cross: ""
           # aarch64 Linux builds natively on an ARM runner: WebKitGTK comes
           # from the distribution, and combining Ubuntu's libraries with a
           # cross sysroot is what `native-proof-build` already avoids.
@@ -99,8 +178,11 @@ jobs:
         if: matrix.cross == ''
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-          echo "PKG_CONFIG_LIBDIR_${{ matrix.target }}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" \
-            | tr '-' '_' >> "${GITHUB_ENV}"
+          target="${{ matrix.target }}"
+          # Only the variable NAME takes underscores; the path keeps its
+          # hyphens. `tr` over the whole line rewrote both and pointed
+          # pkg-config at a directory that does not exist.
+          echo "PKG_CONFIG_LIBDIR_${target//-/_}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - name: Lint this target
         run: >-
           soldr cargo clippy
@@ -134,11 +216,13 @@ jobs:
     name: Test run (${{ matrix.target }})
     needs: test-archive
     strategy:
-      fail-fast: false
+      # One host's failure stops the others: they replay the same binaries, so
+      # the run is already red and the remaining hosts are runner minutes spent
+      # on a known answer. A genuinely host-specific failure is reproduced by
+      # re-running this job alone.
+      fail-fast: true
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
           - os: windows-2025
@@ -226,6 +310,42 @@ jobs:
           esac
           grep -F "${marker}" nextest-output.txt > /dev/null \
             || { echo "no ${marker} test ran: this host did not execute its own code"; exit 1; }
+
+  # Reclaim the account-wide runner pool as soon as the answer is known. A
+  # matrix's own `fail-fast` only stops its siblings; these stop every other
+  # job in the run. Modelled on soldr's cancel-on-*-failure sentinels: one
+  # `gh run cancel` call, no branching.
+  #
+  # Pull requests only. On main a cancelled run would leave no record of which
+  # job failed, and nothing is queued behind it to reclaim.
+  cancel-on-linux-failure:
+    name: Cancel run (Linux tests failed)
+    needs: [test-archive-linux, test-run-linux]
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # No checkout, so `gh` cannot infer the repository from a git remote.
+      - run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+
+  cancel-on-cross-target-failure:
+    name: Cancel run (cross-target tests failed)
+    needs: [test-archive, test-run]
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   # The WebView2 proofs need a real Windows host, and only these. The binary
   # was cross-built on Linux above, so this job holds a Windows runner for the
@@ -424,6 +544,10 @@ jobs:
 
   native-proof-build:
     name: Native proof build (${{ matrix.target }})
+    # Gated on Linux (see `test-archive-linux`): these six cross-builds and the
+    # Apple/Windows execution matrices that consume them are the bulk of a
+    # run's runner minutes, and a Linux test failure already condemns them.
+    needs: test-run-linux
     strategy:
       fail-fast: false
       matrix:
@@ -741,6 +865,9 @@ jobs:
       - run: uv run --no-project --python 3.13 ci/test_auto_release.py
 
   supported-targets:
+    # Gated on Linux: six `--all-features` cross-builds that a red test run
+    # makes moot.
+    needs: test-run-linux
     strategy:
       fail-fast: false
       matrix:
@@ -849,6 +976,10 @@ jobs:
   # runners, so it is a deliberate trade of runner minutes for coverage of the
   # host-selected code rather than an oversight.
   dylints:
+    # Gated on Linux: the `macos-15-intel` entry is the single most expensive
+    # job in this workflow, and a lint finding is not worth an Apple runner
+    # while the tests are red.
+    needs: test-run-linux
     strategy:
       fail-fast: false
       matrix:

@@ -119,20 +119,53 @@ class NativeProofJobsTests(unittest.TestCase):
         linked. If one of these lanes moves to a native builder, the scarce
         Apple and Windows runners go back to holding a compiler.
         """
+        linux = self.job("test-archive-linux")
         job = self.job("test-archive")
         builders = re.findall(r"- builder: (\S+)\s+target: (\S+)", job)
-        self.assertEqual({target for _, target in builders}, TARGETS)
-        self.assertEqual(len(builders), len(TARGETS))
+        covered = {target for _, target in builders} | {"x86_64-unknown-linux-gnu"}
+        self.assertEqual(covered, TARGETS, "every supported target is archived")
+        self.assertEqual(len(builders) + 1, len(TARGETS), "no target is archived twice")
         for builder, target in builders:
             self.assertTrue(builder.startswith("ubuntu-"), f"{target} compiles on {builder}")
-        self.assertIn("ci-tests: true", job)
-        self.assertIn("cargo nextest archive", job)
+        for stage in (linux, job):
+            self.assertIn("ci-tests: true", stage)
+            self.assertIn("cargo nextest archive", stage)
+
+    def test_every_other_platform_waits_for_linux(self):
+        """A red Linux run must not cost an Apple or Windows runner.
+
+        Linux compiles the same sources every other target does, so its
+        failure condemns them. These four jobs are where a run spends most of
+        its runner minutes; each waits for the Linux replay to pass.
+        """
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("needs: test-archive-linux", text)
+        for gated in ("test-archive", "native-proof-build", "dylints", "supported-targets"):
+            with self.subTest(job=gated):
+                self.assertIn("needs: test-run-linux", self.job(gated))
+
+    def test_a_failure_cancels_the_rest_of_the_run(self):
+        """`fail-fast` stops a matrix's siblings; this stops everything else."""
+        for sentinel in ("cancel-on-linux-failure", "cancel-on-cross-target-failure"):
+            with self.subTest(job=sentinel):
+                job = self.job(sentinel)
+                self.assertIn("if: failure() && github.event_name == 'pull_request'", job)
+                self.assertIn("gh run cancel ${{ github.run_id }}", job)
+                self.assertIn("actions: write", job)
+        # The two archive/replay matrices stop their own siblings.
+        for matrix in ("test-archive", "test-run"):
+            with self.subTest(job=matrix):
+                self.assertIn("fail-fast: true", self.job(matrix))
 
     def test_the_replay_lanes_never_compile(self):
         """The point of the archive is that these hosts only execute."""
         job = self.job("test-run")
         pairs = re.findall(r"- os: (\S+)\s+target: (\S+)", job)
-        self.assertEqual(set(pairs), HOSTS)
+        self.assertEqual(
+            set(pairs) | {("ubuntu-24.04", "x86_64-unknown-linux-gnu")},
+            HOSTS,
+            "every supported host replays, Linux through its own gating job",
+        )
         for line in job.split("steps:", 1)[1].splitlines():
             code = line.split("#", 1)[0]
             self.assertIsNone(

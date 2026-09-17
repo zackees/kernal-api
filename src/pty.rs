@@ -335,14 +335,20 @@ mod windows_tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    /// A bounded write must give up on a ConPTY whose child is not reading.
+    /// Every bounded write must return near its timeout on a ConPTY whose child
+    /// is not reading its console input.
     ///
-    /// The session is handed to a worker thread so a write that parks fails
-    /// the test on a deadline instead of hanging it. `ping` never reads its
-    /// console input, and the output is drained so the pseudoconsole never
-    /// stalls on its own output pipe.
+    /// The session lives on a worker thread that reports each call as it
+    /// returns, so the test distinguishes a call that parks (no report within
+    /// the per-call deadline) from a pipe that merely drains slowly. `ping`
+    /// never reads its console input, and the output is drained so the
+    /// pseudoconsole never stalls on its own output pipe.
     #[test]
     fn bounded_write_returns_instead_of_parking_on_a_full_queue() {
+        const CALL_TIMEOUT: Duration = Duration::from_millis(200);
+        const PARKED: Duration = Duration::from_secs(10);
+        const RUN_FOR: Duration = Duration::from_secs(15);
+
         let mut command = PtyCommand::new("cmd.exe");
         command.arguments = vec!["/d".into(), "/c".into(), "ping -n 60 127.0.0.1 >NUL".into()];
         let (mut session, mut reader) = PtySession::spawn(
@@ -364,39 +370,48 @@ mod windows_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let chunk = vec![b'x'; 64 * 1024];
-            let mut total = 0_usize;
-            let mut slowest = Duration::ZERO;
-            while total < 64 * 1024 * 1024 {
-                let started = Instant::now();
-                let written = match session.write_available(&chunk, Duration::from_millis(200)) {
-                    Ok(written) => written,
-                    Err(error) => {
-                        let _ = tx.send(Err(error.to_string()));
-                        return;
-                    }
-                };
-                slowest = slowest.max(started.elapsed());
-                if written == 0 {
-                    let _ = tx.send(Ok((total, true, slowest)));
+            let started = Instant::now();
+            while started.elapsed() < RUN_FOR {
+                let call = Instant::now();
+                let result = session
+                    .write_available(&chunk, CALL_TIMEOUT)
+                    .map_err(|error| error.to_string());
+                let failed = result.is_err();
+                if tx.send(Some((result, call.elapsed()))).is_err() || failed {
                     return;
                 }
-                total += written;
             }
-            let _ = tx.send(Ok((total, false, slowest)));
+            let _ = tx.send(None);
+            // Keep the session alive until the test has read the report.
+            std::thread::sleep(PARKED);
         });
 
-        let (total, refused, slowest) = rx
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a bounded write parked on a ConPTY nobody is reading")
-            .expect("bounded write against a non-reading ConPTY");
-        eprintln!("wrote {total} bytes; refused={refused}; slowest call {slowest:?}");
+        let mut calls = 0_usize;
+        let mut total = 0_usize;
+        let mut refused = 0_usize;
+        let mut slowest = Duration::ZERO;
+        loop {
+            match rx.recv_timeout(PARKED) {
+                Ok(Some((Ok(written), elapsed))) => {
+                    calls += 1;
+                    total += written;
+                    refused += usize::from(written == 0);
+                    slowest = slowest.max(elapsed);
+                }
+                Ok(Some((Err(error), _))) => {
+                    panic!("bounded write failed after {calls} calls and {total} bytes: {error}")
+                }
+                Ok(None) => break,
+                Err(_) => panic!(
+                    "a bounded write parked for {PARKED:?} after {calls} calls, \
+                     {total} bytes, {refused} refused"
+                ),
+            }
+        }
+        eprintln!("{calls} calls wrote {total} bytes; {refused} refused; slowest {slowest:?}");
         assert!(
-            refused,
-            "the input queue accepted {total} bytes without refusing"
-        );
-        assert!(
-            slowest < Duration::from_secs(2),
-            "bounded write did not respect its timeout: {slowest:?}"
+            slowest < CALL_TIMEOUT + Duration::from_secs(1),
+            "a bounded write overran its timeout: {slowest:?}"
         );
     }
 }

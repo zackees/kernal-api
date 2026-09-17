@@ -726,11 +726,37 @@ jobs:
           soldr cargo check --locked
           --manifest-path tools/wasm-abi-generator/Cargo.toml
 
+  # A Dylint pass only sees what the compiler compiles, so `cfg(target_os =
+  # "macos")` bodies are invisible on a Linux host, which is how a raw host type
+  # reached a public signature while both guards reported clean (#147).
+  # `macos-15-intel` closes that half: the lint now runs where those bodies are
+  # compiled.
+  #
+  # Windows is the other half, and is deliberately absent. `soldr cargo dylint`
+  # cannot run there at all: Soldr rejects its own managed `dylint-link` through
+  # a generic `--version`/`--help` probe that a working link wrapper cannot pass
+  # (it forwards the flags to `link.exe`), so the job exits 1 before compiling
+  # anything (zackees/soldr#3274). Verified on this branch -- `windows-2025`
+  # failed in 6m4s on that diagnostic while macOS passed.
+  #
+  # When that lands, add `windows-2025` back *and* a `ci/dylint-shim/cargo.cmd`
+  # beside the existing script: Windows resolves a bare `cargo` through PATHEXT
+  # and would skip the extensionless shim, silently re-entering soldr.
+  #
+  # This is the option #147 recommends, and it costs the extra job the issue
+  # acknowledges. It runs counter to #270's direction of moving work off Apple
+  # runners, so it is a deliberate trade of runner minutes for coverage of the
+  # host-selected code rather than an oversight.
   dylints:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install native webview development packages
+        if: runner.os == 'Linux'
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
@@ -745,6 +771,7 @@ jobs:
           cargo-dylint-version: 6.0.3
           dylint-link-version: 6.0.3
       - name: Restore native pkg-config search path
+        if: runner.os == 'Linux'
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - name: Select the pinned Dylint compiler
         shell: bash

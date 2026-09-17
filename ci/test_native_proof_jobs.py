@@ -112,13 +112,16 @@ class NativeProofJobsTests(unittest.TestCase):
         # The umbrella switch; individual layers such as dylints' build-cache
         # may still be tuned.
         self.assertNotRegex(text, r"(?m)^\s+cache: false\b")
-        # One documented exception: a Windows-hosted `cross-targets` prepare
-        # yields no archive, and setup-soldr's cache then fails the job. Those
-        # supported-targets lanes move to Linux with the OpenSSL syslib
-        # (zackees/soldr#3246); nothing else may disable the cache.
+        # The Windows `supported-targets` lanes were the one exception: a
+        # Windows-hosted `cross-targets` prepare yielded no archive and
+        # setup-soldr's cache then failed the job. They prepare on Linux now
+        # (#273, with the static OpenSSL syslib from zackees/soldr#3246/#3247),
+        # so no job may carry a conditional cache switch at all.
         self.assertEqual(
             re.findall(r"(?m)^\s+cache: (\$\{\{.*\}\})", text),
-            ["${{ !startsWith(matrix.os, 'windows') }}"],
+            [],
+            "every prepare runs on Linux; a conditional cache switch means a "
+            "lane moved back to a Windows-hosted prepare",
         )
 
 

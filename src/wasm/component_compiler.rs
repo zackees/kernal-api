@@ -16,50 +16,11 @@ use wasmtime::component::{
 mod tests {
     use super::*;
     use std::time::Duration;
-    const CACHE_KEY: [u8; 32] = [
-        0xdb, 0xed, 0xcb, 0xc5, 0x83, 0xf5, 0x1d, 0x14, 0x3b, 0xae, 0xb1, 0x9d, 0xbe, 0xac, 0xfd,
-        0x3f, 0xa0, 0xcb, 0x40, 0x8c, 0xe8, 0x39, 0x9b, 0x56, 0xce, 0xc7, 0x22, 0x24, 0xd8, 0x54,
-        0xe9, 0x93,
-    ];
+    use crate::wasm::compiler_dispatch::tests::{compiler_helper_spec, CACHE_KEY};
     mod proof {
         wasmtime::component::bindgen!({
             path: "src/guest_component_compiler.wit", world: "compiler-proof",
         });
-    }
-
-    fn compiler_helper_spec() -> crate::SpawnSpec {
-        let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
-            .arg("--exact")
-            .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")
-            .arg("--nocapture")
-            .current_dir(std::env::current_dir().unwrap())
-            .clear_env(true)
-            .env("KERNAL_COMPILER_WIRE_HELPER", "dual");
-        // The Windows process loader and Rust test harness require these
-        // host-selected system variables and Cargo's DLL loader search path
-        // even for an otherwise empty fixture environment.
-        #[cfg(windows)]
-        let spec = [
-            "APPDATA",
-            "COMSPEC",
-            "HOMEDRIVE",
-            "HOMEPATH",
-            "LOCALAPPDATA",
-            "PATH",
-            "PATHEXT",
-            "SYSTEMDRIVE",
-            "SYSTEMROOT",
-            "TEMP",
-            "TMP",
-            "USERPROFILE",
-            "WINDIR",
-        ]
-            .into_iter()
-            .fold(spec, |spec, key| match std::env::var_os(key) {
-                Some(value) => spec.env(key, value),
-                None => spec,
-            });
-        spec
     }
 
     #[test]

@@ -69,6 +69,9 @@ impl PtyMaster for conpty_passthrough::ConPtyMaster {
         })
     }
 
+    fn write_available(&self, bytes: &[u8], timeout: std::time::Duration) -> io::Result<usize> {
+        conpty_passthrough::ConPtyMaster::write_available(self, bytes, timeout)
+    }
 }
 
 #[cfg(feature = "pty")]

@@ -42,6 +42,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Console::COORD;
@@ -96,6 +97,9 @@ impl From<PtySize> for COORD {
     }
 }
 
+/// How long a bounded write waits before retrying a full stdin pipe.
+const BOUNDED_WRITE_RETRY: Duration = Duration::from_millis(5);
+
 /// One ConPTY: master end held by the host process, slave end ready
 /// to be spawned into a child.
 pub(super) struct ConPtyPair {
@@ -114,6 +118,10 @@ pub struct ConPtyMaster {
     /// Host-side handle for writing child stdin. `None` after
     /// `take_writer` has taken it.
     writer: Option<OwnedHandle>,
+    /// A duplicate of the stdin handle, kept once `take_writer` has handed the
+    /// original away, so [`ConPtyMaster::write_available`] can still reach the
+    /// pipe. Both handles refer to the same pipe end.
+    bounded_writer: Option<OwnedHandle>,
     /// Cached last-known dimensions. ConPTY has no live query API, so
     /// `get_size` returns this. Seeded by `openpty`, updated by `resize`.
     current_size: Mutex<PtySize>,
@@ -137,7 +145,65 @@ impl ConPtyMaster {
             .writer
             .take()
             .ok_or_else(|| io::Error::other("ConPtyMaster writer already taken"))?;
+        self.bounded_writer = Some(handle.try_clone()?);
         Ok(Box::new(HandleWriter::new(handle)))
+    }
+
+    /// Write as much of `bytes` as the stdin pipe accepts before `timeout`.
+    ///
+    /// A blocking `WriteFile` parks once the pipe is full and nothing on this
+    /// side can release it. The pipe is switched to `PIPE_NOWAIT` for the
+    /// attempt, where a byte-mode write takes only what fits and returns, and
+    /// back to `PIPE_WAIT` before returning: the mode belongs to the pipe end,
+    /// so the session's own writer shares it. Anonymous pipes have no
+    /// writability signal to wait on, so a full pipe is retried on a short
+    /// interval until the deadline.
+    pub(super) fn write_available(&self, bytes: &[u8], timeout: Duration) -> io::Result<usize> {
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_NOWAIT, PIPE_WAIT};
+
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let handle = self
+            .bounded_writer
+            .as_ref()
+            .ok_or_else(|| io::Error::other("ConPtyMaster writer has not been taken"))?
+            .as_raw_handle() as HANDLE;
+        let set_mode = |mode: u32| {
+            let ok = unsafe {
+                SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null())
+            };
+            if ok == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        };
+        set_mode(PIPE_NOWAIT)?;
+        let deadline = Instant::now() + timeout;
+        let result = loop {
+            let length = bytes.len().min(u32::MAX as usize) as u32;
+            let mut written: u32 = 0;
+            let ok = unsafe {
+                WriteFile(handle, bytes.as_ptr(), length, &mut written, std::ptr::null_mut())
+            };
+            if ok == 0 {
+                break Err(io::Error::last_os_error());
+            }
+            if written > 0 {
+                break Ok(written as usize);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Ok(0);
+            }
+            std::thread::sleep(remaining.min(BOUNDED_WRITE_RETRY));
+        };
+        let restored = set_mode(PIPE_WAIT);
+        let written = result?;
+        restored?;
+        Ok(written)
     }
 
     pub(super) fn resize(&self, size: PtySize) -> io::Result<()> {
@@ -306,6 +372,7 @@ pub(super) fn openpty(size: PtySize) -> io::Result<ConPtyPair> {
         pseudo_console: Arc::clone(&pseudo_console),
         reader: Some(stdout_pipe.host),
         writer: Some(stdin_pipe.host),
+        bounded_writer: None,
         current_size: Mutex::new(size),
     };
     let slave = ConPtySlave { pseudo_console };

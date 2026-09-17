@@ -81,8 +81,9 @@ impl PtySession {
     /// cannot be interrupted: not by cancelling the thread, and not by ending
     /// the process holding the other end of the terminal.
     ///
-    /// Backends without a bounded write fall back to the blocking write, so the
-    /// method is always usable; only the interruption guarantee is Unix-only.
+    /// Linux, macOS and Windows (ConPTY) all implement the bounded write. A
+    /// backend without one falls back to the blocking write, so the method is
+    /// always usable there, without the interruption guarantee.
     pub fn write_available(&mut self, bytes: &[u8], timeout: Duration) -> io::Result<usize> {
         match self.master.write_available(bytes, timeout) {
             Ok(written) => Ok(written),

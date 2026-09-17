@@ -176,6 +176,7 @@ class GuestScriptTests(unittest.TestCase):
             "EXCLUDE_ROOT",
             "EXCLUDE_TTY",
             "EXCLUDE_VM_TIMING",
+            "EXCLUDE_CONTAINMENT_STATE",
         }
         self.assertEqual(set(groups), expected, "exclusion groups changed")
         for name, entries in groups.items():

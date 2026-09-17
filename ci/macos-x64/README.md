@@ -87,7 +87,8 @@ the stub never has to stand in for real source.
 | `EXCLUDE_MACOS_RENAME` | 2 | The readiness marker's no-clobber publish returns `ENOTSUP` (45). `tempfile` asks for `renameatx_np(RENAME_EXCL)`, which real macOS supports, so this most likely reflects the guest's virtualized filesystem rather than macOS. Test-only: `persist_noclobber` has no production caller. |
 | `EXCLUDE_ROOT` | 1 | The guest runs as **root**, so a `chmod 000` file stays readable and the test observes `Ok` where it asserts a permission error. |
 | `EXCLUDE_TTY` | 1 | A Recovery guest gives the script no controlling terminal to save and restore. |
-| `EXCLUDE_VM_TIMING` | 3 | Two cores in a VM are not representative for wall-clock assertions; suspension windows and containment deadlines elapsed before the work did. |
+| `EXCLUDE_VM_TIMING` | 2 | Two cores in a VM are not representative for wall-clock assertions; a suspension window and a containment deadline elapsed before the work did. |
+| `EXCLUDE_CONTAINMENT_STATE` | 1 | **Investigate, not an artifact.** `real_worker_sequential_stress_leaves_no_parent_state` observed `ForcedContainment { trigger: Cancelled }` where it expects `Stopped(Cancelled)`. That is a state mismatch rather than an elapsed deadline, so it may be a genuine macOS containment difference. Excluded to keep the lane green while it is investigated (#283). |
 
 **Three macOS portability findings this lane surfaced have since been fixed in
 the tests themselves** and are no longer excluded: the TLS fixture's 3650-day

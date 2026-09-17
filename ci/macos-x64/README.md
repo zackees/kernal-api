@@ -73,7 +73,7 @@ the stub never has to stand in for real source.
   `env!("CARGO_MANIFEST_DIR")`, a compile-time constant still pointing at the
   Linux builder's path, and `--workspace-remap` cannot rewrite a compile-time
   constant. They assert on source text that is identical on every host and
-  `rust-native (ubuntu-latest)` already runs them. This mirrors the exclusion
+  ci.yml's Linux `test-run` lanes already run them. This mirrors the exclusion
   the aarch64 lane carries in `ci.yml`.
 - **19 further tests**, excluded by name and grouped by cause in
   `recovery-guest.sh`. Each entry is named rather than pattern-matched, so the

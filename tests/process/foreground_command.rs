@@ -113,7 +113,7 @@ fn captured_output_carries_both_streams_and_the_status() {
     let mut command = Command::new(std::env::current_exe().expect("test binary path"));
     command
         .arg("--exact")
-        .arg("child_probe")
+        .arg("foreground_command::child_probe")
         .env(PROBE, "speak");
 
     let output = foreground_output(&mut command).expect("run the speaking helper");
@@ -147,7 +147,7 @@ fn probe() -> Command {
     let mut command = Command::new(std::env::current_exe().expect("test binary path"));
     command
         .arg("--exact")
-        .arg("child_probe")
+        .arg("foreground_command::child_probe")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     command

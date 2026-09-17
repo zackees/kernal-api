@@ -76,7 +76,7 @@ fn relative_parent_cleanup_survives_working_directory_change() {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "relative_parent_cleanup_survives_working_directory_change",
+            "temporary_directory::relative_parent_cleanup_survives_working_directory_change",
         ])
         .env(PROBE, "1")
         .current_dir(parent.path())

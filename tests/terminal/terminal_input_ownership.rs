@@ -99,7 +99,7 @@ fn native_session_rejects_overlap_and_restores_mode() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "native_session_rejects_overlap_and_restores_mode",
+            "terminal_input_ownership::native_session_rejects_overlap_and_restores_mode",
             "--nocapture",
         ])
         .env("KERNAL_INPUT_OWNERSHIP_CHILD", "1")

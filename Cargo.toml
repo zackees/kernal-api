@@ -21,10 +21,6 @@ path = "src/lib.rs"
 name = "wasm-admission"
 required-features = ["wasm-sketch-host"]
 
-[[test]]
-name = "command_schema_contract"
-required-features = ["command-schema"]
-
 [[bin]]
 name = "kernal-symbolize"
 path = "src/bin/kernal-symbolize.rs"

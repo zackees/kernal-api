@@ -1,0 +1,20 @@
+//! Filesystem capabilities: paths, directories, watching, and hashing.
+//!
+//! One linked test binary per category, not per file: each module below was
+//! its own top-level integration test, and each one statically linked this
+//! crate's whole graph. Test IDs are now `fs::<module>::<test>`.
+//! See AGENTS.md for the rule.
+
+// Aliased: the category also has a `readiness_marker` test module.
+mod blake3_facade;
+mod context_file_observation;
+mod directory_cursor;
+mod fs_watch_facade;
+#[path = "../support/readiness_marker.rs"]
+mod marker_support;
+mod private_regular_file_facade;
+mod readiness_marker;
+mod sha256_facade;
+mod temporary_directory;
+mod tree_hash;
+mod user_home;

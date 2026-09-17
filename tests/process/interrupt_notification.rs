@@ -72,7 +72,7 @@ fn native_interrupt_delivery_is_owned_and_cancellation_safe() {
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "native_interrupt_delivery_is_owned_and_cancellation_safe",
+            "interrupt_notification::native_interrupt_delivery_is_owned_and_cancellation_safe",
             "--nocapture",
         ])
         .env(CHILD, "1")

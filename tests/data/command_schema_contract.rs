@@ -1,3 +1,5 @@
+#![cfg(feature = "command-schema")]
+
 use kernal_api::command::{
     Command, CommandError, OptionSpec, ValueKind, MAX_ARGUMENTS, MAX_ARGUMENT_BYTES,
 };

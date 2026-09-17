@@ -82,7 +82,7 @@ fn native_console_session_restores_mode_and_excludes_overlap() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "native_console_session_restores_mode_and_excludes_overlap",
+            "terminal_input_windows::native_console_session_restores_mode_and_excludes_overlap",
             "--nocapture",
         ])
         .env("KERNAL_CONSOLE_OWNERSHIP_CHILD", "1")

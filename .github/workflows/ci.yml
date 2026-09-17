@@ -26,91 +26,231 @@ permissions:
   actions: write
 
 jobs:
-  rust-native:
+  # Compile every test binary once, on Linux, for all six supported hosts.
+  #
+  # Soldr carries its own LLVM, macOS SDK and Windows syslibs, so a Linux
+  # builder can link Mach-O and PE test binaries; clippy is a compile-time
+  # check and rides along per target. The native hosts below never compile --
+  # they download these archives and run them, so the scarce Apple and Windows
+  # runners are held for the execution window only.
+  #
+  # `ci-tests: true` is the cache contract for a lane whose entire output is
+  # linked test products: zccache never admits those, and the bulk `target/`
+  # snapshot is refused rather than silently storing gigabytes of them
+  # (soldr#2931). Dependency compilation still comes from cook and the per-unit
+  # store. It also defaults the job counts to one, which is why the build jobs
+  # below set `CARGO_BUILD_JOBS` explicitly: this graph (Wasmtime, Cranelift,
+  # Tauri, OpenSSL) built at the runner's own parallelism in 12 minutes before
+  # this change, and a hosted runner has the memory for it.
+  test-archive:
+    name: Test archive (${{ matrix.target }})
     strategy:
       fail-fast: false
-      # macOS is deliberately absent. Apple compilation happens on Linux
-      # through Soldr's cross toolchain; `macos-arm-tests` below runs the
-      # aarch64 tests from a prebuilt archive, so the Apple runner is held
-      # only for the execution window rather than for a full compile.
-      # Windows still compiles natively: `--all-features` links vendored
-      # OpenSSL, which needs nmake until Soldr ships the static OpenSSL
-      # syslib for MSVC (zackees/soldr#3246). It then moves to a Linux
-      # cross-built archive the same way.
       matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - builder: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cross: ""
+          # aarch64 Linux builds natively on an ARM runner: WebKitGTK comes
+          # from the distribution, and combining Ubuntu's libraries with a
+          # cross sysroot is what `native-proof-build` already avoids.
+          - builder: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            cross: ""
+          - builder: ubuntu-24.04
+            target: x86_64-apple-darwin
+            cross: x86_64-apple-darwin
+          - builder: ubuntu-24.04
+            target: aarch64-apple-darwin
+            cross: aarch64-apple-darwin
+          - builder: ubuntu-24.04
+            target: x86_64-pc-windows-msvc
+            cross: x86_64-pc-windows-msvc
+          - builder: ubuntu-24.04
+            target: aarch64-pc-windows-msvc
+            cross: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.builder }}
+    timeout-minutes: 45
+    env:
+      # Panic locations without the full debug tree: these binaries travel to
+      # another host, and the archive is uploaded and downloaded per run.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # `ci-tests: true` would otherwise default this to 1.
+      CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      # `--all-features` now includes the opt-in raw Wry backend.  Keep its
-      # GTK/WebKit headers out of ordinary/default builds, but install them
-      # before this deliberately heavyweight Linux lane compiles it.
+      # `--all-features` includes the opt-in raw Wry backend, which needs the
+      # GTK/WebKit headers when the target is this Linux host.
       - name: Install native webview development packages
-        if: runner.os == 'Linux'
+        if: matrix.cross == ''
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+          libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          # The native tests use Cargo's dev profile. Prebuilding release
-          # dependencies cannot satisfy their cache keys.
-          prebuild-deps-flags: ""
+          ci-tests: true
+          cache-key-suffix: test-archive-${{ matrix.target }}
+          cross-targets: ${{ matrix.cross }}
+          # The test binaries use Cargo's dev profile; cook exactly that graph.
+          prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
       - name: Restore native pkg-config search path
-        if: runner.os == 'Linux'
+        if: matrix.cross == ''
         run: |
-          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - name: Test every native feature together
-        # A cold Windows all-feature graph includes Wasmtime, Tauri/WebView2,
-        # OpenSSL, and the native archive stack.  Fifteen minutes can expire
-        # during compilation before a single test runs; keep this aligned with
-        # the six-target native proof lanes rather than reporting that as a
-        # behavioral failure.
-        timeout-minutes: 30
-        run: soldr cargo test --locked --all-features
-      - run: >-
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          echo "PKG_CONFIG_LIBDIR_${{ matrix.target }}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" \
+            | tr '-' '_' >> "${GITHUB_ENV}"
+      - name: Lint this target
+        run: >-
           soldr cargo clippy
-          --locked --all-features --all-targets -- --deny warnings
-      - run: soldr cargo fmt --all -- --check
-      - name: Build native Windows external-page isolation proof
-        if: runner.os == 'Windows'
+          --locked --all-features --all-targets
+          --target ${{ matrix.target }} -- --deny warnings
+      - name: Archive every test binary for this target
         run: >-
-          soldr cargo build --locked --all-features
+          soldr cargo nextest archive
+          --locked --all-features
+          --target ${{ matrix.target }}
+          --archive-file kernal-tests-${{ matrix.target }}.tar.zst
+      # The WebView2 proofs are the one thing a Windows host still has to run
+      # itself, so ship it the binary rather than the compiler (#270, #273).
+      - name: Build the native webview smoke binary
+        if: endsWith(matrix.target, '-pc-windows-msvc')
+        run: >-
+          soldr cargo build
+          --locked --all-features --target ${{ matrix.target }}
           --bin kernal-tauri-smoke
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernal-tests-${{ matrix.target }}
+          path: |
+            kernal-tests-${{ matrix.target }}.tar.zst
+            target/${{ matrix.target }}/debug/kernal-tauri-smoke.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # Run the prebuilt binaries on each host. Nothing in this job compiles.
+  test-run:
+    name: Test run (${{ matrix.target }})
+    needs: test-archive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      # Apple runners are held off by default: soldr's owner mandate forbids
+      # them and #270 is moving work off them. The Linux and Windows lanes are
+      # unconditional. Skipping is visible in the checks list rather than
+      # silent, so re-enabling is a variable flip.
+      - name: Report that this Apple lane is suppressed
+        if: startsWith(matrix.os, 'macos') && vars.ENABLE_MACOS_RUNNERS != 'true'
+        run: echo "ENABLE_MACOS_RUNNERS is not true; this lane is suppressed."
+      # The workspace is still needed: tests that resolve paths relative to the
+      # manifest directory are remapped onto this checkout.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        with:
+          lfs: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        with:
+          name: kernal-tests-${{ matrix.target }}
+      - name: Install cargo-nextest
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          case "${{ runner.os }}" in
+            Linux) url=https://get.nexte.st/latest/linux ;;
+            macOS) url=https://get.nexte.st/latest/mac ;;
+            Windows) url=https://get.nexte.st/latest/windows ;;
+          esac
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            curl -LsSf "$url" -o nextest.zip && unzip -o -q nextest.zip -d "$HOME/.cargo/bin"
+          else
+            curl -LsSf "$url" | tar zxf - -C "$HOME/.cargo/bin"
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run this host's prebuilt tests
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        # `cargo-nextest` is a cargo subcommand shim: invoked directly it still
+        # expects `nextest` as its first argument.
+        #
+        # The four excluded binaries are source-inspection policy tests. They
+        # read this crate's own source through `env!("CARGO_MANIFEST_DIR")`,
+        # baked in at compile time, so on a host whose checkout path differs
+        # from the builder's they would read nothing. `--workspace-remap`
+        # cannot rewrite a compile-time constant. The Linux lanes keep them:
+        # there the builder and the runner agree on the path, and a policy test
+        # that stops running is worse than one that runs twice.
+        run: |
+          set -euo pipefail
+          filter=""
+          if [ "${{ runner.os }}" != "Linux" ]; then
+            filter="-E not binary(source_policy)"
+          fi
+          cargo-nextest nextest run \
+            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
+            --workspace-remap . ${filter} 2>&1 | tee nextest-output.txt
+      - name: Prove this host ran its own code
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        # A replay that silently ran nothing host-specific would look identical
+        # to a real run. Each host names a test that exists only in its own
+        # platform tree, so an empty or wrong-target archive fails here rather
+        # than reporting success.
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux) marker="platform_linux::" ;;
+            macOS) marker="platform_macos::" ;;
+            Windows) marker="platform_win::" ;;
+          esac
+          grep -F "${marker}" nextest-output.txt > /dev/null \
+            || { echo "no ${marker} test ran: this host did not execute its own code"; exit 1; }
+
+  # The WebView2 proofs need a real Windows host, and only these. The binary
+  # was cross-built on Linux above, so this job holds a Windows runner for the
+  # three proof runs rather than for a compile (#270, #273).
+  windows-webview-smoke:
+    needs: test-archive
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kernal-tests-x86_64-pc-windows-msvc
       - name: Verify native Windows external-page isolation
-        if: runner.os == 'Windows'
-        # Let Cargo resolve Soldr's actual binary path. Keep the feature graph
-        # identical to the preceding build, allowing time for cache recovery.
-        timeout-minutes: 15
-        run: >-
-          soldr cargo run --locked --all-features
-          --bin kernal-tauri-smoke -- close
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe close
       - name: Verify native Windows page bootstrap
         # WebView2 needs the explicit main-frame guard even with Wry main-only.
-        if: runner.os == 'Windows'
-        timeout-minutes: 15
-        run: >-
-          soldr cargo run --locked --all-features
-          --bin kernal-tauri-smoke -- bootstrap
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe bootstrap
       - name: Verify native Windows interactive window lifetime
-        if: runner.os == 'Windows'
-        timeout-minutes: 15
-        run: >-
-          soldr cargo run --locked --all-features
-          --bin kernal-tauri-smoke -- window-close
-      - name: Verify HTTP wire semantics under backend feature unification
-        # Run after locked checks: this deliberately resolves a backend feature
-        # outside our manifest's production graph and may update the lockfile.
-        run: >-
-          soldr cargo test --features http-client,reqwest/gzip
-          --test http_client encoded_responses_preserve_wire_bytes_and_headers
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe window-close
 
-  # Compile the aarch64-apple-darwin test binaries on Linux. Nothing here
-  # needs a Mac: Soldr carries its own LLVM and macOS SDK, and clippy is a
-  # compile-time check that runs fine against a cross target.
-  macos-arm-archive:
+
+  # What is left of the old `rust-native` job: the two checks that are not a
+  # test run. Everything else it did -- compiling and running the all-feature
+  # test suite on two hosts -- is now `test-archive` plus `test-run`.
+  source-checks:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -118,70 +258,16 @@ jobs:
           lfs: true
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          cache-key-suffix: macos-arm-archive
-          cross-targets: aarch64-apple-darwin
-          # clippy and the nextest archive both compile the dev profile.
-          prebuild-deps-flags: --target aarch64-apple-darwin
-      - run: >-
-          soldr cargo clippy
-          --locked --all-features --all-targets
-          --target aarch64-apple-darwin -- --deny warnings
-      - run: >-
-          soldr cargo nextest archive
-          --target aarch64-apple-darwin --all-features
-          --archive-file kernal-arm64.tar.zst
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: kernal-arm64-tests
-          path: kernal-arm64.tar.zst
-          retention-days: 1
-
-  # This job does not compile. It unpacks prebuilt Mach-O test binaries and
-  # runs them, so the 10x-billed Apple hardware is held for the test duration
-  # and nothing else.
-  # Suppressed by default. Apple-hosted runners are held off until the
-  # repository variable `ENABLE_MACOS_RUNNERS` is set to `true`; the job stays
-  # defined and reports as skipped, so re-enabling is a variable flip rather
-  # than a workflow edit. `macos-arm-archive` above still runs on Linux, so the
-  # aarch64-apple-darwin clippy and test-archive coverage is unaffected.
-  macos-arm-tests:
-    needs: macos-arm-archive
-    if: vars.ENABLE_MACOS_RUNNERS == 'true'
-    runs-on: macos-latest
-    steps:
-      # The workspace is still needed: tests that resolve paths relative to
-      # the manifest directory are remapped onto this checkout below.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: kernal-arm64-tests
-      - name: Install cargo-nextest
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf https://get.nexte.st/latest/mac \
-            | tar zxf - -C "$HOME/.cargo/bin"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Run the aarch64 tests from the prebuilt archive
-        # `cargo-nextest` is a cargo subcommand shim: invoked directly it
-        # still expects `nextest` as its first argument, otherwise it parses
-        # the next token as a cargo subcommand and fails.
-        #
-        # The excluded binaries are source-inspection policy tests: they read
-        # this crate's own source through `env!("CARGO_MANIFEST_DIR")`, which
-        # is baked in at compile time and therefore still points at the Linux
-        # builder's path. `--workspace-remap` cannot rewrite a compile-time
-        # constant. Nothing is lost by skipping them here -- they assert on
-        # source text, which is identical on every host, and `rust-native
-        # (ubuntu-latest)` already runs them. A new policy test of this shape
-        # will fail this lane loudly until it is added to the list.
+          prebuild-deps-flags: ""
+      - run: soldr cargo fmt --all -- --check
+      - name: Verify HTTP wire semantics under backend feature unification
+        # Deliberately resolves a backend feature outside our manifest's
+        # production graph, so it may update the lockfile and cannot join the
+        # `--locked` archive above.
         run: >-
-          cargo-nextest nextest run
-          --archive-file kernal-arm64.tar.zst
-          --workspace-remap .
-          -E 'not (binary(daemon_frame_v1) or binary(daemon_identity)
-          or binary(version_policy) or binary(facade_policy))'
+          soldr cargo test --features http-client,reqwest/gzip
+          --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
+
 
   each-feature:
     runs-on: ubuntu-latest
@@ -196,7 +282,7 @@ jobs:
           - crash
           # The four daemon lanes are the frozen running-process substrates.
           # Without them these features are compiled only inside
-          # `--all-features` on `rust-native`, where every other feature is
+          # `--all-features` in `test-archive`, where every other feature is
           # present to supply whatever a missing gate would need -- exactly
           # the coupling this matrix exists to catch.
           - daemon-frame-v1
@@ -250,7 +336,7 @@ jobs:
         if: matrix.feature == 'json'
         run: >-
           soldr cargo test --locked --no-default-features
-          --features json,serde_json/arbitrary_precision --test json_documents
+          --features json,serde_json/arbitrary_precision --test data
 
   # A unit test does not own process main on every test harness, while Tauri
   # requires its event loop to start there.  These executable proofs
@@ -664,8 +750,8 @@ jobs:
             legacy_cargo: true
           # Apple targets cross-compile on Linux through Soldr's own toolchain
           # (its bundled LLVM plus the managed macOS SDK), so neither Apple
-          # build lane needs a macOS runner. The only Apple-hosted lanes left in
-          # this workflow are `macos-arm-tests`, gated off by
+          # build lane needs a macOS runner. The only Apple-hosted lanes left
+          # in this workflow are the `test-run` Apple entries, gated off by
           # `ENABLE_MACOS_RUNNERS`, and the native proof execution matrices.
           - os: ubuntu-latest
             target: x86_64-apple-darwin

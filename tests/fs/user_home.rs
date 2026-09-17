@@ -31,7 +31,7 @@ fn user_home_environment_probe() {
 fn user_home_handles_override_empty_and_missing_environment() {
     for mode in ["override", "empty", "missing"] {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "user_home_environment_probe"]);
+        command.args(["--exact", "user_home::user_home_environment_probe"]);
         command.env("KERNAL_USER_HOME_PROBE", mode);
         match mode {
             "override" => command.env("HOME", "/kernel-home-probe/not-created"),

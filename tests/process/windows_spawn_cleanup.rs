@@ -2,7 +2,7 @@
 
 #[test]
 fn contained_windows_spawn_owns_resources_before_fallible_setup() {
-    let source = include_str!("../src/platform_win/sync_spawn.rs");
+    let source = include_str!("../../src/platform_win/sync_spawn.rs");
     let start = source.find("pub fn spawn_sync(").unwrap();
     let end = source[start..]
         .find("/// Private containment stages")

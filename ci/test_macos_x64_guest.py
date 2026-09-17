@@ -25,7 +25,9 @@ VERIFY_SCRIPT = GUEST_DIR / "verify-guest-results.py"
 # The four source-inspection policy tests read this crate's own tree through a
 # compile-time CARGO_MANIFEST_DIR, which points at the Linux builder in the
 # guest. The aarch64 lane excludes the same four.
-POLICY_BINARIES = ("daemon_frame_v1", "daemon_identity", "version_policy", "facade_policy")
+# The four source-reading tests are one linked binary now (AGENTS.md:
+# one category target, not one per file).
+POLICY_BINARIES = ("source_policy",)
 
 
 def code_only(text: str) -> str:
@@ -136,10 +138,15 @@ class GuestWorkflowShapeTests(unittest.TestCase):
 class GuestScriptTests(unittest.TestCase):
     def test_excludes_the_source_inspection_policy_binaries(self):
         text = GUEST_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("not (binary(", text)
+        self.assertIn("not binary(source_policy)", text)
         for binary in POLICY_BINARIES:
             with self.subTest(binary=binary):
                 self.assertIn(binary, text)
+        # The per-file names are gone; a filter naming one would silently match
+        # nothing and run the tests it means to skip.
+        for retired in ("daemon_frame_v1", "daemon_identity", "version_policy", "facade_policy"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(f"binary({retired})", text)
 
     def test_provides_the_workspace_root_nextest_requires(self):
         """Replaying an archive needs a Cargo.toml at the remap root.

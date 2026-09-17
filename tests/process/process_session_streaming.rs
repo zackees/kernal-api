@@ -52,7 +52,7 @@ fn assert_output_shutdown(cancel_first: bool) {
     runtime().run(async {
         let session = SpawnSpec::new(std::env::current_exe().unwrap())
             .arg("--exact")
-            .arg("silent_process_helper")
+            .arg("process_session_streaming::silent_process_helper")
             .arg("--nocapture")
             .env(SILENT_HELPER_ENV, "1")
             .stdin(StreamMode::Null)
@@ -121,7 +121,7 @@ fn assert_output_shutdown(cancel_first: bool) {
 async fn session() -> ProcessSession {
     SpawnSpec::new(std::env::current_exe().unwrap())
         .arg("--exact")
-        .arg("streaming_process_helper")
+        .arg("process_session_streaming::streaming_process_helper")
         .arg("--nocapture")
         .env(HELPER_ENV, "1")
         .stdin(StreamMode::Null)

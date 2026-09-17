@@ -329,3 +329,74 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A bounded write must give up on a ConPTY whose child is not reading.
+    ///
+    /// The session is handed to a worker thread so a write that parks fails
+    /// the test on a deadline instead of hanging it. `ping` never reads its
+    /// console input, and the output is drained so the pseudoconsole never
+    /// stalls on its own output pipe.
+    #[test]
+    fn bounded_write_returns_instead_of_parking_on_a_full_queue() {
+        let mut command = PtyCommand::new("cmd.exe");
+        command.arguments = vec!["/d".into(), "/c".into(), "ping -n 60 127.0.0.1 >NUL".into()];
+        let (mut session, mut reader) = PtySession::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .expect("spawn a child that does not read its console input");
+        std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while matches!(reader.read(&mut buffer), Ok(count) if count > 0) {}
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut total = 0_usize;
+            let mut slowest = Duration::ZERO;
+            while total < 64 * 1024 * 1024 {
+                let started = Instant::now();
+                let written = match session.write_available(&chunk, Duration::from_millis(200)) {
+                    Ok(written) => written,
+                    Err(error) => {
+                        let _ = tx.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                slowest = slowest.max(started.elapsed());
+                if written == 0 {
+                    let _ = tx.send(Ok((total, true, slowest)));
+                    return;
+                }
+                total += written;
+            }
+            let _ = tx.send(Ok((total, false, slowest)));
+        });
+
+        let (total, refused, slowest) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a bounded write parked on a ConPTY nobody is reading")
+            .expect("bounded write against a non-reading ConPTY");
+        eprintln!("wrote {total} bytes; refused={refused}; slowest call {slowest:?}");
+        assert!(
+            refused,
+            "the input queue accepted {total} bytes without refusing"
+        );
+        assert!(
+            slowest < Duration::from_secs(2),
+            "bounded write did not respect its timeout: {slowest:?}"
+        );
+    }
+}

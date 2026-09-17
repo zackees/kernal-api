@@ -124,6 +124,27 @@ class NativeProofJobsTests(unittest.TestCase):
             "lane moved back to a Windows-hosted prepare",
         )
 
+    def test_dylints_lints_the_windows_selected_code_from_linux(self):
+        """A Dylint pass only sees what it compiles (#147).
+
+        The `cfg(windows)` bodies are invisible to a Linux-hosted pass unless it
+        cross-targets, and no Windows runner can host the lint today
+        (zackees/soldr#3274). Dropping the `--target` step would silently
+        restore the gap that let a `winapi` type reach a public signature.
+        """
+        job = self.job("dylints")
+        self.assertIn("--target x86_64-pc-windows-msvc", job)
+        windows_lint = job.split("Lint the Windows-selected code from Linux", 1)[1]
+        for flag in ("--all-features", "--all-targets", "--target x86_64-pc-windows-msvc"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, windows_lint)
+        self.assertIn(
+            "soldr rustup target add\n          --toolchain nightly-2026-05-28 "
+            "x86_64-pc-windows-msvc",
+            job,
+            "the pinned Dylint toolchain needs the Windows target installed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

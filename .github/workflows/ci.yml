@@ -739,21 +739,23 @@ jobs:
   # `macos-15-intel` closes that half: the lint now runs where those bodies are
   # compiled.
   #
-  # Windows is the other half, and is deliberately absent. `soldr cargo dylint`
-  # cannot run there at all: Soldr rejects its own managed `dylint-link` through
-  # a generic `--version`/`--help` probe that a working link wrapper cannot pass
-  # (it forwards the flags to `link.exe`), so the job exits 1 before compiling
-  # anything (zackees/soldr#3274). Verified on this branch -- `windows-2025`
-  # failed in 6m4s on that diagnostic while macOS passed.
+  # Windows is covered without a Windows runner: the Linux job lints
+  # `x86_64-pc-windows-msvc` as a cross-target below, which compiles the
+  # `cfg(windows)` bodies where a Linux-hosted pass would otherwise skip them.
+  # That needs `--all-features` to cross-build, so it waited on Soldr 0.9.20
+  # (zackees/soldr#3271) for the managed OpenSSL syslib to reach a non-default
+  # feature.
   #
-  # When that lands, add `windows-2025` back *and* a `ci/dylint-shim/cargo.cmd`
+  # A `windows-2025` host job is deliberately still absent, and running one is
+  # not currently possible anyway: Soldr rejects its own managed `dylint-link`
+  # through a generic `--version`/`--help` probe that a working link wrapper
+  # cannot pass, since it forwards the flags to `link.exe` (zackees/soldr#3274).
+  # If that job is ever revived, it also needs a `ci/dylint-shim/cargo.cmd`
   # beside the existing script: Windows resolves a bare `cargo` through PATHEXT
   # and would skip the extensionless shim, silently re-entering soldr.
   #
-  # This is the option #147 recommends, and it costs the extra job the issue
-  # acknowledges. It runs counter to #270's direction of moving work off Apple
-  # runners, so it is a deliberate trade of runner minutes for coverage of the
-  # host-selected code rather than an oversight.
+  # macOS keeps its own host job: an `*-apple-darwin` cross-target pass would
+  # suit #270's direction, but it has no RED/GREEN evidence yet.
   dylints:
     strategy:
       fail-fast: false
@@ -815,6 +817,27 @@ jobs:
         run: >-
           soldr cargo dylint
           --all --workspace -- --all-features --all-targets
+      # The Windows half of #147, without a Windows runner. A Dylint pass wraps
+      # rustc, so cross-targeting compiles the `cfg(windows)` bodies and lints
+      # them here. Verified against the original leak: restoring the `pub` on
+      # `translate_console_key_event` fails this step on a Linux host.
+      #
+      # x86_64 alone is enough. Everything that differs between Windows
+      # architectures in `src/platform_win/**` is a `pub(super)` constant, so no
+      # public signature changes with the arch.
+      - name: Install the Windows target for the pinned Dylint toolchain
+        if: runner.os == 'Linux'
+        run: >-
+          soldr rustup target add
+          --toolchain nightly-2026-05-28 x86_64-pc-windows-msvc
+      - name: Lint the Windows-selected code from Linux
+        if: runner.os == 'Linux'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
+        run: >-
+          soldr cargo dylint
+          --all --workspace --
+          --all-features --all-targets --target x86_64-pc-windows-msvc
 
   python:
     runs-on: ubuntu-latest

@@ -45,8 +45,9 @@ POLICY_FILTER='not (binary(daemon_frame_v1) or binary(daemon_identity) or binary
 # canonicalization comparison in context_file_observation, and the invalid-UTF-8
 # file name in tree_hash, which APFS rejects with EILSEQ before the hash can see
 # it. The remaining entries are the upstream cap-primitives panic, one rename
-# that the guest's filesystem does not support, and Recovery environment
-# artifacts (root, no tty, two-core timing). See issue #283.
+# that the guest's filesystem does not support, Recovery environment artifacts
+# (root, no tty, two-core timing), and one containment-state mismatch that is
+# still under investigation rather than explained. See issue #283.
 # ---------------------------------------------------------------------------
 
 # cap-primitives 4.0.3 panics converting a negative macOS st_rdev:
@@ -57,8 +58,11 @@ POLICY_FILTER='not (binary(daemon_frame_v1) or binary(daemon_identity) or binary
 # APFS device numbers in this guest are negative; there is no fixed 4.x release.
 EXCLUDE_CAP_PRIMITIVES='commit_error_cleans_staging_after_destination_parent_is_renamed completed_symlink_is_not_published_or_followed missing_completed_output_preserves_destination_and_cleans_staging parent_discard_cleans_staging_after_destination_parent_is_renamed parent_discard_removes_worker_partial_and_completed_files replacement_failure_preserves_existing_directory_and_cleans_staging staged_output_is_invisible_until_parent_commit cancellation_after_parent_sync_preserves_output deadline_after_parent_sync_preserves_output_and_reports_cleanup_failure dispatcher_retry_releases_ownership_and_records_one_forced_reap output_cleanup_failure_reports_whether_publication_occurred parent_output_discards_on_failure_or_stop_and_commits_only_success'
 
-# macOS returns ENOTSUP (45) for the atomic rename the readiness marker relies
-# on; Linux's exclusive-rename semantics have no direct macOS equivalent.
+# The readiness marker's no-clobber publish returns ENOTSUP (45) in this guest.
+# `tempfile` asks for renameatx_np(RENAME_EXCL), which APFS and HFS+ support, so
+# this most likely reflects the guest's virtualized filesystem rather than
+# macOS. Not yet verified on real hardware (#283). Test-only: persist_noclobber
+# has no production caller.
 EXCLUDE_MACOS_RENAME='failed_marker_write_is_cleaned_up_and_existing_marker_is_preserved marker_is_invisible_until_payload_is_complete'
 
 # The guest runs as root, so a chmod-000 file is still readable and the test
@@ -70,10 +74,18 @@ EXCLUDE_ROOT='bounded_context_read_reports_unreadable_input'
 EXCLUDE_TTY='native_session_rejects_overlap_and_restores_mode'
 
 # Two cores in a VM are not representative for wall-clock assertions: a
-# suspension window and two containment deadlines elapsed before the work did.
-EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends a_child_bound_to_another_owner_dies_when_that_owner_does real_worker_sequential_stress_leaves_no_parent_state'
+# suspension window and a containment deadline elapsed before the work did.
+EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends a_child_bound_to_another_owner_dies_when_that_owner_does'
 
-EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_ROOT $EXCLUDE_TTY $EXCLUDE_VM_TIMING"
+# NOT a known artifact -- investigate. The guest observed
+# `ForcedContainment { trigger: Cancelled }` where the test expects
+# `Stopped(Cancelled)`: containment was reached by force rather than by a
+# graceful stop. That is a state mismatch, not an elapsed deadline, so it may be
+# a genuine macOS containment difference. Excluded only to keep the lane green
+# while it is investigated (#283).
+EXCLUDE_CONTAINMENT_STATE='real_worker_sequential_stress_leaves_no_parent_state'
+
+EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_ROOT $EXCLUDE_TTY $EXCLUDE_VM_TIMING $EXCLUDE_CONTAINMENT_STATE"
 
 GUEST_EXCLUDE=''
 for name in $EXCLUDED_TESTS; do

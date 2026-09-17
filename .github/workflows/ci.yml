@@ -9,12 +9,17 @@ on:
   push:
     branches: [main]
 
-# One live run per workflow per ref: a new push to a branch or PR cancels the
+# One live run per workflow per ref, main included: a new push cancels the
 # superseded run instead of queuing behind it in the shared account-wide runner
-# pool. Runs on main get a unique group, so they are never cancelled or coalesced.
+# pool. Main used to be exempt through a `github.run_id` group, which kept a CI
+# record for every main commit -- at the cost of a full matrix per commit even
+# when the next push landed seconds later. Two pushes four seconds apart held
+# nine runners in `reld` while unrelated PRs queued. A superseded main commit
+# now has no run of its own; its content is covered by the run for the commit
+# that replaced it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

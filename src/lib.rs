@@ -287,7 +287,8 @@ pub use platform_imp::{
 
 #[cfg(feature = "fs")]
 pub use platform_imp::{
-    fs_create_private_file, fs_decode_path_bytes, fs_encode_path_bytes, fs_file_identity,
+    fs_create_dir_all_private, fs_create_private_file, fs_decode_path_bytes, fs_encode_path_bytes,
+    fs_ensure_dir_private, fs_file_identity, fs_open_shared_append,
     fs_is_lock_conflict, fs_lock_exclusive, fs_lock_shared, fs_open_lock_file, fs_path_identity,
     fs_replace_file, fs_set_file_mtime, fs_sync_directory, fs_try_lock_exclusive,
     fs_try_lock_shared, fs_unlock, fs_user_config_dir, fs_user_data_dir, fs_user_run_data_root,
@@ -304,7 +305,8 @@ pub(crate) use platform_imp::fs_read_context_regular_file_bounded;
 pub use platform_imp::FsWatchWatcher;
 
 pub use platform_imp::{
-    host_boot_id, host_current_process_privilege, host_current_user,
+    host_boot_id, host_cpu_compatibility_features, host_current_process_privilege,
+    host_current_user,
     host_environment_keys_are_case_insensitive, host_filesystem_device_id, host_home_dir,
     host_hostname, host_is_elevated, host_login_environment, host_machine_id, host_namespace_id,
     host_user_machine_identity, HostPrivilegedIdentity,

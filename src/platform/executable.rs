@@ -12,6 +12,17 @@ pub use crate::{
     executable_unlock_for_replacement as unlock_for_replacement, EXECUTABLE_EXTENSION,
 };
 
+/// Path of the image this process is running.
+///
+/// Named for what it answers -- which file on disk this process was launched
+/// from -- so a caller redeploying or re-executing itself reads that intent
+/// from `platform::executable` alongside [`sibling_of_current_image`], which
+/// resolves against exactly this path. The result is the host's answer and can
+/// name a deleted or replaced file; it is not revalidated here.
+pub fn current_image() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
+}
+
 /// Finds a runnable host image using the process `PATH`.
 ///
 /// Splits `PATH` into its component directories and delegates to
@@ -28,6 +39,28 @@ pub fn find_on_path(name: &std::ffi::OsStr) -> Option<std::path::PathBuf> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    /// The running image is an existing file, and siblings resolve beside it.
+    ///
+    /// Asserted against `sibling_of_current_image`, the operation that depends
+    /// on this one, rather than against `std::env::current_exe` -- restating
+    /// the implementation would test nothing.
+    #[test]
+    fn the_current_image_is_a_real_file_its_siblings_resolve_against() {
+        let image = current_image().expect("a running process has an image");
+
+        assert!(image.is_file(), "{} is a file", image.display());
+        let bare = image
+            .file_stem()
+            .expect("image stem")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            sibling_of_current_image(&bare).as_deref(),
+            Some(&*image),
+            "siblings resolve against exactly the image this reports"
+        );
+    }
 
     /// The host decides the spelling; the caller never does.
     ///

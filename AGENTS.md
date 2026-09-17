@@ -40,6 +40,16 @@
   APIs. This does not prohibit host-neutral feature or test configuration;
   the rule is about selecting a host implementation. Guest/WASM target
   selection is a separate concern.
+- Prefer duplication over a selector in the neutral facade. Every `cfg`
+  selector the platform Dylint names -- `target_os`, `target_arch`, `unix`,
+  `windows`, `target_env`, and the rest -- belongs in a concrete tree, even
+  when the three copies would be byte-identical and the selection is not about
+  the OS at all. `platform::host::cpu_compatibility_features` is the worked
+  example: an x86 `cfg` pair in `src/platform/host.rs` would have been one
+  copy instead of three, and it still moved into `platform_linux`,
+  `platform_macos` and `platform_win`, with the neutral leaf re-exporting the
+  bridged name. Three identical copies are cheaper to own than one exception
+  to the boundary.
 - Read [docs/platform-boundary.md](docs/platform-boundary.md) before changing
   a platform capability. Its target structure and enforcement plan are tracked
   by #152. Until that issue lands, the repository's platform Dylint deliberately

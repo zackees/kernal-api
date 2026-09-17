@@ -56,6 +56,7 @@ pub use process_owner_death::{
 #[path = "platform_macos/host.rs"]
 pub(crate) mod host;
 pub use host::{
+    cpu_compatibility_features as host_cpu_compatibility_features,
     boot_id as host_boot_id, current_process_privilege as host_current_process_privilege,
     current_user as host_current_user,
     environment_keys_are_case_insensitive as host_environment_keys_are_case_insensitive,
@@ -72,7 +73,10 @@ pub use host::login_environment_block as host_login_environment_block;
 pub(crate) mod fs;
 #[cfg(feature = "fs")]
 pub use fs::{
+    create_dir_all_private as fs_create_dir_all_private,
     create_private_file as fs_create_private_file,
+    ensure_dir_private as fs_ensure_dir_private,
+    open_shared_append as fs_open_shared_append,
     decode_path_bytes as fs_decode_path_bytes,
     replace_file as fs_replace_file, sync_directory as fs_sync_directory,
     user_config_dir as fs_user_config_dir,

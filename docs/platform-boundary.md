@@ -38,6 +38,15 @@ in the facade contract instead of spreading OS checks through callers.
 - Add a native capability by defining its semantic facade operation,
   implementing it in each concrete platform tree, then exposing it once from
   the crate root. Preserve Linux, macOS, and Windows on x86-64 and ARM64.
+- **Duplication is preferred to a selector in the neutral facade.** The rule is
+  about where a `cfg` selector may appear, not about which selector it is:
+  `target_arch`, `target_env`, `unix` and `windows` are banned outside the
+  concrete trees exactly as `target_os` is, and
+  `dylints/kernal_api_platform_boundary/src/lib.rs` lists all ten. When a
+  capability needs one, copy the implementation into all three trees even if
+  the copies are identical and the selection has nothing to do with the OS.
+  Three copies are cheaper to own than one exception, and an exception is what
+  a future reader will cite for theirs.
 
 For example, a capability module should call a neutral operation:
 
@@ -51,6 +60,13 @@ It should not select a concrete operating system:
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 ```
+
+An arch-only selector in a neutral leaf is the same violation, however
+host-independent the code it guards. `platform::host::cpu_compatibility_features`
+is the worked example: the probe is pure `std::arch`, identical on every host,
+and it still lives in `platform_linux/host.rs`, `platform_macos/host.rs` and
+`platform_win/host.rs`, with `src/platform/host.rs` re-exporting the bridged
+`host_cpu_compatibility_features` and carrying no `cfg` of its own.
 
 ## Validation and current limitation
 

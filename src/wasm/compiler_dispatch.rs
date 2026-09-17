@@ -124,16 +124,16 @@ impl CompilerImports<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::wasm) mod tests {
     use super::*;
 
-    const CACHE_KEY: [u8; 32] = [
+    pub(in crate::wasm) const CACHE_KEY: [u8; 32] = [
         0xdb, 0xed, 0xcb, 0xc5, 0x83, 0xf5, 0x1d, 0x14, 0x3b, 0xae, 0xb1, 0x9d, 0xbe, 0xac, 0xfd,
         0x3f, 0xa0, 0xcb, 0x40, 0x8c, 0xe8, 0x39, 0x9b, 0x56, 0xce, 0xc7, 0x22, 0x24, 0xd8, 0x54,
         0xe9, 0x93,
     ];
 
-    fn compiler_helper_spec() -> crate::SpawnSpec {
+    pub(in crate::wasm) fn compiler_helper_spec() -> crate::SpawnSpec {
         let spec = crate::SpawnSpec::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("wasm::compiler_dispatch::tests::compiler_guest_native_helper")

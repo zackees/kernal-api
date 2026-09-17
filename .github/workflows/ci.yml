@@ -200,13 +200,16 @@ jobs:
         # that stops running is worse than one that runs twice.
         run: |
           set -euo pipefail
-          filter=""
+          # An array, not a string: the filter expression is one argument and
+          # word-splitting would hand nextest `not` and `binary(...)` as two.
+          filter=()
           if [ "${{ runner.os }}" != "Linux" ]; then
-            filter="-E not binary(source_policy)"
+            filter=(-E 'not binary(source_policy)')
           fi
+          set -o pipefail
           cargo-nextest nextest run \
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
-            --workspace-remap . ${filter} 2>&1 | tee nextest-output.txt
+            --workspace-remap . "${filter[@]}" 2>&1 | tee nextest-output.txt
       - name: Prove this host ran its own code
         if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         shell: bash

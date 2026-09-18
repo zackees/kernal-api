@@ -117,6 +117,14 @@ the same client operation and no runtime fallback to a second HAL.
 
 - `platform`: process, filesystem, IPC, PTY, terminal, host identity, and
   resource operations.
+- Async process sessions (`SpawnSpec`, `SpawnAdmission`, `ProcessSession`,
+  `ProcessSessionOptions`, `ProcessOutputEvent`, `ProcessSessionExit`): the
+  one async spawn/stream/reap surface. It covers argument lists, spawn-time
+  admission, best-effort scheduling bands, concurrent output and lifecycle
+  control from shared `&self`, and lossless `ExitStatus` recovery. Failures
+  surface as `std::io::Error` with the stable kind mapping documented in
+  `src/process_adapter.rs`; the substrate's builder, session, and error types
+  never cross it. Descendant-tree cleanup on drop is deliberately not offered.
 - `snapshot`: cooperative sibling-thread capture and deferred unwind.
 - `crash`: the single native crash handler and bounded pre-crash spool.
 - `profile`: bounded sampling, CPU/off-CPU aggregation, and pprof/Firefox/

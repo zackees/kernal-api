@@ -458,6 +458,13 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| -status.signal().unwrap_or(1))
 }
 
+/// Rebuild an [`std::process::ExitStatus`] from the native wait-status word a
+/// session recorded; the inverse of `ExitStatusExt::into_raw`.
+pub(crate) fn process_exit_status_from_native(native_status: u32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(native_status as i32)
+}
+
 pub fn set_process_name(name: &str) {
     let c_name = std::ffi::CString::new(name).unwrap_or_default();
     unsafe { libc::pthread_setname_np(c_name.as_ptr()); }

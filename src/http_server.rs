@@ -7,9 +7,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
-use std::{
-    convert::Infallible, future::Future, io, net::SocketAddr, pin::Pin, sync::Arc, time::Duration,
-};
+#[cfg(feature = "websocket")]
+use std::pin::Pin;
+use std::{convert::Infallible, future::Future, io, net::SocketAddr, sync::Arc, time::Duration};
 
 #[cfg(feature = "websocket")]
 mod websocket;
@@ -197,6 +197,7 @@ impl Limits {
 #[derive(Debug)]
 pub struct Request {
     method: String,
+    #[cfg(feature = "websocket")]
     http_1_1: bool,
     target: String,
     uri: hyper::Uri,
@@ -611,6 +612,7 @@ where
     H: Fn(Request) -> F,
     F: Future<Output = Response>,
 {
+    #[cfg(feature = "websocket")]
     let mut request = request;
     #[cfg(feature = "websocket")]
     let upgrade = hyper::upgrade::on(&mut request);
@@ -637,6 +639,7 @@ where
     };
     let request = Request {
         method: parts.method.to_string(),
+        #[cfg(feature = "websocket")]
         http_1_1: parts.version == hyper::Version::HTTP_11,
         target: parts.uri.to_string(),
         uri: parts.uri,

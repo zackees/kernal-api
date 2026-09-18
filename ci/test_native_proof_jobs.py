@@ -184,6 +184,26 @@ class NativeProofJobsTests(unittest.TestCase):
                 COMPILES.search(code), f"the webview proof compiles: {line.strip()}"
             )
 
+    def test_native_archive_lanes_build_for_the_host(self):
+        """A lane whose runner matches its target must not name the triple.
+
+        Passing `--target` for aarch64 Linux on an ARM runner makes Soldr treat
+        it as a cross build and route linking through a zig shim the runner
+        does not have. Clippy never links, so only the archive step caught it,
+        and only on main.
+        """
+        job = self.job("test-archive")
+        # Only the lint and archive steps run for every lane. The Windows
+        # smoke-binary step names its triple legitimately: it runs only for
+        # Windows, which is always a cross build.
+        steps = job.split("- name: Lint this target", 1)[1]
+        steps = steps.split("- name: Build the native webview smoke binary", 1)[0]
+        self.assertNotIn("--target ${{ matrix.target }}", steps)
+        self.assertEqual(
+            steps.count("matrix.cross && format('--target {0}', matrix.cross)"), 2,
+            "lint and archive both take the triple only for a cross lane",
+        )
+
     def test_ci_never_disables_the_soldr_cache(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("--no-cache", text)

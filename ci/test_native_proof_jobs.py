@@ -116,6 +116,25 @@ class NativeProofJobsTests(unittest.TestCase):
             with self.subTest(job=matrix):
                 self.assertIn("fail-fast: true", self.job(matrix))
 
+    def test_no_job_caps_compile_concurrency(self):
+        """soldr's admission gate owns concurrency, not a job-wide cap.
+
+        setup-soldr's `ci-tests` profile used to export `SOLDR_JOBS=1` (and
+        `CARGO_BUILD_JOBS=1`) for the rest of the job, so every compile step
+        ran one compiler child at a time; `CARGO_BUILD_JOBS: 4` here lifted
+        Cargo's queue but left `SOLDR_JOBS` at 1. setup-soldr v0.9.75 (#505)
+        removed the default: zccache's exclusive admission already compiles
+        the amalgamation-sized units alone. Unset, soldr picks a
+        topology-aware width.
+        """
+        for workflow in WORKFLOW.parent.glob("*.yml"):
+            text = workflow.read_text(encoding="utf-8")
+            with self.subTest(workflow=workflow.name):
+                self.assertNotIn("CARGO_BUILD_JOBS", text)
+                self.assertNotIn("SOLDR_JOBS", text)
+                for pin in re.findall(r"zackees/setup-soldr@(\w+)", text):
+                    self.assertNotEqual(pin, "bb28e96d2dc32c058242f56722297caf1efcbd90")
+
     # -- where things compile ------------------------------------------------
 
     def test_every_target_is_built_on_linux_exactly_once(self):

@@ -92,6 +92,10 @@ jobs:
         # Allow exactly that staged release input into the package, then hold
         # the .crate to source only and crates.io's 10 MiB cap.
         run: uv run --no-project --python 3.12 ci/crate_release.py package
+      # The build-script companion ships from the same tag; the staging glob
+      # below (kernal-api-*.crate) picks its .crate up as well.
+      - name: Package the build-script companion
+        run: uv run --no-project --python 3.12 ci/crate_release.py --package kernal-api-build package
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*

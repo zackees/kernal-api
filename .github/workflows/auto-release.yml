@@ -114,6 +114,18 @@ jobs:
         run: >-
           uv run --no-project --python 3.12 ci/crate_release.py publish
           "release-packages/kernal-api-${TAG#v}.crate"
+      # After the facade, so a first-publish problem with the companion (a new
+      # crate needs its crates.io trusted publisher configured) can never hold
+      # back the facade's release. Both steps verify rather than re-upload a
+      # version crates.io already has, so a re-run publishes only what is missing.
+      - name: Publish or verify identical crates.io artifact (kernal-api-build)
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: >-
+          uv run --no-project --python 3.12 ci/crate_release.py --package kernal-api-build publish
+          "release-packages/kernal-api-build-${TAG#v}.crate"
       # A failed release job stops the whole release run.
       - name: Cancel the run (this job failed)
         if: failure()

@@ -241,7 +241,15 @@ mod resolution {
     /// skip in a check-only lane rather than to a compile error. A run-time
     /// `env::var` would not do: Cargo sets this for the compiler, not for the
     /// test process, so it would skip everywhere and prove nothing.
+    ///
+    /// nextest's `NEXTEST_BIN_EXE_…` is the exception, and it comes first: a
+    /// replayed archive carries the builder's compile-time path, which does
+    /// not exist on the host running it, while nextest exports where it
+    /// actually extracted the binary. Same order as `wasm_worker_containment`.
     fn worker() -> Option<SymbolizerWorker> {
+        if let Some(exported) = std::env::var_os("NEXTEST_BIN_EXE_kernal-symbolize") {
+            return Some(SymbolizerWorker::new(exported));
+        }
         let Some(path) = option_env!("CARGO_BIN_EXE_kernal-symbolize") else {
             skip("this lane did not build kernal-symbolize");
             return None;

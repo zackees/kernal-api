@@ -133,9 +133,10 @@ compile. They are documented on docs.rs but must be enabled by name:
 - `independent-spawn` for the facade-owned scheduler/broker resource-placement
   contract; its options, launch payload, and live handle convert to the
   selected `running-process` release privately
-- `daemon-identity` for direct-daemon identity, sidecar, probe, and
-  endpoint-mux semantics over an existing endpoint; endpoint naming, payload
-  protocols, and daemon lifecycle stay with the application
+- `daemon-identity` for direct-daemon identity, sidecar, probe,
+  endpoint-mux, and verified-process control semantics over an existing
+  endpoint; endpoint naming, payload protocols, and daemon lifecycle stay with
+  the application
 - `daemon-frame-v1` for the frozen v1 daemon-frame envelope codec alone,
   independent of identity, broker IPC, hashing, and runtime
 - `daemon-registration` for the frozen v1 registration records and

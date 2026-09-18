@@ -437,6 +437,13 @@ pub fn exit_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or(1)
 }
 
+/// Rebuild an [`std::process::ExitStatus`] from the exact `DWORD` exit code a
+/// session recorded.
+pub(crate) fn process_exit_status_from_native(native_status: u32) -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(native_status)
+}
+
 pub fn set_process_name(_name: &str) {}
 
 pub fn configure_trampoline_command(command: &mut std::process::Command) {

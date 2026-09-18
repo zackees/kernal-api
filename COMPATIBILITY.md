@@ -98,7 +98,7 @@ descendant teardown, or fresh evidence on the other five targets.
 Until 1.0, the four first-party clients use an exact Cargo requirement:
 
 ```toml
-kernal-api = { version = "=0.1.14", features = ["..."] }
+kernal-api = { version = "=0.1.15", features = ["..."] }
 
 [profile.dev.package.kernal-api]
 codegen-units = 1
@@ -107,7 +107,7 @@ codegen-units = 1
 codegen-units = 1
 ```
 
-The Python companion is likewise pinned with `kernal-api==0.1.14` when used by
+The Python companion is likewise pinned with `kernal-api==0.1.15` when used by
 first-party Python tooling. A source checkout may temporarily use a path patch
 only on an explicit migration branch; release branches must resolve the exact
 registry version. There is no `optional = true` legacy implementation behind
@@ -117,6 +117,14 @@ the same client operation and no runtime fallback to a second HAL.
 
 - `platform`: process, filesystem, IPC, PTY, terminal, host identity, and
   resource operations.
+- Async process sessions (`SpawnSpec`, `SpawnAdmission`, `ProcessSession`,
+  `ProcessSessionOptions`, `ProcessOutputEvent`, `ProcessSessionExit`): the
+  one async spawn/stream/reap surface. It covers argument lists, spawn-time
+  admission, best-effort scheduling bands, concurrent output and lifecycle
+  control from shared `&self`, and lossless `ExitStatus` recovery. Failures
+  surface as `std::io::Error` with the stable kind mapping documented in
+  `src/process_adapter.rs`; the substrate's builder, session, and error types
+  never cross it. Descendant-tree cleanup on drop is deliberately not offered.
 - `snapshot`: cooperative sibling-thread capture and deferred unwind.
 - `crash`: the single native crash handler and bounded pre-crash spool.
 - `profile`: bounded sampling, CPU/off-CPU aggregation, and pprof/Firefox/
@@ -154,6 +162,13 @@ the same client operation and no runtime fallback to a second HAL.
   broker negotiation, and daemon lifecycle remain application policy. A client
   migrating off a direct substrate dependency takes these from here rather
   than reimplementing the records.
+  Recorded-daemon control is facade-owned rather than reached through the
+  substrate's broker client: `DaemonIdentity::verify_live` and
+  `verify_for_control` re-check boot, liveness, executable path, and BLAKE3
+  digest over this crate's host process facade, and the returned
+  `VerifiedDaemon` terminates only the verified process generation.
+  `DaemonIdentityRecord` assembles or inspects an identity field by field; the
+  sidecar JSON and probe reply bytes are unchanged and pinned by tests.
 - `broker_client` (feature `broker-client`, opt-in and outside `full`): the
   broker client adapter. `connect_backend` wraps the substrate's frozen v1
   Hello/Hello-skip connect and returns an owned `std::io` stream;

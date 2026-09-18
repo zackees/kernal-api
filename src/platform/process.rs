@@ -12,7 +12,7 @@ pub use crate::{
     BoundedProcessOutput, CaptureCancellation, PlatformChild, ProcessCaptureError, ProcessExit,
     ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion, ProcessOutputEvent,
     ProcessOutputFault, ProcessPostExitDrain, ProcessPriority, ProcessSession, ProcessSessionExit,
-    ProcessSessionOptions, SpawnSpec, StreamMode, TracedChild, WindowsJobHandle,
+    ProcessSessionOptions, SpawnAdmission, SpawnSpec, StreamMode, TracedChild, WindowsJobHandle,
 };
 
 /// Host-neutral command options selected by the caller before spawning.

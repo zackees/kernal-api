@@ -118,6 +118,13 @@ jobs:
         run: |
           bash ci/check_wasm_abi_generation.sh
           soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
+      # kernal-api-build is published from the same tag as the facade (see
+      # ci/crate_release.py). Package and verify it on every pull request, so
+      # a release never discovers a packaging failure after the facade is out.
+      # Early, while the daemon is quiet: the verify build runs build scripts,
+      # the case zackees/zccache#1597 fails with ETXTBSY under a busy daemon.
+      - name: Package and verify the build-script companion
+        run: uv run --no-project --python 3.12 ci/crate_release.py --package kernal-api-build package
       - name: Check every feature in isolation
         run: |
           set -uo pipefail

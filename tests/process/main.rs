@@ -12,6 +12,7 @@ mod process_exit_observation;
 mod process_identity;
 mod process_owner_death_contract;
 mod process_session;
+mod process_session_control;
 mod process_session_streaming;
 mod process_target;
 mod spawn_mode_facade;

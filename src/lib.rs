@@ -282,6 +282,12 @@ pub use platform_imp::{process_can_replace_current_image, process_replace_curren
 
 pub use platform_imp::{process_same_executable_path, ProcessLiveness};
 
+// Recorded-daemon verification reads the image a PID was started from. The
+// read stays crate-private: it is addressed by PID, so it is only sound
+// behind a retained `ProcessLiveness` reference, which the caller holds.
+#[cfg(feature = "daemon-identity")]
+pub(crate) use platform_imp::process_inspect::process_executable_path;
+
 pub use platform_imp::{
     resources_available_space, resources_fd_exhaustion_error, resources_inode_capacity,
     resources_signals_fd_exhaustion, resources_signals_storage_exhaustion,
@@ -551,6 +557,54 @@ impl ProcessPriority {
     }
 }
 
+/// Caller-owned exclusion acquired immediately around native process creation.
+///
+/// The closure runs on the substrate's spawning lane right before the child is
+/// created, once per native spawn attempt. Its returned permit is held across
+/// that attempt only -- fork/exec on Unix, `CreateProcess` on Windows -- and is
+/// dropped before the spawn result reaches the caller, whether the attempt
+/// succeeded or failed. It is not held for the child's lifetime. Because it
+/// never crosses an `.await`, the permit itself need not be `Send`.
+///
+/// An `Err` from the closure fails the spawn with that same [`io::Error`]; no
+/// child is created. Cloning shares the same closure.
+#[derive(Clone)]
+pub struct SpawnAdmission {
+    inner: running_process::SpawnAdmission,
+}
+
+impl SpawnAdmission {
+    /// Capture the admission function run before each native spawn attempt.
+    pub fn new<F, G>(acquire: F) -> Self
+    where
+        F: Fn() -> io::Result<G> + Send + Sync + 'static,
+        G: 'static,
+    {
+        Self {
+            inner: running_process::SpawnAdmission::new(acquire),
+        }
+    }
+
+    pub(crate) fn into_inner(self) -> running_process::SpawnAdmission {
+        self.inner
+    }
+}
+
+impl std::fmt::Debug for SpawnAdmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SpawnAdmission { .. }")
+    }
+}
+
+/// Whether a scheduling-band request may be dropped when the host refuses it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorityPolicy {
+    /// A refused band fails the spawn.
+    Required,
+    /// A refused band is dropped and the child inherits the spawner's band.
+    BestEffort,
+}
+
 /// Typed spawn description accepted by the blessed process boundary.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
@@ -565,6 +619,8 @@ pub struct SpawnSpec {
     create_process_group: bool,
     lifetime_owner: Option<platform::process::LifetimeOwner>,
     priority: ProcessPriority,
+    priority_policy: PriorityPolicy,
+    admission: Option<SpawnAdmission>,
 }
 
 impl SpawnSpec {
@@ -582,12 +638,24 @@ impl SpawnSpec {
             create_process_group: false,
             lifetime_owner: None,
             priority: ProcessPriority::Normal,
+            priority_policy: PriorityPolicy::Required,
+            admission: None,
         }
     }
 
     /// Append one argument without requiring UTF-8.
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    /// Append every argument in order without requiring UTF-8.
+    pub fn args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
         self
     }
 
@@ -707,8 +775,40 @@ impl SpawnSpec {
     ///
     /// The mapping stays private so callers do not need to conditionalize on
     /// Unix niceness versus Windows process priority classes.
+    ///
+    /// A band the host refuses fails the spawn: on Unix, raising priority
+    /// (for example [`ProcessPriority::High`] without the privilege to lower
+    /// niceness) reports `PermissionDenied`. Use [`Self::priority_best_effort`]
+    /// when the band is a preference rather than a requirement.
     pub fn priority(mut self, priority: ProcessPriority) -> Self {
         self.priority = priority;
+        self.priority_policy = PriorityPolicy::Required;
+        self
+    }
+
+    /// Select a scheduling band that must never prevent the spawn.
+    ///
+    /// The band is applied at creation exactly like [`Self::priority`] where
+    /// the host permits it. When the host refuses it with `PermissionDenied`,
+    /// the spawn is retried once without a band, so the child runs in the
+    /// band it inherits from the spawner. The retry re-runs any
+    /// [`SpawnAdmission`], because each native spawn attempt is admitted.
+    /// A retry that fails still reports its own error. [`ProcessPriority::Normal`]
+    /// requests no band and so never retries.
+    pub fn priority_best_effort(mut self, priority: ProcessPriority) -> Self {
+        self.priority = priority;
+        self.priority_policy = PriorityPolicy::BestEffort;
+        self
+    }
+
+    /// Admit each native spawn attempt through a caller-owned exclusion.
+    ///
+    /// See [`SpawnAdmission`] for exactly when the permit is held. This
+    /// applies to [`Self::spawn`] and [`Self::spawn_session`].
+    /// [`run_bounded_command`] cannot place an admission around its native
+    /// spawn and refuses a spec carrying one with `InvalidInput`.
+    pub fn spawn_admission(mut self, admission: SpawnAdmission) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -1236,6 +1336,16 @@ impl ProcessSessionExit {
     #[must_use]
     pub const fn is_success(self) -> bool {
         matches!(self.exit_code, Some(0))
+    }
+
+    /// Rebuild the host's [`ExitStatus`] from the native status word.
+    ///
+    /// This is lossless: the result reports the same code, signal, and
+    /// success as the status the host returned, so a caller assembling a
+    /// [`std::process::Output`] keeps the child's exact termination.
+    #[must_use]
+    pub fn exit_status(self) -> ExitStatus {
+        platform_imp::process_exit_status_from_native(self.native_status)
     }
 }
 

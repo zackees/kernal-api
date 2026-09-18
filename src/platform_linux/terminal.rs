@@ -107,6 +107,32 @@ impl PtyMaster for PortablePtyMaster {
         }))
     }
 
+    fn prepare_for_teardown(&self) -> io::Result<()> {
+        let Some(fd) = self.0.as_raw_fd() else {
+            return Ok(());
+        };
+        let original = super::fd_flags(fd)?;
+        super::set_fd_flags(fd, original | libc::O_NONBLOCK)
+    }
+
+    fn write_available(&self, bytes: &[u8], timeout: std::time::Duration) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let fd = self
+            .0
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("PTY master does not expose a Unix descriptor"))?;
+        // Status flags belong to the open file description, so every duplicate
+        // shares them. The non-blocking window is therefore restored before
+        // returning rather than left on the session's own writer.
+        let original = super::fd_flags(fd)?;
+        super::set_fd_flags(fd, original | libc::O_NONBLOCK)?;
+        let result = super::write_bounded(fd, bytes, timeout);
+        let _ = super::set_fd_flags(fd, original);
+        result
+    }
+
     fn kill_process_group(&self) -> io::Result<()> {
         match self.0.process_group_leader() {
             Some(pid) => super::super::unix_signal_process_group(
@@ -275,6 +301,63 @@ fn set_fd_flags(fd: i32, flags: libc::c_int) -> std::io::Result<()> {
         let error = std::io::Error::last_os_error();
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error);
+        }
+    }
+}
+
+#[cfg(feature = "pty")]
+fn fd_flags(fd: i32) -> std::io::Result<libc::c_int> {
+    loop {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags != -1 {
+            return Ok(flags);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Write as much of `bytes` as `fd` accepts before `timeout` elapses.
+///
+/// `fd` must already be non-blocking. Returns `0` when the timeout elapses with
+/// the queue still full, which is the point: a caller watching for something
+/// else regains control instead of parking in the kernel.
+#[cfg(feature = "pty")]
+fn write_bounded(fd: i32, bytes: &[u8], timeout: std::time::Duration) -> std::io::Result<usize> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written >= 0 {
+            return Ok(written as usize);
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {}
+            _ => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+        let millis = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if ready == 0 {
+            return Ok(0);
         }
     }
 }

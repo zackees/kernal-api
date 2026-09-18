@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.95.0"
 publish = false
 
+# Warnings are errors here, as in the kernal-api workspace.
+[lints.rust]
+warnings = "deny"
+
 [workspace]
 
 # This tool is deliberately outside the published package and is invoked only

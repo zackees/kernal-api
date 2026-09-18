@@ -188,7 +188,7 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_proof_runner_checks_run_once_on_linux(self):
         checks = self.job("linux-checks")
         self.assertIn("ci.test_native_proof ci.test_native_proof_jobs", checks)
-        self.assertIn("ci.test_nextest_config", checks)
+        self.assertIn("ci.test_nextest_config ci.test_deny_warnings", checks)
         self.assertIn("tests/screenshot-target-repair.ps1", checks)
 
     def test_guest_building_screenshot_cli_runs_only_on_linux(self):

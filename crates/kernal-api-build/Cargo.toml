@@ -23,3 +23,6 @@ path = "src/lib.rs"
 # resource compiler, so a build script pays for nothing else.
 [dependencies]
 embed-resource = "=3.0.11"
+
+[lints]
+workspace = true

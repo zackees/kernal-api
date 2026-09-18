@@ -132,7 +132,7 @@ jobs:
         run: |
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
-            ci.test_nextest_config
+            ci.test_nextest_config ci.test_deny_warnings
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1

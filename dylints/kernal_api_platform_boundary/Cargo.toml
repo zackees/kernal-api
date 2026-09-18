@@ -17,6 +17,10 @@ dylint_testing = "=6.0.3"
 [package.metadata.rust-analyzer]
 rustc_private = true
 
+# Warnings are errors here, as in the kernal-api workspace.
+[lints.rust]
+warnings = "deny"
+
 [workspace]
 
 [profile.release]

@@ -235,8 +235,30 @@ class NativeProofJobsTests(unittest.TestCase):
         source = (WORKFLOW.parents[2] / "ci/native_proof.py").read_text(encoding="utf-8")
         self.assertIn('"--skip", GUEST_BUILDING_SCREENSHOT_TEST', source)
 
-    def test_threaded_script_lane_compiles_only_on_linux(self):
-        self.assertIn("bash scripts/build-threaded-smoke.sh", self.job("linux"))
+    def test_linux_compiles_kernal_api_as_one_all_features_graph(self):
+        """Every kernal-api build in `linux` shares the suite's graph.
+
+        Proofs used to compile their own feature sets -- the webview smoke,
+        the screenshot CLI, six native-proof roles, a threaded-guest script
+        that rebuilt the guest and three more graphs to rerun the native
+        proofs -- about fourteen minutes of compiling beyond the suite. Now
+        they run what `--all-features` builds once. The exceptions are the
+        graphs whose difference is the point: backend feature unification
+        (a dependency feature the production graph must not carry) and the
+        native proofs' `production` graph (`ci/native_proof.py`).
+        """
+        linux = self.job("linux")
+        commands = re.findall(r"soldr cargo (?:run|test|build|nextest run)\b[^\n]*(?:\n\s+--[^\n]*)*", linux)
+        self.assertTrue(commands)
+        unification = ("serde_json/arbitrary_precision", "reqwest/gzip")
+        for command in commands:
+            with self.subTest(command=command):
+                if "--manifest-path" in command or any(feature in command for feature in unification):
+                    continue
+                self.assertIn("--all-features", command)
+        # The native proofs already run the threaded-guest script's proofs
+        # against prebuilt binaries; the script stays a local entry point.
+        self.assertNotIn("build-threaded-smoke", linux)
         self.assertNotIn("build-threaded-smoke", self.job("test"))
 
     def test_feature_isolation_checks_share_one_runner(self):

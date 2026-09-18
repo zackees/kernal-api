@@ -26,11 +26,11 @@ permissions:
   actions: write
 
 jobs:
-  # The whole pipeline is six jobs. Each one is a runner that sets up once and
+  # The whole pipeline is five jobs. Each one is a runner that sets up once and
   # does everything that belongs on it, as steps -- not a runner per check.
   #
-  #   linux          the gate: format, lint, the full test suite, Wasm guests
-  #   linux-checks   every other Linux-only proof, alongside the gate
+  #   linux          the gate: every Linux-only check and proof, then lint,
+  #                  the full test suite, and the Wasm guests the hosts replay
   #   build (x5)     one Linux builder per other target: archive + proofs
   #   test (x5)      one host per other target: run what was built, compile nothing
   #   dylints (x2)   the boundary lints, on their own pinned nightly
@@ -46,62 +46,15 @@ jobs:
   # Linux goes first and gates every other target. It compiles the same
   # sources they do, so a failure here is a failure everywhere, and holding
   # Apple and Windows runners to rediscover it is the waste this ordering
-  # removes. On Linux the builder is the host, so the suite runs in place.
+  # removes. On Linux the builder is the host, so everything runs in place,
+  # on one runner: the Linux-only checks first, then lint and the full suite.
   linux:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # `ci-tests: true` would otherwise default this to 1.
       CARGO_BUILD_JOBS: 4
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - name: Install native webview development packages
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          ci-tests: true
-          cache-key-suffix: linux
-          prebuild-deps-flags: ""
-      - name: Restore native pkg-config search path
-        run: |
-          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - run: soldr cargo fmt --all -- --check
-      - name: Lint every target
-        run: >-
-          soldr cargo clippy
-          --locked --all-features --all-targets -- --deny warnings
-      - name: Run the full test suite
-        # One test per process. `--no-fail-fast` is about tests, not runners:
-        # the suite is about thirty seconds of tests, so stopping at the first
-        # failure saved no capacity and hid the rest until the next cycle.
-        run: soldr cargo nextest run --locked --all-features --no-fail-fast
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - name: Build the target-independent Wasm guests once
-        run: >-
-          uv run --no-project ci/native_proof.py guests
-          --out "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-guest-build"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: native-proof-guests
-          path: ${{ runner.temp }}/native-proof-guests
-          if-no-files-found: error
-          retention-days: 1
-
-  # Every Linux-only proof that is not the test suite, on one runner, in
-  # parallel with the gate rather than behind it: none of it feeds another
-  # target, so it does not need to hold the rest of the pipeline.
-  linux-checks:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -120,13 +73,15 @@ jobs:
       # minute; a poisoned registry costs the whole job.
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          cache-key-suffix: linux-checks
+          ci-tests: true
+          cache-key-suffix: linux
           prebuild-deps-flags: ""
           cargo-registry-cache: false
       - name: Restore native pkg-config search path
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - run: soldr cargo fmt --all -- --check
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Check the CI guards and the guest build scripts
         run: |
@@ -284,11 +239,19 @@ jobs:
       # The x86_64 Linux native proofs, built and run in place: here the
       # builder is the host. Every other target builds in `build` and runs in
       # `test`.
-      - name: Build the Wasm guests for the native proofs
+      # Built once: the x86_64 Linux native proofs below use them in place, and
+      # every other host's `test` job downloads them.
+      - name: Build the target-independent Wasm guests once
         run: >-
           uv run --no-project ci/native_proof.py guests
           --out "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-guest-build"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-proof-guests
+          path: ${{ runner.temp }}/native-proof-guests
+          if-no-files-found: error
+          retention-days: 1
       - name: Compile the x86_64 Linux native proofs
         run: >-
           uv run --no-project ci/native_proof.py build --target x86_64-unknown-linux-gnu
@@ -316,6 +279,15 @@ jobs:
           --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-run-screenshot"
+      - name: Lint every target
+        run: >-
+          soldr cargo clippy
+          --locked --all-features --all-targets -- --deny warnings
+      - name: Run the full test suite
+        # One test per process. `--no-fail-fast` is about tests, not runners:
+        # the suite is about thirty seconds of tests, so stopping at the first
+        # failure saved no capacity and hid the rest until the next cycle.
+        run: soldr cargo nextest run --locked --all-features --no-fail-fast
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -718,7 +690,7 @@ jobs:
   # run would erase the record of which job failed.
   cancel-on-failure:
     name: Cancel run (a job failed)
-    needs: [linux, linux-checks, build, test, dylints]
+    needs: [linux, build, test, dylints]
     if: failure() && github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 5

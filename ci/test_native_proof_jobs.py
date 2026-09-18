@@ -1,7 +1,7 @@
 """Keep CI to a few jobs that compile on Linux and run on all six hosts.
 
-The workflow is six jobs: `linux` (the gate), `linux-checks`, `build` and `test`
-(one runner per other target each), `dylints`, and `cancel-on-failure`. These
+The workflow is five jobs: `linux` (the gate), `build` and `test` (one runner
+per other target each), `dylints`, and `cancel-on-failure`. These
 guards pin the properties that shape was chosen for, one test per property, so
 a later edit that quietly undoes one fails here instead of on a runner bill.
 """
@@ -23,9 +23,9 @@ HOSTS = {
 }
 TARGETS = {target for _, target in HOSTS}
 # x86_64 Linux is the gate: its builder is its host, so it builds and runs in
-# `linux` / `linux-checks` rather than in the per-target matrices.
+# `linux` rather than in the per-target matrices.
 GATE_TARGET = "x86_64-unknown-linux-gnu"
-EXPECTED_JOBS = {"linux", "linux-checks", "build", "test", "dylints", "cancel-on-failure"}
+EXPECTED_JOBS = {"linux", "build", "test", "dylints", "cancel-on-failure"}
 # `cargo-nextest` is the replay driver, not a compiler: it runs binaries out of
 # a prebuilt archive. `.cargo/bin` is a path. Everything else named here would
 # compile on the host running it.
@@ -56,7 +56,7 @@ class NativeProofJobsTests(unittest.TestCase):
 
     # -- the shape -----------------------------------------------------------
 
-    def test_the_pipeline_is_six_jobs(self):
+    def test_the_pipeline_is_five_jobs(self):
         """Checks are steps on a shared runner, not a runner each.
 
         This workflow was 20 job definitions and 52 runners per push. A new
@@ -69,7 +69,22 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_only_python_310_is_tested(self):
         """The package is tested on its supported floor alone."""
         self.assertNotIn("3.13", self.text())
-        self.assertIn("--python 3.10", self.job("linux-checks"))
+        self.assertIn("--python 3.10", self.job("linux"))
+
+    def test_linux_runs_its_own_checks_before_lint_and_the_suite(self):
+        """One Linux runner: the Linux-only checks first, then the gate's lint and suite.
+
+        `linux` and `linux-checks` were two runners doing Linux work side by
+        side; they are one job, and it stays the gate every other job waits on.
+        """
+        linux = self.job("linux")
+        first_check = linux.index("- name: Check the CI guards and the guest build scripts")
+        last_check = linux.index("- name: Run the x86_64 Linux screenshot and containment proofs")
+        lint = linux.index("- name: Lint every target")
+        suite = linux.index("- name: Run the full test suite")
+        self.assertLess(first_check, last_check)
+        self.assertLess(last_check, lint)
+        self.assertLess(lint, suite)
 
     def test_every_other_platform_waits_for_linux(self):
         """A red Linux run must not cost an Apple or Windows runner."""
@@ -82,7 +97,7 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_a_failure_cancels_the_rest_of_the_run(self):
         """`fail-fast` stops a matrix's siblings; the sentinel stops everything else."""
         sentinel = self.job("cancel-on-failure")
-        self.assertIn("needs: [linux, linux-checks, build, test, dylints]", sentinel)
+        self.assertIn("needs: [linux, build, test, dylints]", sentinel)
         self.assertIn("if: failure() && github.event_name == 'pull_request'", sentinel)
         self.assertIn("gh run cancel ${{ github.run_id }}", sentinel)
         self.assertIn("actions: write", sentinel)
@@ -130,7 +145,7 @@ class NativeProofJobsTests(unittest.TestCase):
 
     def test_the_gate_target_runs_its_proofs_in_place(self):
         """x86_64 Linux builds and runs its native proofs where it is built."""
-        checks = self.job("linux-checks")
+        checks = self.job("linux")
         self.assertIn("native_proof.py build --target x86_64-unknown-linux-gnu", checks)
         self.assertIn("native_proof.py run compiler", checks)
         self.assertIn("native_proof.py run screenshot", checks)
@@ -143,7 +158,7 @@ class NativeProofJobsTests(unittest.TestCase):
         first consolidated run failed with `work directory is not empty;
         refusing stale proof state` after the compiler proofs had passed.
         """
-        for job in ("test", "linux-checks"):
+        for job in ("test", "linux"):
             with self.subTest(job=job):
                 body = self.job(job)
                 self.assertIn('native-proof-run-compiler"', body)
@@ -186,7 +201,7 @@ class NativeProofJobsTests(unittest.TestCase):
     # -- Linux-only checks ---------------------------------------------------
 
     def test_proof_runner_checks_run_once_on_linux(self):
-        checks = self.job("linux-checks")
+        checks = self.job("linux")
         self.assertIn("ci.test_native_proof ci.test_native_proof_jobs", checks)
         self.assertIn("ci.test_nextest_config ci.test_deny_warnings", checks)
         self.assertIn("tests/screenshot-target-repair.ps1", checks)
@@ -194,7 +209,7 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_guest_building_screenshot_cli_runs_only_on_linux(self):
         # The one screenshot proof that compiles its own guest is skipped on
         # the native hosts, so it must still run somewhere: here, on Linux.
-        checks = self.job("linux-checks")
+        checks = self.job("linux")
         self.assertLess(
             checks.index("native_proof.py wasm-target"),
             checks.index(f"{native_proof.GUEST_BUILDING_SCREENSHOT_TEST} --exact --ignored"),
@@ -210,12 +225,12 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIn('"--skip", GUEST_BUILDING_SCREENSHOT_TEST', source)
 
     def test_threaded_script_lane_compiles_only_on_linux(self):
-        self.assertIn("bash scripts/build-threaded-smoke.sh", self.job("linux-checks"))
+        self.assertIn("bash scripts/build-threaded-smoke.sh", self.job("linux"))
         self.assertNotIn("build-threaded-smoke", self.job("test"))
 
     def test_feature_isolation_checks_share_one_runner(self):
         """36 isolated `cargo check`s are one step, not 36 runners."""
-        step = self.step("linux-checks", "Check every feature in isolation")
+        step = self.step("linux", "Check every feature in isolation")
         self.assertIn('for feature in "${features[@]}"', step)
         self.assertIn('failed+=("${feature}")', step)
 

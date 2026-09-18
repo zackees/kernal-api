@@ -426,71 +426,90 @@ jobs:
           --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
 
 
+  # One runner checks every feature in isolation, one after another.
+  #
+  # This was a 36-entry matrix: 36 runners, 31 runner-minutes, each paying
+  # checkout, setup-soldr and a cold start to run a single `cargo check`
+  # (about 52s apiece, most of it setup). Here the setup happens once and each
+  # check reuses whatever dependency units an earlier feature already built.
+  #
+  # Every feature runs even after one fails, so a red run lists all of them
+  # rather than one per CI cycle. Each has its own collapsible log group, and
+  # the final error annotation names every feature that failed in isolation.
   each-feature:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        feature:
-          - allocator
-          - archive
-          - archive-auth-test-support
-          - conpty-sidecar
-          - crash
-          # The four daemon lanes are the frozen running-process substrates.
-          # Without them these features are compiled only inside
-          # `--all-features` in `test-archive`, where every other feature is
-          # present to supply whatever a missing gate would need -- exactly
-          # the coupling this matrix exists to catch.
-          - daemon-frame-v1
-          - daemon-identity
-          - daemon-registration
-          - daemon-registration-v2
-          - fs
-          - fs-watch
-          - hash-sha256
-          - secure-random
-          - text-similarity
-          - command-arguments
-          - config-toml
-          - json
-          - source-cpp
-          - terminal-style
-          - terminal-input
-          - event-stream
-          - http-server
-          - http-client
-          # Canonical scheduler/broker spawn API is public only through this
-          # feature. Keep it isolated from the default process HAL.
-          - independent-spawn
-          - ipc
-          - ipc-async
-          - profile
-          - pty
-          - session-relay
-          - snapshot
-          - symbolize
-          - symbolize-split
-          - symbolize-worker
-          - tokio-console
-          - tauri-webview
-          - window-icon
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # `tauri-webview` compiles GTK/WebKit bindings.
       - name: Install native webview development packages
-        if: matrix.feature == 'tauri-webview'
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Restore native pkg-config search path
-        if: matrix.feature == 'tauri-webview'
         run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - run: >-
-          soldr cargo check
-          --locked --no-default-features --features ${{ matrix.feature }}
+      - name: Check every feature in isolation
+        run: |
+          set -uo pipefail
+          features=(
+            allocator
+            archive
+            archive-auth-test-support
+            conpty-sidecar
+            crash
+            # The four daemon lanes are the frozen running-process substrates.
+            # Without them these features are compiled only inside
+            # `--all-features` in `test-archive`, where every other feature is
+            # present to supply whatever a missing gate would need -- exactly
+            # the coupling this matrix exists to catch.
+            daemon-frame-v1
+            daemon-identity
+            daemon-registration
+            daemon-registration-v2
+            fs
+            fs-watch
+            hash-sha256
+            secure-random
+            text-similarity
+            command-arguments
+            config-toml
+            json
+            source-cpp
+            terminal-style
+            terminal-input
+            event-stream
+            http-server
+            http-client
+            # Canonical scheduler/broker spawn API is public only through this
+            # feature. Keep it isolated from the default process HAL.
+            independent-spawn
+            ipc
+            ipc-async
+            profile
+            pty
+            session-relay
+            snapshot
+            symbolize
+            symbolize-split
+            symbolize-worker
+            tokio-console
+            tauri-webview
+            window-icon
+          )
+          failed=()
+          for feature in "${features[@]}"; do
+            echo "::group::${feature}"
+            if ! soldr cargo check --locked --no-default-features --features "${feature}"; then
+              failed+=("${feature}")
+            fi
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::features that do not compile in isolation: ${failed[*]}"
+            exit 1
+          fi
       - name: Test JSON with unified arbitrary-precision backend feature
-        if: matrix.feature == 'json'
         run: >-
           soldr cargo test --locked --no-default-features
           --features json,serde_json/arbitrary_precision --test data

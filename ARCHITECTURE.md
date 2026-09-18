@@ -197,7 +197,9 @@ buffering convention.
 
 1. Fill the facade gaps needed by zccache: cancellation/runtime handles,
    process lifecycle and bounded execution, BLAKE3 hashing, and broker adapters.
-2. Rebase zccache's embedded API on facade-owned async and cancellation types.
+2. Rebase zccache's embedded API on facade-owned async and cancellation types,
+   including the std-only `fair_race!`, `biased_race!`, and `task_local!`
+   macros that replace backend `select!` and task-local call sites.
 3. Move zccache process launch, probing, detached deployment, identity, and
    hashing behind `kernal-api`.
 4. Move broker access through a compatibility facade while preserving the

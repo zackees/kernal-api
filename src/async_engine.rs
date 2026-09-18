@@ -4,11 +4,16 @@
 //! implementation is Tokio, but no Tokio type, trait, module, or macro is
 //! re-exported across the facade.
 //!
-//! This module deliberately provides no generic race combinator. A
-//! `select!`-shaped call site -- multiple arms of differing future types,
-//! per-arm `if` guards, loop-accumulated state across iterations -- has no
-//! non-macro equivalent that is not itself a reimplementation of `select!`,
-//! so those call sites stay on the backend macro. Callers whose only need is
+//! [`crate::biased_race!`] covers ordered selection over two to four
+//! borrowed/pinned futures. [`crate::fair_race!`] supports two to five branches
+//! with a pseudorandom initial polling position. Both snapshot optional guards
+//! and return tagged winners ([`BiasedRace2`]..[`BiasedRace4`],
+//! [`FairRace2`]..[`FairRace5`]); neither implements pattern-mismatch disabling
+//! or an `else` arm. Preserve those behaviors explicitly when migrating a
+//! broader `select!` expression. Source-order priority is a semantic choice,
+//! so biased selection must not substitute for a previously unordered race.
+//! Both macros are implemented with `std` only and expand to `$crate` paths,
+//! so no backend macro or type crosses the facade. Callers whose only need is
 //! racing one operation against cancellation should reach for [`cancellable`]
 //! instead. `join!`-shaped call sites are different: awaiting a fixed, small
 //! set of futures unconditionally to completion has no macro-specific
@@ -18,6 +23,11 @@
 //! facade needs a `kernal-api-macros` companion crate, which is an open
 //! decision tracked in the meta issue rather than something this module
 //! resolves on its own.
+//!
+//! [`crate::task_local!`] declares poll-scoped bindings ([`TaskLocal`]) backed
+//! only by `std::thread_local!`, without exposing runtime types. A binding is
+//! installed around every poll and destruction of the scoped future and is
+//! not inherited by work launched from inside the scope.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -29,12 +39,18 @@ use std::time::Duration;
 use tokio::sync::Notify as BackendNotify;
 
 mod broadcast;
+mod race;
+mod task_local;
 pub use broadcast::{
     broadcast_channel, BroadcastReceiver, BroadcastRecvError, BroadcastSender,
     BroadcastTryRecvError,
 };
 #[cfg(feature = "event-stream")]
 pub use broadcast::{BroadcastLagged, BroadcastStream};
+#[doc(hidden)]
+pub use race::fair_start as __fair_race_start;
+pub use race::{BiasedRace2, BiasedRace3, BiasedRace4, FairRace2, FairRace3, FairRace4, FairRace5};
+pub use task_local::{TaskLocal, TaskLocalAccessError, TaskLocalScope};
 
 /// Current engine implementation, retained for diagnostics and bug reports.
 pub const BACKEND_NAME: &str = "tokio";

@@ -163,6 +163,38 @@ pub trait PtyMaster: Send + 'static {
         Ok(())
     }
 
+    /// Prepare the master for the writes that teardown performs.
+    ///
+    /// Dropping the session's writer sends a newline and the terminal's EOF
+    /// character through the master. On a terminal whose input queue is full
+    /// that write does not return, so teardown would hang for exactly the
+    /// session that filled the queue and then lost its client. Backends make
+    /// that write give up instead of waiting.
+    #[cfg(feature = "pty")]
+    fn prepare_for_teardown(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Write as much of `bytes` as the terminal accepts within `timeout`.
+    ///
+    /// Returns the number of bytes written; `0` means the input queue stayed
+    /// full for the whole timeout. A caller that has to observe something
+    /// other than the terminal — a disconnected client, a shutdown — uses this
+    /// instead of [`std::io::Write::write_all`], which parks until the queue
+    /// drains and cannot be interrupted: not by a signal, and not by ending the
+    /// process holding the other end.
+    ///
+    /// Backends without a bounded write report
+    /// [`std::io::ErrorKind::Unsupported`] rather than pretending to honour the
+    /// timeout by blocking through it.
+    #[cfg(feature = "pty")]
+    fn write_available(&self, _bytes: &[u8], _timeout: std::time::Duration) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bounded PTY writes are not implemented for this backend",
+        ))
+    }
+
     /// Select the externally meaningful PID for this PTY.
     #[cfg(feature = "pty")]
     fn preferred_pid(&self, child: &dyn PtyChild) -> Option<u32> {

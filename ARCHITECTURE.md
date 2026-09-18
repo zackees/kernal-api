@@ -197,6 +197,9 @@ buffering convention.
 
 1. Fill the facade gaps needed by zccache: cancellation/runtime handles,
    process lifecycle and bounded execution, BLAKE3 hashing, and broker adapters.
+   The async compiler-session path is covered by `SpawnSpec::spawn_session`
+   with `SpawnAdmission` and `SpawnSpec::priority_best_effort`, adapted
+   privately in `src/process_adapter.rs`.
 2. Rebase zccache's embedded API on facade-owned async and cancellation types,
    including the std-only `fair_race!`, `biased_race!`, and `task_local!`
    macros that replace backend `select!` and task-local call sites.
@@ -208,6 +211,12 @@ buffering convention.
 5. Remove every direct zccache `running-process` dependency and import, then
    enable the strict boundary Dylint for the whole workspace.
 6. Apply the proven migration to Soldr and fbuild.
+
+Direct-daemon identity (step 3) is owned by the opt-in `daemon_identity`
+facade: the frozen sidecar, probe, and endpoint mux delegate privately to the
+substrate's `backend-identity` feature, while recorded-daemon verification and
+control run on `kernal-api`'s own host process facade so the feature never
+selects the substrate's broker client.
 
 During migration, each capability lands in `kernal-api` before the corresponding
 client ban is enabled. There is no permanent legacy fallback in release builds.

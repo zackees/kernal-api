@@ -6,9 +6,14 @@
 //! protocol identifiers, or daemon lifecycle policy.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use running_process::backend_identity as backend;
+
+#[path = "daemon_identity_control.rs"]
+mod control;
+
+pub use control::{DaemonVerifyError, VerifiedDaemon};
 
 /// An application-selected daemon endpoint.
 ///
@@ -73,7 +78,66 @@ impl DaemonIdentityHashPolicy {
     }
 }
 
+/// Every field of a [`DaemonIdentity`], for applications that assemble or
+/// inspect one field by field.
+///
+/// Converting through this record is lossless in both directions:
+/// `DaemonIdentity::from_record(identity.to_record()) == identity`.  An
+/// application that computes its own executable digest, or a test that needs
+/// a foreign or deliberately stale identity, builds one here instead of
+/// capturing the current process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonIdentityRecord {
+    /// Operating-system process identifier.
+    pub pid: u32,
+    /// Executable path the daemon was started from.
+    pub executable_path: PathBuf,
+    /// BLAKE3 digest of that executable.
+    pub blake3_digest: [u8; 32],
+    /// Historical SHA-256 probe digest; all zeroes when not computed.
+    pub legacy_sha256_digest: [u8; 32],
+    /// Host boot identifier observed when the daemon started.
+    pub boot_id: String,
+    /// Endpoint the daemon serves.
+    pub endpoint: DaemonEndpoint,
+    /// Unix timestamp, in milliseconds, at which the daemon started.
+    pub started_at_unix_ms: u64,
+    /// Idle timeout advertised by the daemon, if it has one.
+    pub idle_timeout_secs: Option<u32>,
+}
+
 impl DaemonIdentity {
+    /// Assemble an identity from explicit field values.
+    ///
+    /// No field is checked against the host; use [`Self::verify_live`] or a
+    /// probe for that.
+    pub fn from_record(record: DaemonIdentityRecord) -> Self {
+        Self::from_backend(backend::DaemonProcess {
+            pid: record.pid,
+            exe_path: record.executable_path,
+            exe_hash: record.blake3_digest,
+            legacy_exe_sha256: record.legacy_sha256_digest,
+            boot_id: record.boot_id,
+            ipc_endpoint: record.endpoint.into_backend(),
+            started_at_unix_ms: record.started_at_unix_ms,
+            idle_timeout_secs: record.idle_timeout_secs,
+        })
+    }
+
+    /// Copy every field of this identity into a plain record.
+    pub fn to_record(&self) -> DaemonIdentityRecord {
+        DaemonIdentityRecord {
+            pid: self.inner.pid,
+            executable_path: self.inner.exe_path.clone(),
+            blake3_digest: self.inner.exe_hash,
+            legacy_sha256_digest: self.inner.legacy_exe_sha256,
+            boot_id: self.inner.boot_id.clone(),
+            endpoint: self.endpoint(),
+            started_at_unix_ms: self.inner.started_at_unix_ms,
+            idle_timeout_secs: self.inner.idle_timeout_secs,
+        }
+    }
+
     /// Construct the identity of this process after its final endpoint has
     /// been selected.
     pub fn current_process(
@@ -173,19 +237,41 @@ impl DaemonIdentity {
     /// Prove, without occupying an async worker, that this identity still
     /// serves its recorded endpoint.
     ///
-    /// A successful probe performs the substrate's single existing endpoint
-    /// connection and nonce round trip.  It does not construct a client,
-    /// derive another endpoint, or add a product-protocol exchange.
+    /// Equivalent to [`Self::probe_endpoint`] with [`Self::endpoint`].
     pub async fn probe_same_endpoint(&self) -> ProbeSameEndpoint {
-        let endpoint = self.inner.ipc_endpoint.clone();
-        let expected = self.inner.clone();
-        match crate::async_engine::launch_blocking(move || {
-            backend::BackendHandle::probe(&endpoint, &expected).is_some()
-        })
-        .await
-        {
-            Ok(true) => ProbeSameEndpoint::Current,
-            Ok(false) | Err(_) => ProbeSameEndpoint::NotCurrent,
+        self.probe_endpoint(&self.endpoint()).await
+    }
+
+    /// Prove, without occupying an async worker, that this identity serves
+    /// `endpoint`.
+    ///
+    /// See [`Self::probe_endpoint_blocking`] for the checks performed.
+    pub async fn probe_endpoint(&self, endpoint: &DaemonEndpoint) -> ProbeSameEndpoint {
+        let endpoint = endpoint.clone();
+        let expected = self.clone();
+        crate::async_engine::launch_blocking(move || expected.probe_endpoint_blocking(&endpoint))
+            .await
+            .unwrap_or(ProbeSameEndpoint::NotCurrent)
+    }
+
+    /// Prove that this identity serves `endpoint`, blocking the caller.
+    ///
+    /// `endpoint` is the endpoint the caller resolved from its own
+    /// configuration; it must equal the recorded endpoint exactly.  The
+    /// recorded process must then verify as in [`Self::verify_live`], and
+    /// the endpoint must answer the frozen v1 nonce probe with precisely this
+    /// identity.  A successful probe performs the substrate's single endpoint
+    /// connection and nonce round trip: it does not construct a client,
+    /// derive another endpoint, or add a product-protocol exchange.  The
+    /// response wait is bounded at 500 ms.
+    ///
+    /// **Blocking.** From asynchronous code use [`Self::probe_endpoint`].
+    pub fn probe_endpoint_blocking(&self, endpoint: &DaemonEndpoint) -> ProbeSameEndpoint {
+        let endpoint = endpoint.clone().into_backend();
+        if backend::BackendHandle::probe(&endpoint, &self.inner).is_some() {
+            ProbeSameEndpoint::Current
+        } else {
+            ProbeSameEndpoint::NotCurrent
         }
     }
 

@@ -1,4 +1,24 @@
 //! Private bridge from facade process semantics to the native substrate.
+//!
+//! # Error mapping
+//!
+//! Every lifecycle and spawn operation surfaces [`io::Error`]; the substrate's
+//! error enum never crosses this boundary. [`process_error_to_io`] is the one
+//! mapping, and it is stable:
+//!
+//! | Substrate failure                      | `io::ErrorKind`                  |
+//! |----------------------------------------|----------------------------------|
+//! | spawn or I/O failure carrying an error | that error, unchanged (kind and raw OS code preserved) |
+//! | started twice                          | `AlreadyExists`                  |
+//! | child no longer running                | `BrokenPipe`                     |
+//! | stdin not piped or already closed      | `BrokenPipe`                     |
+//! | no usable async runtime context        | `Other`                          |
+//! | deadline elapsed                       | `TimedOut`                       |
+//! | retained output exceeded its limit     | `FileTooLarge`                   |
+//!
+//! Bounded capture and bounded runs keep their typed errors
+//! ([`ProcessCaptureError`], [`BoundedProcessError`]) for the two outcomes a
+//! caller acts on, and use the same mapping for the rest.
 
 use std::io;
 use std::process::ExitStatus;
@@ -16,9 +36,9 @@ use crate::platform::process::{
     ProcessInspectError, ProcessInspectErrorKind,
 };
 use crate::{
-    BoundedProcessError, BoundedProcessOutput, PlatformChild, ProcessCaptureError, ProcessExit,
-    ProcessExitWatch, ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion,
-    ProcessOutputEvent, ProcessOutputFault, ProcessPostExitDrain, ProcessSession,
+    BoundedProcessError, BoundedProcessOutput, PlatformChild, PriorityPolicy, ProcessCaptureError,
+    ProcessExit, ProcessExitWatch, ProcessOutput, ProcessOutputChunk, ProcessOutputCompletion,
+    ProcessOutputEvent, ProcessOutputFault, ProcessPostExitDrain, ProcessPriority, ProcessSession,
     ProcessSessionExit, ProcessSessionOptions, SpawnSpec, StreamMode,
 };
 
@@ -104,8 +124,17 @@ pub(crate) async fn spawn(spec: SpawnSpec) -> io::Result<PlatformChild> {
     // Resolved before the child exists: an owner that has already exited must
     // fail the spawn rather than leave a child with nothing watching it.
     let watch = open_owner_watch(owner)?;
+    let fallback = priority_fallback(&spec);
     let mut process = builder(spec).build();
-    process.start().await.map_err(process_error_to_io)?;
+    if let Err(error) = process.start().await {
+        match fallback {
+            Some(fallback) if priority_refused(&error) => {
+                process = builder(fallback).build();
+                process.start().await.map_err(process_error_to_io)?;
+            }
+            _ => return Err(process_error_to_io(error)),
+        }
+    }
     let pid = process.pid().await.map_err(process_error_to_io)?;
     let lifetime = bind_lifetime(owner, watch, pid);
     Ok(PlatformChild::new(
@@ -115,6 +144,31 @@ pub(crate) async fn spawn(spec: SpawnSpec) -> io::Result<PlatformChild> {
         },
         lifetime,
     ))
+}
+
+/// The spec to retry with when a best-effort band is refused, if one could be.
+///
+/// Only a best-effort request that actually asks the host for a band has
+/// something to drop; everything else fails exactly as the first attempt did.
+fn priority_fallback(spec: &SpawnSpec) -> Option<SpawnSpec> {
+    let droppable = spec.priority_policy == PriorityPolicy::BestEffort
+        && spec.priority.substrate_nice().is_some();
+    droppable.then(|| {
+        let mut fallback = spec.clone();
+        fallback.priority = ProcessPriority::Normal;
+        fallback.priority_policy = PriorityPolicy::Required;
+        fallback
+    })
+}
+
+/// Whether a spawn failure is the host refusing a scheduling band.
+///
+/// Unix applies the band in the child before exec, so a refusal arrives as the
+/// spawn's own `PermissionDenied`. An executable that is itself not permitted
+/// reports the same kind; the one retry then fails the same way and that
+/// second error is returned.
+fn priority_refused(error: &ProcessError) -> bool {
+    matches!(error, ProcessError::Spawn(error) if error.kind() == io::ErrorKind::PermissionDenied)
 }
 
 /// Take the owner's exit subscription before anything is spawned.
@@ -184,8 +238,17 @@ pub(crate) async fn spawn_session(
 ) -> io::Result<ProcessSession> {
     let owner = spec.lifetime_owner;
     let watch = open_owner_watch(owner)?;
+    let fallback = priority_fallback(&spec);
     let mut session = builder(spec).session(session_options(options));
-    session.start().await.map_err(process_error_to_io)?;
+    if let Err(error) = session.start().await {
+        match fallback {
+            Some(fallback) if priority_refused(&error) => {
+                session = builder(fallback).session(session_options(options));
+                session.start().await.map_err(process_error_to_io)?;
+            }
+            _ => return Err(process_error_to_io(error)),
+        }
+    }
     let (control, output) = session.into_parts().map_err(process_error_to_io)?;
     let pid = control.pid();
     let lifetime = bind_lifetime(owner, watch, pid);
@@ -221,6 +284,36 @@ pub(crate) fn run_bounded(
             "a bounded run binds only to its spawner; use SpawnSpec::spawn for another owner",
         )));
     }
+    // The substrate's bounded runner spawns internally with no admission
+    // hook. Holding the permit around the whole run would turn a spawn-only
+    // exclusion into a lifetime one, so the request is refused instead.
+    if spec.admission.is_some() {
+        return Err(BoundedProcessError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a bounded run cannot hold a spawn admission; use SpawnSpec::spawn_session",
+        )));
+    }
+    let fallback = priority_fallback(&spec);
+    match run_bounded_once(spec, timeout, output_limit) {
+        Err(error) if priority_refused(&error) => match fallback {
+            Some(fallback) => run_bounded_once(fallback, timeout, output_limit),
+            None => Err(error),
+        },
+        result => result,
+    }
+    .map(|output| BoundedProcessOutput {
+        exit: ProcessExit::new(output.exit_code),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+    .map_err(bounded_process_error)
+}
+
+fn run_bounded_once(
+    spec: SpawnSpec,
+    timeout: Option<Duration>,
+    output_limit: usize,
+) -> Result<running_process::RunOutput, ProcessError> {
     let (command, kill_when_owner_dies, priority) = std_command(spec);
     running_process::run_std_command_bounded_with_options(
         command,
@@ -230,12 +323,6 @@ pub(crate) fn run_bounded(
             .kill_when_owner_dies(kill_when_owner_dies)
             .nice(priority.substrate_nice()),
     )
-    .map(|output| BoundedProcessOutput {
-        exit: ProcessExit::new(output.exit_code),
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-    .map_err(bounded_process_error)
 }
 
 impl ProcessAdapter {
@@ -377,11 +464,13 @@ fn builder(spec: SpawnSpec) -> AsyncProcessBuilder {
         create_process_group,
         lifetime_owner,
         priority,
+        priority_policy: _,
+        admission,
     } = spec;
     let kill_when_owner_dies = binds_to_spawner(lifetime_owner);
-    let mut builder = AsyncProcessBuilder::new(program);
-    for arg in args {
-        builder = builder.arg(arg);
+    let mut builder = AsyncProcessBuilder::new(program).args(args);
+    if let Some(admission) = admission {
+        builder = builder.spawn_admission(admission.into_inner());
     }
     if let Some(current_dir) = current_dir {
         builder = builder.current_dir(current_dir);
@@ -494,6 +583,8 @@ fn std_command(spec: SpawnSpec) -> (std::process::Command, bool, crate::ProcessP
         create_process_group: _,
         lifetime_owner,
         priority,
+        priority_policy: _,
+        admission: _,
     } = spec;
     let kill_when_owner_dies = binds_to_spawner(lifetime_owner);
     let mut command = std::process::Command::new(program);
@@ -610,6 +701,36 @@ mod tests {
             });
             assert!(!binding.is_watching());
         });
+    }
+
+    /// The documented mapping is part of the facade contract: clients that
+    /// used to match the substrate's error enum now match these kinds.
+    #[test]
+    fn process_errors_map_to_stable_io_kinds() {
+        use super::process_error_to_io;
+        use running_process::ProcessError;
+        use std::io::ErrorKind;
+
+        let spawn = process_error_to_io(ProcessError::Spawn(std::io::Error::from_raw_os_error(2)));
+        assert_eq!(spawn.raw_os_error(), Some(2));
+        let io = process_error_to_io(ProcessError::Io(std::io::Error::new(
+            ErrorKind::Interrupted,
+            "fixture",
+        )));
+        assert_eq!(io.kind(), ErrorKind::Interrupted);
+        for (error, kind) in [
+            (ProcessError::AlreadyStarted, ErrorKind::AlreadyExists),
+            (ProcessError::NotRunning, ErrorKind::BrokenPipe),
+            (ProcessError::StdinUnavailable, ErrorKind::BrokenPipe),
+            (ProcessError::RuntimeContext, ErrorKind::Other),
+            (ProcessError::Timeout, ErrorKind::TimedOut),
+            (
+                ProcessError::OutputLimitExceeded { limit: 1 },
+                ErrorKind::FileTooLarge,
+            ),
+        ] {
+            assert_eq!(process_error_to_io(error).kind(), kind);
+        }
     }
 
     #[test]

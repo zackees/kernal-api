@@ -65,7 +65,10 @@ impl ProcessLiveness {
 /// `proc_pidpath` asks about one process. The obvious alternative -- walking
 /// every process on the host and picking the matching one -- answers the same
 /// question at a cost that grows with everything else running.
-#[allow(dead_code)] // Kept private pending an identity-addressed inspect facade.
+#[cfg_attr(
+    not(feature = "daemon-identity"),
+    allow(dead_code, reason = "only recorded-daemon verification reads another image")
+)]
 pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
     let mut buffer = [0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer and its true length are passed together, and the

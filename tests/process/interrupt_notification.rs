@@ -112,6 +112,19 @@ fn prepare_isolated_console() {
     unsafe { winapi::um::wincon::FreeConsole() };
     // SAFETY: no arguments; allocates a console owned by this child.
     assert_ne!(unsafe { winapi::um::consoleapi::AllocConsole() }, 0);
+    // A process created with `CREATE_NEW_PROCESS_GROUP` starts with CTRL+C
+    // ignored, and its children inherit that. nextest launches every test that
+    // way on Windows so it can stop one, so under nextest this fixture's own
+    // `CTRL_C_EVENT` was silently dropped and the first wait timed out; under
+    // `cargo test` the flag was never set. A NULL handler with FALSE restores
+    // normal CTRL+C processing, so the fixture no longer depends on how its
+    // test runner launched it.
+    // SAFETY: NULL handler with FALSE only clears this process's ignore flag;
+    // it installs nothing and cannot affect the parent.
+    assert_ne!(
+        unsafe { winapi::um::consoleapi::SetConsoleCtrlHandler(None, 0) },
+        0
+    );
 }
 
 #[cfg(windows)]

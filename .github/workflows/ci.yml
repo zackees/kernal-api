@@ -26,146 +26,31 @@ permissions:
   actions: write
 
 jobs:
-  # Compile every test binary once, on Linux, for all six supported hosts.
+  # The whole pipeline is six jobs. Each one is a runner that sets up once and
+  # does everything that belongs on it, as steps -- not a runner per check.
   #
-  # Soldr carries its own LLVM, macOS SDK and Windows syslibs, so a Linux
-  # builder can link Mach-O and PE test binaries; clippy is a compile-time
-  # check and rides along per target. The native hosts below never compile --
-  # they download these archives and run them, so the scarce Apple and Windows
-  # runners are held for the execution window only.
+  #   linux          the gate: format, lint, the full test suite, Wasm guests
+  #   linux-checks   every other Linux-only proof, alongside the gate
+  #   build (x5)     one Linux builder per other target: archive + proofs
+  #   test (x5)      one host per other target: run what was built, compile nothing
+  #   dylints (x2)   the boundary lints, on their own pinned nightly
+  #   cancel-on-failure   stops the run the moment any of the above fails
   #
-  # `ci-tests: true` is the cache contract for a lane whose entire output is
-  # linked test products: zccache never admits those, and the bulk `target/`
-  # snapshot is refused rather than silently storing gigabytes of them
-  # (soldr#2931). Dependency compilation still comes from cook and the per-unit
-  # store. It also defaults the job counts to one, which is why the build jobs
-  # below set `CARGO_BUILD_JOBS` explicitly: this graph (Wasmtime, Cranelift,
-  # Tauri, OpenSSL) built at the runner's own parallelism in 12 minutes before
-  # this change, and a hosted runner has the memory for it.
-  # Linux goes first and gates everything else. It compiles the same sources
-  # every other target does, so a failure here is a failure everywhere, and
-  # holding Apple and Windows runners to rediscover it is the waste this
-  # ordering removes. The cost is latency on a green run: the other targets
-  # start after this replay passes.
-  test-archive-linux:
+  # This replaced 20 job definitions and 52 runners per push. Checks that used
+  # to be a job each are now steps; the per-target proof matrices
+  # (`native-proof-build`, `wasm-compiler-native`, `wasm-tauri-screenshot-native`)
+  # folded into `build` and `test`, which already had one runner per target;
+  # `supported-targets` compiled the same all-feature graph `build` archives,
+  # so only its ABI-generator cross-check survived, as a `build` step.
+
+  # Linux goes first and gates every other target. It compiles the same
+  # sources they do, so a failure here is a failure everywhere, and holding
+  # Apple and Windows runners to rediscover it is the waste this ordering
+  # removes. On Linux the builder is the host, so the suite runs in place.
+  linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_BUILD_JOBS: 4
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - name: Install native webview development packages
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          ci-tests: true
-          cache-key-suffix: test-archive-x86_64-unknown-linux-gnu
-          prebuild-deps-flags: ""
-      - name: Restore native pkg-config search path
-        run: |
-          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - name: Lint this target
-        run: >-
-          soldr cargo clippy
-          --locked --all-features --all-targets -- --deny warnings
-      - name: Archive every test binary for this target
-        run: >-
-          soldr cargo nextest archive
-          --locked --all-features
-          --archive-file kernal-tests-x86_64-unknown-linux-gnu.tar.zst
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: kernal-tests-x86_64-unknown-linux-gnu
-          path: kernal-tests-x86_64-unknown-linux-gnu.tar.zst
-          if-no-files-found: error
-          retention-days: 1
-
-  test-run-linux:
-    needs: test-archive-linux
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - name: Install the native webview runtime
-        # The test binaries link libwebkit2gtk at run time, so a replay host
-        # needs the libraries even though it compiles nothing. Same package
-        # names as the archive lane, so the two cannot drift apart.
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: kernal-tests-x86_64-unknown-linux-gnu
-      - name: Install cargo-nextest
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Run this host's prebuilt tests
-        # `--no-fail-fast` is about tests, not runners: the whole replay is
-        # about thirty seconds, so stopping at the first failure saved no
-        # capacity and hid every later failure until the next full CI cycle.
-        # Runner-level fail-fast is unchanged -- the matrix still stops its
-        # siblings and the sentinels still cancel the run when this job fails.
-        #
-        # The Linux lane keeps the source-reading policy tests: here the
-        # builder and the runner agree on the path baked into
-        # `env!("CARGO_MANIFEST_DIR")`, so they read what they mean to.
-        run: |
-          set -euo pipefail
-          cargo-nextest nextest run \
-            --archive-file kernal-tests-x86_64-unknown-linux-gnu.tar.zst \
-            --workspace-remap . --no-fail-fast 2>&1 | tee nextest-output.txt
-      - name: Prove this host ran its own code
-        run: |
-          set -euo pipefail
-          grep -F "platform_linux::" nextest-output.txt > /dev/null \
-            || { echo "no platform_linux:: test ran: this host did not execute its own code"; exit 1; }
-
-  # Every other target, gated on Linux passing above.
-  test-archive:
-    name: Test archive (${{ matrix.target }})
-    needs: test-run-linux
-    strategy:
-      # Fail fast, unlike the per-target proof matrices below. Every target
-      # here compiles the same sources, so the second failure teaches nothing
-      # the first did not -- and holding five more builders to learn it is what
-      # made a broken push saturate the account-wide pool. The sentinel job
-      # below then cancels the rest of the run.
-      fail-fast: true
-      matrix:
-        include:
-          # aarch64 Linux builds natively on an ARM runner: WebKitGTK comes
-          # from the distribution, and combining Ubuntu's libraries with a
-          # cross sysroot is what `native-proof-build` already avoids.
-          - builder: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            cross: ""
-          - builder: ubuntu-24.04
-            target: x86_64-apple-darwin
-            cross: x86_64-apple-darwin
-          - builder: ubuntu-24.04
-            target: aarch64-apple-darwin
-            cross: aarch64-apple-darwin
-          - builder: ubuntu-24.04
-            target: x86_64-pc-windows-msvc
-            cross: x86_64-pc-windows-msvc
-          - builder: ubuntu-24.04
-            target: aarch64-pc-windows-msvc
-            cross: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.builder }}
-    timeout-minutes: 45
-    env:
-      # Panic locations without the full debug tree: these binaries travel to
-      # another host, and the archive is uploaded and downloaded per run.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       # `ci-tests: true` would otherwise default this to 1.
       CARGO_BUILD_JOBS: 4
@@ -173,318 +58,91 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
-      # `--all-features` includes the opt-in raw Wry backend, which needs the
-      # GTK/WebKit headers when the target is this Linux host.
       - name: Install native webview development packages
-        if: matrix.cross == ''
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
           ci-tests: true
-          cache-key-suffix: test-archive-${{ matrix.target }}
-          cross-targets: ${{ matrix.cross }}
-          # The test binaries use Cargo's dev profile; cook exactly that graph.
-          prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+          cache-key-suffix: linux
+          prebuild-deps-flags: ""
       - name: Restore native pkg-config search path
-        if: matrix.cross == ''
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
-          target="${{ matrix.target }}"
-          # Only the variable NAME takes underscores; the path keeps its
-          # hyphens. `tr` over the whole line rewrote both and pointed
-          # pkg-config at a directory that does not exist.
-          echo "PKG_CONFIG_LIBDIR_${target//-/_}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      # A native lane (`cross` empty: aarch64 Linux on an ARM runner) builds
-      # for the host WITHOUT `--target`. Naming the triple explicitly makes
-      # Soldr treat it as a cross build and route linking through its zig
-      # shim, which is absent here (`cargo-zigbuild: not found`) -- and a
-      # native build is what lets WebKitGTK use the distribution's own ABI.
-      # Clippy did not catch this: it never links. `supported-targets` builds
-      # these lanes the same way.
-      - name: Lint this target
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - run: soldr cargo fmt --all -- --check
+      - name: Lint every target
         run: >-
           soldr cargo clippy
-          --locked --all-features --all-targets
-          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
-          -- --deny warnings
-      # Windows keeps debug info in a `.pdb` beside the `.exe`, and nextest
-      # archives the executable without it. `kernal-symbolize`'s tests read
-      # their own binary's PDB -- sibling discovery, CodeView basename, the
-      # image directory searched first -- so on a replay host all 17 failed
-      # in milliseconds. The PDB name carries a build hash and
-      # `archive.include` takes paths, not globs, so build first, name the
-      # PDB that now exists, and archive with it. The path is relative to
-      # `target`, so it extracts beside the executable, where it was built.
-      # Only this binary's PDB: the whole `deps` directory is half a gigabyte
-      # for one binary alone.
-      - name: Archive every test binary for this target
-        shell: bash
-        run: |
-          set -euo pipefail
-          target_args=()
-          if [ -n "${{ matrix.cross }}" ]; then
-            target_args=(--target "${{ matrix.cross }}")
-          fi
-          config_args=()
-          if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
-            soldr cargo test --locked --all-features "${target_args[@]}" --no-run
-            shopt -s nullglob
-            pdbs=(target/${{ matrix.target }}/debug/deps/kernal_symbolize-*.pdb)
-            if [ "${#pdbs[@]}" -eq 0 ]; then
-              echo "::error::the kernal-symbolize test build produced no PDB"
-              exit 1
-            fi
-            cp .config/nextest.toml "${RUNNER_TEMP}/nextest-archive.toml"
-            {
-              echo
-              echo "[profile.default.archive]"
-              echo "include = ["
-              for pdb in "${pdbs[@]}"; do
-                echo "  { path = \"${pdb#target/}\", relative-to = \"target\", on-missing = \"error\" },"
-              done
-              echo "]"
-            } >> "${RUNNER_TEMP}/nextest-archive.toml"
-            config_args=(--config-file "${RUNNER_TEMP}/nextest-archive.toml")
-          fi
-          soldr cargo nextest archive \
-            --locked --all-features "${target_args[@]}" "${config_args[@]}" \
-            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst"
-      # The WebView2 proofs are the one thing a Windows host still has to run
-      # itself, so ship it the binary rather than the compiler (#270, #273).
-      - name: Build the native webview smoke binary
-        if: endsWith(matrix.target, '-pc-windows-msvc')
+          --locked --all-features --all-targets -- --deny warnings
+      - name: Run the full test suite
+        # One test per process. `--no-fail-fast` is about tests, not runners:
+        # the suite is about thirty seconds of tests, so stopping at the first
+        # failure saved no capacity and hid the rest until the next cycle.
+        run: soldr cargo nextest run --locked --all-features --no-fail-fast
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Build the target-independent Wasm guests once
         run: >-
-          soldr cargo build
-          --locked --all-features --target ${{ matrix.target }}
-          --bin kernal-tauri-smoke
+          uv run --no-project ci/native_proof.py guests
+          --out "${{ runner.temp }}/native-proof-guests"
+          --work "${{ runner.temp }}/native-proof-guest-build"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: kernal-tests-${{ matrix.target }}
-          path: |
-            kernal-tests-${{ matrix.target }}.tar.zst
-            target/${{ matrix.target }}/debug/kernal-tauri-smoke.exe
+          name: native-proof-guests
+          path: ${{ runner.temp }}/native-proof-guests
           if-no-files-found: error
           retention-days: 1
 
-  # Run the prebuilt binaries on each host. Nothing in this job compiles.
-  test-run:
-    name: Test run (${{ matrix.target }})
-    needs: test-archive
-    strategy:
-      # One host's failure stops the others: they replay the same binaries, so
-      # the run is already red and the remaining hosts are runner minutes spent
-      # on a known answer. A genuinely host-specific failure is reproduced by
-      # re-running this job alone.
-      fail-fast: true
-      matrix:
-        include:
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+  # Every Linux-only proof that is not the test suite, on one runner, in
+  # parallel with the gate rather than behind it: none of it feeds another
+  # target, so it does not need to hold the rest of the pipeline.
+  linux-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      # Apple runners are held off by default: soldr's owner mandate forbids
-      # them and #270 is moving work off them. The Linux and Windows lanes are
-      # unconditional. Skipping is visible in the checks list rather than
-      # silent, so re-enabling is a variable flip.
-      - name: Report that this Apple lane is suppressed
-        if: startsWith(matrix.os, 'macos') && vars.ENABLE_MACOS_RUNNERS != 'true'
-        run: echo "ENABLE_MACOS_RUNNERS is not true; this lane is suppressed."
-      # The workspace is still needed: tests that resolve paths relative to the
-      # manifest directory are remapped onto this checkout.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         with:
           lfs: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
-        with:
-          name: kernal-tests-${{ matrix.target }}
-      - name: Install the native webview runtime
-        # Linux replay hosts only: Windows and macOS carry WebView2 and
-        # WKWebView with the system.
-        if: runner.os == 'Linux'
+      - name: Install native webview packages and a virtual display
         run: >-
           sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - name: Install cargo-nextest
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
-        shell: bash
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          # Pick by OS *and* architecture. The bare `linux` and `windows`
-          # builds are x86-64: on the ARM runners they fail with `Exec format
-          # error` before a single test starts. `mac` is universal.
-          case "${{ runner.os }}-${{ runner.arch }}" in
-            Linux-X64) url=https://get.nexte.st/latest/linux ;;
-            Linux-ARM64) url=https://get.nexte.st/latest/linux-arm ;;
-            Windows-X64) url=https://get.nexte.st/latest/windows ;;
-            Windows-ARM64) url=https://get.nexte.st/latest/windows-arm ;;
-            macOS-*) url=https://get.nexte.st/latest/mac ;;
-            *) echo "no cargo-nextest build for ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
-          esac
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            curl -LsSf "$url" -o nextest.zip && unzip -o -q nextest.zip -d "$HOME/.cargo/bin"
-          else
-            curl -LsSf "$url" | tar zxf - -C "$HOME/.cargo/bin"
-          fi
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Run this host's prebuilt tests
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
-        shell: bash
-        # `cargo-nextest` is a cargo subcommand shim: invoked directly it still
-        # expects `nextest` as its first argument.
-        #
-        # The four excluded binaries are source-inspection policy tests. They
-        # read this crate's own source through `env!("CARGO_MANIFEST_DIR")`,
-        # baked in at compile time, so on a host whose checkout path differs
-        # from the builder's they would read nothing. `--workspace-remap`
-        # cannot rewrite a compile-time constant. The Linux lanes keep them:
-        # there the builder and the runner agree on the path, and a policy test
-        # that stops running is worse than one that runs twice.
-        run: |
-          set -euo pipefail
-          # An array, not a string: the filter expression is one argument and
-          # word-splitting would hand nextest `not` and `binary(...)` as two.
-          filter=()
-          if [ "${{ runner.os }}" != "Linux" ]; then
-            filter=(-E 'not binary(source_policy)')
-          fi
-          set -o pipefail
-          cargo-nextest nextest run \
-            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
-            --workspace-remap . --no-fail-fast "${filter[@]}" 2>&1 | tee nextest-output.txt
-      - name: Prove this host ran its own code
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
-        shell: bash
-        # A replay that silently ran nothing host-specific would look identical
-        # to a real run. Each host names a test that exists only in its own
-        # platform tree, so an empty or wrong-target archive fails here rather
-        # than reporting success.
-        run: |
-          set -euo pipefail
-          case "${{ runner.os }}" in
-            Linux) marker="platform_linux::" ;;
-            macOS) marker="platform_macos::" ;;
-            Windows) marker="platform_win::" ;;
-          esac
-          grep -F "${marker}" nextest-output.txt > /dev/null \
-            || { echo "no ${marker} test ran: this host did not execute its own code"; exit 1; }
-
-  # Reclaim the account-wide runner pool as soon as the answer is known. A
-  # matrix's own `fail-fast` only stops its siblings; these stop every other
-  # job in the run. Modelled on soldr's cancel-on-*-failure sentinels: one
-  # `gh run cancel` call, no branching.
-  #
-  # Pull requests only. On main a cancelled run would leave no record of which
-  # job failed, and nothing is queued behind it to reclaim.
-  cancel-on-linux-failure:
-    name: Cancel run (Linux tests failed)
-    needs: [test-archive-linux, test-run-linux]
-    if: failure() && github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      # No checkout, so `gh` cannot infer the repository from a git remote.
-      - run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-
-  cancel-on-cross-target-failure:
-    name: Cancel run (cross-target tests failed)
-    needs: [test-archive, test-run]
-    if: failure() && github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - run: gh run cancel ${{ github.run_id }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-
-  # The WebView2 proofs need a real Windows host, and only these. The binary
-  # was cross-built on Linux above, so this job holds a Windows runner for the
-  # three proof runs rather than for a compile (#270, #273).
-  windows-webview-smoke:
-    needs: test-archive
-    runs-on: windows-2025
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: kernal-tests-x86_64-pc-windows-msvc
-      - name: Verify native Windows external-page isolation
-        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe close
-      - name: Verify native Windows page bootstrap
-        # WebView2 needs the explicit main-frame guard even with Wry main-only.
-        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe bootstrap
-      - name: Verify native Windows interactive window lifetime
-        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe window-close
-
-
-  # What is left of the old `rust-native` job: the two checks that are not a
-  # test run. Everything else it did -- compiling and running the all-feature
-  # test suite on two hosts -- is now `test-archive` plus `test-run`.
-  source-checks:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
+          dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
+          toolchain: 1.95.0
+          cache-key-suffix: linux-checks
           prebuild-deps-flags: ""
-      - run: soldr cargo fmt --all -- --check
-      - name: Verify HTTP wire semantics under backend feature unification
-        # Deliberately resolves a backend feature outside our manifest's
-        # production graph, so it may update the lockfile and cannot join the
-        # `--locked` archive above.
-        run: >-
-          soldr cargo test --features http-client,reqwest/gzip
-          --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
-
-
-  # One runner checks every feature in isolation, one after another.
-  #
-  # This was a 36-entry matrix: 36 runners, 31 runner-minutes, each paying
-  # checkout, setup-soldr and a cold start to run a single `cargo check`
-  # (about 52s apiece, most of it setup). Here the setup happens once and each
-  # check reuses whatever dependency units an earlier feature already built.
-  #
-  # Every feature runs even after one fails, so a red run lists all of them
-  # rather than one per CI cycle. Each has its own collapsible log group, and
-  # the final error annotation names every feature that failed in isolation.
-  each-feature:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # `tauri-webview` compiles GTK/WebKit bindings.
-      - name: Install native webview development packages
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
       - name: Restore native pkg-config search path
-        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+        run: |
+          multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
+          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Check the CI guards and the guest build scripts
+        run: |
+          uv run --no-project -m unittest \
+            ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
+            ci.test_nextest_config
+          bash tests/screenshot-build-arguments.sh
+          bash tests/screenshot-target-repair.sh
+          pwsh -NoProfile -File tests/screenshot-target-repair.ps1
+      - name: Check the compilation boundary and the release tooling
+        run: |
+          uv run --no-project ci/check_compilation_boundary_dependencies.py
+          uv run --no-project ci/test_release_package_features.py
+          # tomllib needs Python >= 3.11, so this cannot share the package's
+          # 3.10 floor; 3.12 is the runner's own interpreter.
+          uv run --no-project --python 3.12 ci/test_auto_release.py
+      - name: Test the Python package
+        # Python 3.10 only: it is the floor AGENTS.md supports, and the
+        # package has no version-specific code for a second interpreter to
+        # catch.
+        run: |
+          uv run --no-project --python 3.10 --with-editable . --with pytest pytest python/tests
+          uv build --clear
+          uv run --no-project --python 3.10 --with twine twine check dist/*
       - name: Check every feature in isolation
         run: |
           set -uo pipefail
@@ -549,27 +207,27 @@ jobs:
         run: >-
           soldr cargo test --locked --no-default-features
           --features json,serde_json/arbitrary_precision --test data
-
-  # A unit test does not own process main on every test harness, while Tauri
-  # requires its event loop to start there.  These executable proofs
-  # therefore use a real Xvfb display, a loopback page, and one supplied
-  # kernal-api async runtime. They exercise matching Finished correlation,
-  # actual window destruction, popup/redirect denial, timeout, cancellation,
-  # window-close revocation, bounded viewport capture, and cancelled native
-  # queue admission with zero semantic/native resources.
-  tauri-webview-smoke:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install native webview development packages
+      - name: Verify HTTP wire semantics under backend feature unification
+        # Resolves a backend feature outside the production graph, so it may
+        # update the lockfile and cannot run `--locked`.
         run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-      - name: Restore native pkg-config search path
-        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+          soldr cargo test --features http-client,reqwest/gzip
+          --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
+      - name: Check the external daemon-registration consumers
+        run: |
+          soldr cargo check --locked --manifest-path tests/daemon-registration-consumer/Cargo.toml
+          soldr cargo check --locked --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
+      - name: Verify checked-in guest, host, and ABI manifest generation
+        run: |
+          bash ci/check_wasm_abi_generation.sh
+          soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
+      - name: Build the source-only threaded guest and validate root execution
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
+        run: bash scripts/build-threaded-smoke.sh
       - name: Run real semantic webview lifecycle and capture proofs
+        # A unit test does not own process main on every harness, while Tauri
+        # needs its event loop there, so these run the smoke binary under Xvfb.
         env:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: "1"
@@ -592,59 +250,78 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
-
-  # The native Wasm proofs compile on Linux and execute on every native host.
-  # Soldr's cross toolchain (bundled LLVM, the managed macOS SDK, and the xwin
-  # MSVC sysroot) builds the Apple and Windows binaries, so macOS and Windows
-  # runners are held only while the proofs run. The Linux targets build on
-  # their own architecture because WebKitGTK links the runner's host ABI.
-  native-proof-guests:
-    name: Native proof guests
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          toolchain: 1.95.0
-          cache-key-suffix: native-proof-guests
-          # The guests are separate release workspaces; cooking this crate's
-          # dependency graph would warm nothing they compile.
-          prebuild-deps: none
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - name: Check the proof runner and the guest build scripts
+      - name: Install the screenshot guest target
+        run: uv run --no-project ci/native_proof.py wasm-target wasm32-wasip1-threads
+      - name: Build, admit, and run the real guest through the default screenshot CLI
+        env:
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          NO_AT_BRIDGE: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          KERNAL_API_SCREENSHOT_PROOF_DIR: ${{ runner.temp }}/kernal-api-screenshot-proof
         run: |
-          uv run --no-project -m unittest \
-            ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
-            ci.test_nextest_config
-          bash tests/screenshot-build-arguments.sh
-          bash tests/screenshot-target-repair.sh
-          pwsh -NoProfile -File tests/screenshot-target-repair.ps1
-      - name: Build the target-independent Wasm guests once
+          # The CLI starts Soldr itself. Finish the outer Soldr invocation
+          # before running the harness; never disable its reentry guard.
+          test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
+            jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
+          dbus-run-session -- xvfb-run -a "$test_executable" default_screenshot_cli_uses_containment_and_commits_output --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/screenshot-cli.log"
+          grep -F "test result: ok. 1 passed; 0 failed;" "$RUNNER_TEMP/screenshot-cli.log"
+      # The x86_64 Linux native proofs, built and run in place: here the
+      # builder is the host. Every other target builds in `build` and runs in
+      # `test`.
+      - name: Build the Wasm guests for the native proofs
         run: >-
           uv run --no-project ci/native_proof.py guests
           --out "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-guest-build"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Compile the x86_64 Linux native proofs
+        run: >-
+          uv run --no-project ci/native_proof.py build --target x86_64-unknown-linux-gnu
+          --archive "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
+          --work "${{ runner.temp }}/native-proof-build"
+      - name: Run the x86_64 Linux compiler-policy proofs
+        timeout-minutes: 20
+        run: >-
+          uv run --no-project ci/native_proof.py run compiler
+          --native-target x86_64-unknown-linux-gnu
+          --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
+          --guests "${{ runner.temp }}/native-proof-guests"
+          --work "${{ runner.temp }}/native-proof-run"
+      - name: Run the x86_64 Linux screenshot and containment proofs
+        timeout-minutes: 30
+        env:
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          NO_AT_BRIDGE: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+          KERNAL_API_SCREENSHOT_PROOF_DIR: ${{ runner.temp }}/kernal-api-screenshot-proof
+        run: >-
+          uv run --no-project ci/native_proof.py run screenshot
+          --native-target x86_64-unknown-linux-gnu
+          --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
+          --guests "${{ runner.temp }}/native-proof-guests"
+          --work "${{ runner.temp }}/native-proof-run"
+      - name: Preserve screenshot and process diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: native-proof-guests
-          path: ${{ runner.temp }}/native-proof-guests
-          if-no-files-found: error
-          retention-days: 1
+          name: linux-screenshot-diagnostics
+          path: ${{ runner.temp }}/kernal-api-screenshot-proof
+          if-no-files-found: warn
 
-  native-proof-build:
-    name: Native proof build (${{ matrix.target }})
-    # Gated on Linux (see `test-archive-linux`): these six cross-builds and the
-    # Apple/Windows execution matrices that consume them are the bulk of a
-    # run's runner minutes, and a Linux test failure already condemns them.
-    needs: test-run-linux
+  # Every other target, compiled on Linux: the scarce Apple and Windows
+  # runners in `test` only ever execute what these builders produce.
+  build:
+    name: Build (${{ matrix.target }})
+    needs: linux
     strategy:
-      fail-fast: false
+      # Every target compiles the same sources; the second failure teaches
+      # nothing the first did not.
+      fail-fast: true
       matrix:
         include:
-          - builder: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-            cross: ""
+          # aarch64 Linux builds natively on an ARM runner, so WebKitGTK uses
+          # the distribution's own ABI instead of a cross sysroot.
           - builder: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             cross: ""
@@ -661,13 +338,14 @@ jobs:
             target: aarch64-pc-windows-msvc
             cross: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.builder }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
-      # Line tables keep panic locations while shrinking the debug binaries
-      # that travel to the native hosts.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_BUILD_JOBS: 4
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          lfs: true
       - name: Install native webview development packages
         if: matrix.cross == ''
         run: >-
@@ -675,18 +353,75 @@ jobs:
           libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          toolchain: 1.95.0
-          cache-key-suffix: native-proof-${{ matrix.target }}
+          ci-tests: true
+          cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
-          # The harnesses use Cargo's dev profile; cook exactly that graph.
-          prebuild-deps: soldr-cook
           prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
       - name: Restore native pkg-config search path
         if: matrix.cross == ''
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           target="${{ matrix.target }}"
+          # Only the variable NAME takes underscores; the path keeps hyphens.
           echo "PKG_CONFIG_LIBDIR_${target//-/_}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      # A native lane (`cross` empty) builds for the host WITHOUT `--target`:
+      # naming the triple makes Soldr link through a zig shim the runner does
+      # not carry. Clippy never links, so only the archive would notice.
+      - name: Lint this target
+        run: >-
+          soldr cargo clippy
+          --locked --all-features --all-targets
+          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+          -- --deny warnings
+      # Windows keeps debug info in a `.pdb` beside the `.exe`, and nextest
+      # archives the executable without it; `kernal-symbolize`'s tests read
+      # their own binary's PDB. `archive.include` takes paths, not globs, and
+      # the name carries a build hash, so build first, name the PDB, archive
+      # with it. Only that one: `deps` is half a gigabyte for one binary.
+      - name: Archive every test binary for this target
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_args=()
+          if [ -n "${{ matrix.cross }}" ]; then
+            target_args=(--target "${{ matrix.cross }}")
+          fi
+          config_args=()
+          if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
+            soldr cargo test --locked --all-features "${target_args[@]}" --no-run
+            shopt -s nullglob
+            pdbs=(target/${{ matrix.target }}/debug/deps/kernal_symbolize-*.pdb)
+            if [ "${#pdbs[@]}" -eq 0 ]; then
+              echo "::error::the kernal-symbolize test build produced no PDB"
+              exit 1
+            fi
+            cp .config/nextest.toml "${RUNNER_TEMP}/nextest-archive.toml"
+            {
+              echo
+              echo "[profile.default.archive]"
+              echo "include = ["
+              for pdb in "${pdbs[@]}"; do
+                echo "  { path = \"${pdb#target/}\", relative-to = \"target\", on-missing = \"error\" },"
+              done
+              echo "]"
+            } >> "${RUNNER_TEMP}/nextest-archive.toml"
+            config_args=(--config-file "${RUNNER_TEMP}/nextest-archive.toml")
+          fi
+          soldr cargo nextest archive \
+            --locked --all-features "${target_args[@]}" "${config_args[@]}" \
+            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst"
+      - name: Compile the explicit ABI generator for this target
+        # The one check `supported-targets` made that the archive does not.
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tools/wasm-abi-generator/Cargo.toml
+          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+      - name: Build the native webview smoke binary
+        if: endsWith(matrix.target, '-pc-windows-msvc')
+        run: >-
+          soldr cargo build
+          --locked --all-features --target ${{ matrix.target }}
+          --bin kernal-tauri-smoke
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Compile every native proof binary for this target
         run: >-
@@ -695,41 +430,55 @@ jobs:
           --work "${{ runner.temp }}/native-proof-build"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          name: kernal-tests-${{ matrix.target }}
+          path: |
+            kernal-tests-${{ matrix.target }}.tar.zst
+            target/${{ matrix.target }}/debug/kernal-tauri-smoke.exe
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
           name: native-proof-${{ matrix.target }}
           path: ${{ runner.temp }}/native-proof-${{ matrix.target }}.tar
           if-no-files-found: error
           retention-days: 1
 
-  # Each #22 platform/architecture requires its own successful native run.
-  # Matrix configuration alone is not acceptance evidence. Neither execution
-  # matrix compiles: both run what native-proof-build produced.
-  wasm-compiler-native:
-    name: Native compiler cache (${{ matrix.target }})
-    needs: [native-proof-guests, native-proof-build]
-    # One target's failed build must not skip the other five hosts; a missing
-    # bundle fails only its own host, at download.
-    if: ${{ !cancelled() }}
+  # Run each target's prebuilt binaries on its own host. Nothing here compiles.
+  test:
+    name: Test (${{ matrix.target }})
+    needs: [linux, build]
     strategy:
-      fail-fast: false
+      # One host's failure stops the others; a host-specific failure is
+      # reproduced by re-running this job alone.
+      fail-fast: true
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
           - os: windows-2025
             target: x86_64-pc-windows-msvc
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          lfs: true
+      - name: Install the native webview runtime and a virtual display
+        # The binaries link webkit2gtk at run time, and the screenshot proofs
+        # need a display. Windows and macOS carry their webviews with the OS.
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install --yes
+          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: kernal-tests-${{ matrix.target }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: native-proof-guests
@@ -738,7 +487,60 @@ jobs:
         with:
           name: native-proof-${{ matrix.target }}
           path: ${{ runner.temp }}/native-proof-bundle
+      # The test-suite replay stays behind `ENABLE_MACOS_RUNNERS` on Apple
+      # hosts, as it was; the proofs below run on every host, as they did.
+      - name: Install cargo-nextest
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          # Pick by OS *and* architecture. The bare `linux` and `windows`
+          # builds are x86-64: on the ARM runners they fail with `Exec format
+          # error` before a single test starts. `mac` is universal.
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) url=https://get.nexte.st/latest/linux ;;
+            Linux-ARM64) url=https://get.nexte.st/latest/linux-arm ;;
+            Windows-X64) url=https://get.nexte.st/latest/windows ;;
+            Windows-ARM64) url=https://get.nexte.st/latest/windows-arm ;;
+            macOS-*) url=https://get.nexte.st/latest/mac ;;
+            *) echo "no cargo-nextest build for ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            curl -LsSf "$url" -o nextest.zip && unzip -o -q nextest.zip -d "$HOME/.cargo/bin"
+          else
+            curl -LsSf "$url" | tar zxf - -C "$HOME/.cargo/bin"
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Run this host's prebuilt tests
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An array, not a string: the filter expression is one argument and
+          # word-splitting would hand nextest `not` and `binary(...)` as two.
+          filter=()
+          if [ "${{ runner.os }}" != "Linux" ]; then
+            filter=(-E 'not binary(source_policy)')
+          fi
+          set -o pipefail
+          cargo-nextest nextest run \
+            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
+            --workspace-remap . --no-fail-fast "${filter[@]}" 2>&1 | tee nextest-output.txt
+      - name: Prove this host ran its own code
+        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux) marker="platform_linux::" ;;
+            macOS) marker="platform_macos::" ;;
+            Windows) marker="platform_win::" ;;
+          esac
+          grep -F "${marker}" nextest-output.txt > /dev/null \
+            || { echo "no ${marker} test ran: this host did not execute its own code"; exit 1; }
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Run actual Core and Component compiler-policy guest proofs
+        timeout-minutes: 20
         shell: bash
         run: >-
           uv run --no-project ci/native_proof.py run compiler
@@ -746,41 +548,6 @@ jobs:
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-run"
-
-  wasm-tauri-screenshot-native:
-    name: Native screenshot (${{ matrix.target }})
-    needs: [native-proof-guests, native-proof-build]
-    if: ${{ !cancelled() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: macos-15
-            target: aarch64-apple-darwin
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    env:
-      GDK_BACKEND: x11
-      LIBGL_ALWAYS_SOFTWARE: "1"
-      NO_AT_BRIDGE: "1"
-      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install native WebKitGTK 4.1 and virtual display
-        if: runner.os == 'Linux'
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          dbus-x11 libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
       - name: Configure screenshot proof storage
         shell: pwsh
         run: |
@@ -807,242 +574,41 @@ jobs:
           }
           if (-not (Get-WebViewRuntimeVersion)) { throw 'WebView2 Runtime is unavailable after setup' }
           Write-Output "WebView2 Runtime: $(Get-WebViewRuntimeVersion)"
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: native-proof-guests
-          path: ${{ runner.temp }}/native-proof-guests
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: native-proof-${{ matrix.target }}
-          path: ${{ runner.temp }}/native-proof-bundle
       - name: Run offline native Wasm screenshot, admission, and worker containment proofs
+        timeout-minutes: 30
         shell: bash
+        env:
+          GDK_BACKEND: x11
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          NO_AT_BRIDGE: "1"
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: >-
           uv run --no-project ci/native_proof.py run screenshot
           --native-target ${{ matrix.target }}
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-run"
+      # The WebView2 proofs need a real Windows host, from a binary built on
+      # Linux (#270, #273).
+      - name: Verify native Windows external-page isolation
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe close
+      - name: Verify native Windows page bootstrap
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe bootstrap
+      - name: Verify native Windows interactive window lifetime
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe window-close
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: wasm-tauri-screenshot-${{ matrix.target }}
+          name: screenshot-diagnostics-${{ matrix.target }}
           path: ${{ runner.temp }}/kernal-api-screenshot-proof
           if-no-files-found: warn
-
-  # Without --module the default screenshot CLI builds and admits the real
-  # guest through Soldr before running it in containment. That build is
-  # target-independent and compiles, so it runs here on Linux; the native hosts
-  # skip this one test and run every other screenshot proof prebuilt.
-  screenshot-cli-guest-build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      GDK_BACKEND: x11
-      LIBGL_ALWAYS_SOFTWARE: "1"
-      NO_AT_BRIDGE: "1"
-      WEBKIT_DISABLE_COMPOSITING_MODE: "1"
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Install native WebKitGTK 4.1 and virtual display
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          toolchain: 1.95.0
-          cache-key-suffix: screenshot-cli-guest-build
-          prebuild-deps-flags: ""
-      - name: Restore native pkg-config search path
-        run: echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - name: Install the screenshot guest target
-        # The CLI builds its guest for wasm32-wasip1-threads (run 34925871627
-        # failed with E0463 without it).
-        #
-        # Not a bare `rustup target add`: a restored toolchain cache can list a
-        # target as installed while its libraries are gone, and `add` then
-        # installs nothing, which is how this lane failed intermittently on
-        # unchanged commits (#285). `ensure_wasm_target` checks for
-        # `libcore-*.rlib` on disk and reinstalls when the bookkeeping lies.
-        run: uv run --no-project ci/native_proof.py wasm-target wasm32-wasip1-threads
-      - name: Build, admit, and run the real guest through the default screenshot CLI
-        env:
-          KERNAL_API_SCREENSHOT_PROOF_DIR: ${{ runner.temp }}/kernal-api-screenshot-proof
-        run: |
-          # The CLI starts Soldr itself. Finish the outer Soldr invocation
-          # before running the harness; never disable its reentry guard.
-          test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
-            jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
-          dbus-run-session -- xvfb-run -a "$test_executable" default_screenshot_cli_uses_containment_and_commits_output --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/screenshot-cli.log"
-          grep -F "test result: ok. 1 passed; 0 failed;" "$RUNNER_TEMP/screenshot-cli.log"
-      - name: Preserve screenshot and process diagnostics
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: screenshot-cli-guest-build
-          path: ${{ runner.temp }}/kernal-api-screenshot-proof
-          if-no-files-found: warn
-
-  # Compile the two external facade consumers. Each is its own `[workspace]`
-  # that depends on this crate by path with `default-features = false`, so it
-  # resolves `kernal-api` the way an application does -- without this
-  # workspace's dev-dependencies, lints, or sibling features. `each-feature`
-  # above proves a feature compiles inside this workspace; only this lane
-  # proves the opt-in surface is nameable from outside it, where a public
-  # signature that needs a `running-process` type spelled out fails and
-  # nowhere else. Until this job existed the consumers were read only by the
-  # text scan in `tests/facade_policy.rs`, which compiles nothing.
-  #
-  # One job with two steps rather than a matrix: `setup-soldr` dominates the
-  # cost of a `cargo check` this small, and the step names already say which
-  # consumer broke. `--locked` is deliberate -- each consumer carries its own
-  # lock file, so a dependency change in this crate's manifest has to be
-  # reflected in both of them or this lane fails.
-  facade-consumers:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-      - name: Check the external daemon-registration consumer
-        run: >-
-          soldr cargo check --locked
-          --manifest-path tests/daemon-registration-consumer/Cargo.toml
-      - name: Check the external daemon-registration-v2 consumer
-        run: >-
-          soldr cargo check --locked
-          --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
-
-  # Keeps the Unix build-and-validate script itself covered. Its guest and
-  # worker proofs run on all six native hosts from prebuilt binaries in
-  # wasm-tauri-screenshot-native.
-  threaded-rust-artifact:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          toolchain: 1.95.0
-      - name: Build the source-only threaded guest and validate root execution
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
-        run: bash scripts/build-threaded-smoke.sh
-
-  wasm-abi-generation:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          toolchain: 1.95.0
-      - name: Verify checked-in guest, host, and ABI manifest generation
-        run: bash ci/check_wasm_abi_generation.sh
-      - name: Test the explicit ABI generator
-        run: >-
-          soldr cargo test --locked
-          --manifest-path tools/wasm-abi-generator/Cargo.toml
-
-  compilation-boundary-dependencies:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - run: uv run --no-project ci/check_compilation_boundary_dependencies.py
-      - run: uv run --no-project ci/test_release_package_features.py
-      - run: uv run --no-project --python 3.13 ci/test_auto_release.py
-
-  supported-targets:
-    # Gated on Linux: six `--all-features` cross-builds that a red test run
-    # makes moot.
-    needs: test-run-linux
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            legacy_cargo: true
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            legacy_cargo: true
-          # Apple targets cross-compile on Linux through Soldr's own toolchain
-          # (its bundled LLVM plus the managed macOS SDK), so neither Apple
-          # build lane needs a macOS runner. The only Apple-hosted lanes left
-          # in this workflow are the `test-run` Apple entries, gated off by
-          # `ENABLE_MACOS_RUNNERS`, and the native proof execution matrices.
-          - os: ubuntu-latest
-            target: x86_64-apple-darwin
-            legacy_cargo: false
-          - os: ubuntu-latest
-            target: aarch64-apple-darwin
-            legacy_cargo: false
-          # Windows compiles on Linux like the Apple targets (#273). The
-          # `--all-features` graph links vendored OpenSSL, which needs nmake for
-          # MSVC; Soldr's static OpenSSL syslib replaces it (zackees/soldr#3246,
-          # #3247). That syslib only reaches this crate from Soldr 0.9.20, which
-          # forwards the build's feature selection into the links probe
-          # (zackees/soldr#3271) -- `openssl` is behind the non-default
-          # `archive-auth-test-support` feature here, so the unfiltered probe
-          # saw no `links = "openssl"` and fetched nothing.
-          - os: ubuntu-latest
-            target: x86_64-pc-windows-msvc
-            legacy_cargo: false
-          - os: ubuntu-latest
-            target: aarch64-pc-windows-msvc
-            legacy_cargo: false
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          lfs: true
-      - name: Install native webview development packages
-        if: matrix.legacy_cargo
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
-      - if: matrix.legacy_cargo
-        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-      - if: ${{ !matrix.legacy_cargo }}
-        uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
-        with:
-          # Prepared compiler/SDK archives and compiled crates are cached per
-          # target; `soldr build` compiles the dev profile. Every lane here now
-          # prepares on Linux (#273), so the cache is unconditional: a
-          # Windows-hosted prepare yielded no archive and failed the job, which
-          # was the one exception this key used to carry.
-          cache-key-suffix: supported-${{ matrix.target }}
-          cross-targets: ${{ matrix.target }}
-          prebuild-deps-flags: --target ${{ matrix.target }}
-      - name: Restore native pkg-config search path
-        if: matrix.legacy_cargo
-        run: |
-          echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/x86_64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-          echo "PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      # These Linux runners already match their declared target. Building
-      # natively lets WebKitGTK use the host ABI instead of trying to combine
-      # Ubuntu libraries with Soldr's portable glibc cross sysroot.
-      - if: matrix.legacy_cargo
-        run: >-
-          soldr cargo build
-          --locked --all-features
-      - if: ${{ !matrix.legacy_cargo }}
-        run: >-
-          soldr build
-          --target ${{ matrix.target }} --all-features
-      - name: Compile the explicit ABI generator for the supported target
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
-        run: >-
-          soldr cargo check --locked
-          --manifest-path tools/wasm-abi-generator/Cargo.toml
-          --target ${{ matrix.target }}
-      - name: Compile the explicit ABI generator on native Linux ARM64
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: >-
-          soldr cargo check --locked
-          --manifest-path tools/wasm-abi-generator/Cargo.toml
 
   # A Dylint pass only sees what the compiler compiles, so `cfg(target_os =
   # "macos")` bodies are invisible on a Linux host, which is how a raw host type
@@ -1069,7 +635,7 @@ jobs:
     # Gated on Linux: the `macos-15-intel` entry is the single most expensive
     # job in this workflow, and a lint finding is not worth an Apple runner
     # while the tests are red.
-    needs: test-run-linux
+    needs: linux
     strategy:
       fail-fast: false
       matrix:
@@ -1131,17 +697,21 @@ jobs:
           soldr cargo dylint
           --all --workspace -- --all-features --all-targets
 
-  python:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.10", "3.13"]
+  # Stop the rest of the run the moment any job fails, so a red push releases
+  # its runners to the account-wide pool. Modelled on soldr's
+  # cancel-on-*-failure sentinels. Pull requests only: on main a cancelled
+  # run would erase the record of which job failed.
+  cancel-on-failure:
+    name: Cancel run (a job failed)
+    needs: [linux, linux-checks, build, test, dylints]
+    if: failure() && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - run: >-
-          uv run --no-project --python ${{ matrix.python }}
-          --with-editable . --with pytest pytest python/tests
-      - run: uv build --clear
-      - run: uv run --no-project --python ${{ matrix.python }} --with twine twine check dist/*
+      # No checkout, so `gh` cannot infer the repository from a git remote.
+      - run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

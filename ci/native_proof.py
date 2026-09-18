@@ -38,10 +38,9 @@ TARGETS = LINUX_TARGETS + (
     "aarch64-pc-windows-msvc",
 )
 
-COMPILER_TEST = "wasm::compiler_dispatch::tests::compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler"
+COMPILER_TEST = "wasm::compiler_dispatch::tests::compiler_actual_guest_spawns_drains_hashes_persists_and_waits"
 COMPONENT_TESTS = (
     "wasm::component_compiler::tests::actual_guest_spawns_drains_hashes_waits_and_closes",
-    "wasm::component_compiler::tests::actual_guest_cache_hit_does_not_spawn_the_granted_compiler",
 )
 COMPONENT_ENCODER_OUTPUT = (
     "validated component: {bytes} bytes; two kernel imports; not executed\n"

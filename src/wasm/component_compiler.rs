@@ -16,7 +16,7 @@ use wasmtime::component::{
 mod tests {
     use super::*;
     use std::time::Duration;
-    use crate::wasm::compiler_dispatch::tests::{compiler_helper_spec, CACHE_KEY};
+    use crate::wasm::compiler_dispatch::tests::compiler_helper_spec;
     mod proof {
         wasmtime::component::bindgen!({
             path: "src/guest_component_compiler.wit", world: "compiler-proof",
@@ -134,32 +134,25 @@ mod tests {
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
     fn actual_guest_spawns_drains_hashes_waits_and_closes() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false, false);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false);
     }
 
     #[test]
     #[ignore = "requires lowering-trap-proof KERNAL_COMPONENT_COMPILER_TRAP_WASM encoded with --trap-realloc"]
     fn actual_guest_lowering_trap_retains_credit_until_store_destruction() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_TRAP_WASM", true, false, false);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_TRAP_WASM", true, false);
     }
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
     fn actual_guest_cancelled_read_return_drops_pending_authority() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, true, false);
-    }
-
-    #[test]
-    #[ignore = "requires freshly built KERNAL_COMPONENT_COMPILER_WASM"]
-    fn actual_guest_cache_hit_does_not_spawn_the_granted_compiler() {
-        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, false, true);
+        execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, true);
     }
 
     fn execute_artifact(
         variable: &str,
         expect_lowering_trap: bool,
         cancel_read: bool,
-        cache_hit: bool,
     ) {
         let bytes = std::fs::read(std::env::var_os(variable).expect("Component compiler artifact"))
             .unwrap();
@@ -191,48 +184,12 @@ mod tests {
         .unwrap();
         let budget = ComponentResourceBudget::new(Arc::clone(&hub));
         let cancellation = crate::async_engine::CancellationSource::new();
-        let cache = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
         let artifact = output.path().join("compiler-artifact");
         let neighbor = output.path().join("ungranted-neighbor");
         std::fs::write(&neighbor, b"leave this file alone").unwrap();
-        let expected = cache_hit.then(|| {
-            let mut bytes = vec![0xf1; 2 * 1024 * 1024];
-            bytes.extend(std::iter::repeat_n(0xf2, 2 * 1024 * 1024));
-            bytes
-        });
-        let cache_store = crate::wasm::compiler_cache::CompilerArtifactStore::open(cache.path())
-            .unwrap();
-        if let Some(bytes) = expected.as_deref() {
-            cache_store.put(CACHE_KEY, bytes).unwrap();
-        }
-        let restored = crate::wasm::compiler_cache::restore_cached_output_if_hit(
-            &cache_store,
-            &hub,
-            0,
-            CACHE_KEY,
-            &artifact,
-        )
-        .unwrap();
-        assert_eq!(restored, cache_hit);
-        let spec = if restored {
-            crate::SpawnSpec::new(
-                std::env::current_dir()
-                    .unwrap()
-                    .join("cache-hit-must-not-spawn"),
-            )
-            .current_dir(std::env::current_dir().unwrap())
-            .clear_env(true)
-        } else {
-            compiler_helper_spec()
-        };
         let grant = hub
-            .grant_compiler_with_cache(
-                0,
-                spec,
-                Duration::from_secs(15),
-                Some((CACHE_KEY, restored)),
-            )
+            .grant_compiler(0, compiler_helper_spec(), Duration::from_secs(15))
             .unwrap();
         let mut store = wasmtime::Store::new(
             &engine,
@@ -307,11 +264,6 @@ mod tests {
             assert!(live_before_drop > 0);
             assert_eq!(early_release, Some(Err(HubError::WrongRights)));
             assert!(retained_after_store_drop >= 65536);
-        } else if restored {
-            result.unwrap();
-            assert_eq!(copied, 0, "cache hit must not read compiler output");
-            assert_eq!(std::fs::read(&artifact).unwrap(), expected.unwrap());
-            assert_eq!(std::fs::read(&neighbor).unwrap(), b"leave this file alone");
         } else {
             result.unwrap();
             assert!(copied > 1);

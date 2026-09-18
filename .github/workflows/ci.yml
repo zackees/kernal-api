@@ -209,12 +209,48 @@ jobs:
           --locked --all-features --all-targets
           ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
           -- --deny warnings
+      # Windows keeps debug info in a `.pdb` beside the `.exe`, and nextest
+      # archives the executable without it. `kernal-symbolize`'s tests read
+      # their own binary's PDB -- sibling discovery, CodeView basename, the
+      # image directory searched first -- so on a replay host all 17 failed
+      # in milliseconds. The PDB name carries a build hash and
+      # `archive.include` takes paths, not globs, so build first, name the
+      # PDB that now exists, and archive with it. The path is relative to
+      # `target`, so it extracts beside the executable, where it was built.
+      # Only this binary's PDB: the whole `deps` directory is half a gigabyte
+      # for one binary alone.
       - name: Archive every test binary for this target
-        run: >-
-          soldr cargo nextest archive
-          --locked --all-features
-          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
-          --archive-file kernal-tests-${{ matrix.target }}.tar.zst
+        shell: bash
+        run: |
+          set -euo pipefail
+          target_args=()
+          if [ -n "${{ matrix.cross }}" ]; then
+            target_args=(--target "${{ matrix.cross }}")
+          fi
+          config_args=()
+          if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
+            soldr cargo test --locked --all-features "${target_args[@]}" --no-run
+            shopt -s nullglob
+            pdbs=(target/${{ matrix.target }}/debug/deps/kernal_symbolize-*.pdb)
+            if [ "${#pdbs[@]}" -eq 0 ]; then
+              echo "::error::the kernal-symbolize test build produced no PDB"
+              exit 1
+            fi
+            cp .config/nextest.toml "${RUNNER_TEMP}/nextest-archive.toml"
+            {
+              echo
+              echo "[profile.default.archive]"
+              echo "include = ["
+              for pdb in "${pdbs[@]}"; do
+                echo "  { path = \"${pdb#target/}\", relative-to = \"target\", on-missing = \"error\" },"
+              done
+              echo "]"
+            } >> "${RUNNER_TEMP}/nextest-archive.toml"
+            config_args=(--config-file "${RUNNER_TEMP}/nextest-archive.toml")
+          fi
+          soldr cargo nextest archive \
+            --locked --all-features "${target_args[@]}" "${config_args[@]}" \
+            --archive-file "kernal-tests-${{ matrix.target }}.tar.zst"
       # The WebView2 proofs are the one thing a Windows host still has to run
       # itself, so ship it the binary rather than the compiler (#270, #273).
       - name: Build the native webview smoke binary

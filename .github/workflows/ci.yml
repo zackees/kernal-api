@@ -151,6 +151,17 @@ jobs:
           uv run --no-project --python 3.10 --with-editable . --with pytest pytest python/tests
           uv build --clear
           uv run --no-project --python 3.10 --with twine twine check dist/*
+      # First compile in this job, deliberately. zccache restores a cached
+      # build script without the materialize/spawn exclusion its miss path
+      # has, so a busy daemon can fork a child that inherits the write fd
+      # and the exec fails with ETXTBSY (zackees/zccache#1597). Run after the
+      # 36 feature checks, this step hit it twice in a row; as a standalone
+      # job, with a quiet daemon, it never did. This ordering is a
+      # mitigation until #1597 is fixed, not a cure -- no job cap, no retry.
+      - name: Verify checked-in guest, host, and ABI manifest generation
+        run: |
+          bash ci/check_wasm_abi_generation.sh
+          soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
       - name: Check every feature in isolation
         run: |
           set -uo pipefail
@@ -225,10 +236,6 @@ jobs:
         run: |
           soldr cargo check --locked --manifest-path tests/daemon-registration-consumer/Cargo.toml
           soldr cargo check --locked --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
-      - name: Verify checked-in guest, host, and ABI manifest generation
-        run: |
-          bash ci/check_wasm_abi_generation.sh
-          soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
       - name: Build the source-only threaded guest and validate root execution
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke

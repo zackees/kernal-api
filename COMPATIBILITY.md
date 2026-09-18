@@ -154,6 +154,13 @@ the same client operation and no runtime fallback to a second HAL.
   broker negotiation, and daemon lifecycle remain application policy. A client
   migrating off a direct substrate dependency takes these from here rather
   than reimplementing the records.
+  Recorded-daemon control is facade-owned rather than reached through the
+  substrate's broker client: `DaemonIdentity::verify_live` and
+  `verify_for_control` re-check boot, liveness, executable path, and BLAKE3
+  digest over this crate's host process facade, and the returned
+  `VerifiedDaemon` terminates only the verified process generation.
+  `DaemonIdentityRecord` assembles or inspects an identity field by field; the
+  sidecar JSON and probe reply bytes are unchanged and pinned by tests.
 
 Client CI installs the two Dylints in [DYLINT.md](DYLINT.md). They deny direct
 implementation-crate use and host `cfg` selection outside this HAL, including

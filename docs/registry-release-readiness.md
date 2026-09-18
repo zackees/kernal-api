@@ -59,10 +59,13 @@ resolve to the exact workflow commit; tags and release assets are never replaced
 GitHub release creation happens directly in the same workflow, not through a
 second workflow triggered by a bot-created release event.
 
-Registry publishing is deferred by owner request. GitHub packages, sidecars and
-workers can release without registry credentials. To enable crates.io later,
-configure `CARGO_REGISTRY_TOKEN` and set the repository Actions variable `PUBLISH_CRATES_IO`
-to `true`. PyPI independently uses `PYPI_API_TOKEN` and `PUBLISH_PYPI=true`.
+GitHub packages, sidecars and workers release without registry credentials.
+crates.io publishes through trusted publishing, with no stored token: the
+crate's trusted publisher is `zackees/kernal-api`, workflow `auto-release.yml`,
+and `publish-crates` exchanges its GitHub OIDC token through
+`rust-lang/crates-io-auth-action`. It runs when the repository Actions variable
+`PUBLISH_CRATES_IO` is `true`. PyPI independently uses `PYPI_API_TOKEN` and
+`PUBLISH_PYPI=true`.
 The publishing jobs use the `release` environment; secrets can be configured
 there or at repository scope. Opt-in variables must be repository-level because
 job conditions are evaluated before entering the environment. Neither variable

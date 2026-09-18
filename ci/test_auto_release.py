@@ -33,12 +33,12 @@ class AutoReleaseTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertIn("workflow_call:", workflow)
         self.assertNotIn("github.event.release.tag_name", workflow)
-        self.assertIn("vars.PUBLISH_CRATES_IO == 'true'", workflow)
         self.assertIn("vars.PUBLISH_PYPI == 'true'", workflow)
-        self.assertIn(
-            "needs: [release-guard, validate-and-package, release-assets]", workflow
-        )
         self.assertIn("needs: [validate-and-package, release-assets]", workflow)
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        self.assertIn("vars.PUBLISH_CRATES_IO == 'true'", caller)
+        self.assertIn("needs: [prepare, release]", caller)
+        self.assertIn("!(github.event_name == 'workflow_dispatch' && inputs.dry_run)", caller)
         self.assertIn("!inputs.dry_run", workflow)
         self.assertNotIn("--clobber", workflow)
         self.assertIn("path: registry-packages/*", workflow)
@@ -61,14 +61,34 @@ class AutoReleaseTests(unittest.TestCase):
             workflow,
         )
         self.assertIn(
-            "cp conpty-sidecars/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml",
-            workflow,
-        )
-        self.assertIn(
             "bash ci/verify_conpty_assets.sh target/conpty-assets", workflow
         )
         self.assertIn("soldr cargo package --locked --all-features --allow-dirty", workflow)
-        self.assertIn("soldr cargo publish --locked --no-verify --allow-dirty", workflow)
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        self.assertIn("soldr cargo publish --locked --no-verify --allow-dirty", caller)
+        self.assertIn(
+            "cp conpty-sidecars/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml",
+            caller,
+        )
+
+    def test_crates_io_publishes_through_trusted_publishing(self):
+        """crates.io trusts `auto-release.yml`, so it publishes there, by OIDC.
+
+        The first real release failed at `please provide a non-empty token`:
+        the job read a CARGO_REGISTRY_TOKEN secret that was never set, while
+        the crate's trusted publisher (zackees/kernal-api, auto-release.yml)
+        sat unused.
+        """
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        called = (ROOT / ".github/workflows/release.yml").read_text()
+        job = caller.split("\n  publish-crates:\n", 1)[1]
+        self.assertIn("id-token: write", job)
+        self.assertIn("uses: rust-lang/crates-io-auth-action@", job)
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}", job)
+        self.assertLess(job.index("crates-io-auth-action"), job.index("soldr cargo publish"))
+        for workflow in (caller, called):
+            self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
+        self.assertNotIn("cargo publish", called)
 
     def verify_source(self, tag="v0.1.0", sha="a" * 40, tagged_sha=None):
         env = {"RELEASE_TAG": tag, "RELEASE_SHA": sha, "GITHUB_SHA": "a" * 40}

@@ -90,6 +90,47 @@ class AutoReleaseTests(unittest.TestCase):
             self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
         self.assertNotIn("cargo publish", called)
 
+    def test_shipping_jobs_restore_no_cache(self):
+        """What ships is built from sources, never from a cache another job wrote.
+
+        v0.1.13's aarch64 Linux worker restored a shared `tnone` toolchain
+        entry saved by the previous release's aarch64 job: its rustup records
+        listed the aarch64 std installed mid-build, the archive did not hold
+        it, and the build failed at E0463. `cache: false` alone does not reach
+        the toolchain cache, so every layer is named. `validate-and-package`
+        may cache: it tests, and packages sources a cache cannot alter.
+        """
+        called = (ROOT / ".github/workflows/release.yml").read_text()
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        for text, job in ((called, "symbolizer-workers"), (caller, "publish-crates")):
+            body = text.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
+            steps = body.split("zackees/setup-soldr@")[1:]
+            with self.subTest(job=job):
+                self.assertTrue(steps)
+                for step in steps:
+                    block = step.split("\n      - ", 1)[0]
+                    self.assertIn("cache: false", block)
+                    self.assertIn("build-cache: false", block)
+                    self.assertIn("solo-toolchain-cache: false", block)
+
+    def test_a_failed_release_job_stops_the_release(self):
+        called = (ROOT / ".github/workflows/release.yml").read_text()
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        self.assertNotIn("fail-fast: false", called)
+        self.assertIn("fail-fast: true", called)
+        for text, jobs in (
+            (called, ("release-guard", "validate-and-package", "symbolizer-workers", "publish-pypi", "release-assets")),
+            (caller, ("publish-crates",)),
+        ):
+            for job in jobs:
+                with self.subTest(job=job):
+                    body = text.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
+                    last = body.rsplit("\n      - ", 1)[1]
+                    self.assertIn("name: Cancel the run (this job failed)", last)
+                    self.assertIn("if: failure()", last)
+                    self.assertIn("gh run cancel ${{ github.run_id }}", last)
+            self.assertIn("actions: write", text.split("\njobs:\n", 1)[0])
+
     def verify_source(self, tag="v0.1.0", sha="a" * 40, tagged_sha=None):
         env = {"RELEASE_TAG": tag, "RELEASE_SHA": sha, "GITHUB_SHA": "a" * 40}
         results = ["a" * 40, "" if tagged_sha is None else tag, tagged_sha]

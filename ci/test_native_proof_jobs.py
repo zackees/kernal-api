@@ -217,6 +217,19 @@ class NativeProofJobsTests(unittest.TestCase):
             with self.subTest(build=suffix):
                 self.assertIn(f"https://get.nexte.st/latest/{suffix} ;;", job)
 
+    def test_feature_isolation_checks_share_one_runner(self):
+        """36 isolated `cargo check`s are one job's steps, not 36 runners.
+
+        As a matrix they cost 36 runners and 31 runner-minutes, most of it
+        repeated checkout and setup; sequentially they share one setup and the
+        dependency units earlier features already built. Every feature still
+        runs after a failure, so one red run names them all.
+        """
+        job = self.job("each-feature")
+        self.assertNotIn("matrix:", job)
+        self.assertIn('for feature in "${features[@]}"', job)
+        self.assertIn('failed+=("${feature}")', job)
+
     def test_ci_never_disables_the_soldr_cache(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("--no-cache", text)

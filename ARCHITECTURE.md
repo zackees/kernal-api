@@ -197,6 +197,9 @@ buffering convention.
 
 1. Fill the facade gaps needed by zccache: cancellation/runtime handles,
    process lifecycle and bounded execution, BLAKE3 hashing, and broker adapters.
+   The async compiler-session path is covered by `SpawnSpec::spawn_session`
+   with `SpawnAdmission` and `SpawnSpec::priority_best_effort`, adapted
+   privately in `src/process_adapter.rs`.
 2. Rebase zccache's embedded API on facade-owned async and cancellation types.
 3. Move zccache process launch, probing, detached deployment, identity, and
    hashing behind `kernal-api`.

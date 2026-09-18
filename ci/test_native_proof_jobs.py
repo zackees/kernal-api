@@ -1,7 +1,8 @@
 """Keep CI to a few jobs that compile on Linux and run on all six hosts.
 
-The workflow is five jobs: `linux` (the gate), `build` and `test` (one runner
-per other target each), `dylints`, and `cancel-on-failure`. These
+The workflow is four jobs: `linux` (the gate), `build` and `test` (one runner
+per other target each), and `dylints`; each ends in a step that cancels the run
+when that job fails. These
 guards pin the properties that shape was chosen for, one test per property, so
 a later edit that quietly undoes one fails here instead of on a runner bill.
 """
@@ -25,7 +26,7 @@ TARGETS = {target for _, target in HOSTS}
 # x86_64 Linux is the gate: its builder is its host, so it builds and runs in
 # `linux` rather than in the per-target matrices.
 GATE_TARGET = "x86_64-unknown-linux-gnu"
-EXPECTED_JOBS = {"linux", "build", "test", "dylints", "cancel-on-failure"}
+EXPECTED_JOBS = {"linux", "build", "test", "dylints"}
 # `cargo-nextest` is the replay driver, not a compiler: it runs binaries out of
 # a prebuilt archive. `.cargo/bin` is a path. Everything else named here would
 # compile on the host running it.
@@ -56,7 +57,7 @@ class NativeProofJobsTests(unittest.TestCase):
 
     # -- the shape -----------------------------------------------------------
 
-    def test_the_pipeline_is_five_jobs(self):
+    def test_the_pipeline_is_four_jobs(self):
         """Checks are steps on a shared runner, not a runner each.
 
         This workflow was 20 job definitions and 52 runners per push. A new
@@ -95,12 +96,22 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIn("needs: [linux, build]", self.job("test"))
 
     def test_a_failure_cancels_the_rest_of_the_run(self):
-        """`fail-fast` stops a matrix's siblings; the sentinel stops everything else."""
-        sentinel = self.job("cancel-on-failure")
-        self.assertIn("needs: [linux, build, test, dylints]", sentinel)
-        self.assertIn("if: failure() && github.event_name == 'pull_request'", sentinel)
-        self.assertIn("gh run cancel ${{ github.run_id }}", sentinel)
-        self.assertIn("actions: write", sentinel)
+        """`fail-fast` stops a matrix's siblings; each job's last step stops everything else.
+
+        A sentinel job that `needs` every other job cannot do this: `needs`
+        waits for all of them to finish, so a red `linux-checks` sat beside
+        five Build and two dylints runners that ran to completion.
+        """
+        for name in EXPECTED_JOBS:
+            with self.subTest(job=name):
+                job = self.job(name)
+                steps = re.split(r"\n      - ", job.split("steps:", 1)[1])
+                last = steps[-1]
+                self.assertIn("name: Cancel the run (this job failed)", last)
+                self.assertIn("if: failure() && github.event_name == 'pull_request'", last)
+                self.assertIn("gh run cancel ${{ github.run_id }}", last)
+                self.assertIn("GH_REPO: ${{ github.repository }}", last)
+        self.assertIn("actions: write", self.text().split("\njobs:\n", 1)[0])
         for matrix in ("build", "test"):
             with self.subTest(job=matrix):
                 self.assertIn("fail-fast: true", self.job(matrix))

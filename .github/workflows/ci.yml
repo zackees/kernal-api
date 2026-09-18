@@ -26,7 +26,7 @@ permissions:
   actions: write
 
 jobs:
-  # The whole pipeline is five jobs. Each one is a runner that sets up once and
+  # The whole pipeline is four jobs. Each one is a runner that sets up once and
   # does everything that belongs on it, as steps -- not a runner per check.
   #
   #   linux          the gate: every Linux-only check and proof, then lint,
@@ -34,7 +34,7 @@ jobs:
   #   build (x5)     one Linux builder per other target: archive + proofs
   #   test (x5)      one host per other target: run what was built, compile nothing
   #   dylints (x2)   the boundary lints, on their own pinned nightly
-  #   cancel-on-failure   stops the run the moment any of the above fails
+  # Each job's last step cancels the run when that job fails (pull requests).
   #
   # This replaced 20 job definitions and 52 runners per push. Checks that used
   # to be a job each are now steps; the per-target proof matrices
@@ -295,6 +295,18 @@ jobs:
           name: linux-screenshot-diagnostics
           path: ${{ runner.temp }}/kernal-api-screenshot-proof
           if-no-files-found: warn
+      # Last step: a failure anywhere in this job stops the whole run, so a
+      # red push releases its runners instead of finishing jobs that no longer
+      # matter. A step, not a sentinel job: a job that `needs` the others
+      # starts only when all of them finish, which is too late to cancel
+      # anything. Pull requests only: on main a cancelled run would erase the
+      # record of which job failed.
+      - name: Cancel the run (this job failed)
+        if: failure() && github.event_name == 'pull_request'
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   # Every other target, compiled on Linux: the scarce Apple and Windows
   # runners in `test` only ever execute what these builders produce.
@@ -429,6 +441,13 @@ jobs:
           path: ${{ runner.temp }}/native-proof-${{ matrix.target }}.tar
           if-no-files-found: error
           retention-days: 1
+      # Stops the whole run on a failure here; see the step in `linux`.
+      - name: Cancel the run (this job failed)
+        if: failure() && github.event_name == 'pull_request'
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   # Run each target's prebuilt binaries on its own host. Nothing here compiles.
   test:
@@ -596,6 +615,13 @@ jobs:
           name: screenshot-diagnostics-${{ matrix.target }}
           path: ${{ runner.temp }}/kernal-api-screenshot-proof
           if-no-files-found: warn
+      # Stops the whole run on a failure here; see the step in `linux`.
+      - name: Cancel the run (this job failed)
+        if: failure() && github.event_name == 'pull_request'
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
 
   # A Dylint pass only sees what the compiler compiles, so `cfg(target_os =
   # "macos")` bodies are invisible on a Linux host, which is how a raw host type
@@ -683,22 +709,11 @@ jobs:
         run: >-
           soldr cargo dylint
           --all --workspace -- --all-features --all-targets
-
-  # Stop the rest of the run the moment any job fails, so a red push releases
-  # its runners to the account-wide pool. Modelled on soldr's
-  # cancel-on-*-failure sentinels. Pull requests only: on main a cancelled
-  # run would erase the record of which job failed.
-  cancel-on-failure:
-    name: Cancel run (a job failed)
-    needs: [linux, build, test, dylints]
-    if: failure() && github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      # No checkout, so `gh` cannot infer the repository from a git remote.
-      - run: gh run cancel ${{ github.run_id }}
+      # Stops the whole run on a failure here; see the step in `linux`.
+      - name: Cancel the run (this job failed)
+        if: failure() && github.event_name == 'pull_request'
+        # No checkout guaranteed, so `gh` cannot infer the repository.
+        run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}

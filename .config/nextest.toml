@@ -1,3 +1,30 @@
+# Adopted from soldr's .config/nextest.toml, which hit the same two problems
+# after the same move to nextest archives and one-binary-per-category tests.
+#
+# 1. A per-test budget. Without one, a hung test holds its runner until the
+#    job's own 30-45 minute timeout -- exactly the capacity the replay lanes
+#    exist to free. nextest runs each test in its own process, so a timeout
+#    kills one test and the run summary names it. `period` x `terminate-after`
+#    is the budget: 60s x 2 = 120s, soldr's value. The slowest real test here
+#    measured 13.5s on Windows and 12.1s on Linux, so that is ~9x headroom.
+#    Windows kills the test's job object at the deadline; the grace period
+#    only applies to Unix, where nextest sends SIGTERM first.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2, grace-period = "30s" }
+
+# =====================================================================
+# 2. READ THIS BEFORE EDITING ANY `filter = ` LINE BELOW (soldr#2934).
+#
+# Integration tests are modules of a category binary (AGENTS.md), so libtest
+# names them `<module>::<test>` and the binary is the category, not the old
+# file. A filter that matches nothing IS NOT AN ERROR IN NEXTEST: it is
+# silently ignored, and the override quietly stops applying. After renaming or
+# moving a test, re-verify every filter naming it -- `cargo nextest list -E
+# '<filter>'` prints the selected set, and an empty set means the filter is
+# dead. `ci/test_nextest_config.py` fails the build on a filter that names a
+# test binary or test function that no longer exists.
+# =====================================================================
+
 # nextest runs one test per process, as many at once as there are CPUs. That
 # is what makes the replay lanes fast, and it is also a load the old
 # `cargo test` lane never applied: there, tests were threads inside one

@@ -110,11 +110,19 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
+      # No restored crate registry here. This job compiles dozens of different
+      # feature graphs, and a registry cache seeded by a job that needed only
+      # part of the graph restores trimmed crate directories cargo trusts as
+      # extracted: the first run on this shape failed all 36 feature checks at
+      # `libc-0.2.189/src/unix/mod.rs: file not found`, from an 8,723-file
+      # restore where the gate had restored 26,983. `dylints` guards against
+      # the same thing with its own CARGO_HOME. Downloading sources costs a
+      # minute; a poisoned registry costs the whole job.
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          toolchain: 1.95.0
           cache-key-suffix: linux-checks
           prebuild-deps-flags: ""
+          cargo-registry-cache: false
       - name: Restore native pkg-config search path
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"

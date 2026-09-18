@@ -276,6 +276,50 @@ fn daemon_identity_remains_opt_in_and_out_of_full() {
     );
 }
 
+/// The broker client adapter selects the substrate's heavy `client` feature,
+/// so it stays opt-in, outside `full`, and an adapter rather than a second
+/// broker implementation.
+#[test]
+fn broker_client_remains_opt_in_out_of_full_and_an_adapter() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains("broker-client = [\"running-process/client\"]"),
+        "broker-client must compose only the substrate's client feature"
+    );
+    let full = manifest
+        .split("full = [")
+        .nth(1)
+        .and_then(|tail| tail.split(']').next())
+        .expect("locate full feature");
+    assert!(
+        !full.contains("broker-client"),
+        "full must not pull the broker client's CLI/config/IPC graph"
+    );
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        lib.contains("#[cfg(feature = \"broker-client\")]\npub mod broker_client;"),
+        "default builds must omit the broker client facade module"
+    );
+    let adapter = std::fs::read_to_string(root.join("src/broker_client.rs"))
+        .expect("read broker client facade");
+    assert!(
+        adapter.contains("backend::connect_to_backend("),
+        "the facade must delegate the broker connect to the substrate"
+    );
+    for forbidden in [
+        "write_frame(",
+        "read_frame(",
+        "encode_to_vec(",
+        "HelloReply::decode(",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "the broker client facade must not reimplement the broker wire ({forbidden:?})"
+        );
+    }
+}
+
 #[test]
 fn daemon_frame_v1_remains_transport_free_and_product_neutral() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1093,6 +1137,7 @@ fn published_documentation_renders_every_public_module() {
         "daemon-frame-v1",
         "daemon-registration",
         "daemon-registration-v2",
+        "broker-client",
     ] {
         assert!(
             metadata.contains(&format!("\"{feature}\"")),
@@ -1116,6 +1161,7 @@ fn published_documentation_renders_every_public_module() {
         ("daemon-frame-v1", "daemon_frame_v1"),
         ("daemon-registration", "daemon_registration"),
         ("daemon-registration-v2", "daemon_registration_v2"),
+        ("broker-client", "broker_client"),
     ] {
         assert!(
             lib.contains(&format!(
@@ -1133,6 +1179,7 @@ fn published_documentation_renders_every_public_module() {
         "daemon-frame-v1",
         "daemon-registration",
         "daemon-registration-v2",
+        "broker-client",
         "window-icon",
     ] {
         assert!(

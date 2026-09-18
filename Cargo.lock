@@ -568,6 +568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b193af5b67834b676abd72466a96c1024e6a6ad978a1f484bd90b85c94041351"
 dependencies = [
  "clap_builder",
+ "clap_derive",
 ]
 
 [[package]]
@@ -580,6 +581,18 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_derive"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1110bd8a634a1ab8cb04345d8d878267d57c3cf1b38d91b71af6686408bbca6a"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -4490,10 +4503,15 @@ version = "4.10.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02f0ff903e7b61396a074648fc6301668492de90aea4b5d09cc914eee9389e9b"
 dependencies = [
+ "anyhow",
  "blake3",
+ "clap",
+ "dirs 6.0.0",
  "getrandom 0.4.3",
+ "interprocess",
  "libc",
  "prost",
+ "prost-types",
  "running-process-platform-internal",
  "running-process-protocol",
  "serde",
@@ -4502,6 +4520,7 @@ dependencies = [
  "sysinfo",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.8.23",
  "winapi",
  "windows-sys 0.61.2",
 ]

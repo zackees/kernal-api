@@ -39,6 +39,11 @@ CASES = (
     ("tauri-webview", "tauri"),
     ("tauri-webview", "tauri-runtime-wry"),
     ("tauri-webview", "wry"),
+    # The broker client adapter pulls running-process/client, whose CLI,
+    # config, and IPC stack must stay out of every graph that does not ask.
+    ("broker-client", "clap"),
+    ("broker-client", "interprocess"),
+    ("broker-client", "anyhow"),
 )
 
 SKETCH_AND_WEBVIEW_PACKAGES = {

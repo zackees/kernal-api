@@ -136,6 +136,8 @@ jobs:
             daemon-identity
             daemon-registration
             daemon-registration-v2
+            # Broker client adapter over running-process/client (heavy graph).
+            broker-client
             fs
             fs-watch
             hash-sha256

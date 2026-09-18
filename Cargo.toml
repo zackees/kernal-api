@@ -127,6 +127,11 @@ daemon-registration = ["running-process/daemon-registration"]
 # separate from v1 records and pulls no broker client, identity, IPC, or
 # runtime policy into applications that dual-write during the v1-to-v2 rollout.
 daemon-registration-v2 = ["running-process/daemon-registration-v2"]
+# Facade-owned broker client adapter: backend connect plus owned route, refusal,
+# and error classification. The broker implementation stays in running-process;
+# its `client` feature is heavy (clap, interprocess, anyhow, toml), so this is
+# opt-in and outside `full`.
+broker-client = ["running-process/client"]
 pty = ["dep:portable-pty", "terminal-input"]
 event-stream = ["dep:futures-core", "dep:tokio-stream", "tokio-stream/sync"]
 http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "dep:http-body-util", "dep:bytes", "dep:futures-core"]
@@ -476,6 +481,7 @@ features = [
   "daemon-frame-v1",
   "daemon-registration",
   "daemon-registration-v2",
+  "broker-client",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 targets = [

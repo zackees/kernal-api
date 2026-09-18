@@ -166,10 +166,23 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
             "{cargo_job} must depend on release-guard before invoking soldr/cargo"
         );
     }
+    // publish-crates runs in auto-release.yml, the workflow registered as the
+    // crate's trusted publisher. It needs the whole `release` workflow, which
+    // is release.yml -- release-guard included -- so the guard still runs
+    // before cargo publish.
+    let auto_release = std::fs::read_to_string(root.join(".github/workflows/auto-release.yml"))
+        .expect("read auto-release workflow");
     assert!(
-        workflow_job(&release_workflow, "publish-crates")
-            .contains("needs: [release-guard, validate-and-package, release-assets]"),
-        "publish-crates must directly depend on release-guard before cargo publish"
+        workflow_job(&auto_release, "release").contains("uses: ./.github/workflows/release.yml"),
+        "auto-release's release job must run release.yml, where release-guard lives"
+    );
+    assert!(
+        workflow_job(&auto_release, "publish-crates").contains("needs: [prepare, release]"),
+        "publish-crates must depend on the whole release workflow before cargo publish"
+    );
+    assert!(
+        !release_workflow.contains("cargo publish"),
+        "cargo publish must stay in auto-release.yml's publish-crates job"
     );
 
     let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");

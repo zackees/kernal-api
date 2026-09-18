@@ -1,43 +1,35 @@
-//! Shared candidate fixture: cache decision plus exact controlled compiler miss.
-use kernal_api::guest::{
-    Blake3Hasher, CompilerCacheStatus, CompilerGrant, CompilerOutputEvent, OperationError,
-};
+//! Shared candidate fixture: an exact, controlled compiler run.
+use kernal_api::guest::{Blake3Hasher, CompilerGrant, CompilerOutputEvent, OperationError};
 #[cfg(feature = "compiler-artifact-output")]
 use kernal_api::guest::{Blob, OutputFile};
 
 // Keep the representative parser in this guest path rather than validating it
 // only through the separate hash probe. Both runtime candidates include this
 // file, so a compiler miss now exercises the same explicit-host Rustc policy
-// before it derives the cache key or asks the host to spawn.
+// before it asks the host to spawn.
 #[path = "rustc_policy.rs"]
 mod rustc_policy;
 
 pub async fn proof() -> Result<(), OperationError> {
-    proof_with_cache(true).await
+    controlled_run().await
 }
 
-/// Same controlled compiler miss path without the request-key list lowering.
-/// This exists only for the allocator-fault fixture, so its trap can be shown
-/// to occur while lowering output data rather than an earlier hash digest.
+/// The allocator-fault fixture's entry point: the same controlled run, so its
+/// trap can be shown to occur while lowering output data. It used to differ
+/// from `proof` by skipping a cache-key lowering; the compiler-artifact cache
+/// experiment that key fed is gone, so the two are now the same run.
 #[allow(dead_code)] // used by the separately selected lowering-trap fixture
 pub async fn output_lowering_proof() -> Result<(), OperationError> {
-    proof_with_cache(false).await
+    controlled_run().await
 }
 
-async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
+async fn controlled_run() -> Result<(), OperationError> {
     if !rustc_policy::proof() {
         return Err(OperationError::Failed);
     }
     let grant = CompilerGrant::granted()?.ok_or(OperationError::Rejected)?;
     if CompilerGrant::granted()?.is_some() {
         return Err(OperationError::Failed);
-    }
-    if cache {
-        match grant.cache_status(&request_key().await?)? {
-            // A hit must avoid even submitting the host-owned compiler grant.
-            CompilerCacheStatus::Hit => return Ok(()),
-            CompilerCacheStatus::Miss => {}
-        }
     }
     // The Core fixture persists only the verified compiler payload through an
     // embedding-selected exact destination. The Component candidate shares
@@ -126,37 +118,4 @@ async fn proof_with_cache(cache: bool) -> Result<(), OperationError> {
         output.write_blob(&artifact).await?;
     }
     Ok(())
-}
-
-/// Assemble the actual zccache request protocol through the public bounded
-/// hash facade. The private fixture represents the host identity with the
-/// grant's precomputed expected key, never with a cache path or artifact byte
-/// stream. A production host would derive that identity from metadata/content
-/// facts before instantiation.
-async fn request_key() -> Result<[u8; 32], OperationError> {
-    use zccache_hash::request_fingerprint::RequestFingerprint;
-
-    let raw = ["-MD", "-MF-", "source.c"].map(String::from);
-    let env = [("A", ""), ("Z", "last")];
-    let mut cursor =
-        RequestFingerprint::new("cc", ["-O2", "-O0", ""].into_iter(), &raw, "work", &env);
-    let mut hash = Blake3Hasher::new().await?;
-    let mut buffer = [0u8; 65536];
-    let mut used = 0;
-    while let Some(mut fragment) = cursor.next_fragment() {
-        while !fragment.is_empty() {
-            let count = fragment.len().min(buffer.len() - used);
-            buffer[used..used + count].copy_from_slice(&fragment[..count]);
-            used += count;
-            fragment = &fragment[count..];
-            if used == buffer.len() {
-                hash.update(&buffer).await?;
-                used = 0;
-            }
-        }
-    }
-    if used != 0 {
-        hash.update(&buffer[..used]).await?;
-    }
-    hash.finalize().await
 }

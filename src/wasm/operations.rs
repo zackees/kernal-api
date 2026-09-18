@@ -2059,26 +2059,6 @@ impl OperationHub {
         self.commit_blob_operation(store, blob, output, None)
     }
 
-    /// Restore a host-owned cached artifact through the same exact-output
-    /// containment path used for guest publication. The destination is never
-    /// granted to the guest on this path.
-    #[cfg(feature = "wasm-sketch-host")]
-    pub(crate) fn restore_cached_output(
-        &self,
-        store: u64,
-        destination: &Path,
-        bytes: &[u8],
-    ) -> Result<(), HubError> {
-        let blob = self.create_blob(store)?;
-        for chunk in bytes.chunks(self.blob_limits.maximum_chunk_bytes) {
-            self.blob_write(store, blob, chunk)?;
-        }
-        self.seal_blob(store, blob)?;
-        let output = self.grant_exact_output(store, destination)?;
-        self.commit_blob_to_output(store, blob, output)
-            .map_err(|_| HubError::Closed)
-    }
-
     #[cfg(feature = "wasm-sketch-host")]
     pub(crate) fn submit_output_commit(
         self: &Arc<Self>,

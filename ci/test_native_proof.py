@@ -218,7 +218,9 @@ class RunTests(unittest.TestCase):
             env for arguments, env in host.calls
             if "--list" not in arguments and any(test in arguments for test in proof.COMPONENT_TESTS)
         ]
-        self.assertEqual(len(component_runs), 2)
+        # One run per Component proof: the cache-hit proof left with the
+        # compiler-artifact cache experiment.
+        self.assertEqual(len(component_runs), len(proof.COMPONENT_TESTS))
         for env in component_runs:
             self.assertEqual(env["KERNAL_COMPONENT_COMPILER_WASM"], str(work / "compiler-policy.component.wasm"))
 

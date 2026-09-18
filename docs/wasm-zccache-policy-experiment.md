@@ -256,29 +256,22 @@ close. The same cache-aware shared policy passes freshly rebuilt revision-8
 Core and Component guest artifacts on Linux x86-64. Unit coverage also checks
 exact key matching, store ownership, miss/hit values, and zero spawn attempts.
 
-The Core private threaded-root fixture now uses the real
-`zccache-artifact::KvStore`, pinned at
-`d385a184ca5ad3cad207daf25093374f27b219de`, in the private
-`kernal-compiler-v1` namespace. On a miss, after the guest has completed its
-normal process/output lifecycle and the exact output job has drained, the
-host reads that embedding-selected output and atomically retains it under the
-same 32-byte request key. On a hit, the host reads and verifies the zccache
-value, restores it through the existing exact-output atomic replacement path
-before instantiating the Store, and withholds output authority from the guest.
-The guest sees only `Hit` and returns before spawn; cache root, namespace, and
-artifact bytes remain private host state.
+**Removed: the compiler-artifact cache.** The Core threaded-root fixture
+used to retain and restore compiler outputs through the real
+`zccache-artifact::KvStore` (a git dependency pinned at `d385a184`). That was
+the experiment's proof that a guest-driven compile could be cached in zccache's
+own store. It is gone, for two reasons. The dependency blocked publishing
+kernal-api -- crates.io cannot accept a git dependency, and zccache stopped
+publishing `zccache-artifact` at 1.9.0 -- and it pointed the wrong way:
+zccache is a kernal-api client (#5), and on its migration branch
+`zccache-artifact` itself depends on kernal-api, so the pair would become a
+dependency cycle. The cache was also reachable only from tests; production
+could never open the store.
 
-The ignored actual Core round-trip test first runs the controlled miss, then
-runs the same request with a deliberately nonexistent compiler executable.
-It verifies the second embedding-selected output equals the cached first
-artifact, so success demonstrates both retention/retrieval and no compiler
-spawn. The focused KV test independently verifies persistence through the
-real zccache format. This remains a bounded private experiment, not a public
-cache API, a cache enumeration capability, or an artifact-cache selection
-decision. Reserve operation/resource capacity before the controlled miss
-spawn; revocation between reservation and attachment must reclaim a spawned
-session. Output delivery retains its aggregate in-flight byte budget in
-addition to native queue limits.
+The guest-facing `cache_status` decision remains in the ABI, backed by the
+embedder-supplied key/hit pair on a compiler grant with no storage behind it.
+If caching returns, the application that owns the cache supplies it to the
+host, so kernal-api never names a zccache type.
 
 The `wasm-compiler-native` CI matrix runs that exact compiler-cache proof on
 each required native host. `ci/native_proof.py guests` builds the separate

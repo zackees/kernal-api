@@ -910,68 +910,23 @@ impl AdmittedSketch {
         let mut grants = grants;
         let compiler = grants.compiler.take();
         let output = grants.output.take();
-        // Consult the concrete private cache before Store construction. A hit
-        // restores the embedding-selected exact path now, and deliberately
-        // withholds output authority from the guest.
-        if compiler
-            .as_ref()
-            .is_some_and(|grant| grant.cache.is_some())
-            && output.is_none()
-        {
-            return Err(SketchExecutionError::OutputGrantRejected);
-        }
-        let cache_hit = compiler
-            .as_ref()
-            .and_then(|grant| grant.cache.as_ref())
-            .map(|cache| {
-                compiler_cache::restore_cached_output_if_hit(
-                    &cache.store,
-                    &operations,
-                    0,
-                    cache.key,
-                    output.as_deref().expect("compiler cache has output"),
-                )
-                .map_err(|error| match error {
-                    compiler_cache::CacheRestoreError::Cache => {
-                        SketchExecutionError::CompilerArtifactCacheFailed
-                    }
-                    compiler_cache::CacheRestoreError::Output => {
-                        SketchExecutionError::OutputGrantRejected
-                    }
-                })
-            })
-            .transpose()?
-            .unwrap_or(false);
         // Grant before constructing or instantiating the root Store: even a
-        // module start section sees only the already-authorized resource. A
-        // cache hit gets no output token because the host restored it above.
-        let initial_output = (!cache_hit)
-            .then_some(output.as_deref())
-            .flatten()
+        // module start section sees only the already-authorized resource.
+        let initial_output = output
+            .as_deref()
             .map(|path| operations.grant_exact_output_wire(0, path))
             .transpose()
             .map_err(|_| SketchExecutionError::OutputGrantRejected)?;
         let operation_cleanup = Arc::clone(&operations);
-        let cache_write = (!cache_hit)
-            .then(|| {
-                compiler.as_ref().and_then(|grant| {
-                    grant.cache.as_ref().map(|cache| (cache.clone(), output.clone()))
-                })
-            })
-            .flatten();
         let initial_compiler = compiler
             .map(
-                |RootCompilerGrant {
-                     spec,
-                     deadline,
-                     cache,
-                 }| {
+                |RootCompilerGrant { spec, deadline }| {
                     operations
                         .grant_compiler_with_cache(
                             0,
                             spec,
                             deadline,
-                            cache.map(|cache| (cache.key, cache_hit)),
+                            None,
                         )
                         .map(|token| token.wire())
                 },
@@ -1127,14 +1082,6 @@ impl AdmittedSketch {
         archive_cleanup.map_err(|_| SketchExecutionError::BlockingTaskFailed)?;
         #[cfg(feature = "tauri-webview")]
         webview_cleanup?;
-        if let Some((cache, Some(output))) = cache_write {
-            let bytes = std::fs::read(output)
-                .map_err(|_| SketchExecutionError::CompilerArtifactCacheFailed)?;
-            cache
-                .store
-                .put(cache.key, &bytes)
-                .map_err(|_| SketchExecutionError::CompilerArtifactCacheFailed)?;
-        }
         Ok(result)
     }
     fn prepare_threaded_root_with_permit(
@@ -1386,7 +1333,6 @@ pub enum SketchExecutionError {
     PrelinkFailed,
     OutputGrantRejected,
     OutputCleanupFailed,
-    CompilerArtifactCacheFailed,
     WebviewGrantRejected,
     WebviewCleanupFailed,
     NonzeroExit {
@@ -1422,7 +1368,6 @@ impl SketchExecutionError {
             Self::PrelinkFailed => "prelink-failed",
             Self::OutputGrantRejected => "output-grant-rejected",
             Self::OutputCleanupFailed => "output-cleanup-failed",
-            Self::CompilerArtifactCacheFailed => "compiler-artifact-cache-failed",
             Self::WebviewGrantRejected => "webview-grant-rejected",
             Self::WebviewCleanupFailed => "webview-cleanup-failed",
             Self::NonzeroExit { .. } => "nonzero-exit",
@@ -2000,13 +1945,6 @@ struct RootGrants {
 struct RootCompilerGrant {
     spec: crate::SpawnSpec,
     deadline: std::time::Duration,
-    cache: Option<RootCompilerArtifactCache>,
-}
-
-#[derive(Clone)]
-struct RootCompilerArtifactCache {
-    key: [u8; 32],
-    store: compiler_cache::CompilerArtifactStore,
 }
 
 struct ThreadStoreState {
@@ -5252,7 +5190,6 @@ fn capture_threaded_smoke_report(
 }
 
 mod compiler_dispatch;
-mod compiler_cache;
 #[cfg(feature = "wasm-component-compiler-experiment")]
 mod component_compiler;
 mod hash_dispatch;

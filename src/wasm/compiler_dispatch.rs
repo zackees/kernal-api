@@ -290,44 +290,14 @@ pub(in crate::wasm) mod tests {
 
     #[test]
     #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
-    fn compiler_actual_guest_spawns_drains_hashes_persists_waits_and_caches() {
-        let cache = tempfile::tempdir().unwrap();
+    fn compiler_actual_guest_spawns_drains_hashes_persists_and_waits() {
         let output = tempfile::tempdir().unwrap();
         let artifact = output.path().join("compiler-artifact");
-        execute_actual_guest(cache.path(), artifact.clone(), compiler_helper_spec());
+        execute_actual_guest(artifact.clone(), compiler_helper_spec());
         assert_verified_artifact(&artifact);
-        let expected = std::fs::read(&artifact).unwrap();
-        assert_eq!(
-            compiler_cache::CompilerArtifactStore::open(cache.path())
-                .unwrap()
-                .get(CACHE_KEY)
-                .unwrap()
-                .as_deref(),
-            Some(expected.as_slice())
-        );
     }
 
-    #[test]
-    #[ignore = "requires freshly built KERNAL_COMPILER_GUEST_WASM revision-8 guest"]
-    fn compiler_actual_guest_cache_hit_restores_without_spawning_the_granted_compiler() {
-        let cache = tempfile::tempdir().unwrap();
-        let outputs = tempfile::tempdir().unwrap();
-        let miss = outputs.path().join("miss-artifact");
-        execute_actual_guest(cache.path(), miss.clone(), compiler_helper_spec());
-        let expected = std::fs::read(&miss).unwrap();
-        let hit = outputs.path().join("hit-artifact");
-        let forbidden = crate::SpawnSpec::new(
-            std::env::current_dir()
-                .unwrap()
-                .join("cache-hit-must-not-spawn"),
-        )
-        .current_dir(std::env::current_dir().unwrap())
-        .clear_env(true);
-        execute_actual_guest(cache.path(), hit.clone(), forbidden);
-        assert_eq!(std::fs::read(hit).unwrap(), expected);
-    }
-
-    fn execute_actual_guest(cache_root: &std::path::Path, output: std::path::PathBuf, spec: crate::SpawnSpec) {
+    fn execute_actual_guest(output: std::path::PathBuf, spec: crate::SpawnSpec) {
         let bytes = std::fs::read(
             std::env::var_os("KERNAL_COMPILER_GUEST_WASM").expect("compiler guest artifact"),
         )
@@ -371,10 +341,6 @@ pub(in crate::wasm) mod tests {
                     compiler: Some(RootCompilerGrant {
                         spec,
                         deadline: Duration::from_secs(15),
-                        cache: Some(RootCompilerArtifactCache {
-                            key: CACHE_KEY,
-                            store: compiler_cache::CompilerArtifactStore::open(cache_root).unwrap(),
-                        }),
                     }),
                     output: Some(output.clone()),
                     #[cfg(all(test, feature = "archive-auth-test-support"))]

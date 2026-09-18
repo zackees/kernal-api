@@ -135,6 +135,21 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIn("native_proof.py run compiler", checks)
         self.assertIn("native_proof.py run screenshot", checks)
 
+    def test_each_proof_suite_gets_its_own_work_directory(self):
+        """The runner refuses a work directory holding another run's state.
+
+        The compiler and screenshot suites were separate jobs, so each had a
+        fresh directory. As consecutive steps they must not share one: the
+        first consolidated run failed with `work directory is not empty;
+        refusing stale proof state` after the compiler proofs had passed.
+        """
+        for job in ("test", "linux-checks"):
+            with self.subTest(job=job):
+                body = self.job(job)
+                self.assertIn('native-proof-run-compiler"', body)
+                self.assertIn('native-proof-run-screenshot"', body)
+                self.assertNotIn('native-proof-run"', body)
+
     def test_the_windows_webview_proof_runs_a_prebuilt_binary(self):
         """WebView2 needs a Windows host; it does not need a Windows compile."""
         self.assertIn("kernal-tauri-smoke.exe close", self.job("test"))

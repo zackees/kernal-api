@@ -110,11 +110,19 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool
+      # No restored crate registry here. This job compiles dozens of different
+      # feature graphs, and a registry cache seeded by a job that needed only
+      # part of the graph restores trimmed crate directories cargo trusts as
+      # extracted: the first run on this shape failed all 36 feature checks at
+      # `libc-0.2.189/src/unix/mod.rs: file not found`, from an 8,723-file
+      # restore where the gate had restored 26,983. `dylints` guards against
+      # the same thing with its own CARGO_HOME. Downloading sources costs a
+      # minute; a poisoned registry costs the whole job.
       - uses: zackees/setup-soldr@bb28e96d2dc32c058242f56722297caf1efcbd90
         with:
-          toolchain: 1.95.0
           cache-key-suffix: linux-checks
           prebuild-deps-flags: ""
+          cargo-registry-cache: false
       - name: Restore native pkg-config search path
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
@@ -286,7 +294,7 @@ jobs:
           --native-target x86_64-unknown-linux-gnu
           --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-compiler"
       - name: Run the x86_64 Linux screenshot and containment proofs
         timeout-minutes: 30
         env:
@@ -300,7 +308,7 @@ jobs:
           --native-target x86_64-unknown-linux-gnu
           --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-screenshot"
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -547,7 +555,7 @@ jobs:
           --native-target ${{ matrix.target }}
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-compiler"
       - name: Configure screenshot proof storage
         shell: pwsh
         run: |
@@ -587,7 +595,7 @@ jobs:
           --native-target ${{ matrix.target }}
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-screenshot"
       # The WebView2 proofs need a real Windows host, from a binary built on
       # Linux (#270, #273).
       - name: Verify native Windows external-page isolation

@@ -280,10 +280,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$HOME/.cargo/bin"
-          case "${{ runner.os }}" in
-            Linux) url=https://get.nexte.st/latest/linux ;;
-            macOS) url=https://get.nexte.st/latest/mac ;;
-            Windows) url=https://get.nexte.st/latest/windows ;;
+          # Pick by OS *and* architecture. The bare `linux` and `windows`
+          # builds are x86-64: on the ARM runners they fail with `Exec format
+          # error` before a single test starts. `mac` is universal.
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) url=https://get.nexte.st/latest/linux ;;
+            Linux-ARM64) url=https://get.nexte.st/latest/linux-arm ;;
+            Windows-X64) url=https://get.nexte.st/latest/windows ;;
+            Windows-ARM64) url=https://get.nexte.st/latest/windows-arm ;;
+            macOS-*) url=https://get.nexte.st/latest/mac ;;
+            *) echo "no cargo-nextest build for ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
           esac
           if [ "${{ runner.os }}" = "Windows" ]; then
             curl -LsSf "$url" -o nextest.zip && unzip -o -q nextest.zip -d "$HOME/.cargo/bin"

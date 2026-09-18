@@ -204,6 +204,19 @@ class NativeProofJobsTests(unittest.TestCase):
             "lint and archive both take the triple only for a cross lane",
         )
 
+    def test_each_replay_host_gets_a_nextest_it_can_execute(self):
+        """The bare `linux` and `windows` nextest builds are x86-64.
+
+        On an ARM runner they die with `Exec format error` before any test
+        starts, which is how the aarch64 Linux replay failed on main. Every ARM
+        host in `HOSTS` needs its own download.
+        """
+        job = self.job("test-run")
+        self.assertIn('"${{ runner.os }}-${{ runner.arch }}"', job)
+        for suffix in ("linux", "linux-arm", "windows", "windows-arm", "mac"):
+            with self.subTest(build=suffix):
+                self.assertIn(f"https://get.nexte.st/latest/{suffix} ;;", job)
+
     def test_ci_never_disables_the_soldr_cache(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("--no-cache", text)

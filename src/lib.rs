@@ -273,6 +273,12 @@ pub use platform_imp::{process_can_replace_current_image, process_replace_curren
 
 pub use platform_imp::{process_same_executable_path, ProcessLiveness};
 
+// Recorded-daemon verification reads the image a PID was started from. The
+// read stays crate-private: it is addressed by PID, so it is only sound
+// behind a retained `ProcessLiveness` reference, which the caller holds.
+#[cfg(feature = "daemon-identity")]
+pub(crate) use platform_imp::process_inspect::process_executable_path;
+
 pub use platform_imp::{
     resources_available_space, resources_fd_exhaustion_error, resources_inode_capacity,
     resources_signals_fd_exhaustion, resources_signals_storage_exhaustion,

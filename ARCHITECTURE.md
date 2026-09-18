@@ -207,6 +207,12 @@ buffering convention.
    enable the strict boundary Dylint for the whole workspace.
 6. Apply the proven migration to Soldr and fbuild.
 
+Direct-daemon identity (step 3) is owned by the opt-in `daemon_identity`
+facade: the frozen sidecar, probe, and endpoint mux delegate privately to the
+substrate's `backend-identity` feature, while recorded-daemon verification and
+control run on `kernal-api`'s own host process facade so the feature never
+selects the substrate's broker client.
+
 During migration, each capability lands in `kernal-api` before the corresponding
 client ban is enabled. There is no permanent legacy fallback in release builds.
 

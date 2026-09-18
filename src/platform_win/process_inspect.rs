@@ -132,7 +132,10 @@ impl ProcessLiveness {
 }
 
 /// Resolve the on-disk image a running process was started from.
-#[allow(dead_code)] // Kept private pending an identity-addressed inspect facade.
+#[cfg_attr(
+    not(feature = "daemon-identity"),
+    allow(dead_code, reason = "only recorded-daemon verification reads another image")
+)]
 pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
     // SAFETY: see `ProcessLiveness::open`.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };

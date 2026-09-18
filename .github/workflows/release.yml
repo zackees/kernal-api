@@ -89,8 +89,9 @@ jobs:
         # Registry consumers do not inherit this checkout's Git patches. Check
         # the extracted package with every advertised feature before publishing.
         # The generated sidecar manifest is the verified release input.
-        # Allow exactly that staged release input into the package.
-        run: soldr cargo package --locked --all-features --allow-dirty
+        # Allow exactly that staged release input into the package, then hold
+        # the .crate to source only and crates.io's 10 MiB cap.
+        run: uv run --no-project --python 3.12 ci/crate_release.py package
       - name: Package exact Python companion
         run: uv build --clear
       - run: uv run --no-project --with twine twine check dist/*
@@ -159,7 +160,7 @@ jobs:
       - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
         with:
           # Shipped binaries restore nothing. Every cache is a key another job
-          # can write -- the v0.1.13 aarch64 worker restored a toolchain whose
+          # can write -- the v0.1.14 aarch64 worker restored a toolchain whose
           # rustup records listed an aarch64 std that the saved archive did not
           # contain, and failed at E0463. Build from sources and releases only.
           cache: false

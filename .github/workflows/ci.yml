@@ -110,6 +110,12 @@ jobs:
           curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "$HOME/.cargo/bin"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run this host's prebuilt tests
+        # `--no-fail-fast` is about tests, not runners: the whole replay is
+        # about thirty seconds, so stopping at the first failure saved no
+        # capacity and hid every later failure until the next full CI cycle.
+        # Runner-level fail-fast is unchanged -- the matrix still stops its
+        # siblings and the sentinels still cancel the run when this job fails.
+        #
         # The Linux lane keeps the source-reading policy tests: here the
         # builder and the runner agree on the path baked into
         # `env!("CARGO_MANIFEST_DIR")`, so they read what they mean to.
@@ -117,7 +123,7 @@ jobs:
           set -euo pipefail
           cargo-nextest nextest run \
             --archive-file kernal-tests-x86_64-unknown-linux-gnu.tar.zst \
-            --workspace-remap . 2>&1 | tee nextest-output.txt
+            --workspace-remap . --no-fail-fast 2>&1 | tee nextest-output.txt
       - name: Prove this host ran its own code
         run: |
           set -euo pipefail
@@ -321,7 +327,7 @@ jobs:
           set -o pipefail
           cargo-nextest nextest run \
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
-            --workspace-remap . "${filter[@]}" 2>&1 | tee nextest-output.txt
+            --workspace-remap . --no-fail-fast "${filter[@]}" 2>&1 | tee nextest-output.txt
       - name: Prove this host ran its own code
         if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         shell: bash

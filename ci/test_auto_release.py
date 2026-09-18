@@ -90,19 +90,22 @@ class AutoReleaseTests(unittest.TestCase):
             self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
         self.assertNotIn("cargo publish", called)
 
-    def test_release_jobs_restore_no_cache(self):
-        """A release builds from sources, never from a cache another job wrote.
+    def test_shipping_jobs_restore_no_cache(self):
+        """What ships is built from sources, never from a cache another job wrote.
 
         v0.1.13's aarch64 Linux worker restored a shared `tnone` toolchain
         entry saved by the previous release's aarch64 job: its rustup records
         listed the aarch64 std installed mid-build, the archive did not hold
         it, and the build failed at E0463. `cache: false` alone does not reach
-        the toolchain cache, so every layer is named.
+        the toolchain cache, so every layer is named. `validate-and-package`
+        may cache: it tests, and packages sources a cache cannot alter.
         """
-        for name in ("release.yml", "auto-release.yml"):
-            text = (ROOT / ".github/workflows" / name).read_text()
-            steps = text.split("zackees/setup-soldr@")[1:]
-            with self.subTest(workflow=name):
+        called = (ROOT / ".github/workflows/release.yml").read_text()
+        caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
+        for text, job in ((called, "symbolizer-workers"), (caller, "publish-crates")):
+            body = text.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
+            steps = body.split("zackees/setup-soldr@")[1:]
+            with self.subTest(job=job):
                 self.assertTrue(steps)
                 for step in steps:
                     block = step.split("\n      - ", 1)[0]

@@ -294,7 +294,7 @@ jobs:
           --native-target x86_64-unknown-linux-gnu
           --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-compiler"
       - name: Run the x86_64 Linux screenshot and containment proofs
         timeout-minutes: 30
         env:
@@ -308,7 +308,7 @@ jobs:
           --native-target x86_64-unknown-linux-gnu
           --bundle "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-screenshot"
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -555,7 +555,7 @@ jobs:
           --native-target ${{ matrix.target }}
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-compiler"
       - name: Configure screenshot proof storage
         shell: pwsh
         run: |
@@ -595,7 +595,7 @@ jobs:
           --native-target ${{ matrix.target }}
           --bundle "${{ runner.temp }}/native-proof-bundle/native-proof-${{ matrix.target }}.tar"
           --guests "${{ runner.temp }}/native-proof-guests"
-          --work "${{ runner.temp }}/native-proof-run"
+          --work "${{ runner.temp }}/native-proof-run-screenshot"
       # The WebView2 proofs need a real Windows host, from a binary built on
       # Linux (#270, #273).
       - name: Verify native Windows external-page isolation

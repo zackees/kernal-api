@@ -73,3 +73,7 @@
   by #152. Until that issue lands, the repository's platform Dylint deliberately
   exempts `kernal-api` itself, so passing Dylint alone is not evidence that new
   facade-owner source follows this boundary.
+- Warnings are errors. The root manifest denies `warnings` for the workspace,
+  and every standalone package denies it in its own `[lints.rust]` table;
+  `ci/test_deny_warnings.py` fails if a package lacks one. Fix a warning, or
+  `#[allow]` it at the narrowest item with a reason; never relax the table.

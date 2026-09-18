@@ -8,6 +8,10 @@ publish = false
 # This package deliberately owns its own workspace root. It is a source-only
 # guest fixture and must never become a dependency or workspace member of the
 # host facade.
+# Warnings are errors here, as in the kernal-api workspace.
+[lints.rust]
+warnings = "deny"
+
 [workspace]
 
 [dependencies]

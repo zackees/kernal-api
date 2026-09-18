@@ -12,9 +12,6 @@ use kernal_api::wasm::{
     SketchExecutionLimits, SketchFuelLimits, SketchModulePolicy,
 };
 
-#[path = "support/threaded_fixture.rs"]
-mod threaded_fixture;
-
 #[test]
 fn epoch_limits_are_bounded_and_cancellation_is_facade_owned() {
     let limits = SketchEpochLimits::new(Duration::from_millis(10), Duration::from_millis(1), 2)
@@ -64,7 +61,7 @@ fn public_controlled_execution_cancels_a_running_compute_loop_and_cleans_up() {
             .expect("compiler policy"),
     )
     .expect("compiler");
-    let bytes = threaded_fixture::looping_root_wasm();
+    let bytes = crate::threaded_fixture::looping_root_wasm();
     let sketch = compiler
         .admit(
             &bytes,

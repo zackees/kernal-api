@@ -3,7 +3,7 @@
 //! acceptance evidence.
 
 #[allow(dead_code)]
-#[path = "../src/guest.rs"]
+#[path = "../../src/guest.rs"]
 mod guest;
 
 #[test]

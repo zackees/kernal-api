@@ -18,7 +18,13 @@ HOSTS = {
 TARGETS = {target for _, target in HOSTS}
 RUN_JOBS = {"wasm-compiler-native": "compiler", "wasm-tauri-screenshot-native": "screenshot"}
 # Anything that would compile Rust on the host running it.
-COMPILES = re.compile(r"\bsoldr\b|\bcargo\b|\brustup\b|\brustc\b|build-guest|build-threaded-smoke")
+# `cargo-nextest` is the replay driver, not a compiler: it runs binaries out of
+# a prebuilt archive. `.cargo/bin` is a path. Everything else named here would
+# compile on the host running it.
+COMPILES = re.compile(
+    r"\bsoldr\b|(?<!\.)\bcargo\b(?!-nextest)|\brustup\b|\brustc\b"
+    r"|build-guest|build-threaded-smoke"
+)
 
 
 class NativeProofJobsTests(unittest.TestCase):
@@ -105,6 +111,78 @@ class NativeProofJobsTests(unittest.TestCase):
         job = self.job("threaded-rust-artifact")
         self.assertIn("runs-on: ubuntu-latest", job)
         self.assertNotRegex(job, r"macos|windows")
+
+    def test_every_test_binary_is_built_on_linux(self):
+        """One compile for six hosts (#270).
+
+        The archive job is where every test binary for every supported host is
+        linked. If one of these lanes moves to a native builder, the scarce
+        Apple and Windows runners go back to holding a compiler.
+        """
+        linux = self.job("test-archive-linux")
+        job = self.job("test-archive")
+        builders = re.findall(r"- builder: (\S+)\s+target: (\S+)", job)
+        covered = {target for _, target in builders} | {"x86_64-unknown-linux-gnu"}
+        self.assertEqual(covered, TARGETS, "every supported target is archived")
+        self.assertEqual(len(builders) + 1, len(TARGETS), "no target is archived twice")
+        for builder, target in builders:
+            self.assertTrue(builder.startswith("ubuntu-"), f"{target} compiles on {builder}")
+        for stage in (linux, job):
+            self.assertIn("ci-tests: true", stage)
+            self.assertIn("cargo nextest archive", stage)
+
+    def test_every_other_platform_waits_for_linux(self):
+        """A red Linux run must not cost an Apple or Windows runner.
+
+        Linux compiles the same sources every other target does, so its
+        failure condemns them. These four jobs are where a run spends most of
+        its runner minutes; each waits for the Linux replay to pass.
+        """
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("needs: test-archive-linux", text)
+        for gated in ("test-archive", "native-proof-build", "dylints", "supported-targets"):
+            with self.subTest(job=gated):
+                self.assertIn("needs: test-run-linux", self.job(gated))
+
+    def test_a_failure_cancels_the_rest_of_the_run(self):
+        """`fail-fast` stops a matrix's siblings; this stops everything else."""
+        for sentinel in ("cancel-on-linux-failure", "cancel-on-cross-target-failure"):
+            with self.subTest(job=sentinel):
+                job = self.job(sentinel)
+                self.assertIn("if: failure() && github.event_name == 'pull_request'", job)
+                self.assertIn("gh run cancel ${{ github.run_id }}", job)
+                self.assertIn("actions: write", job)
+        # The two archive/replay matrices stop their own siblings.
+        for matrix in ("test-archive", "test-run"):
+            with self.subTest(job=matrix):
+                self.assertIn("fail-fast: true", self.job(matrix))
+
+    def test_the_replay_lanes_never_compile(self):
+        """The point of the archive is that these hosts only execute."""
+        job = self.job("test-run")
+        pairs = re.findall(r"- os: (\S+)\s+target: (\S+)", job)
+        self.assertEqual(
+            set(pairs) | {("ubuntu-24.04", "x86_64-unknown-linux-gnu")},
+            HOSTS,
+            "every supported host replays, Linux through its own gating job",
+        )
+        for line in job.split("steps:", 1)[1].splitlines():
+            code = line.split("#", 1)[0]
+            self.assertIsNone(
+                COMPILES.search(code), f"test-run compiles on its host: {line.strip()}"
+            )
+        # Silence is not success: each host proves it ran its own platform tree.
+        self.assertIn("did not execute its own code", job)
+
+    def test_the_windows_webview_proof_runs_a_prebuilt_binary(self):
+        """WebView2 needs a Windows host; it does not need a Windows compile."""
+        job = self.job("windows-webview-smoke")
+        self.assertIn("download-artifact", job)
+        for line in job.split("steps:", 1)[1].splitlines():
+            code = line.split("#", 1)[0]
+            self.assertIsNone(
+                COMPILES.search(code), f"the webview proof compiles: {line.strip()}"
+            )
 
     def test_ci_never_disables_the_soldr_cache(self):
         text = WORKFLOW.read_text(encoding="utf-8")

@@ -1,8 +1,5 @@
 #![cfg(feature = "wasm-sketch-host")]
 
-#[path = "support/abi_metadata.rs"]
-mod abi_metadata;
-
 use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy,
 };
@@ -233,7 +230,11 @@ fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
         text(name, &mut features);
     }
     custom("target_features", &features, &mut wasm);
-    custom("kernal-api.abi", abi_metadata::METADATA, &mut wasm);
+    custom(
+        "kernal-api.abi",
+        crate::threaded_fixture::abi_metadata::METADATA,
+        &mut wasm,
+    );
     wasm
 }
 

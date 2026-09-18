@@ -9,6 +9,24 @@
 - Support Linux, macOS, and Windows on x86-64 and ARM64.
 - Keep heavyweight facilities feature-gated. `default = []` must remain a
   useful async process/host HAL without profiling dependencies.
+- Add an integration test as a module of an existing category in `tests/`, not
+  as a new top-level file. Every top-level `tests/*.rs` is its own linked
+  binary that statically links this crate's whole graph -- Wasmtime, Cranelift,
+  Tauri and all -- so one per file costs about 180 MB and a full link each.
+  Sixty of them made a 1.7 GB test archive; the nine categories
+  (`tests/<category>/main.rs` declaring each file as a module) make it 619 MB
+  and eleven links. Test IDs are `<category>::<module>::<test>`, so a
+  `--exact` filter or a test that re-execs itself by name carries the module
+  prefix. A file keeps its own `#![cfg(feature = "...")]`, which is what lets a
+  category compile under any feature subset; do not reach for
+  `required-features` on the category target. A new top-level test file needs a
+  stated reason. Today: `wasm_tauri_screenshot` and `wasm_worker_containment`,
+  which `ci/native_proof.py` ships to native hosts by target name, and
+  `allocator_heap_profile`, which starts the process-global heap profiler while
+  another test asserts it is dormant. Process-global, one-way state is the
+  standing reason a test earns its own binary -- sharing one made those two
+  order-dependent, and nextest hid it by running every test in its own process
+  while `cargo test` failed. This mirrors soldr#2934.
 - Follow the target graph in [ARCHITECTURE.md](ARCHITECTURE.md): applications
   depend on `kernal-api`, which privately depends on `running-process`. Phase 1
   has landed; the dependency is mandatory and asserted by

@@ -13,7 +13,8 @@ use sysinfo::{Pid, ProcessStatus, System};
 
 const HELPER_ENV: &str = "KERNAL_API_OWNER_DEATH_HELPER";
 const PID_FILE_ENV: &str = "KERNAL_API_OWNER_DEATH_PID_FILE";
-const HELPER_TEST: &str = "owner_death_helper_spawns_an_adapted_child";
+const HELPER_TEST: &str =
+    "process_owner_death_contract::owner_death_helper_spawns_an_adapted_child";
 
 #[test]
 fn owner_death_helper_spawns_an_adapted_child() {

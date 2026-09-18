@@ -27,9 +27,9 @@ NEXTEST_BIN=cargo-nextest
 # `env!("CARGO_MANIFEST_DIR")`, a compile-time constant still pointing at the
 # Linux builder's path. `--workspace-remap` cannot rewrite a compile-time
 # constant, and none of the guest's files live there. They assert on source
-# text that is identical on every host, and `rust-native (ubuntu-latest)`
-# already runs them. Mirrors the aarch64 lane's exclusion list in ci.yml.
-POLICY_FILTER='not (binary(daemon_frame_v1) or binary(daemon_identity) or binary(version_policy) or binary(facade_policy))'
+# text that is identical on every host, and ci.yml's Linux `test-run` lanes
+# already run them. Mirrors the Linux `test-run` lanes in ci.yml.
+POLICY_FILTER='not binary(source_policy)'
 
 # ---------------------------------------------------------------------------
 # Tests that cannot pass in this guest, grouped by cause.

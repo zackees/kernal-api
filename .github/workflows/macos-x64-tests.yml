@@ -9,9 +9,9 @@ name: macOS x86_64 tests
 # through the action's share directory. Verified payload: a universal
 # (x86_64 + arm64) Mach-O, `cf fa ed fe` fat header, sha256-checked on staging.
 #
-# Why this exists: `rust-native` runs on `rust-native (ubuntu-latest)` and
-# `(windows-latest)` only, and `macos-arm-tests` covers aarch64 from a prebuilt
-# archive but is gated off by `ENABLE_MACOS_RUNNERS`. The Apple-hosted matrices
+# Why this exists: ci.yml's `test-run` covers aarch64 and x86_64 macOS from
+# prebuilt archives, but both Apple entries are gated off by
+# `ENABLE_MACOS_RUNNERS`. The Apple-hosted matrices
 # in ci.yml execute the compiler-policy and screenshot proofs, not the test
 # suite. So x86_64-apple-darwin was built and its unit tests ran nowhere,
 # leaving the `target_arch` branches in src/snapshot/unwind.rs and
@@ -30,7 +30,7 @@ name: macOS x86_64 tests
 # login, which removes that entire dependency class.
 #
 # Advisory by design: nightly and on demand, never a required check and never a
-# release gate -- the same cadence `macos-arm-tests` was built for.
+# release gate -- the cadence the suppressed Apple lanes were built for.
 
 on:
   schedule:

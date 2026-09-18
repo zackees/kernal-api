@@ -5,11 +5,8 @@ use kernal_api::wasm::{
     SketchCompiler, SketchCompilerConfig, SketchModuleError, SketchModulePolicy,
 };
 
-#[path = "support/abi_metadata.rs"]
-mod abi_metadata;
-
 fn generated_abi_metadata() -> Vec<u8> {
-    abi_metadata::METADATA.to_vec()
+    crate::threaded_fixture::abi_metadata::METADATA.to_vec()
 }
 
 fn compiler() -> SketchCompiler {

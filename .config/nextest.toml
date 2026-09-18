@@ -1,0 +1,18 @@
+# nextest runs one test per process, as many at once as there are CPUs. That
+# is what makes the replay lanes fast, and it is also a load the old
+# `cargo test` lane never applied: there, tests were threads inside one
+# process and the harness ran a single binary at a time.
+#
+# A test that asserts work finishes inside a wall-clock window cannot tell that
+# load from a regression. `a_handful_of_threads_fills_a_small_ring_long_before
+# _the_window_ends` spawns four worker threads and expects them to fill a ring
+# before a deadline; on a four-core runner with three other test processes
+# resident it missed the window and failed the first replay.
+#
+# The fix is scheduling, not a weaker assertion: `threads-required` reserves
+# the whole test-thread budget, so nextest runs this test alone. Add a test
+# here when it measures elapsed time or saturates the CPU on purpose -- not
+# when it is merely slow.
+[[profile.default.overrides]]
+filter = 'test(=profile::tests::a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends)'
+threads-required = "num-test-threads"

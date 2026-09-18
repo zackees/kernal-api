@@ -190,16 +190,24 @@ jobs:
           # hyphens. `tr` over the whole line rewrote both and pointed
           # pkg-config at a directory that does not exist.
           echo "PKG_CONFIG_LIBDIR_${target//-/_}=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
+      # A native lane (`cross` empty: aarch64 Linux on an ARM runner) builds
+      # for the host WITHOUT `--target`. Naming the triple explicitly makes
+      # Soldr treat it as a cross build and route linking through its zig
+      # shim, which is absent here (`cargo-zigbuild: not found`) -- and a
+      # native build is what lets WebKitGTK use the distribution's own ABI.
+      # Clippy did not catch this: it never links. `supported-targets` builds
+      # these lanes the same way.
       - name: Lint this target
         run: >-
           soldr cargo clippy
           --locked --all-features --all-targets
-          --target ${{ matrix.target }} -- --deny warnings
+          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+          -- --deny warnings
       - name: Archive every test binary for this target
         run: >-
           soldr cargo nextest archive
           --locked --all-features
-          --target ${{ matrix.target }}
+          ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
           --archive-file kernal-tests-${{ matrix.target }}.tar.zst
       # The WebView2 proofs are the one thing a Windows host still has to run
       # itself, so ship it the binary rather than the compiler (#270, #273).

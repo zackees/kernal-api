@@ -13,7 +13,9 @@ on:
 
 permissions:
   contents: write
-  actions: read
+  # release.yml's jobs cancel the run when one fails; a called workflow gets
+  # no more than its caller grants.
+  actions: write
 
 concurrency:
   group: kernal-api-release
@@ -69,12 +71,22 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.sha }}
           lfs: true
       - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+        with:
+        # A release restores nothing. Every cache is a key that another job
+        # can write -- the v0.1.13 aarch64 worker restored a toolchain whose
+        # rustup records listed an aarch64 std that the saved archive did not
+        # contain, and failed at E0463. Build from sources and releases only.
+          cache: false
+          build-cache: false
+          # Not covered by `cache: false`: the toolchain cache is separate.
+          solo-toolchain-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: registry-packages
@@ -110,3 +122,10 @@ jobs:
             echo "crates.io returned HTTP ${status}" >&2
             exit 1
           fi
+      # A failed release job stops the whole release run.
+      - name: Cancel the run (this job failed)
+        if: failure()
+        run: gh run cancel ${{ github.run_id }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

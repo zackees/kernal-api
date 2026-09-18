@@ -63,9 +63,12 @@ class AutoReleaseTests(unittest.TestCase):
         self.assertIn(
             "bash ci/verify_conpty_assets.sh target/conpty-assets", workflow
         )
-        self.assertIn("soldr cargo package --locked --all-features --allow-dirty", workflow)
+        self.assertIn("uv run --no-project --python 3.12 ci/crate_release.py package", workflow)
         caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
-        self.assertIn("soldr cargo publish --locked --no-verify --allow-dirty", caller)
+        self.assertIn("ci/crate_release.py publish", caller)
+        script = (ROOT / "ci/crate_release.py").read_text()
+        self.assertIn('"package", "--locked", "--all-features", "--allow-dirty"', script)
+        self.assertIn('"publish", "--locked", "--no-verify", "--allow-dirty"', script)
         self.assertIn(
             "cp conpty-sidecars/conpty-sidecar.sha256.toml conpty-sidecar.sha256.toml",
             caller,
@@ -85,7 +88,7 @@ class AutoReleaseTests(unittest.TestCase):
         self.assertIn("id-token: write", job)
         self.assertIn("uses: rust-lang/crates-io-auth-action@", job)
         self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}", job)
-        self.assertLess(job.index("crates-io-auth-action"), job.index("soldr cargo publish"))
+        self.assertLess(job.index("crates-io-auth-action"), job.index("ci/crate_release.py publish"))
         for workflow in (caller, called):
             self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", workflow)
         self.assertNotIn("cargo publish", called)
@@ -93,7 +96,7 @@ class AutoReleaseTests(unittest.TestCase):
     def test_shipping_jobs_restore_no_cache(self):
         """What ships is built from sources, never from a cache another job wrote.
 
-        v0.1.13's aarch64 Linux worker restored a shared `tnone` toolchain
+        v0.1.14's aarch64 Linux worker restored a shared `tnone` toolchain
         entry saved by the previous release's aarch64 job: its rustup records
         listed the aarch64 std installed mid-build, the archive did not hold
         it, and the build failed at E0463. `cache: false` alone does not reach

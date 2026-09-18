@@ -98,6 +98,7 @@ jobs:
           # tomllib needs Python >= 3.11, so this cannot share the package's
           # 3.10 floor; 3.12 is the runner's own interpreter.
           uv run --no-project --python 3.12 ci/test_auto_release.py
+          uv run --no-project --python 3.12 ci/test_crate_release.py
       - name: Test the Python package
         # Python 3.10 only: it is the floor AGENTS.md supports, and the
         # package has no version-specific code for a second interpreter to

@@ -199,10 +199,24 @@ class NativeProofJobsTests(unittest.TestCase):
         steps = job.split("- name: Lint this target", 1)[1]
         steps = steps.split("- name: Build the native webview smoke binary", 1)[0]
         self.assertNotIn("--target ${{ matrix.target }}", steps)
-        self.assertEqual(
-            steps.count("matrix.cross && format('--target {0}', matrix.cross)"), 2,
-            "lint and archive both take the triple only for a cross lane",
+        lint, archive = steps.split("- name: Archive every test binary for this target", 1)
+        self.assertIn("matrix.cross && format('--target {0}', matrix.cross)", lint)
+        self.assertIn(
+            'target_args=(--target "${{ matrix.cross }}")', archive,
+            "the archive takes the triple only for a cross lane",
         )
+
+    def test_windows_archives_ship_the_symbolizer_pdb(self):
+        """`kernal-symbolize`'s tests read their own binary's PDB.
+
+        nextest archives a Windows executable without its `.pdb`, so on a replay
+        host every one of those tests failed in milliseconds. The archive step
+        must name that PDB, and fail rather than ship an archive without it.
+        """
+        job = self.job("test-archive")
+        self.assertIn("kernal_symbolize-*.pdb", job)
+        self.assertIn('on-missing = \\"error\\"', job)
+        self.assertIn("the kernal-symbolize test build produced no PDB", job)
 
     def test_each_replay_host_gets_a_nextest_it_can_execute(self):
         """The bare `linux` and `windows` nextest builds are x86-64.

@@ -12,6 +12,7 @@ mod directory_cursor;
 mod fs_watch_facade;
 #[path = "../support/readiness_marker.rs"]
 mod marker_support;
+mod materialization;
 mod private_regular_file_facade;
 mod readiness_marker;
 mod sha256_facade;

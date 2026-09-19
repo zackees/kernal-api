@@ -66,6 +66,13 @@ selection is intentionally separate from native-host selection. The detailed
 authoring and validation guide is [docs/platform-boundary.md](docs/platform-boundary.md);
 issue #152 tracks completing Dylint enforcement of this architecture.
 
+Filesystem mechanics that cache materialization depends on -- native
+replacement with its Windows sharing-violation retry, link and reparse
+classification, permission bits, path identity, and volume facts -- follow
+the same shape: `src/platform/fs/{materialize,path_file,replacement}.rs` are
+the neutral facade, and each concrete tree's `fs_materialize.rs` owns the
+host half, reached through the crate-private `native_fs_materialize` name.
+
 ## WebAssembly sketch runtime
 
 `kernal-api` will host long-lived Rust sketches compiled to WebAssembly. A

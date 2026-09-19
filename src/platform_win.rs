@@ -90,6 +90,12 @@ pub use fs::{
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };
 
+// Cache-materialization mechanics; the neutral facade reaches them through
+// the crate-root `native_fs_materialize` name.
+#[cfg(feature = "fs")]
+#[path = "platform_win/fs_materialize.rs"]
+pub(crate) mod fs_materialize;
+
 #[cfg(feature = "fs-watch")]
 #[path = "platform_win/fs_watch.rs"]
 pub(crate) mod fs_watch;

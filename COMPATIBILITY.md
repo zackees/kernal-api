@@ -117,6 +117,17 @@ the same client operation and no runtime fallback to a second HAL.
 
 - `platform`: process, filesystem, IPC, PTY, terminal, host identity, and
   resource operations.
+- `platform::fs` cache-materialization mechanics (feature `fs`): the
+  `replacement` module (native rename replacement with the Windows
+  antivirus/sharing-violation retry ladder, generation rename, delete-fallback
+  replacement, staged directory install, and the Windows share/lock error
+  classifiers), the `path_file` identity module, `LinkKind`/`classify`,
+  `hard_link_count`, `symlink_file`, `set_readonly`, `make_executable`,
+  `metadata_mode`/`apply_metadata_mode`, `file_change_marker`,
+  `volume_identity_u128`, `file_id_width`, `allocated_bytes`,
+  `native_call_path`, `path_from_raw_bytes`, and
+  `sync_directory_if_supported`. Cache layout, retry budgets beyond the fixed
+  ladder, and materialization tiers remain client policy.
 - Async process sessions (`SpawnSpec`, `SpawnAdmission`, `ProcessSession`,
   `ProcessSessionOptions`, `ProcessOutputEvent`, `ProcessSessionExit`): the
   one async spawn/stream/reap surface. It covers argument lists, spawn-time

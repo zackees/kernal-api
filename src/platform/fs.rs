@@ -103,6 +103,22 @@ mod async_io;
 #[cfg(feature = "fs")]
 pub use async_io::AsyncFileIo;
 
+#[cfg(feature = "fs")]
+mod materialize;
+#[cfg(feature = "fs")]
+pub use materialize::{
+    allocated_bytes, apply_metadata_mode, classify, file_change_marker, file_id_width,
+    hard_link_count, make_executable, metadata_mode, native_call_path, path_from_raw_bytes,
+    set_readonly, symlink_file, sync_directory_if_supported, volume_identity_u128,
+    FileChangeMarker, LinkKind,
+};
+/// Path-observed file identity with the native identifier width.
+#[cfg(feature = "fs")]
+pub mod path_file;
+/// Native replacement for publishing staged files and directories.
+#[cfg(feature = "fs")]
+pub mod replacement;
+
 /// Resolve the current user's home directory using native account conventions.
 ///
 /// On Unix, a nonempty `HOME` overrides the account database; missing or empty

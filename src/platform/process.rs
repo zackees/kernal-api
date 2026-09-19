@@ -1527,15 +1527,18 @@ pub fn set_priority(
 /// reports [`std::io::ErrorKind::NotFound`]. The path is the host's answer
 /// and may name a deleted or replaced file.
 pub fn executable_path(process: &ProcessLiveness) -> std::io::Result<std::path::PathBuf> {
-    let path = crate::process_executable_path(process.pid())?;
-    if process.is_alive() {
-        Ok(path)
-    } else {
-        Err(std::io::Error::new(
+    // Liveness is re-checked on both outcomes: some hosts (Windows) fail the
+    // image query itself once the process has exited, with an uncategorized
+    // OS error, and that must surface as the same NotFound as a read that
+    // raced the exit.
+    let read = crate::process_executable_path(process.pid());
+    if !process.is_alive() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "process exited while its image path was read",
-        ))
+        ));
     }
+    read
 }
 
 /// Replace this process's standard input, output, and error with the null

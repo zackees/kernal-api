@@ -979,6 +979,12 @@ fn directory_entry_from_jwalk(entry: jwalk::DirEntry<((), ())>) -> DirectoryEntr
     }
 }
 
+/// How long a shared-pool walk waits for a worker before giving up; the
+/// walker's own long-standing default, stated so the documented behaviour of
+/// [`DirectoryWalkParallelism::SharedPool`] cannot drift from it.
+#[cfg(feature = "fs")]
+const SHARED_POOL_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The predicate a [`DirectoryWalk`] consults before descending into a
 /// directory. Shared, because the walk hands it to every worker thread that
 /// reads a directory, and named, because spelling it inline twice is the
@@ -986,17 +992,46 @@ fn directory_entry_from_jwalk(entry: jwalk::DirEntry<((), ())>) -> DirectoryEntr
 #[cfg(feature = "fs")]
 type PruneDirectories = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
+/// Where a [`DirectoryWalk`] runs its parallel directory reads.
+#[cfg(feature = "fs")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DirectoryWalkParallelism {
+    /// Share the process-wide worker pool with every other walk and parallel
+    /// computation. Cheapest, and the default.
+    ///
+    /// Because that pool is shared, the walk cannot rely on getting a worker:
+    /// when none picks it up within about one second -- the pool saturated by
+    /// other work, or this walk started from inside that same pool -- the
+    /// walk yields an error item and ends rather than risk a deadlock. On a
+    /// busy machine that is a failure caused by load alone.
+    #[default]
+    SharedPool,
+    /// Give this walk its own worker pool, created when the walk starts and
+    /// released when it ends.
+    ///
+    /// `threads` is the pool size; zero means one thread per available CPU.
+    /// The walk never waits on other work for a worker, so it never ends
+    /// early because the machine is busy. That costs one pool creation per
+    /// walk -- worth it wherever a spurious walk failure is not acceptable.
+    DedicatedPool {
+        /// Worker threads; zero selects one per available CPU.
+        threads: usize,
+    },
+}
+
 /// A parallel directory-tree walk, configured before it runs.
 ///
 /// Every option here defaults to what [`std::fs::read_dir`] itself would do
 /// for a single directory: hidden entries included, symbolic links not
-/// followed, no ordering guarantee, and nothing pruned.
+/// followed, no ordering guarantee, and nothing pruned. Reads run on the
+/// shared worker pool unless [`DirectoryWalk::parallelism`] says otherwise.
 #[cfg(feature = "fs")]
 pub struct DirectoryWalk {
     root: PathBuf,
     follow_symbolic_links: bool,
     include_hidden_entries: bool,
     sorted: bool,
+    parallelism: DirectoryWalkParallelism,
     prune_directories: Option<PruneDirectories>,
 }
 
@@ -1009,6 +1044,7 @@ impl DirectoryWalk {
             follow_symbolic_links: false,
             include_hidden_entries: true,
             sorted: false,
+            parallelism: DirectoryWalkParallelism::SharedPool,
             prune_directories: None,
         }
     }
@@ -1030,6 +1066,16 @@ impl DirectoryWalk {
     /// Default: `false`, which is faster.
     pub fn sorted(mut self, sorted: bool) -> Self {
         self.sorted = sorted;
+        self
+    }
+
+    /// Where the walk's directory reads run. Default:
+    /// [`DirectoryWalkParallelism::SharedPool`].
+    ///
+    /// Choose [`DirectoryWalkParallelism::DedicatedPool`] when the walk must
+    /// not fail merely because the shared pool is busy.
+    pub fn parallelism(mut self, parallelism: DirectoryWalkParallelism) -> Self {
+        self.parallelism = parallelism;
         self
     }
 
@@ -1061,6 +1107,16 @@ impl DirectoryWalk {
             .follow_links(self.follow_symbolic_links)
             .skip_hidden(!self.include_hidden_entries)
             .sort(self.sorted)
+            .parallelism(match self.parallelism {
+                DirectoryWalkParallelism::SharedPool => jwalk::Parallelism::RayonDefaultPool {
+                    busy_timeout: SHARED_POOL_BUSY_TIMEOUT,
+                },
+                // A private pool has no busy-timeout: nothing else can hold
+                // its workers, so the deadlock guard has nothing to guard.
+                DirectoryWalkParallelism::DedicatedPool { threads } => {
+                    jwalk::Parallelism::RayonNewPool(threads)
+                }
+            })
             .process_read_dir(move |_depth, _parent, _state, children| {
                 let Some(keep) = &prune_directories else {
                     return;

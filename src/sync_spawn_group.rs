@@ -180,7 +180,7 @@ pub fn spawn_sync_daemon(
     environment: crate::platform::process::SyncEnvironment,
     _breakaway: bool,
 ) -> io::Result<crate::platform::process::DaemonChild> {
-    apply_environment(command, environment);
+    apply_environment(command, environment)?;
     command
         .stdin(Stdio::null())
         .stdout(daemon_slot_to_stdio(&stdio.stdout)?)
@@ -201,7 +201,7 @@ pub fn spawn_sync(
     stdio: crate::platform::process::SpawnStdio<'_>,
     environment: crate::platform::process::SyncEnvironment,
 ) -> io::Result<crate::platform::process::SpawnedChild> {
-    apply_environment(command, environment);
+    apply_environment(command, environment)?;
     command.stdin(slot_to_stdio(&stdio.stdin)?);
     command.stdout(slot_to_stdio(&stdio.stdout)?);
     command.stderr(slot_to_stdio(&stdio.stderr)?);
@@ -266,9 +266,9 @@ pub fn spawn_sync(
 fn apply_environment(
     command: &mut Command,
     environment: crate::platform::process::SyncEnvironment,
-) {
-    let crate::platform::process::SyncEnvironment::Explicit(base) = environment else {
-        return;
+) -> io::Result<()> {
+    let Some(base) = environment.into_base()? else {
+        return Ok(());
     };
 
     // `env_clear` also clears Command's mutation map. Preserve additions,
@@ -289,6 +289,7 @@ fn apply_environment(
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]

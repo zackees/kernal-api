@@ -128,6 +128,10 @@ the same client operation and no runtime fallback to a second HAL.
   `native_call_path`, `path_from_raw_bytes`, and
   `sync_directory_if_supported`. Cache layout, retry budgets beyond the fixed
   ladder, and materialization tiers remain client policy.
+  `DirectoryWalk::parallelism` selects `DirectoryWalkParallelism::SharedPool`
+  (the default, which abandons a walk the saturated shared pool cannot serve
+  within about a second) or `DedicatedPool { threads }`, a per-walk pool that
+  never ends a walk because the machine is busy.
 - `platform::ipc` owner-only single-instance transport (feature `ipc`):
   `LocalSocketListener::bind_owner_only` (pathname socket, mode `0o600`,
   observed `SocketPeerCredentials`), `LocalSocketStream`,
@@ -143,7 +147,9 @@ the same client operation and no runtime fallback to a second HAL.
   `ProcessSessionOptions`, `ProcessOutputEvent`, `ProcessSessionExit`): the
   one async spawn/stream/reap surface. It covers argument lists, spawn-time
   admission, best-effort scheduling bands, concurrent output and lifecycle
-  control from shared `&self`, and lossless `ExitStatus` recovery. Failures
+  control from shared `&self`, and lossless `ExitStatus` recovery.
+  `ProcessOutputFault::new` builds a stream fault from its portable parts so
+  consumers can test their completion handling. Failures
   surface as `std::io::Error` with the stable kind mapping documented in
   `src/process_adapter.rs`; the substrate's builder, session, and error types
   never cross it. Descendant-tree cleanup on drop is deliberately not offered.
@@ -156,6 +162,11 @@ the same client operation and no runtime fallback to a second HAL.
   `native_jobserver_supported`, and the PID-addressed read-only readers
   `cpu_ticks_for_pid`, `peak_rss_bytes_for_pid`, `tree_rss_bytes_for_pid`
   (`MAX_TREE_RSS_PROCESSES`, `PEAK_RSS_READABLE_AFTER_EXIT`).
+  `ProcessLiveness::has_exited` is the fallible exit question: `Err` reports a
+  failed observation instead of reading it as an exit. `spawn_sync` and
+  `spawn_sync_daemon` take a `SyncEnvironment` base -- `Inherit`, `Explicit`,
+  or `UserBaseline`, the logged-in user's login environment rather than the
+  launcher's ambient one -- with command-level variables applied last.
   `platform::executable::file_name_os` spells an executable name without
   losing native string data or doubling an existing extension. No PID-only
   forced termination is offered: terminate a bare PID through
@@ -182,7 +193,12 @@ the same client operation and no runtime fallback to a second HAL.
   paths; clients must not reach for `tokio::select!` or `tokio::task_local!`.
   It owns the fair write-preferring `RwLock` with borrowed, owned and blocking
   guard newtypes (`RwLockReadGuard`, `RwLockWriteGuard`,
-  `OwnedRwLockReadGuard`, `OwnedRwLockWriteGuard`), `PeriodicTimer`'s
+  `OwnedRwLockReadGuard`, `OwnedRwLockWriteGuard`), the FIFO `Mutex` with
+  `MutexGuard`, `OwnedMutexGuard` (which keeps its `Arc<Mutex<T>>` alive, so
+  `Weak`-keyed lock registries see a held lock) and `MutexTryLockError`,
+  `Notify::notified`/`owned_notified` futures (`Notified`, `OwnedNotified`)
+  that can be enabled before waiting, `Task::detach_on_drop`,
+  `RuntimeBuilder::max_blocking_threads`, `PeriodicTimer`'s
   `MissedTickBehavior` (`Burst`, `Delay`, `Skip`), and the ambient shutdown
   subscriptions `TerminationSignal` (SIGTERM; Windows console break, close
   and shutdown) and `wait_for_interrupt` (Ctrl+C) for launched work.
@@ -216,7 +232,9 @@ the same client operation and no runtime fallback to a second HAL.
   substrate's broker client: `DaemonIdentity::verify_live` and
   `verify_for_control` re-check boot, liveness, executable path, and BLAKE3
   digest over this crate's host process facade, and the returned
-  `VerifiedDaemon` terminates only the verified process generation.
+  `VerifiedDaemon` terminates only the verified process generation and
+  answers `has_exited` through the retained process reference, reporting a
+  failed observation as an error rather than as an exit.
   `DaemonIdentityRecord` assembles or inspects an identity field by field; the
   sidecar JSON and probe reply bytes are unchanged and pinned by tests.
 - `broker_client` (feature `broker-client`, opt-in and outside `full`): the

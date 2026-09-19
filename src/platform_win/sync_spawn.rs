@@ -1986,9 +1986,9 @@ fn build_env_block(
             .collect()
     };
 
-    let base = match environment {
-        crate::platform::process::SyncEnvironment::Inherit => std::env::vars_os().collect(),
-        crate::platform::process::SyncEnvironment::Explicit(base) => base,
+    let base = match environment.into_base()? {
+        None => std::env::vars_os().collect(),
+        Some(base) => base,
     };
 
     let mut env: BTreeMap<Vec<u16>, (OsString, OsString)> = BTreeMap::new();

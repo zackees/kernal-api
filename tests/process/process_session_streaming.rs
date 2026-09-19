@@ -216,3 +216,19 @@ fn kill_reaps_without_draining_backpressured_output() {
         .expect("kill and reap must not require output delivery");
     });
 }
+
+/// Consumers build the fault their own completion handling receives, so that
+/// handling is testable without provoking a real pipe failure.
+#[test]
+fn an_output_fault_is_constructible_from_its_portable_parts() {
+    let fault = kernal_api::ProcessOutputFault::new(
+        std::io::ErrorKind::BrokenPipe,
+        "pipe closed",
+        Some(32),
+    );
+    assert_eq!(fault.kind(), std::io::ErrorKind::BrokenPipe);
+    assert_eq!(fault.message(), "pipe closed");
+    assert_eq!(fault.raw_os_error(), Some(32));
+    let completion = ProcessOutputCompletion::StderrError(fault.clone());
+    assert_eq!(completion, ProcessOutputCompletion::StderrError(fault));
+}

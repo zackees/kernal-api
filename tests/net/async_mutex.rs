@@ -1,0 +1,123 @@
+//! `async_engine::Mutex`: borrowed, owned, non-waiting, and blocking guards,
+//! and an owned guard that keeps its facade handle alive.
+
+use kernal_api::async_engine::{self, Mutex, MutexTryLockError};
+use std::future::Future;
+use std::sync::{Arc, Weak};
+use std::task::Poll;
+
+/// Poll `future` exactly once and report whether it is still pending.
+async fn poll_once<F: Future + Unpin>(future: &mut F) -> bool {
+    std::future::poll_fn(|context| {
+        Poll::Ready(std::pin::Pin::new(&mut *future).poll(context).is_pending())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn borrowed_guards_mutate_exclusively() {
+    let lock = Mutex::new(vec![1_u8]);
+    {
+        let mut guard = lock.lock().await;
+        guard.push(2);
+        assert_eq!(format!("{guard:?}"), "[1, 2]");
+        assert_eq!(lock.try_lock().err(), Some(MutexTryLockError));
+    }
+    assert_eq!(*lock.try_lock().expect("released"), [1, 2]);
+    assert_eq!(*Mutex::<u8>::default().lock().await, 0);
+    assert_eq!(MutexTryLockError.to_string(), "mutex is busy");
+}
+
+#[tokio::test]
+async fn owned_guards_move_into_launched_work() {
+    let lock = Arc::new(Mutex::new(0_u32));
+    let mut guard = Arc::clone(&lock).lock_owned().await;
+    *guard += 1;
+    assert!(Arc::clone(&lock).try_lock_owned().is_err());
+    async_engine::launch(async move {
+        *guard += 1;
+    })
+    .await
+    .unwrap();
+    let guard = Arc::clone(&lock)
+        .try_lock_owned()
+        .expect("released by the task");
+    assert_eq!(*guard, 2);
+}
+
+/// The owned guard retains the very `Arc<Mutex<T>>` it came from.
+///
+/// A registry keyed by `Weak<Mutex<T>>` -- zccache's per-output link locks --
+/// hands a second caller the *same* lock by upgrading the weak reference.
+/// If the guard kept only private storage alive, dropping the last caller
+/// handle would let the upgrade fail while the lock was still held, and the
+/// second caller would mint a fresh, uncontended lock: two holders of what
+/// was meant to be one exclusive section.
+#[tokio::test]
+async fn an_owned_guard_keeps_weak_registry_entries_upgradable() {
+    let lock = Arc::new(Mutex::new(()));
+    let registry: Weak<Mutex<()>> = Arc::downgrade(&lock);
+
+    let guard = Arc::clone(&lock).lock_owned().await;
+    drop(lock);
+    let same = registry
+        .upgrade()
+        .expect("a held owned guard keeps the facade Arc alive");
+    assert!(
+        Arc::clone(&same).try_lock_owned().is_err(),
+        "the upgraded handle is the held lock, not a new one"
+    );
+    drop(same);
+    drop(guard);
+    assert!(
+        registry.upgrade().is_none(),
+        "releasing the guard releases the handle"
+    );
+
+    let lock = Arc::new(Mutex::new(()));
+    let registry = Arc::downgrade(&lock);
+    let guard = Arc::clone(&lock).try_lock_owned().expect("uncontended");
+    drop(lock);
+    assert!(
+        registry.upgrade().is_some(),
+        "try_lock_owned retains it too"
+    );
+    drop(guard);
+    assert!(registry.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn a_cancelled_waiter_does_not_strand_the_next() {
+    let lock = Arc::new(Mutex::new(Vec::new()));
+    let held = Arc::clone(&lock).lock_owned().await;
+
+    let mut abandoned = Box::pin(Arc::clone(&lock).lock_owned());
+    assert!(poll_once(&mut abandoned).await, "queued behind the holder");
+    let first = async_engine::launch({
+        let lock = Arc::clone(&lock);
+        async move { lock.lock().await.push(1) }
+    });
+    async_engine::yield_now().await;
+    // Cancelling the earlier waiter must not strand the one behind it.
+    drop(abandoned);
+
+    drop(held);
+    first.await.unwrap();
+    lock.lock().await.push(2);
+    assert_eq!(*lock.lock().await, [1, 2]);
+}
+
+#[test]
+fn blocking_lock_serves_synchronous_threads() {
+    let lock = Arc::new(Mutex::new(0_u32));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let lock = Arc::clone(&lock);
+            std::thread::spawn(move || *lock.blocking_lock() += 1)
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(*lock.blocking_lock(), 4);
+}

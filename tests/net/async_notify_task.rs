@@ -1,0 +1,129 @@
+//! `Notify` futures created before they wait, `Task::detach_on_drop`,
+//! payload-agnostic channel `Debug`, and the blocking-lane thread cap.
+
+use kernal_api::async_engine::{self, Notify, RuntimeBuilder};
+use std::pin::pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+const BOUND: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn an_enabled_notified_future_sees_a_later_broadcast() {
+    let notify = Notify::new();
+    let mut notified = pin!(notify.notified());
+    assert!(!notified.as_mut().enable(), "nothing sent yet");
+    // `notify_waiters` wakes only registered waiters and stores no permit:
+    // registering through `enable` is what makes this broadcast count.
+    notify.notify_waiters();
+    async_engine::timeout(BOUND, notified)
+        .await
+        .expect("the registered waiter is woken");
+}
+
+#[tokio::test]
+async fn enable_reports_a_stored_permit() {
+    let notify = Notify::new();
+    notify.notify_one();
+    let mut notified = pin!(notify.notified());
+    assert!(notified.as_mut().enable(), "the stored permit is received");
+    async_engine::timeout(BOUND, notified)
+        .await
+        .expect("a received notification completes at once");
+}
+
+#[tokio::test]
+async fn an_owned_notified_future_outlives_its_borrow() {
+    let notify = Arc::new(Notify::new());
+    let mut notified = Box::pin(Arc::clone(&notify).owned_notified());
+    assert!(!notified.as_mut().enable());
+    let waiter = async_engine::launch(notified);
+    notify.notify_waiters();
+    async_engine::timeout(BOUND, waiter)
+        .await
+        .expect("the owned waiter is woken")
+        .unwrap();
+    assert!(format!("{:?}", Arc::clone(&notify).owned_notified()).contains("OwnedNotified"));
+}
+
+#[tokio::test]
+async fn a_detach_on_drop_task_survives_its_handle_and_stays_joinable() {
+    let (release, released) = async_engine::oneshot_channel::<()>();
+    let (done, mut finished) = async_engine::channel::<u32>(1);
+    let task = async_engine::launch(async move {
+        let _ = released.await;
+        done.send(7).await.unwrap();
+    })
+    .detach_on_drop();
+    drop(task);
+    release.send(()).unwrap();
+    let value = async_engine::timeout(BOUND, finished.recv())
+        .await
+        .expect("the dropped handle did not cancel the task");
+    assert_eq!(value, Some(7));
+
+    let joinable = async_engine::launch(async { 11 }).detach_on_drop();
+    assert_eq!(joinable.await.unwrap(), 11);
+
+    let cancellable = async_engine::launch(std::future::pending::<()>()).detach_on_drop();
+    cancellable.cancel();
+    assert!(cancellable.await.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn channel_handles_debug_without_a_debug_payload() {
+    struct Opaque;
+    let (sender, receiver) = async_engine::channel::<Opaque>(1);
+    let (unbounded, unbounded_receiver) = async_engine::unbounded_channel::<Opaque>();
+    let (oneshot, oneshot_receiver) = async_engine::oneshot_channel::<Opaque>();
+    for (debug, name) in [
+        (format!("{sender:?}"), "Sender"),
+        (format!("{receiver:?}"), "Receiver"),
+        (format!("{unbounded:?}"), "UnboundedSender"),
+        (format!("{unbounded_receiver:?}"), "UnboundedReceiver"),
+        (format!("{oneshot:?}"), "OneshotSender"),
+        (format!("{oneshot_receiver:?}"), "OneshotReceiver"),
+    ] {
+        assert!(debug.starts_with(name), "{debug}");
+    }
+}
+
+#[test]
+fn max_blocking_threads_caps_the_blocking_lane() {
+    let runtime = RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let running = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    runtime.run(async {
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let running = Arc::clone(&running);
+                let peak = Arc::clone(&peak);
+                async_engine::launch_blocking(move || {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for task in tasks {
+            task.await.unwrap();
+        }
+    });
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        1,
+        "one blocking thread at a time"
+    );
+}
+
+#[test]
+#[should_panic(expected = "max_blocking_threads must be greater than zero")]
+fn max_blocking_threads_rejects_zero() {
+    let _ = RuntimeBuilder::multi_thread().max_blocking_threads(0);
+}

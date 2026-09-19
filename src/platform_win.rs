@@ -828,3 +828,5 @@ pub(crate) fn configure_native_worker_environment(command: &mut std::process::Co
 
 #[path = "platform_win/interrupt.rs"]
 pub(crate) mod interrupt;
+#[path = "platform_win/termination.rs"]
+pub(crate) mod termination;

@@ -131,7 +131,10 @@ the same client operation and no runtime fallback to a second HAL.
   collapsed export.
 - `symbolize`: protobuf-tagged ASLR-independent capture schema and isolated
   PDB/DWARF/Mach-O parser worker.
-- `allocator`: the facade-owned allocator plus sampled heap lifecycle/dumps.
+- `allocator`: the facade-owned allocator plus sampled heap lifecycle/dumps,
+  the owned counter snapshot (`stats() -> ProfilerStats`, `HeapStats`), and
+  the legacy text dump (`dump_file`). Clients must not name `mimalloc_pprof`
+  or re-export it for an embedding host.
 - `async_engine`: the facade-owned runtime/task surface and task diagnostics.
   It also owns cancellation tokens, connection deadlines, and progress/idle
   timeout policy; clients must not substitute a raw runtime or global transfer
@@ -142,6 +145,12 @@ the same client operation and no runtime fallback to a second HAL.
   `BiasedRace4`), and `task_local!` (`TaskLocal`, `TaskLocalScope`,
   `TaskLocalAccessError`). All three are std-only and expand to `$crate`
   paths; clients must not reach for `tokio::select!` or `tokio::task_local!`.
+  It owns the fair write-preferring `RwLock` with borrowed, owned and blocking
+  guard newtypes (`RwLockReadGuard`, `RwLockWriteGuard`,
+  `OwnedRwLockReadGuard`, `OwnedRwLockWriteGuard`), `PeriodicTimer`'s
+  `MissedTickBehavior` (`Burst`, `Delay`, `Skip`), and the ambient shutdown
+  subscriptions `TerminationSignal` (SIGTERM; Windows console break, close
+  and shutdown) and `wait_for_interrupt` (Ctrl+C) for launched work.
 - `platform::window_icon` (feature `window-icon`): window and stock icon
   mechanics for the host console or a child, including the ICO/PNG decode and
   the X11 property write. GUI hosting is opt-in, so a headless client does not

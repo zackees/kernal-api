@@ -56,15 +56,20 @@ PARENT_DEATH_TEST = "failure_proof::d4_parent_death_kills_exact_worker"
 
 # Two `cargo test --no-run` feature graphs yield every proof executable.
 #
-# `all` is the graph the full test suite and the test archive already build
-# (`--all-features`), so on a builder that has run them it costs nothing.
+# `all` is the graph the full test suite and the test archive already build,
+# so on a builder that has run them it costs nothing: `--all-features` in the
+# `linux` job, and the target graph (every feature but the host-only ones; see
+# ci/target_features.py) that the per-target `build` job exports as
+# KERNAL_TARGET_FEATURES.
 # `production` is the one graph whose distinctness is the proof: the
 # containment proofs run the worker binary a production build ships, without
 # `wasm-sketch-worker-test-support` hooks or `tauri-webview`, and the
 # admission proof shows a guest cannot reach the webview when the webview is
 # not compiled in at all.
+TARGET_FEATURES = os.environ.get("KERNAL_TARGET_FEATURES", "")
+ALL_FEATURES = ("--features", TARGET_FEATURES) if TARGET_FEATURES else ("--all-features",)
 GRAPHS = {
-    "all": ("--all-features", "--lib", "--test", "wasm_tauri_screenshot", "--test", "wasm_worker_containment"),
+    "all": (*ALL_FEATURES, "--lib", "--test", "wasm_tauri_screenshot", "--test", "wasm_worker_containment"),
     "production": (
         "--features", "wasm-sketch-worker", "--test", "wasm_tauri_screenshot", "--test", "wasm_worker_containment",
     ),

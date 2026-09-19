@@ -222,6 +222,11 @@ the same client operation and no runtime fallback to a second HAL.
   reaches the build-dependency (Cargo applies it by name and rejects renaming
   one package twice), so forwarded capabilities compile for the build script
   too; see the module documentation for the library-crate workaround.
+  It is host-only: it runs in a build script on the build host, so a graph
+  linked for another target never includes it. CI's per-target matrix builds
+  every feature but this one (`ci/target_features.py`); a Linux-hosted link
+  for `*-pc-windows-msvc` cannot resolve embed-resource's `vswhom-sys`
+  symbols, whose C++ archive is only built on a Windows host.
 - `daemon_identity`, `daemon_frame_v1`, `daemon_registration`,
   `daemon_registration_v2` (features of the same names, each opt-in and
   outside `full`): the frozen v1/v2 daemon wires -- identity/sidecar/probe/mux

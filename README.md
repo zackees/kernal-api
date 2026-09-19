@@ -139,7 +139,9 @@ its reach, because Cargo rejects depending on one package under two names.
 An application that forwards a heavy capability either accepts compiling it
 for the host build script or forwards through an application-owned library
 crate (`viewer = ["dep:app-viewer"]`). Either way the build script compiles
-this crate's mandatory dependencies for the host. See the
+this crate's mandatory dependencies for the host. It is a host-only
+facility, so CI's per-target build matrix links every feature except it
+(`ci/target_features.py`) and covers it through that fixture instead. See the
 [`build_resources` module documentation](src/build_resources.rs) and
 `tests/build-resources-consumer`.
 

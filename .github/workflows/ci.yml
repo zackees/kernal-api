@@ -87,7 +87,7 @@ jobs:
         run: |
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
-            ci.test_nextest_config ci.test_deny_warnings
+            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
@@ -360,6 +360,22 @@ jobs:
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
           prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      # Every feature except host-only build-script facilities, derived from
+      # Cargo.toml so a new feature is covered here automatically. This is a
+      # graph linked for the TARGET; `build-resources` runs only in an
+      # application's build script on the build host, and its embed-resource
+      # -> vswhom-sys C++ archive is built only on a Windows host, so linking
+      # it into kernal-api's own test binaries from a Linux cross builder
+      # fails with undefined `vswhom_*` symbols. `build-resources` stays
+      # covered by the per-feature isolation check and by
+      # tests/build-resources-consumer, checked natively in `linux` and for
+      # each Windows target below. ci/native_proof.py reads the same variable,
+      # so its `all` graph remains the one this job's archive already built.
+      - name: Select the target feature graph
+        run: >-
+          echo "KERNAL_TARGET_FEATURES=$(uv run --no-project --python 3.12 ci/target_features.py)"
+          >> "${GITHUB_ENV}"
       - name: Restore native pkg-config search path
         if: matrix.cross == ''
         run: |
@@ -373,7 +389,7 @@ jobs:
       - name: Lint this target
         run: >-
           soldr cargo clippy
-          --locked --all-features --all-targets
+          --locked --features "${KERNAL_TARGET_FEATURES}" --all-targets
           ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
           -- --deny warnings
       # Windows keeps debug info in a `.pdb` beside the `.exe`, and nextest
@@ -391,7 +407,7 @@ jobs:
           fi
           config_args=()
           if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
-            soldr cargo test --locked --all-features "${target_args[@]}" --no-run
+            soldr cargo test --locked --features "${KERNAL_TARGET_FEATURES}" "${target_args[@]}" --no-run
             shopt -s nullglob
             pdbs=(target/${{ matrix.target }}/debug/deps/kernal_symbolize-*.pdb)
             if [ "${#pdbs[@]}" -eq 0 ]; then
@@ -411,7 +427,7 @@ jobs:
             config_args=(--config-file "${RUNNER_TEMP}/nextest-archive.toml")
           fi
           soldr cargo nextest archive \
-            --locked --all-features "${target_args[@]}" "${config_args[@]}" \
+            --locked --features "${KERNAL_TARGET_FEATURES}" "${target_args[@]}" "${config_args[@]}" \
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst"
       - name: Compile the explicit ABI generator for this target
         # The one check `supported-targets` made that the archive does not.
@@ -419,13 +435,21 @@ jobs:
           soldr cargo check --locked
           --manifest-path tools/wasm-abi-generator/Cargo.toml
           ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+      # `build-resources` as it is meant to run: in an application's build
+      # script on this (Linux) host, compiling resources for the Windows
+      # target. The target graph above excludes it; this is its coverage.
+      - name: Embed Windows resources through the build-resources consumer
+        if: endsWith(matrix.target, '-pc-windows-msvc')
+        run: >-
+          soldr cargo check --locked
+          --manifest-path tests/build-resources-consumer/Cargo.toml
+          --target ${{ matrix.target }}
       - name: Build the native webview smoke binary
         if: endsWith(matrix.target, '-pc-windows-msvc')
         run: >-
           soldr cargo build
-          --locked --all-features --target ${{ matrix.target }}
+          --locked --features "${KERNAL_TARGET_FEATURES}" --target ${{ matrix.target }}
           --bin kernal-tauri-smoke
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Compile every native proof binary for this target
         run: >-
           uv run --no-project ci/native_proof.py build --target ${{ matrix.target }}

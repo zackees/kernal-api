@@ -28,6 +28,11 @@
 //! only by `std::thread_local!`, without exposing runtime types. A binding is
 //! installed around every poll and destruction of the scoped future and is
 //! not inherited by work launched from inside the scope.
+//!
+//! [`RwLock`] is fair and write-preferring, with borrowed, owned, and blocking
+//! guards that are facade-owned newtypes. [`TerminationSignal`] and
+//! [`wait_for_interrupt`] are owned shutdown-signal subscriptions for launched
+//! work that cannot borrow its [`Runtime`].
 
 use std::future::Future;
 use std::pin::Pin;
@@ -40,6 +45,8 @@ use tokio::sync::Notify as BackendNotify;
 
 mod broadcast;
 mod race;
+mod rw_lock;
+mod signals;
 mod task_local;
 pub use broadcast::{
     broadcast_channel, BroadcastReceiver, BroadcastRecvError, BroadcastSender,
@@ -50,6 +57,11 @@ pub use broadcast::{BroadcastLagged, BroadcastStream};
 #[doc(hidden)]
 pub use race::fair_start as __fair_race_start;
 pub use race::{BiasedRace2, BiasedRace3, BiasedRace4, FairRace2, FairRace3, FairRace4, FairRace5};
+pub use rw_lock::{
+    OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockTryLockError,
+    RwLockWriteGuard,
+};
+pub use signals::{wait_for_interrupt, TerminationSignal};
 pub use task_local::{TaskLocal, TaskLocalAccessError, TaskLocalScope};
 
 /// Current engine implementation, retained for diagnostics and bug reports.
@@ -498,11 +510,28 @@ pub async fn sleep_until(deadline: Deadline) {
 
 /// A fixed-cadence timer with an immediate first tick.
 ///
-/// Missed ticks are delivered in a burst until the original schedule catches
-/// up. No background task is spawned. Drop the timer to stop observing ticks.
+/// Missed ticks use [`MissedTickBehavior::Burst`] by default: they are
+/// delivered in a burst until the original schedule catches up. No background
+/// task is spawned. Drop the timer to stop observing ticks.
 #[derive(Debug)]
 pub struct PeriodicTimer {
     inner: tokio::time::Interval,
+}
+
+/// How a [`PeriodicTimer`] responds when ticks are missed because the
+/// consumer was busy past one or more scheduled instants.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum MissedTickBehavior {
+    /// Fire every missed tick immediately until the original schedule
+    /// catches up.
+    #[default]
+    Burst,
+    /// Fire one tick now and restart the cadence from this instant.
+    Delay,
+    /// Fire one tick now and resume on the original schedule, dropping the
+    /// ticks that were missed.
+    Skip,
 }
 
 impl PeriodicTimer {
@@ -513,16 +542,59 @@ impl PeriodicTimer {
     /// Returns an error outside a runtime or when `period` is zero or exceeds
     /// 365 days. The runtime must have its timer driver enabled.
     pub fn new(period: Duration) -> std::io::Result<Self> {
-        if period.is_zero() || period > Duration::from_secs(365 * 24 * 60 * 60) {
+        if period > Duration::from_secs(365 * 24 * 60 * 60) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "periodic timer period must be positive and at most 365 days",
             ));
         }
+        Self::new_unbounded(period)
+    }
+
+    /// Create a timer for any nonzero period representable by the host clock.
+    ///
+    /// This keeps legacy persisted configuration (such as a multi-year flush
+    /// interval) intact. Prefer [`Self::new`] for new policy-bound settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error outside a runtime, when `period` is zero, or when the
+    /// first deadline would overflow the host clock.
+    pub fn new_unbounded(period: Duration) -> std::io::Result<Self> {
+        if period.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period must be positive",
+            ));
+        }
         RuntimeHandle::current().map_err(std::io::Error::other)?;
+        if tokio::time::Instant::now().checked_add(period).is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "periodic timer period exceeds the host clock range",
+            ));
+        }
         let mut inner = tokio::time::interval(period);
         inner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
         Ok(Self { inner })
+    }
+
+    /// Select missed-tick behavior without changing the immediate first tick.
+    pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
+        self.inner.set_missed_tick_behavior(match behavior {
+            MissedTickBehavior::Burst => tokio::time::MissedTickBehavior::Burst,
+            MissedTickBehavior::Delay => tokio::time::MissedTickBehavior::Delay,
+            MissedTickBehavior::Skip => tokio::time::MissedTickBehavior::Skip,
+        });
+    }
+
+    /// The missed-tick behavior currently in effect.
+    pub fn missed_tick_behavior(&self) -> MissedTickBehavior {
+        match self.inner.missed_tick_behavior() {
+            tokio::time::MissedTickBehavior::Burst => MissedTickBehavior::Burst,
+            tokio::time::MissedTickBehavior::Delay => MissedTickBehavior::Delay,
+            tokio::time::MissedTickBehavior::Skip => MissedTickBehavior::Skip,
+        }
     }
 
     /// Wait for the next scheduled tick. Cancelling a pending call does not

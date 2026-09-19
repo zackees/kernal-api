@@ -1026,3 +1026,5 @@ pub const fn process_can_replace_current_image() -> bool {
 }
 #[path = "platform_linux/interrupt.rs"]
 pub(crate) mod interrupt;
+#[path = "platform_linux/termination.rs"]
+pub(crate) mod termination;

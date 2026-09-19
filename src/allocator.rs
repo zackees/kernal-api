@@ -96,6 +96,150 @@ pub fn live_sample_count() -> usize {
     mimalloc_pprof::prof::stats().live_samples
 }
 
+/// Snapshot of the heap profiler's sampled counters plus the allocator's
+/// exact heap counters, taken by [`stats`].
+///
+/// Every value except [`Self::heap`] is *sampled* and meaningful only while
+/// (or after) the profiler runs; the heap counters are exact and valid even
+/// while the profiler is dormant.
+#[derive(Clone, Debug, Default)]
+pub struct ProfilerStats {
+    inner: mimalloc_pprof::prof::ProfStats,
+}
+
+impl ProfilerStats {
+    /// Whether the profiler was sampling when the snapshot was taken.
+    pub fn enabled(&self) -> bool {
+        self.inner.enabled
+    }
+
+    /// Whether freed samples are retained as cumulative allocation history.
+    pub fn accumulating(&self) -> bool {
+        self.inner.accum
+    }
+
+    /// The byte sampling interval in effect (0 when never started).
+    pub fn sample_rate(&self) -> usize {
+        self.inner.sample_rate
+    }
+
+    /// Currently live sampled allocations.
+    pub fn live_samples(&self) -> usize {
+        self.inner.live_samples
+    }
+
+    /// Bytes attributed to currently live sampled allocations.
+    pub fn live_bytes(&self) -> usize {
+        self.inner.live_bytes
+    }
+
+    /// Cumulative sampled allocations, live or freed.
+    pub fn accumulated_samples(&self) -> usize {
+        self.inner.accum_samples
+    }
+
+    /// Bytes attributed to cumulative sampled allocations.
+    pub fn accumulated_bytes(&self) -> usize {
+        self.inner.accum_bytes
+    }
+
+    /// Distinct call stacks interned by the profiler.
+    pub fn unique_stacks(&self) -> usize {
+        self.inner.unique_stacks
+    }
+
+    /// Bytes the profiler itself has committed for its bookkeeping.
+    pub fn profiler_committed_bytes(&self) -> usize {
+        self.inner.arena_committed
+    }
+
+    /// Samples dropped because the stack table was full.
+    pub fn stack_table_overflows(&self) -> usize {
+        self.inner.stack_table_overflows
+    }
+
+    /// Every dropped sample, for any reason; never less than
+    /// [`Self::stack_table_overflows`].
+    pub fn dropped_samples(&self) -> usize {
+        self.inner.dropped_samples
+    }
+
+    /// Exact allocator heap counters taken with this snapshot.
+    pub fn heap(&self) -> HeapStats {
+        HeapStats {
+            inner: self.inner.heap.clone(),
+        }
+    }
+}
+
+/// Exact (not sampled) allocator heap counters from a [`ProfilerStats`].
+#[derive(Clone, Debug, Default)]
+pub struct HeapStats {
+    inner: mimalloc_pprof::prof::HeapStats,
+}
+
+impl HeapStats {
+    /// Bytes currently committed from the OS.
+    pub fn committed(&self) -> usize {
+        self.inner.committed
+    }
+
+    /// Bytes currently reserved from the OS; never less than
+    /// [`Self::committed`].
+    pub fn reserved(&self) -> usize {
+        self.inner.reserved
+    }
+
+    /// Bytes the application requested and still holds.
+    ///
+    /// Maintained only when [`Self::detailed`] is true; otherwise 0.
+    pub fn malloc_requested(&self) -> usize {
+        self.inner.malloc_requested
+    }
+
+    /// Live allocator pages.
+    pub fn pages(&self) -> usize {
+        self.inner.pages
+    }
+
+    /// Pages abandoned by exited threads.
+    pub fn pages_abandoned(&self) -> usize {
+        self.inner.pages_abandoned
+    }
+
+    /// Live first-class heaps.
+    pub fn heaps(&self) -> usize {
+        self.inner.heaps
+    }
+
+    /// Live thread-local heaps, excluding the main thread's static heap.
+    pub fn thread_heaps(&self) -> usize {
+        self.inner.theaps
+    }
+
+    /// Cumulative bytes purged back to the OS.
+    pub fn purged(&self) -> usize {
+        self.inner.purged
+    }
+
+    /// Whether detailed statistics are compiled in, which is what makes
+    /// [`Self::malloc_requested`] meaningful. Without it, "allocated
+    /// nothing" and "not tracked" are indistinguishable.
+    pub fn detailed(&self) -> bool {
+        self.inner.detailed
+    }
+}
+
+/// Read the profiler and allocator counters.
+///
+/// Returns all-zero counters if the linked allocator rejects the stats
+/// request; it never fails.
+pub fn stats() -> ProfilerStats {
+    ProfilerStats {
+        inner: mimalloc_pprof::prof::stats(),
+    }
+}
+
 /// A collision-resistant default filename for one heap snapshot.
 pub fn next_dump_name() -> String {
     let sequence = DUMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -109,6 +253,21 @@ pub fn next_dump_name() -> String {
 /// Write the retained heap samples to an explicit pprof protobuf path.
 pub fn dump_to(path: impl AsRef<Path>) -> std::io::Result<()> {
     mimalloc_pprof::prof::dump_proto_file(path.as_ref())
+}
+
+/// Write the retained heap samples to `path` in the legacy text heap-profile
+/// format (`heap profile:` header plus `MAPPED_LIBRARIES:`), readable by
+/// `pprof`/`jeprof` with the matching binary.
+///
+/// Prefer [`dump_to`] (binary `profile.proto`) for new consumers; this form
+/// serves tooling that already reads text heap profiles.
+///
+/// # Errors
+///
+/// Returns `InvalidInput` for a non-UTF-8 path or one containing NUL, and
+/// the OS error when the file cannot be written.
+pub fn dump_file(path: impl AsRef<Path>) -> std::io::Result<()> {
+    mimalloc_pprof::prof::dump_file(path.as_ref())
 }
 
 /// Serialize the retained heap samples to an in-memory pprof protobuf buffer.

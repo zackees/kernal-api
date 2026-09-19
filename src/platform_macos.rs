@@ -1085,3 +1085,5 @@ pub const fn process_can_replace_current_image() -> bool {
 }
 #[path = "platform_macos/interrupt.rs"]
 pub(crate) mod interrupt;
+#[path = "platform_macos/termination.rs"]
+pub(crate) mod termination;

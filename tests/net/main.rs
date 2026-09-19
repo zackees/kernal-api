@@ -10,6 +10,7 @@ mod async_biased_race;
 mod async_blocking_channel;
 mod async_broadcast;
 mod async_fair_race;
+mod async_rw_lock;
 mod async_task_local;
 mod async_timers_permits;
 mod http_client;

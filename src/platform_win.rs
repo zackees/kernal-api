@@ -109,6 +109,15 @@ pub use executable::{
 #[cfg(feature = "ipc")]
 #[path = "platform_win/ipc.rs"]
 pub(crate) mod ipc;
+#[cfg(feature = "ipc")]
+#[path = "platform_win/ipc_owner_only.rs"]
+mod ipc_owner_only;
+#[cfg(feature = "ipc")]
+pub use ipc_owner_only::{
+    retire_socket_endpoint as ipc_retire_socket_endpoint, LocalPipeClient as IpcLocalPipeClient,
+    LocalSocketListener as IpcLocalSocketListener, LocalSocketStream as IpcLocalSocketStream,
+    OwnerOnlyPipeInstance as IpcOwnerOnlyPipeInstance,
+};
 #[cfg(any(feature = "ipc", feature = "fs"))]
 #[path = "platform_win/ipc_private_dir.rs"]
 mod ipc_private_dir;

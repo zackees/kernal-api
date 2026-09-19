@@ -117,6 +117,17 @@ the same client operation and no runtime fallback to a second HAL.
 
 - `platform`: process, filesystem, IPC, PTY, terminal, host identity, and
   resource operations.
+- `platform::ipc` owner-only single-instance transport (feature `ipc`):
+  `LocalSocketListener::bind_owner_only` (pathname socket, mode `0o600`,
+  observed `SocketPeerCredentials`), `LocalSocketStream`,
+  `OwnerOnlyPipeInstance::create` (protected owner+SYSTEM DACL, remote
+  clients rejected, optional first-instance exclusivity), `LocalPipeClient`
+  (one open attempt, pipe-busy error preserved), and `retire_socket_endpoint`
+  (unlinks sockets only; a no-op for named pipes). Byte I/O is polled with
+  standard-library types; every host exports every name, and the pair that is
+  not the host's transport is uninhabited and reports `Unsupported`. Endpoint
+  spelling, retirement timing, pooling, retry, deadlines, and peer admission
+  stay with the caller.
 - Async process sessions (`SpawnSpec`, `SpawnAdmission`, `ProcessSession`,
   `ProcessSessionOptions`, `ProcessOutputEvent`, `ProcessSessionExit`): the
   one async spawn/stream/reap surface. It covers argument lists, spawn-time

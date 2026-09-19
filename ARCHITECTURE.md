@@ -52,6 +52,14 @@ This one-way graph resolves the async/process cycle without creating a smaller
   implementation for a capability that `kernal-api` provides.
 - New facade operations bake in safe defaults: bounded resources, cancellation,
   connection and progress timeouts, child cleanup, and diagnostic visibility.
+- Process mutation is addressed by proof of ownership, never by a bare PID.
+  `platform::process::force_kill`, `kill_tree`, and `set_priority` take a
+  generation-checked `ProcessIdentity`; `force_terminate_process_group`
+  borrows the owner's unreaped `std::process::Child`; and
+  `executable_path` reads through a retained `ProcessLiveness`. Only
+  read-only telemetry (`cpu_ticks_for_pid`, `peak_rss_bytes_for_pid`,
+  `tree_rss_bytes_for_pid`) is PID-addressed, for a child the caller has not
+  reaped.
 
 The public API describes intent rather than backend vocabulary. This allows a
 backend to be trimmed, vendored, or rewritten without changing every client.

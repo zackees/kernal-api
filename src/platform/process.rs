@@ -1465,3 +1465,160 @@ pub use crate::{
     process_can_replace_current_image as can_replace_current_image,
     process_replace_current_image as replace_current_image,
 };
+
+/// Make a synchronous child lead its own process group before it starts.
+///
+/// Unix calls `setsid` in the child, so it leads a new session and process
+/// group whose id is its PID. Windows sets `CREATE_NEW_PROCESS_GROUP`, the
+/// console-control group; on Windows this *replaces* any creation flags the
+/// command already carries, as [`std::os::windows::process::CommandExt`]
+/// does. No descriptor, stdio, owner-death, or resource policy is added.
+pub fn configure_session_leader_command(command: &mut std::process::Command) {
+    crate::process_configure_session_leader_command(command);
+}
+
+/// Force-kill the process group led by `child`, an unreaped child of this
+/// process configured with [`configure_session_leader_command`].
+///
+/// The target is proven rather than trusted. Borrowing the owner's
+/// [`std::process::Child`] -- not a bare PID -- and checking with a
+/// non-consuming `waitid(WNOWAIT)` that the child is still unreaped is what
+/// keeps its PID, and therefore the group id it leads, from having been
+/// reissued: a numeric PID read from anywhere else is exactly the recycled
+/// target [`DaemonIdentity::verify_for_control`] exists to refuse, so no
+/// PID-only spelling of this operation is offered. Call it before reaping the
+/// child; once reaped it reports [`std::io::ErrorKind::NotFound`] and signals
+/// nothing. A group that has already fully exited is `Ok(())`.
+///
+/// Windows has no numeric process-group kill primitive and returns
+/// [`std::io::ErrorKind::Unsupported`]; capture the child's
+/// [`ProcessIdentity`] and use [`kill_tree`] there.
+///
+/// [`DaemonIdentity::verify_for_control`]: https://docs.rs/kernal-api/latest/kernal_api/daemon_identity/struct.DaemonIdentity.html#method.verify_for_control
+pub fn force_terminate_process_group(child: &std::process::Child) -> std::io::Result<()> {
+    crate::process_force_terminate_child_process_group(child)
+}
+
+/// Move exactly `identity` into a scheduling band after it has started.
+///
+/// Prefer [`SpawnSpec::priority`](crate::SpawnSpec::priority) where the band
+/// is known at launch. [`ProcessPriority::Normal`] leaves the process's
+/// current policy untouched. The generation is revalidated first: a reissued
+/// PID is [`ProcessIdentityActionError::StaleIdentity`] and an exited one is
+/// [`ProcessIdentityAction::AlreadyExited`]. Windows checks and adjusts
+/// through one handle, which pins the process. Unix has no descriptor-based
+/// `setpriority`, so a process that exits, is reaped, and has its PID
+/// reissued between the check and the call could be re-prioritised instead.
+/// That window is tolerated here because a scheduling band is reversible and
+/// non-destructive; termination offers no such window ([`force_kill`]).
+pub fn set_priority(
+    identity: ProcessIdentity,
+    priority: crate::ProcessPriority,
+) -> Result<ProcessIdentityAction, ProcessIdentityActionError> {
+    crate::process_set_priority_identity(identity, priority)
+}
+
+/// Resolve the on-disk image of the process `process` refers to.
+///
+/// Addressed through a retained [`ProcessLiveness`] rather than a bare PID:
+/// the path is read and then the same live reference is asked whether its
+/// process is still running. A process that is still alive after the read
+/// cannot have handed its PID to another image during it. An exited process
+/// reports [`std::io::ErrorKind::NotFound`]. The path is the host's answer
+/// and may name a deleted or replaced file.
+pub fn executable_path(process: &ProcessLiveness) -> std::io::Result<std::path::PathBuf> {
+    let path = crate::process_executable_path(process.pid())?;
+    if process.is_alive() {
+        Ok(path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "process exited while its image path was read",
+        ))
+    }
+}
+
+/// Replace this process's standard input, output, and error with the null
+/// device.
+///
+/// Mutates process-global state. Intended only for a daemon's early bootstrap
+/// path, before other threads use the standard streams.
+pub fn detach_standard_streams() {
+    crate::process_detach_standard_streams();
+}
+
+/// Point standard input at the null device and standard output and error at
+/// `path`, opened for append (created if missing).
+///
+/// Returns `false`, leaving output and error unchanged, when `path` cannot be
+/// opened; input has already been detached by then. Mutates process-global
+/// state, like [`detach_standard_streams`].
+#[must_use]
+pub fn redirect_standard_streams_to_log(path: &std::path::Path) -> bool {
+    crate::process_redirect_standard_streams_to_log(path)
+}
+
+/// Whether [`NativeJobserver::create`] can succeed on this host.
+///
+/// True on Linux and macOS (a GNU make `R,W` descriptor pair); false on
+/// Windows, where GNU make's named-semaphore form is not provided.
+#[must_use]
+pub fn native_jobserver_supported() -> bool {
+    crate::process_native_jobserver_supported()
+}
+
+/// A host-owned GNU make jobserver, primed with `capacity` tokens.
+///
+/// `NativeJobserver::create(capacity)` returns `InvalidInput` for zero and
+/// `Unsupported` where [`native_jobserver_supported`] is false;
+/// `auth_string()` is the `--jobserver-auth=R,W` descriptor pair. Both
+/// descriptors are close-on-exec: a launcher hands them to a child
+/// deliberately rather than leaking them into every spawn.
+pub use crate::NativeJobserver;
+
+/// Opaque, monotonically increasing CPU time consumed by `pid`.
+///
+/// Only differences between two readings of the same process mean anything
+/// (Linux clock ticks, macOS `rusage` time, Windows 100 ns units). `None`
+/// when the process is gone or the host denies the reading. Addressed by
+/// PID: read-only telemetry, sound for a child the caller has not reaped.
+#[must_use]
+pub fn cpu_ticks_for_pid(pid: u32) -> Option<u64> {
+    crate::process_cpu_ticks_for_pid(pid)
+}
+
+/// Resident-memory high-water mark of `pid`, in bytes.
+///
+/// Linux reads `VmHWM`, macOS the lifetime maximum physical footprint, and
+/// Windows `PeakWorkingSetSize`. `None` when the process is gone or its
+/// accounting was already torn down (a Unix zombie); see
+/// [`PEAK_RSS_READABLE_AFTER_EXIT`]. Read-only telemetry addressed by PID,
+/// sound for a child the caller has not reaped.
+#[must_use]
+pub fn peak_rss_bytes_for_pid(pid: u32) -> Option<u64> {
+    crate::process_peak_rss_bytes_for_pid(pid)
+}
+
+/// Current resident bytes of `pid` plus every live descendant.
+///
+/// A current figure, not a high-water mark (Linux `VmRSS`, macOS
+/// `ri_resident_size`, Windows `WorkingSetSize`); sampling repeatedly and
+/// keeping the maximum yields a sampled peak for the whole tree, which is how
+/// a grandchild such as a linker becomes visible. Descendants come from
+/// `/proc/<pid>/task/*/children`, `proc_listchildpids`, or one Toolhelp32
+/// snapshot, and the walk visits at most [`MAX_TREE_RSS_PROCESSES`]. `None`
+/// when `pid` itself cannot be read.
+#[must_use]
+pub fn tree_rss_bytes_for_pid(pid: u32) -> Option<u64> {
+    crate::process_tree_rss_bytes_for_pid(pid)
+}
+
+/// Upper bound on processes one [`tree_rss_bytes_for_pid`] call visits, so a
+/// fork bomb cannot turn a sample into an unbounded walk.
+pub const MAX_TREE_RSS_PROCESSES: usize = crate::PROCESS_MAX_TREE_RSS_PROCESSES;
+
+/// Whether [`peak_rss_bytes_for_pid`] stays exact for a child that has
+/// exited while its owner still holds it. True on Windows, where the retained
+/// handle keeps the process object readable; false on Unix, where a zombie's
+/// memory accounting is gone.
+pub const PEAK_RSS_READABLE_AFTER_EXIT: bool = crate::PROCESS_PEAK_RSS_READABLE_AFTER_EXIT;

@@ -32,6 +32,28 @@ pub use autostart::{
 pub(crate) mod process_inspect;
 pub use process_inspect::{process_same_executable_path, ProcessLiveness};
 
+#[path = "platform_win/process_control.rs"]
+mod process_control;
+pub use process_control::NativeJobserver;
+pub(crate) use process_control::{
+    configure_session_leader_command as process_configure_session_leader_command,
+    detach_standard_streams as process_detach_standard_streams,
+    force_terminate_child_process_group as process_force_terminate_child_process_group,
+    native_jobserver_supported as process_native_jobserver_supported,
+    redirect_standard_streams_to_log as process_redirect_standard_streams_to_log,
+    set_priority_identity as process_set_priority_identity,
+};
+
+#[path = "platform_win/process_usage.rs"]
+mod process_usage;
+pub(crate) use process_usage::{
+    cpu_ticks_for_pid as process_cpu_ticks_for_pid,
+    peak_rss_bytes_for_pid as process_peak_rss_bytes_for_pid,
+    tree_rss_bytes_for_pid as process_tree_rss_bytes_for_pid,
+    MAX_TREE_RSS_PROCESSES as PROCESS_MAX_TREE_RSS_PROCESSES,
+    PEAK_RSS_READABLE_AFTER_EXIT as PROCESS_PEAK_RSS_READABLE_AFTER_EXIT,
+};
+
 #[path = "platform_win/raw_write.rs"]
 pub(crate) mod raw_write;
 pub use raw_write::write_all_to_descriptor as fs_write_all_to_descriptor;
@@ -99,7 +121,8 @@ pub use fs_watch::Watcher as FsWatchWatcher;
 #[path = "platform_win/executable.rs"]
 pub(crate) mod executable;
 pub use executable::{
-    file_name as executable_file_name, find_in_paths as executable_find_in_paths,
+    file_name as executable_file_name, file_name_os as executable_file_name_os,
+    find_in_paths as executable_find_in_paths,
     native_library_name as executable_native_library_name,
     sibling_of_current_image as executable_sibling_of_current_image,
     stem_matches as executable_stem_matches,

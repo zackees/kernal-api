@@ -5,15 +5,19 @@
 //! crate's whole graph. Test IDs are now `process::<module>::<test>`.
 //! See AGENTS.md for the rule.
 
+mod executable_naming;
 mod foreground_command;
 mod interrupt_notification;
+mod native_jobserver;
 mod posix_arguments;
 mod process_exit_observation;
+mod process_host_control;
 mod process_identity;
 mod process_owner_death_contract;
 mod process_session;
 mod process_session_control;
 mod process_session_streaming;
 mod process_target;
+mod process_usage;
 mod spawn_mode_facade;
 mod windows_spawn_cleanup;

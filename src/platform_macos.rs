@@ -93,6 +93,12 @@ pub use fs::{
     read_private_regular_file_bounded as fs_read_private_regular_file_bounded,
 };
 
+// Cache-materialization mechanics; the neutral facade reaches them through
+// the crate-root `native_fs_materialize` name.
+#[cfg(feature = "fs")]
+#[path = "platform_macos/fs_materialize.rs"]
+pub(crate) mod fs_materialize;
+
 #[cfg(feature = "fs-watch")]
 #[path = "platform_macos/fs_watch.rs"]
 pub(crate) mod fs_watch;
@@ -1094,3 +1100,5 @@ pub const fn process_can_replace_current_image() -> bool {
 }
 #[path = "platform_macos/interrupt.rs"]
 pub(crate) mod interrupt;
+#[path = "platform_macos/termination.rs"]
+pub(crate) mod termination;

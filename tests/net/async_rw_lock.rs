@@ -1,0 +1,117 @@
+//! `async_engine::RwLock`: fair write preference, owned/borrowed/blocking
+//! guards, and cancellation that releases a queued waiter.
+
+use kernal_api::async_engine::{self, RwLock, RwLockTryLockError};
+use std::future::Future;
+use std::sync::Arc;
+use std::task::Poll;
+use std::time::Duration;
+
+/// Poll `future` exactly once and report whether it is still pending.
+async fn poll_once<F: Future + Unpin>(future: &mut F) -> bool {
+    std::future::poll_fn(|context| {
+        Poll::Ready(std::pin::Pin::new(&mut *future).poll(context).is_pending())
+    })
+    .await
+}
+
+#[tokio::test]
+async fn borrowed_guards_share_reads_and_mutate_exclusively() {
+    let lock = RwLock::new(vec![1_u8]);
+    {
+        let first = lock.read().await;
+        let second = lock.read().await;
+        assert_eq!(*first, *second);
+        assert_eq!(format!("{first:?}"), "[1]");
+    }
+    lock.write().await.push(2);
+    assert_eq!(*lock.read().await, [1, 2]);
+    assert_eq!(lock.into_inner(), Some(vec![1, 2]));
+    assert_eq!(*RwLock::<u8>::default().read().await, 0);
+}
+
+#[tokio::test]
+async fn owned_guards_move_into_launched_work() {
+    let lock = Arc::new(RwLock::new(0_u32));
+    let mut writer = Arc::clone(&lock).write_owned().await;
+    *writer += 1;
+    let task = async_engine::launch(async move {
+        *writer += 1;
+        drop(writer);
+    });
+    task.await.unwrap();
+    let reader = Arc::clone(&lock).read_owned().await;
+    assert_eq!(*reader, 2);
+    let reader = async_engine::launch(async move { *reader }).await.unwrap();
+    assert_eq!(reader, 2);
+}
+
+#[tokio::test]
+async fn owned_guard_keeps_the_value_alive_past_the_lock() {
+    let lock = Arc::new(RwLock::new(String::from("kept")));
+    let guard = Arc::clone(&lock).read_owned().await;
+    let lock = Arc::into_inner(lock).expect("only the guard's private lease remains");
+    assert_eq!(
+        lock.into_inner(),
+        None,
+        "the owned guard still reaches the value"
+    );
+    assert_eq!(&*guard, "kept");
+}
+
+#[tokio::test]
+async fn a_queued_writer_blocks_later_readers() {
+    let lock = Arc::new(RwLock::new(()));
+    let reader = Arc::clone(&lock).read_owned().await;
+    let mut writer = Box::pin(Arc::clone(&lock).write_owned());
+    assert!(poll_once(&mut writer).await, "writer waits for the reader");
+
+    // Write preference: a later reader must not overtake the queued writer.
+    assert_eq!(
+        Arc::clone(&lock).try_read_owned().err(),
+        Some(RwLockTryLockError)
+    );
+    let mut late_reader = Box::pin(lock.read());
+    assert!(poll_once(&mut late_reader).await);
+
+    drop(reader);
+    let writer = async_engine::timeout(Duration::from_secs(5), writer)
+        .await
+        .expect("writer acquires once the earlier reader leaves");
+    assert!(poll_once(&mut late_reader).await, "reader still queued");
+    drop(writer);
+    async_engine::timeout(Duration::from_secs(5), late_reader)
+        .await
+        .expect("reader acquires after the writer");
+    assert!(Arc::clone(&lock).try_read_owned().is_ok());
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_writer_releases_later_readers() {
+    let lock = Arc::new(RwLock::new(()));
+    let reader = lock.read().await;
+    let mut writer = Box::pin(lock.write());
+    assert!(poll_once(&mut writer).await);
+    assert!(Arc::clone(&lock).try_read_owned().is_err());
+    drop(writer);
+    assert!(Arc::clone(&lock).try_read_owned().is_ok());
+    drop(reader);
+}
+
+#[test]
+fn blocking_guards_work_from_synchronous_threads() {
+    let lock = Arc::new(RwLock::new(1_u8));
+    *lock.blocking_write() = 2;
+    assert_eq!(*lock.blocking_read(), 2);
+    let runtime = async_engine::RuntimeBuilder::current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let shared = Arc::clone(&lock);
+    runtime.run(async move {
+        async_engine::launch_blocking(move || *shared.blocking_write() = 3)
+            .await
+            .unwrap();
+    });
+    assert_eq!(*lock.blocking_read(), 3);
+}

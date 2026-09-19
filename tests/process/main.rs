@@ -16,4 +16,5 @@ mod process_session_control;
 mod process_session_streaming;
 mod process_target;
 mod spawn_mode_facade;
+mod termination_signal;
 mod windows_spawn_cleanup;

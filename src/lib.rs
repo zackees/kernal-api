@@ -311,6 +311,9 @@ pub use platform_imp::{
 };
 
 #[cfg(feature = "fs")]
+pub(crate) use platform_imp::fs_materialize as native_fs_materialize;
+
+#[cfg(feature = "fs")]
 pub(crate) use platform_imp::fs_read_private_regular_file_bounded;
 
 #[cfg(feature = "fs")]

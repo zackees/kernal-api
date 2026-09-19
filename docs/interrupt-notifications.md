@@ -17,10 +17,21 @@ polled. Applications that change terminal modes before polling must use eager
 registration instead. A wait intentionally has no timeout; compose it with a
 deadline or cancellation where required by application policy.
 
+Launched `'static` work that cannot borrow its `Runtime` (a daemon's shutdown
+watcher) uses the ambient forms on the currently entered runtime instead:
+`async_engine::wait_for_interrupt()` registers for Ctrl+C when first polled,
+and `async_engine::TerminationSignal::new()` registers eagerly for the host's
+graceful-termination request: Unix SIGTERM, or Windows console CTRL_BREAK,
+close and shutdown. Both return `Unsupported` with no entered runtime; a
+runtime without its signal driver panics. `TerminationSignal::recv` returns
+`None` once the native receiver closes and is cancellation-safe. Windows ends
+the process shortly after a close or shutdown event regardless of the
+handler; that notification is the window to drain, not a veto. Logoff is not
+observed, because services receive every user's logoff.
+
 Registration affects process-wide signal handling. Dropping the listener does
-not restore native default handlers. This facility does not handle SIGTERM,
-Windows CTRL_BREAK, console close, shutdown or logoff, and does not replace the
-existing daemon shutdown-request contract. Do not combine competing signal
+not restore native default handlers. None of these replace the existing daemon
+shutdown-request contract. Do not combine competing signal
 installers without explicitly coordinating ownership. Applications decide exit
 codes, repeated-interrupt policy and cleanup. Abrupt termination cannot run Drop.
 

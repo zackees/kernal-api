@@ -98,7 +98,7 @@ descendant teardown, or fresh evidence on the other five targets.
 Until 1.0, the four first-party clients use an exact Cargo requirement:
 
 ```toml
-kernal-api = { version = "=0.1.15", features = ["..."] }
+kernal-api = { version = "=0.1.16", features = ["..."] }
 
 [profile.dev.package.kernal-api]
 codegen-units = 1
@@ -107,7 +107,7 @@ codegen-units = 1
 codegen-units = 1
 ```
 
-The Python companion is likewise pinned with `kernal-api==0.1.15` when used by
+The Python companion is likewise pinned with `kernal-api==0.1.16` when used by
 first-party Python tooling. A source checkout may temporarily use a path patch
 only on an explicit migration branch; release branches must resolve the exact
 registry version. There is no `optional = true` legacy implementation behind
@@ -117,6 +117,17 @@ the same client operation and no runtime fallback to a second HAL.
 
 - `platform`: process, filesystem, IPC, PTY, terminal, host identity, and
   resource operations.
+- `platform::fs` cache-materialization mechanics (feature `fs`): the
+  `replacement` module (native rename replacement with the Windows
+  antivirus/sharing-violation retry ladder, generation rename, delete-fallback
+  replacement, staged directory install, and the Windows share/lock error
+  classifiers), the `path_file` identity module, `LinkKind`/`classify`,
+  `hard_link_count`, `symlink_file`, `set_readonly`, `make_executable`,
+  `metadata_mode`/`apply_metadata_mode`, `file_change_marker`,
+  `volume_identity_u128`, `file_id_width`, `allocated_bytes`,
+  `native_call_path`, `path_from_raw_bytes`, and
+  `sync_directory_if_supported`. Cache layout, retry budgets beyond the fixed
+  ladder, and materialization tiers remain client policy.
 - `platform::ipc` owner-only single-instance transport (feature `ipc`):
   `LocalSocketListener::bind_owner_only` (pathname socket, mode `0o600`,
   observed `SocketPeerCredentials`), `LocalSocketStream`,
@@ -142,7 +153,10 @@ the same client operation and no runtime fallback to a second HAL.
   collapsed export.
 - `symbolize`: protobuf-tagged ASLR-independent capture schema and isolated
   PDB/DWARF/Mach-O parser worker.
-- `allocator`: the facade-owned allocator plus sampled heap lifecycle/dumps.
+- `allocator`: the facade-owned allocator plus sampled heap lifecycle/dumps,
+  the owned counter snapshot (`stats() -> ProfilerStats`, `HeapStats`), and
+  the legacy text dump (`dump_file`). Clients must not name `mimalloc_pprof`
+  or re-export it for an embedding host.
 - `async_engine`: the facade-owned runtime/task surface and task diagnostics.
   It also owns cancellation tokens, connection deadlines, and progress/idle
   timeout policy; clients must not substitute a raw runtime or global transfer
@@ -153,6 +167,12 @@ the same client operation and no runtime fallback to a second HAL.
   `BiasedRace4`), and `task_local!` (`TaskLocal`, `TaskLocalScope`,
   `TaskLocalAccessError`). All three are std-only and expand to `$crate`
   paths; clients must not reach for `tokio::select!` or `tokio::task_local!`.
+  It owns the fair write-preferring `RwLock` with borrowed, owned and blocking
+  guard newtypes (`RwLockReadGuard`, `RwLockWriteGuard`,
+  `OwnedRwLockReadGuard`, `OwnedRwLockWriteGuard`), `PeriodicTimer`'s
+  `MissedTickBehavior` (`Burst`, `Delay`, `Skip`), and the ambient shutdown
+  subscriptions `TerminationSignal` (SIGTERM; Windows console break, close
+  and shutdown) and `wait_for_interrupt` (Ctrl+C) for launched work.
 - `platform::window_icon` (feature `window-icon`): window and stock icon
   mechanics for the host console or a child, including the ICO/PNG decode and
   the X11 property write. GUI hosting is opt-in, so a headless client does not

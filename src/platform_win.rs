@@ -90,6 +90,12 @@ pub use fs::{
     user_state_dir as fs_user_state_dir, FileIdentity as FsFileIdentity,
 };
 
+// Cache-materialization mechanics; the neutral facade reaches them through
+// the crate-root `native_fs_materialize` name.
+#[cfg(feature = "fs")]
+#[path = "platform_win/fs_materialize.rs"]
+pub(crate) mod fs_materialize;
+
 #[cfg(feature = "fs-watch")]
 #[path = "platform_win/fs_watch.rs"]
 pub(crate) mod fs_watch;
@@ -837,3 +843,5 @@ pub(crate) fn configure_native_worker_environment(command: &mut std::process::Co
 
 #[path = "platform_win/interrupt.rs"]
 pub(crate) mod interrupt;
+#[path = "platform_win/termination.rs"]
+pub(crate) mod termination;

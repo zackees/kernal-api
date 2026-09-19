@@ -144,6 +144,10 @@ compile. They are documented on docs.rs but must be enabled by name:
 - `daemon-registration-v2` for frozen v2 service-definition registration
   alone, so an application dual-writing during the v1-to-v2 rollout pulls no
   broker client, identity, IPC, or runtime policy
+- `broker-client` for the broker client adapter: a blocking backend connect
+  returning an owned `std::io` stream, plus owned route, refusal-code,
+  refusal-kind, and error values for classifying why a broker declined; the
+  broker implementation stays in the private substrate
 
 The library never installs a global allocator or subscriber by surprise.
 Applications opt in explicitly and can still compile all facilities into one

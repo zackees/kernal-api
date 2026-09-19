@@ -125,6 +125,15 @@ pub mod daemon_registration;
 #[cfg(feature = "daemon-registration-v2")]
 pub mod daemon_registration_v2;
 
+/// Facade-owned broker client: backend connect and refusal classification.
+///
+/// This opt-in adapter keeps the broker implementation in the private
+/// substrate while applications receive owned request, connection, route,
+/// refusal, and error values. Endpoint naming, payload protocols, and fallback
+/// policy remain with callers.
+#[cfg(feature = "broker-client")]
+pub mod broker_client;
+
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 

@@ -175,6 +175,14 @@ the same client operation and no runtime fallback to a second HAL.
   `VerifiedDaemon` terminates only the verified process generation.
   `DaemonIdentityRecord` assembles or inspects an identity field by field; the
   sidecar JSON and probe reply bytes are unchanged and pinned by tests.
+- `broker_client` (feature `broker-client`, opt-in and outside `full`): the
+  broker client adapter. `connect_backend` wraps the substrate's frozen v1
+  Hello/Hello-skip connect and returns an owned `std::io` stream;
+  `BackendRoute`, `RefusalCode` (total `i32` conversion), `RefusalKind`,
+  `BrokerRefusal`, and `BrokerClientError` are owned values, with backend
+  errors converted privately. The broker implementation, its wire, and its
+  round trips stay in `running-process`; endpoint naming, payloads, and
+  fallback policy remain application policy.
 
 Client CI installs the two Dylints in [DYLINT.md](DYLINT.md). They deny direct
 implementation-crate use and host `cfg` selection outside this HAL, including

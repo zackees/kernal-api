@@ -225,7 +225,9 @@ client ban is enabled. There is no permanent legacy fallback in release builds.
 
 The broker daemon implementation remains in `running-process` during the first
 migrations. This avoids combining an architectural cleanup with a wire or
-lifecycle rewrite.
+lifecycle rewrite. Clients reach it through the opt-in `broker_client` adapter
+(feature `broker-client`), which owns the request, connection, route, refusal,
+and error values and converts the substrate's client types privately.
 
 After zccache, Soldr, and fbuild consume the facade successfully, the generic
 broker-daemon pattern should move up into `kernal-api` as a managed-service

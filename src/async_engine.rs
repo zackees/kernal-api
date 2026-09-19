@@ -37,13 +37,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::sync::Notify as BackendNotify;
 
 mod broadcast;
+mod mutex;
 mod race;
 mod rw_lock;
 mod signals;
@@ -54,6 +55,7 @@ pub use broadcast::{
 };
 #[cfg(feature = "event-stream")]
 pub use broadcast::{BroadcastLagged, BroadcastStream};
+pub use mutex::{Mutex, MutexGuard, MutexTryLockError, OwnedMutexGuard};
 #[doc(hidden)]
 pub use race::fair_start as __fair_race_start;
 pub use race::{BiasedRace2, BiasedRace3, BiasedRace4, FairRace2, FairRace3, FairRace4, FairRace5};
@@ -127,6 +129,20 @@ impl<T> Task<T> {
     /// the default itself.
     pub fn detach(mut self) {
         self.detached = true;
+    }
+
+    /// Keep the task running if this handle is later dropped, and return the
+    /// handle.
+    ///
+    /// Unlike [`Task::detach`], the caller keeps the handle: it can still
+    /// await the task's result, ask [`Task::is_finished`], or cancel it
+    /// explicitly with [`Task::cancel`]. Only the implicit cancellation on
+    /// drop is switched off. Use it where a result is wanted when available
+    /// but the work must complete even if the waiter gives up -- a cache
+    /// store that a cancelled request should not abandon half-written.
+    pub fn detach_on_drop(mut self) -> Self {
+        self.detached = true;
+        self
     }
 }
 
@@ -261,6 +277,20 @@ impl RuntimeBuilder {
     /// Set the number of async worker threads.
     pub fn worker_threads(mut self, count: usize) -> Self {
         self.inner.worker_threads(count);
+        self
+    }
+
+    /// Cap the threads the blocking-work lane ([`launch_blocking`]) may use.
+    ///
+    /// The cap excludes the async worker threads. Blocking work submitted
+    /// beyond it queues until a lane thread frees up.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` is zero.
+    pub fn max_blocking_threads(mut self, count: usize) -> Self {
+        assert!(count > 0, "max_blocking_threads must be greater than zero");
+        self.inner.max_blocking_threads(count);
         self
     }
 
@@ -786,21 +816,22 @@ pub struct Cancelled;
 /// producer and its waiters.
 ///
 /// A notification permit is not queued indefinitely: only a waiter already
-/// registered (via a `notified()` call whose future has been polled at least
-/// once) observes a given `notify_one`/`notify_waiters` call. Callers that
+/// registered (via a `notified()` future that has been polled at least once
+/// or [enabled](Notified::enable)) observes a given
+/// `notify_one`/`notify_waiters` call. Callers that
 /// need every state transition observed exactly once should encode that
 /// state explicitly (an atomic flag, a channel) rather than relying on
 /// notification counting.
 #[derive(Debug)]
 pub struct Notify {
-    inner: BackendNotify,
+    inner: Arc<BackendNotify>,
 }
 
 impl Notify {
     /// Create a new notification signal with no permit outstanding.
     pub fn new() -> Self {
         Self {
-            inner: BackendNotify::new(),
+            inner: Arc::new(BackendNotify::new()),
         }
     }
 
@@ -816,9 +847,104 @@ impl Notify {
         self.inner.notify_waiters();
     }
 
-    /// Wait for the next notification.
-    pub async fn notified(&self) {
-        self.inner.notified().await;
+    /// Create a future that completes on the next notification.
+    ///
+    /// The future exists as soon as this returns, but it joins the waiter
+    /// list only when first polled or explicitly [enabled](Notified::enable).
+    /// Enable it before releasing whatever lock guards the state being
+    /// waited for, so a notification sent in between is not lost.
+    pub fn notified(&self) -> Notified<'_> {
+        Notified {
+            inner: self.inner.notified(),
+        }
+    }
+
+    /// [`Self::notified`] for a shared `Notify`, returning a future that owns
+    /// its reference and so may outlive the borrow it was created from --
+    /// stored in a struct or moved into launched work.
+    pub fn owned_notified(self: Arc<Self>) -> OwnedNotified {
+        OwnedNotified {
+            inner: Arc::clone(&self.inner).notified_owned(),
+        }
+    }
+}
+
+/// Future returned by [`Notify::notified`]; completes on a notification.
+#[must_use = "a notification future does nothing unless enabled or awaited"]
+pub struct Notified<'a> {
+    // Structurally pinned: it is never moved out of a pinned `Notified`, and
+    // `Notified` has no `Drop` impl and no manual `Unpin` impl.
+    inner: tokio::sync::futures::Notified<'a>,
+}
+
+impl<'a> Notified<'a> {
+    fn project(self: Pin<&mut Self>) -> Pin<&mut tokio::sync::futures::Notified<'a>> {
+        // SAFETY: `inner` is structurally pinned (see the field comment), so
+        // projecting the pin to it upholds the pinning guarantee.
+        unsafe { self.map_unchecked_mut(|notified| &mut notified.inner) }
+    }
+
+    /// Join the waiter list now, without waiting.
+    ///
+    /// Returns `true` when a notification has already been received, in
+    /// which case awaiting the future completes immediately. Calling it again
+    /// after registration only reports that state.
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        self.project().enable()
+    }
+}
+
+impl Future for Notified<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        self.project().poll(context)
+    }
+}
+
+impl std::fmt::Debug for Notified<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Notified").finish_non_exhaustive()
+    }
+}
+
+/// Future returned by [`Notify::owned_notified`]; completes on a
+/// notification and keeps its `Notify` alive.
+#[must_use = "a notification future does nothing unless enabled or awaited"]
+pub struct OwnedNotified {
+    // Structurally pinned: it is never moved out of a pinned `OwnedNotified`,
+    // and `OwnedNotified` has no `Drop` impl and no manual `Unpin` impl.
+    inner: tokio::sync::futures::OwnedNotified,
+}
+
+impl OwnedNotified {
+    fn project(self: Pin<&mut Self>) -> Pin<&mut tokio::sync::futures::OwnedNotified> {
+        // SAFETY: `inner` is structurally pinned (see the field comment), so
+        // projecting the pin to it upholds the pinning guarantee.
+        unsafe { self.map_unchecked_mut(|notified| &mut notified.inner) }
+    }
+
+    /// Join the waiter list now, without waiting.
+    ///
+    /// Returns `true` when a notification has already been received, in
+    /// which case awaiting the future completes immediately. Calling it again
+    /// after registration only reports that state.
+    pub fn enable(self: Pin<&mut Self>) -> bool {
+        self.project().enable()
+    }
+}
+
+impl Future for OwnedNotified {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        self.project().poll(context)
+    }
+}
+
+impl std::fmt::Debug for OwnedNotified {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("OwnedNotified").finish_non_exhaustive()
     }
 }
 
@@ -874,7 +1000,7 @@ pub struct ProgressReporter {
 
 #[derive(Debug)]
 struct ProgressState {
-    last_progress: Mutex<tokio::time::Instant>,
+    last_progress: StdMutex<tokio::time::Instant>,
     notify: BackendNotify,
 }
 
@@ -892,7 +1018,7 @@ impl ProgressReporter {
     pub fn new() -> Self {
         Self {
             state: Arc::new(ProgressState {
-                last_progress: Mutex::new(tokio::time::Instant::now()),
+                last_progress: StdMutex::new(tokio::time::Instant::now()),
                 notify: BackendNotify::new(),
             }),
         }
@@ -1075,10 +1201,31 @@ pub struct SemaphorePermit {
 ///
 /// Cloning a `Sender` adds another producer; the channel closes for
 /// receiving once every clone (and the original) has been dropped.
-#[derive(Debug)]
 pub struct Sender<T> {
     inner: tokio::sync::mpsc::Sender<T>,
 }
+
+// Channel handles describe themselves without `T: Debug`: the payload type
+// says nothing about the handle, and a derive would stop a struct that holds a
+// sender of an opaque type from deriving `Debug` itself.
+macro_rules! debug_channel_handle {
+    ($($handle:ident),+ $(,)?) => {$(
+        impl<T> std::fmt::Debug for $handle<T> {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.debug_struct(stringify!($handle)).finish_non_exhaustive()
+            }
+        }
+    )+};
+}
+
+debug_channel_handle!(
+    Sender,
+    Receiver,
+    UnboundedSender,
+    UnboundedReceiver,
+    OneshotSender,
+    OneshotReceiver,
+);
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
@@ -1142,7 +1289,6 @@ impl<T> Sender<T> {
 
 /// Receiving half of a bounded, multi-producer channel created by
 /// [`channel`].
-#[derive(Debug)]
 pub struct Receiver<T> {
     inner: tokio::sync::mpsc::Receiver<T>,
 }
@@ -1189,7 +1335,6 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 
 /// Sending half of an unbounded, multi-producer channel created by
 /// [`unbounded_channel`].
-#[derive(Debug)]
 pub struct UnboundedSender<T> {
     inner: tokio::sync::mpsc::UnboundedSender<T>,
 }
@@ -1222,7 +1367,6 @@ impl<T> UnboundedSender<T> {
 
 /// Receiving half of an unbounded, multi-producer channel created by
 /// [`unbounded_channel`].
-#[derive(Debug)]
 pub struct UnboundedReceiver<T> {
     inner: tokio::sync::mpsc::UnboundedReceiver<T>,
 }
@@ -1310,7 +1454,6 @@ pub enum TryRecvError {
 }
 
 /// Sending half of a single-value channel created by [`oneshot_channel`].
-#[derive(Debug)]
 pub struct OneshotSender<T> {
     inner: tokio::sync::oneshot::Sender<T>,
 }
@@ -1337,7 +1480,6 @@ impl<T> OneshotSender<T> {
 /// Awaiting a `OneshotReceiver` resolves once the paired [`OneshotSender`]
 /// sends its value or is dropped; it composes with [`timeout`] and
 /// [`cancellable`] like any other future.
-#[derive(Debug)]
 pub struct OneshotReceiver<T> {
     inner: tokio::sync::oneshot::Receiver<T>,
 }

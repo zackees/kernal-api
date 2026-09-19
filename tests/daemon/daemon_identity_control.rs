@@ -239,6 +239,7 @@ fn this_process_verifies_live_and_for_control() {
     let live = identity.verify_live().expect("this process verifies");
     assert_eq!(live.pid(), std::process::id());
     assert!(live.is_alive());
+    assert!(!live.has_exited().expect("observe a live daemon"));
     assert!(matches!(
         live.force_kill(),
         Err(DaemonVerifyError::ControlNotRetained { pid }) if pid == std::process::id()
@@ -321,13 +322,32 @@ fn verified_child_is_killed_exactly_once() {
         .expect("sleeper verifies for control");
     assert_eq!(verified.pid(), child.id());
     assert!(verified.is_alive());
+    assert!(!verified.has_exited().expect("observe the running sleeper"));
     assert_eq!(
         verified.force_kill().expect("kill verified sleeper"),
         ProcessIdentityAction::Performed
     );
+    // A real daemon is not this process's child, so nothing reaps it here:
+    // the exit must be observable through the retained reference alone,
+    // before (and regardless of) any wait by a parent.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !verified
+        .has_exited()
+        .expect("observe the killed, unreaped sleeper")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a killed daemon must be observed as exited"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let status = child.wait().expect("reap sleeper");
     assert!(!status.success());
     assert!(!verified.is_alive(), "the retained reference sees the exit");
+    assert!(
+        verified.has_exited().expect("observe the killed sleeper"),
+        "the fallible observation reports the exit, not an error"
+    );
     assert!(
         !matches!(verified.force_kill(), Ok(ProcessIdentityAction::Performed)),
         "a second kill never reaches another process"

@@ -1030,14 +1030,20 @@ pub struct ProcessOutputFault {
 }
 
 impl ProcessOutputFault {
-    pub(crate) fn new(
+    /// Describe an output-stream failure from its portable parts.
+    ///
+    /// Sessions construct these themselves; this is public so a consumer can
+    /// build the fault its own handling code receives -- to test how it turns
+    /// a [`ProcessOutputCompletion::StdoutError`] into its own error type,
+    /// say -- without provoking a real pipe failure.
+    pub fn new(
         kind: std::io::ErrorKind,
-        message: String,
+        message: impl Into<String>,
         raw_os_error: Option<i32>,
     ) -> Self {
         Self {
             kind,
-            message,
+            message: message.into(),
             raw_os_error,
         }
     }

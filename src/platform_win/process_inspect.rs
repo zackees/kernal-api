@@ -3,10 +3,12 @@
 use std::io;
 use std::path::PathBuf;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
 
 use super::process_exit_watch::{has_already_exited, KernelHandle, SYNCHRONIZE};
@@ -129,6 +131,39 @@ impl ProcessLiveness {
         let ok = unsafe { GetExitCodeProcess(self.process.0, &mut exit_code) };
         ok != 0 && exit_code == STILL_ACTIVE
     }
+
+    /// Whether that process has exited, or why the host could not tell.
+    ///
+    /// Where [`Self::is_alive`] folds every failed observation into "not
+    /// alive", this reports it: `Err` means the question itself failed, and
+    /// says nothing about the process. The retained handle is asked with a
+    /// zero-length wait where it carries `SYNCHRONIZE`, and through
+    /// `GetExitCodeProcess` otherwise -- where, as for [`Self::is_alive`], an
+    /// exit with code 259 is indistinguishable from running and is reported
+    /// as not exited.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        if self.waitable {
+            // SAFETY: the handle is live for this value's lifetime and was
+            // opened with SYNCHRONIZE; a zero timeout makes this a question
+            // rather than a wait.
+            let waited = unsafe { WaitForSingleObject(self.process.0, 0) };
+            return match waited {
+                WAIT_OBJECT_0 => Ok(true),
+                WAIT_TIMEOUT => Ok(false),
+                WAIT_FAILED => Err(io::Error::last_os_error()),
+                other => Err(io::Error::other(format!(
+                    "unexpected process wait result {other:#x}"
+                ))),
+            };
+        }
+        let mut exit_code = 0_u32;
+        // SAFETY: the handle is live for this value's lifetime and the
+        // out-parameter is a valid initialised u32.
+        if unsafe { GetExitCodeProcess(self.process.0, &mut exit_code) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(exit_code != STILL_ACTIVE)
+    }
 }
 
 /// Resolve the on-disk image a running process was started from.
@@ -234,6 +269,25 @@ mod tests {
         let handle = ProcessLiveness::open(child.id()).expect("open child");
         child.wait().expect("wait");
         assert!(!handle.is_alive(), "an exited child must report dead");
+        assert!(handle.has_exited().expect("observe exit"));
+    }
+
+    /// The fallible question agrees with the infallible one on both paths.
+    #[test]
+    fn has_exited_answers_through_both_handle_kinds() {
+        let me = ProcessLiveness::open(std::process::id()).expect("open self");
+        assert!(!me.has_exited().expect("observe self"));
+
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/C", "exit 3"])
+            .spawn()
+            .expect("spawn");
+        let waitable = ProcessLiveness::open(child.id()).expect("open child");
+        let mut query_only = ProcessLiveness::open(child.id()).expect("open child");
+        query_only.waitable = false;
+        child.wait().expect("wait");
+        assert!(waitable.has_exited().expect("wait-based observation"));
+        assert!(query_only.has_exited().expect("exit-code observation"));
     }
 
     /// 259 is a legal exit code, and an exit is an exit whichever number it
@@ -283,6 +337,7 @@ mod tests {
             handle.is_alive(),
             "the fallback cannot tell 259 from STILL_ACTIVE, and says so"
         );
+        assert!(!handle.has_exited().expect("exit-code observation"));
     }
 
     /// Asking politely is not silently upgraded to terminating.

@@ -16,6 +16,10 @@ use crate::platform::process::{ProcessId, ProcessInspectError, ProcessInspectErr
 pub struct ProcessLiveness {
     pid: u32,
     pid_fd: Option<OwnedFd>,
+    /// `/proc` start ticks captured at open, only on the no-pidfd fallback,
+    /// so a later exit question can tell the opened process from a successor
+    /// that was handed the same PID.
+    start_ticks: Option<u64>,
 }
 
 impl std::fmt::Debug for ProcessLiveness {
@@ -38,9 +42,18 @@ impl ProcessLiveness {
         if !process_exists(pid) {
             return Err(not_found());
         }
+        let pid_fd = try_pidfd_open(pid)?;
+        // Best effort: `/proc` may be mounted `hidepid`, and opening has never
+        // depended on reading it. Without a capture the fallback exit check
+        // can only ask whether the PID is in use.
+        let start_ticks = match pid_fd {
+            Some(_) => None,
+            None => read_proc_stat(pid).ok().flatten().map(|stat| stat.start_ticks),
+        };
         Ok(Self {
             pid,
-            pid_fd: try_pidfd_open(pid)?,
+            pid_fd,
+            start_ticks,
         })
     }
 
@@ -56,6 +69,83 @@ impl ProcessLiveness {
             None => process_exists(self.pid),
         }
     }
+
+    /// Whether that process has exited, or why the host could not tell.
+    ///
+    /// Where [`Self::is_alive`] folds every failed observation into "not
+    /// alive", this reports it: `Err` means the question itself failed, and
+    /// says nothing about the process. With a pidfd the answer comes from a
+    /// zero-timeout poll of that descriptor. Without one, `kill(pid, 0)` asks
+    /// whether the PID is in use, and the `/proc` start ticks captured at
+    /// open decide whether it is still in use by the opened process: a zombie
+    /// or a different start time means it exited. Where open could not read
+    /// `/proc`, an in-use PID is reported as not exited -- the same limit
+    /// [`Self::is_alive`] has on such a host.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        match self.pid_fd.as_ref() {
+            Some(pid_fd) => pidfd_has_exited(pid_fd),
+            None => self.pid_has_exited(),
+        }
+    }
+
+    fn pid_has_exited(&self) -> io::Result<bool> {
+        let native_pid = validate_pid(self.pid).map_err(|error| error.source)?;
+        // SAFETY: `native_pid` is in range; signal 0 delivers nothing.
+        if unsafe { libc::kill(native_pid, 0) } != 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => return Ok(true),
+                // Present but not ours to signal: still a process, so fall
+                // through to the identity check.
+                Some(libc::EPERM) => {}
+                _ => return Err(error),
+            }
+        }
+        let Some(start_ticks) = self.start_ticks else {
+            return Ok(false);
+        };
+        match read_proc_stat(self.pid)? {
+            None => Ok(true),
+            Some(stat) => Ok(stat.is_zombie || stat.start_ticks != start_ticks),
+        }
+    }
+}
+
+/// The two `/proc/<pid>/stat` fields an exit question needs.
+struct ProcStat {
+    is_zombie: bool,
+    start_ticks: u64,
+}
+
+/// Read `/proc/<pid>/stat`; `Ok(None)` when no such process exists.
+fn read_proc_stat(pid: u32) -> io::Result<Option<ProcStat>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        // ESRCH surfaces when the process vanishes between open and read.
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error),
+    };
+    parse_proc_stat(&stat)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed /proc process stat"))
+}
+
+fn parse_proc_stat(stat: &str) -> Option<ProcStat> {
+    // `comm` is parenthesised and may contain spaces or ')'; only the final
+    // ')' starts the fixed-position fields.
+    let suffix = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = suffix.split_ascii_whitespace();
+    let state = fields.next()?; // field 3
+    let start_ticks = fields.nth(18)?.parse().ok()?; // field 22
+    Some(ProcStat {
+        is_zombie: matches!(state, "Z" | "X" | "x"),
+        start_ticks,
+    })
 }
 
 /// Resolve the on-disk image a running process was started from.
@@ -136,6 +226,40 @@ fn try_pidfd_open(pid: u32) -> Result<Option<OwnedFd>, ProcessInspectError> {
 }
 
 /// A pidfd becomes readable exactly when its process exits.
+///
+/// `EINTR` is retried; any other poll failure, or a descriptor the kernel
+/// reports as invalid or in error, is returned rather than guessed at.
+fn pidfd_has_exited(pid_fd: &OwnedFd) -> io::Result<bool> {
+    loop {
+        let mut poll_fd = libc::pollfd {
+            fd: pid_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd is described, and the zero timeout
+        // makes this a poll rather than a wait.
+        let rc = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        if poll_fd.revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
+            return Err(io::Error::other(format!(
+                "pidfd poll reported an error condition (revents {:#x})",
+                poll_fd.revents
+            )));
+        }
+        return Ok(poll_fd.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+    }
+}
+
+/// A pidfd becomes readable exactly when its process exits.
 fn pidfd_is_alive(pid_fd: &OwnedFd) -> bool {
     let mut poll_fd = libc::pollfd {
         fd: pid_fd.as_raw_fd(),
@@ -192,6 +316,54 @@ mod tests {
         let mut child = child;
         child.wait().expect("reap");
         assert!(!handle.is_alive(), "a reaped child must report dead");
+        assert!(handle.has_exited().expect("observe exit"));
+    }
+
+    /// The no-pidfd fallback answers from `kill(pid, 0)` plus the start
+    /// ticks captured at open, so a PID now owned by another process -- here
+    /// simulated by a mismatched capture -- reads as exited, not alive.
+    #[test]
+    fn the_pid_fallback_detects_exit_and_a_successor() {
+        let me = std::process::id();
+        let start_ticks = read_proc_stat(me).expect("stat").expect("self").start_ticks;
+        let live = ProcessLiveness {
+            pid: me,
+            pid_fd: None,
+            start_ticks: Some(start_ticks),
+        };
+        assert!(!live.has_exited().expect("observe self"));
+
+        let successor = ProcessLiveness {
+            pid: me,
+            pid_fd: None,
+            start_ticks: Some(start_ticks.wrapping_add(1)),
+        };
+        assert!(successor.has_exited().expect("observe successor"));
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let start_ticks = read_proc_stat(pid).expect("stat").map(|stat| stat.start_ticks);
+        let handle = ProcessLiveness {
+            pid,
+            pid_fd: None,
+            start_ticks,
+        };
+        child.wait().expect("reap");
+        assert!(handle.has_exited().expect("observe reaped child"));
+    }
+
+    /// `comm` may itself contain `) ` and spaces; the fixed fields follow the
+    /// last `)`.
+    #[test]
+    fn proc_stat_parsing_survives_a_hostile_comm() {
+        let fields: Vec<String> = (4..=22).map(|field| field.to_string()).collect();
+        let stat = format!("42 (a) b) c) Z {}", fields.join(" "));
+        let parsed = parse_proc_stat(&stat).expect("parse");
+        assert!(parsed.is_zombie);
+        assert_eq!(parsed.start_ticks, 22);
     }
 }
 

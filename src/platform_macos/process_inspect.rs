@@ -58,6 +58,20 @@ impl ProcessLiveness {
         !self.exited.load(Ordering::Relaxed)
             && kqueue_process_is_alive(&self.exit_kqueue, &self.exited)
     }
+
+    /// Whether that process has exited, or why the host could not tell.
+    ///
+    /// Where [`Self::is_alive`] folds every failed observation into "not
+    /// alive", this reports it: `Err` means the question itself failed, and
+    /// says nothing about the process. The answer comes from a zero-timeout
+    /// read of the `NOTE_EXIT` subscription taken at open, latched once seen
+    /// exactly as [`Self::is_alive`] latches it.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        if self.exited.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        kqueue_process_has_exited(&self.exit_kqueue, &self.exited)
+    }
 }
 
 /// Resolve the on-disk image a running process was started from.
@@ -171,6 +185,50 @@ fn open_exit_kqueue(pid: u32) -> Result<OwnedFd, ProcessInspectError> {
     }
 }
 
+/// Collect a pending `NOTE_EXIT` without waiting.
+///
+/// `EINTR` is retried; any other `kevent` failure, or an `EV_ERROR` event, is
+/// returned rather than read as an exit.
+fn kqueue_process_has_exited(kqueue_fd: &OwnedFd, exited: &AtomicBool) -> io::Result<bool> {
+    loop {
+        let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+        let timeout = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: no changes are submitted, room for one event is provided,
+        // and the zero timeout makes this a poll rather than a wait.
+        let rc = unsafe {
+            libc::kevent(
+                kqueue_fd.as_raw_fd(),
+                ptr::null(),
+                0,
+                event.as_mut_ptr(),
+                1,
+                &timeout,
+            )
+        };
+        if rc < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if rc == 0 {
+            return Ok(false);
+        }
+        // SAFETY: `kevent` reported one collected event, so it wrote it.
+        let event = unsafe { event.assume_init() };
+        if event.flags & libc::EV_ERROR != 0 {
+            return Err(io::Error::from_raw_os_error(event.data as i32));
+        }
+        // The only subscription on this queue is `NOTE_EXIT`.
+        exited.store(true, Ordering::Relaxed);
+        return Ok(true);
+    }
+}
+
 fn kqueue_process_is_alive(kqueue_fd: &OwnedFd, exited: &AtomicBool) -> bool {
     let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
     let timeout = libc::timespec {
@@ -238,6 +296,24 @@ mod tests {
         child.wait().expect("reap");
         assert!(!handle.is_alive(), "a reaped child must report dead");
         assert!(!handle.is_alive(), "and must still report dead");
+        assert!(handle.has_exited().expect("observe the latched exit"));
+    }
+
+    /// The fallible question collects the exit itself and latches it too.
+    #[test]
+    fn has_exited_observes_and_latches_an_exit() {
+        let me = ProcessLiveness::open(std::process::id()).expect("open self");
+        assert!(!me.has_exited().expect("observe self"));
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn");
+        let handle = ProcessLiveness::open(child.id()).expect("open child");
+        child.wait().expect("reap");
+        assert!(handle.has_exited().expect("observe exit"));
+        assert!(handle.has_exited().expect("observe the latched exit"));
+        assert!(!handle.is_alive());
     }
 }
 

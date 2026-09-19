@@ -43,6 +43,28 @@ impl VerifiedDaemon {
         self.liveness.is_alive()
     }
 
+    /// Whether the verified daemon instance has exited, or why the host could
+    /// not tell.
+    ///
+    /// [`Self::is_alive`] is a convenience predicate that reads any failed
+    /// observation as "not alive". Cleanup that follows [`Self::force_kill`]
+    /// -- removing a lock file, retiring an endpoint -- needs the stronger
+    /// answer: `Ok(true)` only when the retained process reference observed
+    /// the exit, `Ok(false)` while it is still running, and `Err` when the
+    /// observation itself failed, which says nothing about the daemon.
+    ///
+    /// The question is asked through the reference retained at verification
+    /// (a pidfd, a kqueue exit subscription, or an open process handle), never
+    /// by reopening the PID, so a successor that reuses the PID is not
+    /// mistaken for the daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host failure when the exit could not be observed.
+    pub fn has_exited(&self) -> io::Result<bool> {
+        self.liveness.has_exited()
+    }
+
     /// Forcibly terminate exactly the verified daemon instance.
     ///
     /// Only values produced by [`DaemonIdentity::verify_for_control`] retain

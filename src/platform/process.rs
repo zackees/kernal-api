@@ -517,6 +517,31 @@ pub enum SyncEnvironment {
     Inherit,
     /// Start with this complete, caller-assembled base environment.
     Explicit(Vec<(std::ffi::OsString, std::ffi::OsString)>),
+    /// Start with the logged-in user's baseline environment, as a fresh login
+    /// would have it, instead of the spawning process's ambient environment.
+    ///
+    /// Resolved at spawn time through [`crate::platform::host::login_environment`]:
+    /// Windows builds it from machine and user settings; Unix rebuilds it from
+    /// the passwd entry (`USER`, `LOGNAME`, `HOME`, `SHELL`, the platform
+    /// default `PATH`, and the carried-over locale, time-zone, and temporary
+    /// directory variables). This is the base a long-lived daemon wants: it
+    /// does not inherit whatever a particular launching shell or build tool
+    /// happened to export. Values the daemon does need must be set
+    /// explicitly on the command.
+    UserBaseline,
+}
+
+impl SyncEnvironment {
+    /// The complete base environment, or `None` to inherit the ambient one.
+    pub(crate) fn into_base(
+        self,
+    ) -> std::io::Result<Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>> {
+        match self {
+            Self::Inherit => Ok(None),
+            Self::Explicit(base) => Ok(Some(base)),
+            Self::UserBaseline => crate::platform::host::login_environment().map(Some),
+        }
+    }
 }
 
 /// Private, facade-owned bounds for one contained worker process tree.

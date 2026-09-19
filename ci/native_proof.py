@@ -54,46 +54,41 @@ GUEST_BUILDING_SCREENSHOT_TEST = "default_screenshot_cli_uses_containment_and_co
 PARENT_DEATH_TEST = "failure_proof::d4_parent_death_kills_exact_worker"
 
 
+# Two `cargo test --no-run` feature graphs yield every proof executable.
+#
+# `all` is the graph the full test suite and the test archive already build
+# (`--all-features`), so on a builder that has run them it costs nothing.
+# `production` is the one graph whose distinctness is the proof: the
+# containment proofs run the worker binary a production build ships, without
+# `wasm-sketch-worker-test-support` hooks or `tauri-webview`, and the
+# admission proof shows a guest cannot reach the webview when the webview is
+# not compiled in at all.
+GRAPHS = {
+    "all": ("--all-features", "--lib", "--test", "wasm_tauri_screenshot", "--test", "wasm_worker_containment"),
+    "production": (
+        "--features", "wasm-sketch-worker", "--test", "wasm_tauri_screenshot", "--test", "wasm_worker_containment",
+    ),
+}
+
+
 @dataclass(frozen=True)
 class Role:
-    """One `cargo test --no-run` feature graph and the executables it yields."""
+    """One proof harness, and the binaries it drives, from one feature graph."""
 
     name: str
-    cargo: tuple[str, ...]
+    graph: str
     test_target: str
     bins: tuple[str, ...] = ()
 
 
 ROLES = (
-    # Also runs the threaded artifact admission test: `default = []`, so this
-    # is the graph `cargo test --features wasm-sketch-host --lib` compiles.
-    Role("compiler-host", ("--no-default-features", "--features", "wasm-sketch-host", "--lib"), "kernal_api"),
-    Role(
-        "component-host",
-        ("--no-default-features", "--features", "wasm-sketch-host,wasm-component-compiler-experiment", "--lib"),
-        "kernal_api",
-    ),
-    Role(
-        "screenshot",
-        ("--features", "wasm-sketch-worker,tauri-webview-test-support", "--test", "wasm_tauri_screenshot"),
-        "wasm_tauri_screenshot",
-        ("kernal-wasm-worker", "kernal-api-wasm-tauri"),
-    ),
-    Role("screenshot-admission", ("--features", "wasm-sketch-host", "--test", "wasm_tauri_screenshot"), "wasm_tauri_screenshot"),
-    # The production worker and the test-support worker are separate graphs on
-    # purpose: each containment proof runs against the binary it describes.
-    Role(
-        "worker-containment",
-        ("--features", "wasm-sketch-worker", "--test", "wasm_worker_containment"),
-        "wasm_worker_containment",
-        ("kernal-wasm-worker",),
-    ),
-    Role(
-        "worker-containment-support",
-        ("--features", "wasm-sketch-worker-test-support", "--test", "wasm_worker_containment"),
-        "wasm_worker_containment",
-        ("kernal-wasm-worker",),
-    ),
+    # The library harness also runs the threaded artifact admission test.
+    Role("compiler-host", "all", "kernal_api"),
+    Role("component-host", "all", "kernal_api"),
+    Role("screenshot", "all", "wasm_tauri_screenshot", ("kernal-wasm-worker", "kernal-api-wasm-tauri")),
+    Role("screenshot-admission", "production", "wasm_tauri_screenshot"),
+    Role("worker-containment", "production", "wasm_worker_containment", ("kernal-wasm-worker",)),
+    Role("worker-containment-support", "all", "wasm_worker_containment", ("kernal-wasm-worker",)),
 )
 
 GUESTS = {
@@ -244,18 +239,27 @@ def build(target: str, archive: Path, work: Path) -> None:
     if bundle.exists():
         raise ValueError("bundle staging directory already exists; refusing stale binaries")
     manifest: dict = {"target": target, "roles": {}}
-    for role in ROLES:
+    staged: dict[tuple[str, Path], str] = {}
+
+    def stage_once(graph: str, executable: Path) -> str:
+        # Roles sharing a graph share its executables; ship each one once.
+        key = (graph, executable)
+        if key not in staged:
+            staged[key] = stage(executable, bundle, graph)
+        return staged[key]
+
+    for graph, cargo in GRAPHS.items():
         messages = capture(
-            ["soldr", "cargo", "test", "--locked", "--no-run", "--message-format=json", *target_arguments, *role.cargo]
+            ["soldr", "cargo", "test", "--locked", "--no-run", "--message-format=json", *target_arguments, *cargo]
         )
-        entry = {
-            "test": stage(select_executable(messages, role.test_target, test=True), bundle, role.name),
-            "bins": {
-                binary: stage(select_executable(messages, binary, test=False, kind="bin"), bundle, role.name)
-                for binary in role.bins
-            },
-        }
-        manifest["roles"][role.name] = entry
+        for role in (role for role in ROLES if role.graph == graph):
+            manifest["roles"][role.name] = {
+                "test": stage_once(graph, select_executable(messages, role.test_target, test=True)),
+                "bins": {
+                    binary: stage_once(graph, select_executable(messages, binary, test=False, kind="bin"))
+                    for binary in role.bins
+                },
+            }
     tools = capture(
         [
             "soldr", "cargo", "build", "--locked", "--release", "--message-format=json",

@@ -55,11 +55,15 @@ class FakeCargo:
         if "benchmarks/wasm-sketch/component-tools/Cargo.toml" in arguments:
             lines.append(compiler_artifact("kernal-component-tools", executable("kernal-component-tools")))
             return "\n".join(lines)
-        role = next(role for role in proof.ROLES if arguments[-len(role.cargo):] == list(role.cargo))
+        graph = next(name for name, cargo in proof.GRAPHS.items() if arguments[-len(cargo):] == list(cargo))
+        roles = [role for role in proof.ROLES if role.graph == graph]
         # The library itself is never selected as a test harness.
         lines.append(json.dumps({"reason": "compiler-artifact", "target": {"name": "kernal_api", "kind": ["lib"]}, "profile": {"test": False}, "executable": None}))
-        lines.append(compiler_artifact(role.test_target, executable(f"{role.test_target}-0123"), test=True, kind="test"))
-        lines.extend(compiler_artifact(binary, executable(binary)) for binary in role.bins)
+        # Cargo reports each unit once per graph, however many roles use it.
+        for test_target in dict.fromkeys(role.test_target for role in roles):
+            lines.append(compiler_artifact(test_target, executable(f"{test_target}-0123"), test=True, kind="test"))
+        for binary in dict.fromkeys(binary for role in roles for binary in role.bins):
+            lines.append(compiler_artifact(binary, executable(binary)))
         return "\n".join(lines)
 
 
@@ -154,9 +158,10 @@ class BuildTests(unittest.TestCase):
         manifest = json.loads((extracted / proof.MANIFEST).read_text())
         return [call for call in fake.calls if call[:2] == ["soldr", "cargo"]], manifest, extracted
 
-    def test_cross_build_compiles_every_role_for_the_target_and_packs_it(self):
+    def test_cross_build_compiles_each_graph_once_for_the_target_and_packs_it(self):
         cargo, manifest, extracted = self.build("aarch64-pc-windows-msvc", "x86_64-unknown-linux-gnu")
-        self.assertEqual(len(cargo), len(proof.ROLES) + 1)
+        # One compile per feature graph plus the Component tools, not one per role.
+        self.assertEqual(len(cargo), len(proof.GRAPHS) + 1)
         for command in cargo:
             self.assertIn("--locked", command)
             self.assertNotIn("--no-cache", command)
@@ -172,11 +177,31 @@ class BuildTests(unittest.TestCase):
         for relative in staged:
             self.assertTrue((extracted / relative).is_file(), relative)
         # Each containment graph ships the worker it was compiled with.
+        roles = manifest["roles"]
         self.assertNotEqual(
-            (extracted / manifest["roles"]["worker-containment"]["bins"]["kernal-wasm-worker"]).read_text(),
-            "",
+            roles["worker-containment"]["bins"]["kernal-wasm-worker"],
+            roles["worker-containment-support"]["bins"]["kernal-wasm-worker"],
         )
-        self.assertEqual(len(set(staged)), len(staged))
+        # Roles sharing a graph share its files; nothing is staged twice.
+        self.assertEqual(roles["compiler-host"]["test"], roles["component-host"]["test"])
+        self.assertEqual(
+            roles["screenshot"]["bins"]["kernal-wasm-worker"],
+            roles["worker-containment-support"]["bins"]["kernal-wasm-worker"],
+        )
+        self.assertEqual(sorted(path.relative_to(extracted).as_posix() for path in extracted.rglob("*") if path.is_file()),
+                         sorted(set(staged) | {proof.MANIFEST}))
+
+    def test_the_production_graph_is_the_only_one_not_shared_with_the_suite(self):
+        """Every graph but `production` is the all-features one the suite builds."""
+        self.assertEqual(set(proof.GRAPHS), {"all", "production"})
+        self.assertEqual(proof.GRAPHS["all"][0], "--all-features")
+        production = proof.GRAPHS["production"]
+        self.assertNotIn("--all-features", production)
+        self.assertEqual(production[production.index("--features") + 1], "wasm-sketch-worker")
+        # The containment and admission proofs are the production graph's reason to exist.
+        by_name = {role.name: role for role in proof.ROLES}
+        self.assertEqual(by_name["worker-containment"].graph, "production")
+        self.assertEqual(by_name["screenshot-admission"].graph, "production")
 
     def test_native_linux_build_links_the_host_abi(self):
         cargo, manifest, _ = self.build("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu")

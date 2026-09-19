@@ -199,10 +199,6 @@ jobs:
         run: |
           soldr cargo check --locked --manifest-path tests/daemon-registration-consumer/Cargo.toml
           soldr cargo check --locked --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
-      - name: Build the source-only threaded guest and validate root execution
-        env:
-          CARGO_TARGET_DIR: ${{ runner.temp }}/kernal-api-threaded-smoke
-        run: bash scripts/build-threaded-smoke.sh
       - name: Run real semantic webview lifecycle and capture proofs
         # A unit test does not own process main on every harness, while Tauri
         # needs its event loop there, so these run the smoke binary under Xvfb.
@@ -212,22 +208,22 @@ jobs:
           NO_AT_BRIDGE: "1"
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- close
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- bootstrap
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- bootstrap
           # Expand fixture variables inside the child Bash, not this step shell.
           # shellcheck disable=SC2016
           dbus-run-session -- xvfb-run -a bash -c '
-            soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- popup & proof=$!;
+            soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- popup & proof=$!;
             for _ in $(seq 1 50); do window=$(xdotool search --name "kernal-api external-content proof" | head -1 || true); [ -n "$window" ] && break; sleep 0.1; done;
             test -n "$window"; sleep 1; xdotool mousemove --window "$window" 150 150 click 1; wait "$proof"'
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- redirect
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- timeout
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- cancel
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- window-close
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- capture-cancel
-          dbus-run-session -- xvfb-run -a soldr cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -- open-cancel
-          dbus-run-session -- xvfb-run -a soldr cargo test --locked --features tauri-webview --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- redirect
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- timeout
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- window-close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- capture
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- capture-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- open-cancel
+          dbus-run-session -- xvfb-run -a soldr cargo test --locked --all-features --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
       - name: Install the screenshot guest target
         run: uv run --no-project ci/native_proof.py wasm-target wasm32-wasip1-threads
       - name: Build, admit, and run the real guest through the default screenshot CLI
@@ -240,7 +236,7 @@ jobs:
         run: |
           # The CLI starts Soldr itself. Finish the outer Soldr invocation
           # before running the harness; never disable its reentry guard.
-          test_executable="$(soldr cargo test --locked --features wasm-sketch-worker,tauri-webview-test-support --test wasm_tauri_screenshot --no-run --message-format=json |
+          test_executable="$(soldr cargo test --locked --all-features --test wasm_tauri_screenshot --no-run --message-format=json |
             jq -er -s '[.[] | select(.reason == "compiler-artifact" and .target.name == "wasm_tauri_screenshot" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected exactly one screenshot test executable") end')"
           dbus-run-session -- xvfb-run -a "$test_executable" default_screenshot_cli_uses_containment_and_commits_output --exact --ignored --nocapture --test-threads=1 | tee "$RUNNER_TEMP/screenshot-cli.log"
           grep -F "test result: ok. 1 passed; 0 failed;" "$RUNNER_TEMP/screenshot-cli.log"

@@ -20,7 +20,7 @@ the screenshot lifecycle starts. The map uses a deterministic standard hasher
 and the channel reads are non-blocking after join: the closed profile therefore
 adds neither ambient `random_get` nor `poll_oneoff` imports.
 
-The source fixture uses an exact `=0.1.15` version plus a **migration-only local
+The source fixture uses an exact `=0.1.16` version plus a **migration-only local
 path**; it must switch to an actually published guest-capable release before
 release acceptance. The packaged facade has separately passed a Wasm check,
 but this is not evidence that the guest-capable package has been published.

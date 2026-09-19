@@ -3,12 +3,13 @@
 //! An executable's Explorer icon, version information and application manifest
 //! are resources linked into that executable. Cargo links a build script's
 //! resources only into the binaries of the package that runs it, so an
-//! application depends on this package as a build-dependency and calls
-//! [`embed_windows_app_resources`] from its `build.rs`. On every other target
-//! the call does nothing.
+//! application depends on kernal-api as a build-dependency, with
+//! `default-features = false` and only the `windows-resources` feature, and
+//! calls [`embed_windows_app_resources`] from its `build.rs`. On every other
+//! target the call does nothing.
 //!
 //! ```no_run
-//! use kernal_api_build::{embed_windows_app_resources, WindowsAppResources};
+//! use kernal_api::windows_resources::{embed_windows_app_resources, WindowsAppResources};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let resources = WindowsAppResources::new("Example Viewer", "example", env!("CARGO_PKG_VERSION"))?

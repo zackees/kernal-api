@@ -2758,7 +2758,7 @@ dependencies = [
 
 [[package]]
 name = "kernal-api"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "addr2line 0.24.2",
  "blake3",
@@ -2771,6 +2771,7 @@ dependencies = [
  "console-subscriber",
  "crash-handler",
  "dirs 6.0.0",
+ "embed-resource",
  "flate2",
  "framehop",
  "futures-core",
@@ -2847,13 +2848,6 @@ dependencies = [
  "x11rb",
  "zip",
  "zstd",
-]
-
-[[package]]
-name = "kernal-api-build"
-version = "0.1.17"
-dependencies = [
- "embed-resource",
 ]
 
 [[package]]

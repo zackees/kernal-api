@@ -16,6 +16,7 @@ import sys
 CASES = (
     ("pty", "portable-pty"),
     ("text-similarity", "strsim"),
+    ("windows-resources", "embed-resource"),
     ("command-arguments", "shell-words"),
     ("json", "serde_json"),
     ("source-cpp", "tree-sitter"),

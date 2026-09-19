@@ -1,6 +1,6 @@
 [package]
 name = "kernal-api"
-version = "0.1.17"
+version = "0.1.18"
 build = "build.rs"
 edition = "2021"
 rust-version = "1.95.0"
@@ -84,6 +84,13 @@ secure-random = ["dep:getrandom"]
 # migrations, and scheduling policy; run this facade on a kernel blocking worker.
 sqlite = ["dep:rusqlite", "dep:tempfile"]
 text-similarity = ["dep:strsim"]
+# Windows executable resources (icon, version information, Common-Controls v6
+# manifest) for an application's own build script. An application depends on
+# kernal-api a second time as a build-dependency with `default-features =
+# false` and only this feature; it must enable its runtime features on the
+# normal dependency declaration, not through `kernal-api/feature` entries in
+# its own feature table, which Cargo applies to the build-dependency as well.
+windows-resources = ["dep:embed-resource"]
 command-arguments = ["dep:shell-words"]
 command-schema = ["dep:clap"]
 # Owned, bounded application-error context without a third-party error carrier.
@@ -289,6 +296,7 @@ futures-core = { version = "=0.3.34", optional = true }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink"], optional = true }
 getrandom = { version = "=0.4.3", optional = true }
 strsim = { version = "=0.11.1", optional = true }
+embed-resource = { version = "=3.0.11", optional = true }
 toml = { version = "=0.8.23", optional = true }
 shell-words = { version = "=1.1.1", optional = true }
 clap = { version = "=4.6.0", features = ["std", "string"], optional = true }
@@ -498,11 +506,6 @@ targets = [
 workspace = true
 
 [workspace]
-# The build-script companion is a separate package, not a feature: a
-# `dep-name/feature-name` entry in an application applies to every
-# dependency of that name, so a feature here would drag this crate's
-# runtime capabilities into the application's host build script.
-members = ["crates/kernal-api-build"]
 exclude = ["src/wasm/generated/v1/guest"]
 
 # Every warning is an error, in every build of every package here: CI, local

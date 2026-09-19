@@ -33,26 +33,32 @@ fn crash_handler_is_locked_at_exactly_one_version() {
     assert_eq!(versions, ["\"0.7.0\""]);
 }
 
-/// The build-script companion is released from this repository under the same
-/// tag, so a version bump that forgets it would ship a package claiming an
-/// older release.
+/// Windows resource embedding runs in an application's build script, where the
+/// application depends on this crate a second time with only this feature. It
+/// therefore stays opt-in, out of `full`, and free of every other feature, so
+/// the build-dependency compiles nothing but the resource compiler beyond the
+/// crate's native base.
 #[test]
-fn build_companion_version_matches_the_facade() {
+fn windows_resources_is_a_standalone_opt_in_feature() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let version = |manifest: &str| {
-        manifest
-            .lines()
-            .find_map(|line| line.trim_end().strip_prefix("version = "))
-            .expect("manifest version")
-            .to_owned()
-    };
-    let facade = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
-    let companion = std::fs::read_to_string(root.join("crates/kernal-api-build/Cargo.toml"))
-        .expect("read companion manifest");
-    assert_eq!(
-        version(&companion),
-        version(&facade),
-        "crates/kernal-api-build must carry the same version as kernal-api"
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains("windows-resources = [\"dep:embed-resource\"]\n"),
+        "windows-resources must select only the resource compiler"
+    );
+    let full = manifest
+        .split("full = [")
+        .nth(1)
+        .and_then(|tail| tail.split(']').next())
+        .expect("locate full feature");
+    assert!(
+        !full.contains("windows-resources"),
+        "full must not pull build-script resource embedding into runtime builds"
+    );
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        lib.contains("#[cfg(feature = \"windows-resources\")]\npub mod windows_resources;"),
+        "default builds must omit the Windows resources module"
     );
 }
 
@@ -100,6 +106,7 @@ fn implementation_crates_are_not_publicly_reexported() {
         "pub use console_api",
         "pub use console_subscriber",
         "pub use crash_handler",
+        "pub use embed_resource",
         "pub use framehop",
         "pub use globset",
         "pub use interprocess",

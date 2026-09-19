@@ -98,7 +98,7 @@ descendant teardown, or fresh evidence on the other five targets.
 Until 1.0, the four first-party clients use an exact Cargo requirement:
 
 ```toml
-kernal-api = { version = "=0.1.17", features = ["..."] }
+kernal-api = { version = "=0.1.18", features = ["..."] }
 
 [profile.dev.package.kernal-api]
 codegen-units = 1
@@ -107,7 +107,7 @@ codegen-units = 1
 codegen-units = 1
 ```
 
-The Python companion is likewise pinned with `kernal-api==0.1.17` when used by
+The Python companion is likewise pinned with `kernal-api==0.1.18` when used by
 first-party Python tooling. A source checkout may temporarily use a path patch
 only on an explicit migration branch; release branches must resolve the exact
 registry version. There is no `optional = true` legacy implementation behind
@@ -211,15 +211,15 @@ the same client operation and no runtime fallback to a second HAL.
   copy. `platform::window_icon`, `set_window_icon_impl` and
   `window_icon_support_impl` were available on the default feature set before
   this release; enabling `window-icon` is required as of it.
-- `kernal-api-build` (separate package in `crates/kernal-api-build`, released
-  from this repository under the same tag): build-script embedding of a
-  Windows executable's icon, version information and Common-Controls v6
-  manifest. Applications add it as a build-dependency and call it from their
-  own `build.rs`; the resource compiler and its backend stay private, and
-  non-Windows targets are a no-op. It is a package rather than a feature
-  because a `dep-name/feature-name` entry applies to every dependency of that
-  name, which would compile this crate's runtime capabilities for the host
-  build script.
+- `windows_resources` (feature `windows-resources`, opt-in and outside
+  `full`): build-script embedding of a Windows executable's icon, version
+  information and Common-Controls v6 manifest. Applications depend on this
+  crate a second time as a build-dependency with only this feature and call it
+  from their own `build.rs`; the resource compiler and its backend stay
+  private, and non-Windows targets are a no-op. It replaces the unpublished
+  `kernal-api-build` package, which shipped only as a git dependency;
+  `kernal_api_build::X` becomes `kernal_api::windows_resources::X` with the
+  same items.
 - `daemon_identity`, `daemon_frame_v1`, `daemon_registration`,
   `daemon_registration_v2` (features of the same names, each opt-in and
   outside `full`): the frozen v1/v2 daemon wires -- identity/sidecar/probe/mux

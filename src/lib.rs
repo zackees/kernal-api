@@ -74,6 +74,10 @@ pub mod random;
 #[cfg(feature = "text-similarity")]
 pub mod text;
 
+/// Windows executable resources, embedded from an application's own build script.
+#[cfg(feature = "windows-resources")]
+pub mod windows_resources;
+
 /// Bounded terminal key decoding and owned native polling.
 #[cfg(feature = "terminal-input")]
 pub mod keys;

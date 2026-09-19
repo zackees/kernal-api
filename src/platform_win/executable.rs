@@ -18,6 +18,21 @@ pub fn file_name(bare: &str) -> String {
     }
 }
 
+/// Spell `bare` as this host names an executable, keeping native UTF-16.
+///
+/// Unlike [`file_name`], a name that already carries any extension is
+/// returned unchanged, so a caller never receives `tool.exe.exe` or
+/// `tool.cmd.exe`.
+pub fn file_name_os(bare: &OsStr) -> OsString {
+    if Path::new(bare).extension().is_some() {
+        bare.to_os_string()
+    } else {
+        let mut name = bare.to_os_string();
+        name.push(".exe");
+        name
+    }
+}
+
 /// Path to a sibling program installed beside the running image.
 ///
 /// Returns `None` when the current image cannot be resolved, has no parent

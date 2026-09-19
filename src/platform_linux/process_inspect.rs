@@ -59,10 +59,6 @@ impl ProcessLiveness {
 }
 
 /// Resolve the on-disk image a running process was started from.
-#[cfg_attr(
-    not(feature = "daemon-identity"),
-    allow(dead_code, reason = "only recorded-daemon verification reads another image")
-)]
 pub fn process_executable_path(pid: u32) -> Result<PathBuf, io::Error> {
     std::fs::read_link(format!("/proc/{pid}/exe"))
 }

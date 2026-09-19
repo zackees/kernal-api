@@ -18,6 +18,13 @@ pub fn file_name(bare: &str) -> String {
     }
 }
 
+/// Spell `bare` as this host names an executable, keeping native bytes.
+///
+/// Nothing is appended here: this host's runnable images carry no suffix.
+pub fn file_name_os(bare: &OsStr) -> OsString {
+    bare.to_os_string()
+}
+
 /// Path to a sibling program installed beside the running image.
 ///
 /// Returns `None` when the current image cannot be resolved, has no parent

@@ -5,7 +5,8 @@
 //! running image, is a host mechanic and is decided here.
 
 pub use crate::{
-    executable_file_name as file_name, executable_find_in_paths as find_in_paths,
+    executable_file_name as file_name, executable_file_name_os as file_name_os,
+    executable_find_in_paths as find_in_paths,
     executable_native_library_name as native_library_name,
     executable_sibling_of_current_image as sibling_of_current_image,
     executable_stem_matches as stem_matches,

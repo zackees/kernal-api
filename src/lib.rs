@@ -282,11 +282,20 @@ pub use platform_imp::{process_can_replace_current_image, process_replace_curren
 
 pub use platform_imp::{process_same_executable_path, ProcessLiveness};
 
-// Recorded-daemon verification reads the image a PID was started from. The
-// read stays crate-private: it is addressed by PID, so it is only sound
-// behind a retained `ProcessLiveness` reference, which the caller holds.
-#[cfg(feature = "daemon-identity")]
+// Reading the image a PID was started from stays crate-private: it is
+// addressed by PID, so it is only sound behind a retained `ProcessLiveness`
+// reference, which `platform::process::executable_path` requires.
 pub(crate) use platform_imp::process_inspect::process_executable_path;
+
+pub use platform_imp::NativeJobserver;
+pub(crate) use platform_imp::{
+    process_configure_session_leader_command, process_cpu_ticks_for_pid,
+    process_detach_standard_streams, process_force_terminate_child_process_group,
+    process_native_jobserver_supported, process_peak_rss_bytes_for_pid,
+    process_redirect_standard_streams_to_log, process_set_priority_identity,
+    process_tree_rss_bytes_for_pid, PROCESS_MAX_TREE_RSS_PROCESSES,
+    PROCESS_PEAK_RSS_READABLE_AFTER_EXIT,
+};
 
 pub use platform_imp::{
     resources_available_space, resources_fd_exhaustion_error, resources_inode_capacity,
@@ -295,7 +304,7 @@ pub use platform_imp::{
 };
 
 pub use platform_imp::{
-    executable_file_name, executable_find_in_paths, executable_native_library_name,
+    executable_file_name, executable_file_name_os, executable_find_in_paths, executable_native_library_name,
     executable_sibling_of_current_image, executable_stem_matches,
     executable_unlock_for_replacement, EXECUTABLE_EXTENSION,
 };

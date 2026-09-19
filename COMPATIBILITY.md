@@ -136,6 +136,19 @@ the same client operation and no runtime fallback to a second HAL.
   surface as `std::io::Error` with the stable kind mapping documented in
   `src/process_adapter.rs`; the substrate's builder, session, and error types
   never cross it. Descendant-tree cleanup on drop is deliberately not offered.
+- Host process control and telemetry in `platform::process`, on the default
+  feature set: `configure_session_leader_command`, the owned-child
+  `force_terminate_process_group(&std::process::Child)`, generation-checked
+  `set_priority(ProcessIdentity, ProcessPriority)`, `executable_path(&ProcessLiveness)`,
+  daemon bootstrap `detach_standard_streams` /
+  `redirect_standard_streams_to_log`, the GNU make `NativeJobserver` with
+  `native_jobserver_supported`, and the PID-addressed read-only readers
+  `cpu_ticks_for_pid`, `peak_rss_bytes_for_pid`, `tree_rss_bytes_for_pid`
+  (`MAX_TREE_RSS_PROCESSES`, `PEAK_RSS_READABLE_AFTER_EXIT`).
+  `platform::executable::file_name_os` spells an executable name without
+  losing native string data or doubling an existing extension. No PID-only
+  forced termination is offered: terminate a bare PID through
+  `capture_identity` and `force_kill`.
 - `snapshot`: cooperative sibling-thread capture and deferred unwind.
 - `crash`: the single native crash handler and bounded pre-crash spool.
 - `profile`: bounded sampling, CPU/off-CPU aggregation, and pprof/Firefox/

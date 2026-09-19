@@ -165,7 +165,22 @@ mod named_pipe {
         server.connect().await.unwrap();
         drop(client);
         drop(server);
-        let _replacement = OwnerOnlyPipeInstance::create(&endpoint, true).unwrap();
+        // The canceled connect left an overlapped ConnectNamedPipe that the
+        // runtime still owns; Windows keeps the instance (and so the name)
+        // until that completion is reaped, which happens asynchronously after
+        // the drop. Assert the name is released within a bounded time while the
+        // runtime runs, not synchronously at drop.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let _replacement = loop {
+            match OwnerOnlyPipeInstance::create(&endpoint, true) {
+                Ok(replacement) => break replacement,
+                Err(error) if std::time::Instant::now() < deadline => {
+                    assert_eq!(error.raw_os_error(), Some(5), "unexpected error: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("pipe name not released after owner drop: {error}"),
+            }
+        };
     }
 
     #[tokio::test]

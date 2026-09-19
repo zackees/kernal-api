@@ -76,6 +76,13 @@ Optional features keep consumers from linking tooling they do not use:
   Defaults admit at most one million selected files, 16 GiB per file, and eight
   readers (limited by host parallelism). Digests ignore absolute roots and
   timestamps; symlinks are skipped and non-UTF-8 regular-file paths fail explicitly.
+- `fs` also owns cache-materialization mechanics: `platform::fs::replacement`
+  (native atomic replace, generation rename, delete-fallback replace, and
+  directory install, with a fixed 50/100/250/500 ms Windows sharing-violation
+  retry), `platform::fs::path_file` identity, link classification and counts,
+  readonly/execute/mode bits, Windows USN change markers, raw volume identity,
+  allocated size, and native path spellings. Materialization policy stays with
+  the application.
 - `fs-watch` for filesystem-change watcher construction and event
   classification (created/modified/removed/renamed plus an explicit
   overflow-or-lost-watch rescan signal); debouncing, ignore-lists, and

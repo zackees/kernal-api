@@ -200,7 +200,9 @@ buffering convention.
    The async compiler-session path is covered by `SpawnSpec::spawn_session`
    with `SpawnAdmission` and `SpawnSpec::priority_best_effort`, adapted
    privately in `src/process_adapter.rs`.
-2. Rebase zccache's embedded API on facade-owned async and cancellation types.
+2. Rebase zccache's embedded API on facade-owned async and cancellation types,
+   including the std-only `fair_race!`, `biased_race!`, and `task_local!`
+   macros that replace backend `select!` and task-local call sites.
 3. Move zccache process launch, probing, detached deployment, identity, and
    hashing behind `kernal-api`.
 4. Move broker access through a compatibility facade while preserving the

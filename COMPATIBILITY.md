@@ -136,6 +136,12 @@ the same client operation and no runtime fallback to a second HAL.
   It also owns cancellation tokens, connection deadlines, and progress/idle
   timeout policy; clients must not substitute a raw runtime or global transfer
   timeout for these contracts.
+  It owns `select!`-shaped selection and task-local bindings too:
+  `fair_race!` (two to five guarded branches, `FairRace2`..`FairRace5`),
+  `biased_race!` (two to four branches in source order, `BiasedRace2`..
+  `BiasedRace4`), and `task_local!` (`TaskLocal`, `TaskLocalScope`,
+  `TaskLocalAccessError`). All three are std-only and expand to `$crate`
+  paths; clients must not reach for `tokio::select!` or `tokio::task_local!`.
 - `platform::window_icon` (feature `window-icon`): window and stock icon
   mechanics for the host console or a child, including the ICO/PNG decode and
   the X11 property write. GUI hosting is opt-in, so a headless client does not

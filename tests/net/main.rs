@@ -6,8 +6,11 @@
 //! See AGENTS.md for the rule.
 
 mod archive_facade;
+mod async_biased_race;
 mod async_blocking_channel;
 mod async_broadcast;
+mod async_fair_race;
+mod async_task_local;
 mod async_timers_permits;
 mod http_client;
 mod http_server;

@@ -353,6 +353,12 @@ pub use platform_imp::{
     IpcPeerIdentitySource, IpcStream,
 };
 
+#[cfg(feature = "ipc")]
+pub use platform_imp::{
+    ipc_retire_socket_endpoint, IpcLocalPipeClient, IpcLocalSocketListener, IpcLocalSocketStream,
+    IpcOwnerOnlyPipeInstance,
+};
+
 /// Failure details for the deprecated 4.x raw descriptor/handle handoff API.
 ///
 /// This type exists only at the crate-root compatibility boundary. New product

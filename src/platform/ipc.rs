@@ -36,6 +36,101 @@ pub use crate::{
     IpcPeerIdentitySource as PeerIdentitySource, IpcStream as Stream,
 };
 
+// Owner-only single-instance transport primitives.
+//
+// These are the lower-level building blocks beneath `Listener`/`Stream`: one
+// pathname-socket listener or one named-pipe instance at a time, with the
+// native endpoint string passed through verbatim. Endpoint spelling, stale
+// retirement, parent-directory policy, pooling, retry, deadlines, and peer
+// admission policy stay with the caller. Every host exports every name; the
+// pair that is not the selected host's transport is uninhabited, and its
+// constructors report `std::io::ErrorKind::Unsupported`. All polling byte I/O
+// uses standard-library types only.
+//
+// * `LocalSocketListener::bind_owner_only(&Path)` binds a pathname socket and
+//   sets the socket file to mode `0o600`. It never retires an existing path
+//   and dropping it does not unlink the pathname. `accept(&self)` yields a
+//   `LocalSocketStream` and the observed `SocketPeerCredentials`; a canceled
+//   accept leaves the listener usable.
+// * `LocalSocketStream::connect(&Path)` connects to a pathname socket.
+// * `OwnerOnlyPipeInstance::create(endpoint, first)` creates one byte-mode
+//   named-pipe instance whose protected DACL grants only the owner and SYSTEM
+//   and which rejects remote clients. `first` requests first-instance
+//   exclusivity. `connect(&self)` waits for one client; canceling that future
+//   retains the instance.
+// * `LocalPipeClient::open(endpoint)` performs one native open attempt and
+//   preserves its error, including pipe-busy (231), so callers own retry.
+//
+// Construction requires an active I/O-enabled async runtime.
+#[cfg(feature = "ipc")]
+pub use crate::{
+    IpcLocalPipeClient as LocalPipeClient, IpcLocalSocketListener as LocalSocketListener,
+    IpcLocalSocketStream as LocalSocketStream, IpcOwnerOnlyPipeInstance as OwnerOnlyPipeInstance,
+};
+
+/// Remove a caller-owned socket pathname, refusing non-sockets and symlinks.
+///
+/// A missing path succeeds. On a host whose local IPC transport leaves no
+/// filesystem endpoint behind (named pipes), this is a no-op. It does not
+/// probe liveness: the caller decides retirement is appropriate, and the
+/// parent directory must be protected against concurrent path replacement
+/// because inspection and unlink are separate operations.
+#[cfg(feature = "ipc")]
+pub fn retire_socket_endpoint(path: &std::path::Path) -> std::io::Result<()> {
+    crate::ipc_retire_socket_endpoint(path)
+}
+
+/// Credentials observed on a connection accepted by
+/// [`LocalSocketListener::accept`].
+///
+/// An unavailable PID does not imply unavailable credentials: some hosts
+/// report only the peer's user.
+#[cfg(feature = "ipc")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketPeerCredentials {
+    pid: Option<u32>,
+    current_user: bool,
+    available: bool,
+}
+
+#[cfg(feature = "ipc")]
+impl SocketPeerCredentials {
+    // Only a pathname-socket host observes credentials; the other host never
+    // constructs this value.
+    #[allow(dead_code, reason = "constructed only by pathname-socket hosts")]
+    pub(crate) fn observed(pid: Option<u32>, current_user: bool) -> Self {
+        Self {
+            pid,
+            current_user,
+            available: true,
+        }
+    }
+
+    #[allow(dead_code, reason = "constructed only by pathname-socket hosts")]
+    pub(crate) fn unavailable() -> Self {
+        Self {
+            pid: None,
+            current_user: false,
+            available: false,
+        }
+    }
+
+    /// The peer process ID, when the host reports one.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    /// Whether the peer runs as this process's effective user.
+    pub fn is_current_user(&self) -> bool {
+        self.current_user
+    }
+
+    /// Whether the host reported peer credentials at all.
+    pub fn credentials_available(&self) -> bool {
+        self.available
+    }
+}
+
 /// Opaque platform attachment created while transferring an accepted IPC
 /// connection to a backend process.
 ///

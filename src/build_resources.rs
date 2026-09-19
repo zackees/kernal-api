@@ -3,12 +3,48 @@
 //! An executable's Explorer icon, version information and application manifest
 //! are resources linked into that executable. Cargo links a build script's
 //! resources only into the binaries of the package that runs it, so an
-//! application depends on this package as a build-dependency and calls
-//! [`embed_windows_app_resources`] from its `build.rs`. On every other target
-//! the call does nothing.
+//! application calls [`embed_windows_app_resources`] from its own `build.rs`.
+//! On every other target the call does nothing.
+//!
+//! # Depending on it from a build script
+//!
+//! Add `kernal-api` a second time, as a build-dependency with only this
+//! feature, and enable the application's runtime capabilities in its
+//! `[dependencies]` entry:
+//!
+//! ```toml
+//! [dependencies]
+//! kernal-api = { version = "=0.1.17", features = ["window-icon"] }
+//!
+//! [build-dependencies]
+//! kernal-api = { version = "=0.1.17", default-features = false, features = ["build-resources"] }
+//! ```
+//!
+//! Cargo's edition-2021 feature resolver resolves build-dependency features
+//! separately from the runtime graph's, so `window-icon` above never reaches
+//! the build script and `build-resources` never reaches the executable.
+//!
+//! One Cargo rule crosses that line: a `kernal-api/<feature>` entry in the
+//! application's own `[features]` table applies to *every* dependency named
+//! `kernal-api`, the build-dependency included. An application feature such
+//! as `viewer = ["kernal-api/tauri-webview"]` therefore also compiles the
+//! webview stack for the host build script. The build-dependency cannot be
+//! renamed out of reach: Cargo rejects one package depending on another under
+//! two names ("depends on crate ... multiple times with different names"),
+//! whatever the dependency kinds. An application that forwards a heavy
+//! capability either accepts that host compile, or moves the forwarding into
+//! an application-owned library crate (`viewer = ["dep:app-viewer"]`, with
+//! `app-viewer` enabling the kernal-api capability), so its binary package's
+//! feature table never names `kernal-api/...`. `tests/build-resources-consumer`
+//! and `ci/check_compilation_boundary_dependencies.py` pin both behaviours.
+//!
+//! Even with no forwarded features, the build script compiles `kernal-api`'s
+//! mandatory dependencies -- the process substrate, Tokio, BLAKE3 and the
+//! host platform crates -- for the host. Only the optional capabilities stay
+//! out.
 //!
 //! ```no_run
-//! use kernal_api_build::{embed_windows_app_resources, WindowsAppResources};
+//! use kernal_api::build_resources::{embed_windows_app_resources, WindowsAppResources};
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let resources = WindowsAppResources::new("Example Viewer", "example", env!("CARGO_PKG_VERSION"))?
@@ -18,9 +54,11 @@
 //! # }
 //! ```
 //!
-//! The resource compiler is resolved privately: `rc.exe` from the Windows SDK
-//! on MSVC hosts, `llvm-rc` when cross-compiling to `*-pc-windows-msvc`, and
-//! the `RC`/`RC_<target>` environment variables override both.
+//! The resource compiler is resolved privately from the build script's
+//! environment, not from the host this crate was compiled for: `rc.exe` from
+//! the Windows SDK on MSVC hosts, `llvm-rc` when cross-compiling to
+//! `*-pc-windows-msvc`, and the `RC`/`RC_<target>` environment variables
+//! override both. The target is read from Cargo's `CARGO_CFG_TARGET_OS`.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -282,40 +320,11 @@ fn render_resource_script(
     Ok(script)
 }
 
+// Rendering is private; the public validation contract is tested in
+// tests/process/windows_app_resources.rs.
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn numeric_version_uses_the_semver_core() {
-        assert_eq!(numeric_version("2.0.20").unwrap(), [2, 0, 20, 0]);
-        assert_eq!(
-            numeric_version("1.2.3-beta.4+build.5").unwrap(),
-            [1, 2, 3, 0]
-        );
-        for invalid in ["", "2", "2.0", "2.0.x", "2.0.20.1", "70000.0.0", "2..0"] {
-            assert!(
-                matches!(
-                    numeric_version(invalid),
-                    Err(WindowsResourceError::InvalidVersion(_))
-                ),
-                "{invalid:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn text_fields_reject_quotes_controls_and_overlong_values() {
-        assert!(WindowsAppResources::new("FastLED Viewer", "fastled", "2.0.20").is_ok());
-        for bad in ["", "a\"b", "a\nb", &"x".repeat(MAX_TEXT_BYTES + 1)] {
-            assert!(matches!(
-                WindowsAppResources::new(bad, "fastled", "2.0.20"),
-                Err(WindowsResourceError::InvalidText {
-                    field: "product name"
-                })
-            ));
-        }
-    }
 
     #[test]
     fn script_embeds_manifest_icon_and_version_strings() {

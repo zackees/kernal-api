@@ -138,6 +138,13 @@ http-server = ["dep:hyper", "hyper/server", "hyper/http1", "dep:hyper-util", "de
 # HTTP/1 WebSocket upgrading remains part of the owned server surface: callers
 # exchange facade messages and never name Hyper or a WebSocket implementation.
 websocket = ["http-server", "dep:futures-util", "dep:tokio-tungstenite"]
+# Build-script helper: Windows executable resources (icon, version info,
+# Common-Controls v6 manifest) for an application's own `build.rs`, taken as a
+# second, same-name `kernal-api` build-dependency with only this feature.
+# Cargo keeps `[dependencies]` features out of that build-dependency, but a
+# `kernal-api/feature` entry in the application's own feature table reaches it,
+# and Cargo rejects renaming one package twice; see src/build_resources.rs.
+build-resources = ["dep:embed-resource"]
 # Window-icon and stock-icon mechanics for the host console or a child. This
 # is GUI hosting: on Linux it decodes PNG and speaks the X11 client protocol,
 # so it is gated like every peer capability rather than sitting in the
@@ -282,6 +289,9 @@ bytes = { version = "=1.12.1", optional = true }
 console-api = { version = "=0.9.0", optional = true }
 console-subscriber = { version = "=0.5.0", optional = true }
 crash-handler = { version = "=0.7.0", optional = true }
+# Resource-compiler driver for `build-resources`; runs in the application's
+# build script and picks rc.exe/llvm-rc from that script's environment.
+embed-resource = { version = "=3.0.11", optional = true }
 dirs = { version = "=6.0.0", optional = true }
 flate2 = { version = "=1.1.9", optional = true }
 framehop = { version = "=0.13.3", optional = true }
@@ -483,6 +493,7 @@ features = [
   "daemon-registration",
   "daemon-registration-v2",
   "broker-client",
+  "build-resources",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 targets = [
@@ -498,11 +509,6 @@ targets = [
 workspace = true
 
 [workspace]
-# The build-script companion is a separate package, not a feature: a
-# `dep-name/feature-name` entry in an application applies to every
-# dependency of that name, so a feature here would drag this crate's
-# runtime capabilities into the application's host build script.
-members = ["crates/kernal-api-build"]
 exclude = ["src/wasm/generated/v1/guest"]
 
 # Every warning is an error, in every build of every package here: CI, local

@@ -44,7 +44,12 @@ CASES = (
     ("broker-client", "clap"),
     ("broker-client", "interprocess"),
     ("broker-client", "anyhow"),
+    # The build-script helper's resource compiler is for build scripts only.
+    ("build-resources", "embed-resource"),
 )
+
+# An application with kernal-api as both a dependency and a build-dependency.
+BUILD_RESOURCES_CONSUMER = "tests/build-resources-consumer/Cargo.toml"
 
 SKETCH_AND_WEBVIEW_PACKAGES = {
     "tauri",
@@ -83,6 +88,61 @@ def tree(features: str, *, normal_only: bool = False) -> set[str]:
     }
 
 
+def consumer_features(edges: str, *extra: str) -> set[str]:
+    """kernal-api's resolved features on one edge kind of the fixture consumer."""
+    command = [
+        "soldr",
+        "cargo",
+        "tree",
+        "--locked",
+        "--manifest-path",
+        BUILD_RESOURCES_CONSUMER,
+        "--edges",
+        edges,
+        "--depth",
+        "1",
+        "--prefix",
+        "depth",
+        "--format",
+        "{p}|{f}",
+        *extra,
+    ]
+    completed = subprocess.run(command, check=True, text=True, capture_output=True)
+    rows = [
+        line[1:].split("|", 1)
+        for line in completed.stdout.splitlines()
+        if line.startswith("1kernal-api ")
+    ]
+    if len(rows) != 1:
+        raise SystemExit(f"expected one kernal-api {edges} edge, found {len(rows)}")
+    return {feature for feature in rows[0][1].split(",") if feature}
+
+
+def build_resources_consumer_failures() -> list[str]:
+    """RED/GREEN for the documented build-dependency shape.
+
+    A capability enabled in the application's `[dependencies]` entry must not
+    reach its build script, and `build-resources` must not reach the runtime.
+    A `kernal-api/<feature>` entry in the application's own feature table
+    does reach the build script -- Cargo applies it to every dependency with
+    that name -- and the documentation says so; this pins that behaviour.
+    """
+    failures = []
+    runtime = consumer_features("normal")
+    build = consumer_features("build")
+    if "window-icon" not in runtime or "build-resources" in runtime:
+        failures.append(f"consumer runtime kernal-api features are {sorted(runtime)}")
+    if build != {"build-resources"}:
+        failures.append(f"consumer build-script kernal-api features are {sorted(build)}")
+    forwarded = consumer_features("build", "--features", "forwarded")
+    if "text-similarity" not in forwarded:
+        failures.append(
+            "a forwarded kernal-api/<feature> no longer reaches the build-dependency; "
+            "update the build-resources documentation"
+        )
+    return failures
+
+
 def main() -> int:
     default_graph = tree("")
     failures: list[str] = []
@@ -115,6 +175,7 @@ def main() -> int:
         failures.append(
             f"secure-random adds unrelated facilities: {', '.join(unexpected_entropy)}"
         )
+    failures.extend(build_resources_consumer_failures())
     for feature, package in CASES:
         if package in default_graph:
             failures.append(f"RED failed: default graph unexpectedly contains {package}")

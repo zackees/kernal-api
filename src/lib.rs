@@ -134,6 +134,13 @@ pub mod daemon_registration_v2;
 #[cfg(feature = "broker-client")]
 pub mod broker_client;
 
+/// Build-script helpers: Windows executable resources for an application's
+/// own `build.rs`. Depend on it as a renamed build-dependency so the
+/// application's `kernal-api/<feature>` entries never reach the build script
+/// (see the module documentation).
+#[cfg(feature = "build-resources")]
+pub mod build_resources;
+
 /// Canonical async runtime, task, I/O, network, and synchronization facade.
 pub mod async_engine;
 

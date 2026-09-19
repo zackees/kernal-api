@@ -438,12 +438,37 @@ jobs:
       # `build-resources` as it is meant to run: in an application's build
       # script on this (Linux) host, compiling resources for the Windows
       # target. The target graph above excludes it; this is its coverage.
+      #
+      # embed-resource invokes `llvm-rc` for an MSVC target and reads the
+      # documented `RC_<target>` override, which is how a host that carries
+      # only versioned LLVM binaries (this runner) names its own. Resolve one
+      # rather than assume the plain name is on PATH; failing to compile
+      # resources must stay a real failure, so nothing here is skipped.
       - name: Embed Windows resources through the build-resources consumer
         if: endsWith(matrix.target, '-pc-windows-msvc')
-        run: >-
-          soldr cargo check --locked
-          --manifest-path tests/build-resources-consumer/Cargo.toml
-          --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          find_rc() {
+            command -v llvm-rc 2>/dev/null && return 0
+            ls -1 /usr/lib/llvm-*/bin/llvm-rc /usr/bin/llvm-rc-* 2>/dev/null | sort -V | tail -1
+          }
+          rc="$(find_rc || true)"
+          if [ -z "${rc}" ]; then
+            sudo apt-get update && sudo apt-get install --yes llvm
+            rc="$(find_rc || true)"
+          fi
+          if [ -z "${rc}" ]; then
+            echo "::error::no llvm-rc on this host; embed-resource cannot target ${TARGET}"
+            exit 1
+          fi
+          echo "resource compiler: ${rc}"
+          export "RC_${TARGET//-/_}=${rc}"
+          soldr cargo check --locked \
+            --manifest-path tests/build-resources-consumer/Cargo.toml \
+            --target "${TARGET}"
       - name: Build the native webview smoke binary
         if: endsWith(matrix.target, '-pc-windows-msvc')
         run: >-

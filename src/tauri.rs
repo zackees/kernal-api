@@ -177,6 +177,8 @@ impl NativeWebviewLoop {
     pub(crate) fn new(
         async_runtime: RuntimeHandle,
     ) -> Result<(Self, NativeWebviewBackend), NativeWebviewError> {
+        #[cfg(target_os = "linux")]
+        linux_webkitgtk::prepare_renderer_environment();
         let runtime = Wry::new(Default::default())
             .map_err(|error| NativeWebviewError::HostFailure(error.to_string()))?;
         let backend = NativeWebviewBackend {

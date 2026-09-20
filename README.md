@@ -112,26 +112,38 @@ Optional features keep consumers from linking tooling they do not use:
   Rust artifact fixture remains source-only under `guests/threaded-smoke`
 - `full` for diagnostic executables that need the entire non-daemon surface
 
-## Build-script companion
+## Build-script resources
 
-`crates/kernal-api-build` is a separate package, published from this
-repository, for work that only an application's own `build.rs` can do.
-`kernal_api_build::embed_windows_app_resources` embeds a Windows executable's
-icon, version information and Common-Controls v6 manifest; on every other
-target it does nothing. Cargo links a build script's resources only into the
-binaries of the package that runs the script, so an application adds it as a
-build-dependency:
+`build-resources` is a feature of this package, outside `full`, for work that
+only an application's own `build.rs` can do.
+`kernal_api::build_resources::embed_windows_app_resources` embeds a Windows
+executable's icon, version information and Common-Controls v6 manifest; on
+every other target it does nothing. Cargo links a build script's resources
+only into the binaries of the package that runs the script, so an application
+adds `kernal-api` a second time, as a build-dependency with only this feature:
 
 ```toml
+[dependencies]
+kernal-api = { version = "=0.1.17", features = ["window-icon"] }
+
 [build-dependencies]
-kernal-api-build = { git = "https://github.com/zackees/kernal-api.git", tag = "v0.1.7" }
+kernal-api = { version = "=0.1.17", default-features = false, features = ["build-resources"] }
 ```
 
-It is deliberately not a feature of `kernal-api`: a `dep-name/feature-name`
-entry in an application's feature table applies to every dependency with that
-name, including the build-dependency, which would compile this crate's runtime
-capabilities for the host build script. This package depends only on the
-resource compiler.
+Features enabled in the `[dependencies]` entry never reach the build script:
+Cargo's edition-2021 resolver resolves build-dependency features separately.
+A `kernal-api/<feature>` entry in the application's own `[features]` table is
+the exception -- Cargo applies it to every dependency named `kernal-api`, the
+build-dependency included -- and the build-dependency cannot be renamed out of
+its reach, because Cargo rejects depending on one package under two names.
+An application that forwards a heavy capability either accepts compiling it
+for the host build script or forwards through an application-owned library
+crate (`viewer = ["dep:app-viewer"]`). Either way the build script compiles
+this crate's mandatory dependencies for the host. It is a host-only
+facility, so CI's per-target build matrix links every feature except it
+(`ci/target_features.py`) and covers it through that fixture instead. See the
+[`build_resources` module documentation](src/build_resources.rs) and
+`tests/build-resources-consumer`.
 
 The four daemon slices are deliberately outside `full`, because each one
 carries a frozen wire that only an application already speaking it should

@@ -211,15 +211,22 @@ the same client operation and no runtime fallback to a second HAL.
   copy. `platform::window_icon`, `set_window_icon_impl` and
   `window_icon_support_impl` were available on the default feature set before
   this release; enabling `window-icon` is required as of it.
-- `kernal-api-build` (separate package in `crates/kernal-api-build`, released
-  from this repository under the same tag): build-script embedding of a
-  Windows executable's icon, version information and Common-Controls v6
-  manifest. Applications add it as a build-dependency and call it from their
-  own `build.rs`; the resource compiler and its backend stay private, and
-  non-Windows targets are a no-op. It is a package rather than a feature
-  because a `dep-name/feature-name` entry applies to every dependency of that
-  name, which would compile this crate's runtime capabilities for the host
-  build script.
+- `build_resources` (feature `build-resources`, outside `full`): build-script
+  embedding of a Windows executable's icon, version information and
+  Common-Controls v6 manifest. Applications add `kernal-api` a second time as
+  a build-dependency with only this feature and call it from their own
+  `build.rs`; the resource compiler and its backend stay private, and
+  non-Windows targets are a no-op. This replaces the never-published
+  `kernal-api-build` companion package: kernal-api is one package. A
+  `kernal-api/<feature>` entry in the application's own feature table also
+  reaches the build-dependency (Cargo applies it by name and rejects renaming
+  one package twice), so forwarded capabilities compile for the build script
+  too; see the module documentation for the library-crate workaround.
+  It is host-only: it runs in a build script on the build host, so a graph
+  linked for another target never includes it. CI's per-target matrix builds
+  every feature but this one (`ci/target_features.py`); a Linux-hosted link
+  for `*-pc-windows-msvc` cannot resolve embed-resource's `vswhom-sys`
+  symbols, whose C++ archive is only built on a Windows host.
 - `daemon_identity`, `daemon_frame_v1`, `daemon_registration`,
   `daemon_registration_v2` (features of the same names, each opt-in and
   outside `full`): the frozen v1/v2 daemon wires -- identity/sidecar/probe/mux

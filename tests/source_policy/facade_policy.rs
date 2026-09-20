@@ -33,26 +33,60 @@ fn crash_handler_is_locked_at_exactly_one_version() {
     assert_eq!(versions, ["\"0.7.0\""]);
 }
 
-/// The build-script companion is released from this repository under the same
-/// tag, so a version bump that forgets it would ship a package claiming an
-/// older release.
+/// Build-script resource embedding is a feature of this one package, not a
+/// separately published companion: the optional resource compiler stays out
+/// of every graph that does not ask, out of `full`, and the fixture consumer
+/// keeps the documented same-name build-dependency shape.
 #[test]
-fn build_companion_version_matches_the_facade() {
+fn build_resources_is_an_opt_in_feature_of_the_one_package() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let version = |manifest: &str| {
-        manifest
-            .lines()
-            .find_map(|line| line.trim_end().strip_prefix("version = "))
-            .expect("manifest version")
-            .to_owned()
-    };
-    let facade = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
-    let companion = std::fs::read_to_string(root.join("crates/kernal-api-build/Cargo.toml"))
-        .expect("read companion manifest");
-    assert_eq!(
-        version(&companion),
-        version(&facade),
-        "crates/kernal-api-build must carry the same version as kernal-api"
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");
+    assert!(
+        manifest.contains("build-resources = [\"dep:embed-resource\"]"),
+        "build-resources must own exactly the resource compiler"
+    );
+    assert!(
+        manifest.contains("embed-resource = { version = \"=3.0.11\", optional = true }"),
+        "the resource compiler must be an optional, exact-pinned dependency"
+    );
+    assert!(
+        !manifest.contains("members ="),
+        "kernal-api is one package; build helpers are features, not workspace members"
+    );
+    assert!(
+        !root.join("crates").exists(),
+        "no separately published companion package may return"
+    );
+    let full = manifest
+        .split("full = [")
+        .nth(1)
+        .and_then(|features| features.split(']').next())
+        .expect("locate full feature");
+    assert!(
+        !full.contains("build-resources"),
+        "full is the runtime surface; the build-script helper stays out"
+    );
+    let lib = std::fs::read_to_string(root.join("src/lib.rs")).expect("read facade root");
+    assert!(
+        lib.contains("#[cfg(feature = \"build-resources\")]\npub mod build_resources;"),
+        "default builds must omit the build_resources module"
+    );
+
+    let consumer = std::fs::read_to_string(root.join("tests/build-resources-consumer/Cargo.toml"))
+        .expect("read build-resources consumer manifest");
+    assert!(
+        consumer.contains("[workspace]")
+            && consumer.contains(
+                "[build-dependencies]\nkernal-api = { path = \"../..\", default-features = false, features = [\"build-resources\"] }"
+            ),
+        "the consumer must take build-resources as a same-name build-dependency outside this workspace"
+    );
+    let build_script =
+        std::fs::read_to_string(root.join("tests/build-resources-consumer/build.rs"))
+            .expect("read build-resources consumer build script");
+    assert!(
+        build_script.contains("embed_windows_app_resources(&resources)"),
+        "the consumer build script must still embed resources"
     );
 }
 

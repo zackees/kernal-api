@@ -87,7 +87,7 @@ jobs:
         run: |
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
-            ci.test_nextest_config ci.test_deny_warnings
+            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
@@ -118,13 +118,6 @@ jobs:
         run: |
           bash ci/check_wasm_abi_generation.sh
           soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
-      # kernal-api-build is published from the same tag as the facade (see
-      # ci/crate_release.py). Package and verify it on every pull request, so
-      # a release never discovers a packaging failure after the facade is out.
-      # Early, while the daemon is quiet: the verify build runs build scripts,
-      # the case zackees/zccache#1597 fails with ETXTBSY under a busy daemon.
-      - name: Package and verify the build-script companion
-        run: uv run --no-project --python 3.12 ci/crate_release.py --package kernal-api-build package
       - name: Check every feature in isolation
         run: |
           set -uo pipefail
@@ -145,6 +138,8 @@ jobs:
             daemon-registration-v2
             # Broker client adapter over running-process/client (heavy graph).
             broker-client
+            # Build-script helper (Windows resources) over embed-resource.
+            build-resources
             fs
             fs-watch
             hash-sha256
@@ -197,10 +192,13 @@ jobs:
         run: >-
           soldr cargo test --features http-client,reqwest/gzip
           --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
-      - name: Check the external daemon-registration consumers
+      - name: Check the external facade consumers
         run: |
           soldr cargo check --locked --manifest-path tests/daemon-registration-consumer/Cargo.toml
           soldr cargo check --locked --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
+          # kernal-api as both a dependency and a build-dependency; its
+          # feature split is asserted by check_compilation_boundary_dependencies.py.
+          soldr cargo check --locked --manifest-path tests/build-resources-consumer/Cargo.toml
       - name: Run real semantic webview lifecycle and capture proofs
         # A unit test does not own process main on every harness, while Tauri
         # needs its event loop there, so these run the smoke binary under Xvfb.
@@ -362,6 +360,22 @@ jobs:
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
           prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      # Every feature except host-only build-script facilities, derived from
+      # Cargo.toml so a new feature is covered here automatically. This is a
+      # graph linked for the TARGET; `build-resources` runs only in an
+      # application's build script on the build host, and its embed-resource
+      # -> vswhom-sys C++ archive is built only on a Windows host, so linking
+      # it into kernal-api's own test binaries from a Linux cross builder
+      # fails with undefined `vswhom_*` symbols. `build-resources` stays
+      # covered by the per-feature isolation check and by
+      # tests/build-resources-consumer, checked natively in `linux` and for
+      # each Windows target below. ci/native_proof.py reads the same variable,
+      # so its `all` graph remains the one this job's archive already built.
+      - name: Select the target feature graph
+        run: >-
+          echo "KERNAL_TARGET_FEATURES=$(uv run --no-project --python 3.12 ci/target_features.py)"
+          >> "${GITHUB_ENV}"
       - name: Restore native pkg-config search path
         if: matrix.cross == ''
         run: |
@@ -375,7 +389,7 @@ jobs:
       - name: Lint this target
         run: >-
           soldr cargo clippy
-          --locked --all-features --all-targets
+          --locked --features "${KERNAL_TARGET_FEATURES}" --all-targets
           ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
           -- --deny warnings
       # Windows keeps debug info in a `.pdb` beside the `.exe`, and nextest
@@ -393,7 +407,7 @@ jobs:
           fi
           config_args=()
           if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
-            soldr cargo test --locked --all-features "${target_args[@]}" --no-run
+            soldr cargo test --locked --features "${KERNAL_TARGET_FEATURES}" "${target_args[@]}" --no-run
             shopt -s nullglob
             pdbs=(target/${{ matrix.target }}/debug/deps/kernal_symbolize-*.pdb)
             if [ "${#pdbs[@]}" -eq 0 ]; then
@@ -413,7 +427,7 @@ jobs:
             config_args=(--config-file "${RUNNER_TEMP}/nextest-archive.toml")
           fi
           soldr cargo nextest archive \
-            --locked --all-features "${target_args[@]}" "${config_args[@]}" \
+            --locked --features "${KERNAL_TARGET_FEATURES}" "${target_args[@]}" "${config_args[@]}" \
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst"
       - name: Compile the explicit ABI generator for this target
         # The one check `supported-targets` made that the archive does not.
@@ -421,13 +435,46 @@ jobs:
           soldr cargo check --locked
           --manifest-path tools/wasm-abi-generator/Cargo.toml
           ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
+      # `build-resources` as it is meant to run: in an application's build
+      # script on this (Linux) host, compiling resources for the Windows
+      # target. The target graph above excludes it; this is its coverage.
+      #
+      # embed-resource invokes `llvm-rc` for an MSVC target and reads the
+      # documented `RC_<target>` override, which is how a host that carries
+      # only versioned LLVM binaries (this runner) names its own. Resolve one
+      # rather than assume the plain name is on PATH; failing to compile
+      # resources must stay a real failure, so nothing here is skipped.
+      - name: Embed Windows resources through the build-resources consumer
+        if: endsWith(matrix.target, '-pc-windows-msvc')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          find_rc() {
+            command -v llvm-rc 2>/dev/null && return 0
+            ls -1 /usr/lib/llvm-*/bin/llvm-rc /usr/bin/llvm-rc-* 2>/dev/null | sort -V | tail -1
+          }
+          rc="$(find_rc || true)"
+          if [ -z "${rc}" ]; then
+            sudo apt-get update && sudo apt-get install --yes llvm
+            rc="$(find_rc || true)"
+          fi
+          if [ -z "${rc}" ]; then
+            echo "::error::no llvm-rc on this host; embed-resource cannot target ${TARGET}"
+            exit 1
+          fi
+          echo "resource compiler: ${rc}"
+          export "RC_${TARGET//-/_}=${rc}"
+          soldr cargo check --locked \
+            --manifest-path tests/build-resources-consumer/Cargo.toml \
+            --target "${TARGET}"
       - name: Build the native webview smoke binary
         if: endsWith(matrix.target, '-pc-windows-msvc')
         run: >-
           soldr cargo build
-          --locked --all-features --target ${{ matrix.target }}
+          --locked --features "${KERNAL_TARGET_FEATURES}" --target ${{ matrix.target }}
           --bin kernal-tauri-smoke
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Compile every native proof binary for this target
         run: >-
           uv run --no-project ci/native_proof.py build --target ${{ matrix.target }}

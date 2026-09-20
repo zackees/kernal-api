@@ -279,6 +279,11 @@ evolved facade and platform code. It records clean and representative
 incremental critical-path time, peak RSS where the host provides it, Soldr
 cache snapshots, debug output size, and packaged archive size.
 
+Build-script helpers follow the same rule: Windows executable resources are
+the `build-resources` feature (`kernal_api::build_resources`), taken as a
+second, same-name build-dependency, not a separately published
+`kernal-api-build` package. That package was never published and is gone.
+
 No change has demonstrated a cohesive implementation-only unit whose split
 would pay for another compilation boundary. Therefore no private crate and no
 release amalgamation is adopted. A later split proposal must compare its shape

@@ -191,9 +191,20 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(sorted(path.relative_to(extracted).as_posix() for path in extracted.rglob("*") if path.is_file()),
                          sorted(set(staged) | {proof.MANIFEST}))
 
+    def test_the_all_graph_follows_the_build_job_target_features(self):
+        """In `build`, `all` is the target graph the archive built, not `--all-features`."""
+        import importlib
+
+        with patch.dict("os.environ", {"KERNAL_TARGET_FEATURES": "fs,json"}):
+            reloaded = importlib.reload(proof)
+            self.assertEqual(reloaded.GRAPHS["all"][:2], ("--features", "fs,json"))
+            self.assertNotIn("--all-features", reloaded.GRAPHS["all"])
+        importlib.reload(proof)
+
     def test_the_production_graph_is_the_only_one_not_shared_with_the_suite(self):
         """Every graph but `production` is the all-features one the suite builds."""
         self.assertEqual(set(proof.GRAPHS), {"all", "production"})
+        # The `linux` suite's graph unless the `build` job exported its target graph.
         self.assertEqual(proof.GRAPHS["all"][0], "--all-features")
         production = proof.GRAPHS["production"]
         self.assertNotIn("--all-features", production)

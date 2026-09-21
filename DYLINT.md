@@ -30,22 +30,42 @@ The `dylints` job in `.github/workflows/ci.yml` therefore runs both lints as
 soldr cargo dylint --all --workspace -- --all-features --all-targets
 ```
 
-`--all-features` puts every gated module in front of the lint -- `crash`,
-`wasm`, `symbolize`, `profile`, `snapshot`, `fs`, `fs-watch`, `ipc`, `pty`,
-`tokio-console`, `window-icon`, the daemon slices -- and `--all-targets` adds
-the integration tests and the two `required-features` worker binaries. A green
-`dylints` job means the whole crate is clean, not just the ungated core. The
-job runs on `ubuntu-latest`, so `cfg(windows)` and `cfg(target_os = "macos")`
-bodies remain unlinted by it; `tests/facade_policy.rs` scans those as text
-regardless of host. That scan joins a declaration wrapped across line breaks
-before matching it, so a backend path sitting on a continuation line is
-covered -- the gap that let a raw `winapi::` type reach a public signature
-until #147 closed it, since the resolving lint could not see a `cfg`-elided
-host either. It stays coarse in the ways a text scan must: it matches
-spellings rather than resolved types, so an alias that renames an owned crate
-is outside its reach, and that remains the lint's job where the lint runs.
-Narrowing the feature set is a coverage decision, not a knob: if it is ever
-narrowed, say here exactly which features remain covered.
+on Linux and Intel macOS. `--all-features` puts every gated module in front of
+the lint -- `crash`, `wasm`, `symbolize`, `profile`, `snapshot`, `fs`,
+`fs-watch`, `ipc`, `pty`, `tokio-console`, `window-icon`, the daemon slices --
+and `--all-targets` adds the integration tests and the two `required-features`
+worker binaries.
+
+The Linux matrix entry also materializes and cross-lints both supported Windows
+targets plus Apple ARM with the same all-feature shape:
+
+```console
+soldr cargo dylint --all --workspace -- \
+  --all-features --all-targets --target x86_64-pc-windows-msvc
+soldr cargo dylint --all --workspace -- \
+  --all-features --all-targets --target aarch64-pc-windows-msvc
+soldr cargo dylint --all --workspace -- \
+  --all-features --all-targets --target aarch64-apple-darwin
+```
+
+A green `dylints` job therefore resolves and checks Linux x86-64, macOS Intel
+and ARM64, plus Windows x86-64 and ARM64 selected source, not just the ungated
+core. The cross-target steps verify that each nightly target has real `libcore`
+and `libstd` archives before linting, rather than trusting rustup's cached
+target bookkeeping.
+
+Linux ARM is not yet cross-linted: the all-feature graph needs an ARM GLib
+sysroot that the current managed Linux target toolchain does not provide. Its
+native ARM build lane still compiles the product graph, while the text scan
+below remains the guard for source that the resolving lint cannot select.
+
+`tests/facade_policy.rs` still scans all source as text regardless of host. It
+joins a declaration wrapped across line breaks before matching it, so a backend
+path on a continuation line is covered too. The scan remains deliberately
+coarse: it matches spellings rather than resolved types, so an alias that
+renames an owned crate requires the resolving lint coverage above. Narrowing
+the feature set or target set is a coverage decision, not a knob: if either is
+ever narrowed, say here exactly what remains covered.
 
 ## Platform-boundary status
 

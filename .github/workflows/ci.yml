@@ -679,29 +679,19 @@ jobs:
   # A Dylint pass only sees what the compiler compiles, so `cfg(target_os =
   # "macos")` bodies are invisible on a Linux host, which is how a raw host type
   # reached a public signature while both guards reported clean (#147).
-  # `macos-15-intel` closes that half: the lint now runs where those bodies are
-  # compiled.
+  # `macos-15-intel` closes that half: the lint runs where those bodies compile.
   #
-  # Windows is the other half, and is deliberately absent. `soldr cargo dylint`
-  # cannot run there at all: Soldr rejects its own managed `dylint-link` through
-  # a generic `--version`/`--help` probe that a working link wrapper cannot pass
-  # (it forwards the flags to `link.exe`), so the job exits 1 before compiling
-  # anything (zackees/soldr#3274). Verified on this branch -- `windows-2025`
-  # failed in 6m4s on that diagnostic while macOS passed.
-  #
-  # When that lands, add `windows-2025` back *and* a `ci/dylint-shim/cargo.cmd`
-  # beside the existing script: Windows resolves a bare `cargo` through PATHEXT
-  # and would skip the extensionless shim, silently re-entering soldr.
-  #
-  # This is the option #147 recommends, and it costs the extra job the issue
-  # acknowledges. It runs counter to #270's direction of moving work off Apple
-  # runners, so it is a deliberate trade of runner minutes for coverage of the
-  # host-selected code rather than an oversight.
+  # Windows-selected code is linted below by cross-targeting both supported
+  # Windows targets from Linux. That adds resolving coverage for `cfg(windows)`
+  # bodies without a Windows runner. macOS remains a host job because no Apple
+  # cross-target RED/GREEN proof exists.
   dylints:
     # Gated on Linux: the `macos-15-intel` entry is the single most expensive
     # job in this workflow, and a lint finding is not worth an Apple runner
     # while the tests are red.
     needs: linux
+    env:
+      DYLINT_TOOLCHAIN: nightly-2026-05-28
     strategy:
       fail-fast: false
       matrix:
@@ -721,7 +711,7 @@ jobs:
           build-cache: false
           prebuild-deps: none
           dylint: true
-          dylint-toolchain: nightly-2026-05-28
+          dylint-toolchain: ${{ env.DYLINT_TOOLCHAIN }}
           cargo-dylint-version: 6.0.3
           dylint-link-version: 6.0.3
       - name: Restore native pkg-config search path
@@ -730,9 +720,9 @@ jobs:
       - name: Select the pinned Dylint compiler
         shell: bash
         run: |
-          rustc_path="$(soldr rustup which --toolchain nightly-2026-05-28 rustc)"
+          rustc_path="$(soldr rustup which --toolchain "$DYLINT_TOOLCHAIN" rustc)"
           echo "RUSTC=${rustc_path}" >> "${GITHUB_ENV}"
-          echo "RUSTUP_TOOLCHAIN=nightly-2026-05-28" >> "${GITHUB_ENV}"
+          echo "RUSTUP_TOOLCHAIN=${DYLINT_TOOLCHAIN}" >> "${GITHUB_ENV}"
           chmod +x ci/dylint-shim/cargo
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
       - name: Test facade boundary lint
@@ -741,14 +731,14 @@ jobs:
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
         run: >-
           soldr rustup run
-          nightly-2026-05-28 cargo test
+          "$DYLINT_TOOLCHAIN" cargo test
           --manifest-path dylints/kernal_api_boundary/Cargo.toml
       - name: Test platform boundary lint
         env:
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
         run: >-
           soldr rustup run
-          nightly-2026-05-28 cargo test
+          "$DYLINT_TOOLCHAIN" cargo test
           --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml
       # A Dylint pass only sees what the compiler compiles, and `default = []`.
       # Without `--all-features` every gated module -- `crash`, `wasm`,
@@ -762,6 +752,56 @@ jobs:
         run: >-
           soldr cargo dylint
           --all --workspace -- --all-features --all-targets
+      # A Dylint pass only sees code that its compiler selects. Cross-targeting
+      # here compiles and lints the `cfg(windows)` bodies without spending a
+      # Windows runner (#147). Restoring the original public `winapi` leak in
+      # `translate_console_key_event` makes this pass fail on a Linux host.
+      #
+      # Both supported Windows architectures need a pass. `cpu_compatibility_features`
+      # has architecture-selected public declarations, even though its signatures
+      # currently agree; an aarch64-only backend-type leak must not evade Dylint.
+      - name: Materialize the x86_64-pc-windows-msvc target for the pinned Dylint toolchain
+        if: runner.os == 'Linux'
+        run: >-
+          bash ci/ensure-rustup-target.sh
+          "$DYLINT_TOOLCHAIN" x86_64-pc-windows-msvc
+      - name: Lint the x86_64-pc-windows-msvc-selected code from Linux
+        if: runner.os == 'Linux'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
+        run: >-
+          soldr cargo dylint
+          --all --workspace --
+          --all-features --all-targets --target x86_64-pc-windows-msvc
+      - name: Materialize the aarch64-pc-windows-msvc target for the pinned Dylint toolchain
+        if: runner.os == 'Linux'
+        run: >-
+          bash ci/ensure-rustup-target.sh
+          "$DYLINT_TOOLCHAIN" aarch64-pc-windows-msvc
+      - name: Lint the aarch64-pc-windows-msvc-selected code from Linux
+        if: runner.os == 'Linux'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
+        run: >-
+          soldr cargo dylint
+          --all --workspace --
+          --all-features --all-targets --target aarch64-pc-windows-msvc
+      # The Intel macOS matrix entry already selects its own code. Apple ARM
+      # also cross-lints cleanly from Linux, so retain the host proof and cover
+      # its architecture-selected declarations without an extra Apple runner.
+      - name: Materialize the aarch64-apple-darwin target for the pinned Dylint toolchain
+        if: runner.os == 'Linux'
+        run: >-
+          bash ci/ensure-rustup-target.sh
+          "$DYLINT_TOOLCHAIN" aarch64-apple-darwin
+      - name: Lint the aarch64-apple-darwin-selected code from Linux
+        if: runner.os == 'Linux'
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
+        run: >-
+          soldr cargo dylint
+          --all --workspace --
+          --all-features --all-targets --target aarch64-apple-darwin
       # Stops the whole run on a failure here; see the step in `linux`.
       - name: Cancel the run (this job failed)
         if: failure() && github.event_name == 'pull_request'

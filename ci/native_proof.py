@@ -279,33 +279,9 @@ def build(target: str, archive: Path, work: Path) -> None:
     pack(bundle, archive)
 
 
-def target_materialized(target: str) -> bool:
-    libdir = Path(capture(["soldr", "rustc", "--print", "target-libdir", "--target", target]).strip())
-    if not libdir.is_absolute():
-        raise ValueError(f"{target} libdir is not absolute")
-    return any(libdir.glob("libcore-*.rlib")) and any(libdir.glob("libstd-*.rlib"))
-
-
 def ensure_wasm_target(target: str) -> None:
-    """Verify target libraries on disk rather than rustup's bookkeeping.
-
-    A restored toolchain cache can list a target as installed while its
-    libraries are gone; `target add` then installs nothing. An empty
-    manifest lets `target remove` succeed so the next `add` really downloads.
-    """
-    if target_materialized(target):
-        return
-    capture(["soldr", "rustup", "target", "add", target])
-    if target_materialized(target):
-        return
-    sysroot = Path(capture(["soldr", "rustc", "--print", "sysroot"]).strip())
-    manifest = sysroot / "lib" / "rustlib" / f"manifest-rust-std-{target}"
-    if not manifest.exists():
-        manifest.touch()
-    capture(["soldr", "rustup", "target", "remove", target])
-    capture(["soldr", "rustup", "target", "add", target])
-    if not target_materialized(target):
-        raise ValueError(f"{target} still lacks core/std libraries after reinstall")
+    """Materialize a Wasm target through the shared rustup repair helper."""
+    capture(["bash", "ci/ensure-rustup-target.sh", target])
 
 
 def embed_threaded_metadata(built: Path, admitted: Path) -> None:

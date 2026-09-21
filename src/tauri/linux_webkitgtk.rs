@@ -5,6 +5,8 @@
 //! bindings here prevents them from leaking through the semantic facade.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use gtk::gdk::prelude::MonitorExt as _;
 use gtk::prelude::GtkSettingsExt as _;
@@ -19,6 +21,74 @@ mod dpi;
 
 thread_local! {
     static DPI: RefCell<Option<(gtk::Settings, dpi::Correction)>> = const { RefCell::new(None) };
+}
+
+/// Host facts that decide the renderer environment, separated from the process
+/// state they are read from so the decision itself is testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HostFacts {
+    nvidia: bool,
+    x11_backend: bool,
+    already_set: Vec<String>,
+}
+
+fn environment_overrides(facts: &HostFacts) -> BTreeMap<&'static str, &'static str> {
+    let mut result = BTreeMap::new();
+    let mut set = |key, value| {
+        if !facts.already_set.iter().any(|present| present == key) {
+            result.insert(key, value);
+        }
+    };
+    // JavaScriptCore gates `SharedArrayBuffer` behind this switch, and a
+    // cross-origin-isolated page alone does not enable it. Without it a guest
+    // that uses threads -- an Emscripten pthread build loads its module into
+    // workers -- fails at the first worker message and never paints.
+    set("JSC_useSharedArrayBuffer", "1");
+    if facts.nvidia {
+        set("__NV_DISABLE_EXPLICIT_SYNC", "1");
+        if facts.x11_backend {
+            set("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+        }
+    }
+    result
+}
+
+fn detect_host() -> HostFacts {
+    let gdk_backend = std::env::var("GDK_BACKEND").unwrap_or_default();
+    let x11_backend = if gdk_backend.is_empty() {
+        std::env::var_os("WAYLAND_DISPLAY").is_none()
+    } else {
+        gdk_backend
+            .split(',')
+            .next()
+            .is_some_and(|backend| backend.trim().eq_ignore_ascii_case("x11"))
+    };
+    let already_set = [
+        "JSC_useSharedArrayBuffer",
+        "__NV_DISABLE_EXPLICIT_SYNC",
+        "WEBKIT_DISABLE_DMABUF_RENDERER",
+    ]
+    .into_iter()
+    .filter(|key| std::env::var_os(key).is_some())
+    .map(str::to_owned)
+    .collect();
+    HostFacts {
+        nvidia: Path::new("/proc/driver/nvidia/version").exists()
+            || Path::new("/sys/module/nvidia").exists(),
+        x11_backend,
+        already_set,
+    }
+}
+
+/// Must run before Wry initializes WebKitGTK, which snapshots this environment
+/// when it launches its renderer processes. Existing user values win.
+pub(super) fn prepare_renderer_environment() {
+    for (key, value) in environment_overrides(&detect_host()) {
+        // SAFETY: this application-level setup runs before the facade creates
+        // Wry/WebKitGTK or starts the UI event loop, so no facade thread can
+        // concurrently read or modify process environment state.
+        unsafe { std::env::set_var(key, value) };
+    }
 }
 
 /// Published Wry installs an IPC script and endpoint even with no application
@@ -111,4 +181,39 @@ pub(super) fn configure_permissions(
             false
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn facts(nvidia: bool, x11_backend: bool, already_set: &[&str]) -> HostFacts {
+        HostFacts {
+            nvidia,
+            x11_backend,
+            already_set: already_set
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn environment_decision_table_preserves_user_values() {
+        assert_eq!(
+            environment_overrides(&facts(false, false, &[])),
+            BTreeMap::from([("JSC_useSharedArrayBuffer", "1")])
+        );
+        let x11_nvidia = environment_overrides(&facts(true, true, &[]));
+        assert_eq!(x11_nvidia.get("__NV_DISABLE_EXPLICIT_SYNC"), Some(&"1"));
+        assert_eq!(x11_nvidia.get("WEBKIT_DISABLE_DMABUF_RENDERER"), Some(&"1"));
+        assert!(!environment_overrides(&facts(true, false, &[]))
+            .contains_key("WEBKIT_DISABLE_DMABUF_RENDERER"));
+        assert!(!environment_overrides(&facts(
+            true,
+            true,
+            &["JSC_useSharedArrayBuffer", "WEBKIT_DISABLE_DMABUF_RENDERER"],
+        ))
+        .contains_key("JSC_useSharedArrayBuffer"));
+    }
 }

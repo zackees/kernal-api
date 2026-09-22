@@ -44,19 +44,23 @@ fn bounded_context_read_accepts_ordinary_empty_exact_and_binary_files() {
 
 #[cfg(unix)]
 #[test]
-fn bounded_context_read_reports_unreadable_input() {
+fn bounded_context_read_reports_unreadable_input_when_host_enforces_permissions() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let directory = tempfile::tempdir().unwrap();
     let unreadable = directory.path().join("unreadable");
     fs::write(&unreadable, b"no").unwrap();
     fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
-    assert_eq!(
-        read_context_regular_file_bounded(&unreadable, 2)
-            .unwrap_err()
-            .kind(),
-        ErrorKind::PermissionDenied
-    );
+    let result = read_context_regular_file_bounded(&unreadable, 2);
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+    match result {
+        Ok(_) => assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "a non-root process must not read a mode-000 file",
+        ),
+        Err(error) => assert_eq!(error.kind(), ErrorKind::PermissionDenied),
+    }
 }
 
 #[test]

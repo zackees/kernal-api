@@ -46,7 +46,7 @@ POLICY_FILTER='not binary(source_policy)'
 # file name in tree_hash, which APFS rejects with EILSEQ before the hash can see
 # it. The remaining entries are the upstream cap-primitives panic, one rename
 # that the guest's filesystem does not support, Recovery environment artifacts
-# (root, no tty, two-core timing), and one containment-state mismatch that is
+# (no tty, two-core timing), and one containment-state mismatch that is
 # still under investigation rather than explained. See issue #283.
 # ---------------------------------------------------------------------------
 
@@ -65,10 +65,6 @@ EXCLUDE_CAP_PRIMITIVES='commit_error_cleans_staging_after_destination_parent_is_
 # has no production caller.
 EXCLUDE_MACOS_RENAME='failed_marker_write_is_cleaned_up_and_existing_marker_is_preserved marker_is_invisible_until_payload_is_complete'
 
-# The guest runs as root, so a chmod-000 file is still readable and the test
-# observes Ok where it asserts a permission error.
-EXCLUDE_ROOT='bounded_context_read_reports_unreadable_input'
-
 # A Recovery guest gives this script no controlling terminal to save and
 # restore, so the termios flags it compares are not the ones it set.
 EXCLUDE_TTY='native_session_rejects_overlap_and_restores_mode'
@@ -85,7 +81,7 @@ EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_windo
 # while it is investigated (#283).
 EXCLUDE_CONTAINMENT_STATE='real_worker_sequential_stress_leaves_no_parent_state'
 
-EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_ROOT $EXCLUDE_TTY $EXCLUDE_VM_TIMING $EXCLUDE_CONTAINMENT_STATE"
+EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_TTY $EXCLUDE_VM_TIMING $EXCLUDE_CONTAINMENT_STATE"
 
 GUEST_EXCLUDE=''
 for name in $EXCLUDED_TESTS; do

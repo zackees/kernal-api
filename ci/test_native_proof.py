@@ -1,7 +1,9 @@
 """Fail-closed tests for the Linux-built, natively executed proof runner."""
 
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -304,53 +306,114 @@ class RunTests(unittest.TestCase):
 
 
 class WasmTargetRepairTests(unittest.TestCase):
-    def repair(self, effects, *, healthy=False):
+    def repair(
+        self,
+        behavior,
+        *,
+        healthy=False,
+        toolchain=None,
+        reported_libdir=None,
+        reported_sysroot=None,
+    ):
         root = temporary_directory(self)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
         libdir = root / "lib"
         sysroot = root / "sysroot"
         (sysroot / "lib" / "rustlib").mkdir(parents=True)
-        calls = []
-
-        def materialize():
-            libdir.mkdir(exist_ok=True)
+        calls = root / "calls"
+        effects = root / "effects"
+        add_count = root / "add-count"
+        effects.write_text(behavior, encoding="utf-8")
+        add_count.write_text("0", encoding="utf-8")
+        if healthy:
+            libdir.mkdir()
             (libdir / "libcore-0.rlib").touch()
             (libdir / "libstd-0.rlib").touch()
 
-        if healthy:
-            materialize()
-
-        def capture(arguments, *, env=None, cwd=proof.REPO):
-            arguments = [str(argument) for argument in arguments]
-            calls.append(arguments)
-            if "target-libdir" in arguments:
-                return f"{libdir}\n"
-            if "sysroot" in arguments:
-                return f"{sysroot}\n"
-            if arguments[:3] == ["soldr", "rustup", "target"]:
-                if effects.pop(0):
-                    materialize()
-                return ""
-            raise AssertionError(arguments)
-
-        with patch.object(proof, "capture", side_effect=capture):
-            proof.ensure_wasm_target(proof.THREADS)
+        fake_soldr = bin_dir / "soldr"
+        fake_soldr.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "$CALLS"
+if [ "$1" = rustc ] && [ "$2" = --print ]; then
+    if [ "$3" = target-libdir ]; then printf '%s\\n' "$LIBDIR"; else printf '%s\\n' "$SYSROOT"; fi
+    exit 0
+fi
+if [ "$1" = rustup ] && [ "$2" = run ] && [ "$4" = rustc ]; then
+    if [ "$6" = target-libdir ]; then printf '%s\\n' "$LIBDIR"; else printf '%s\\n' "$SYSROOT"; fi
+    exit 0
+fi
+if [ "$1" = rustup ] && [ "$2" = target ] && [ "$3" = add ]; then
+    count=$(cat "$ADD_COUNT")
+    count=$((count + 1))
+    printf '%s' "$count" > "$ADD_COUNT"
+    case "$(cat "$EFFECTS")" in
+        immediate) mkdir -p "$LIBDIR"; touch "$LIBDIR/libcore-0.rlib" "$LIBDIR/libstd-0.rlib" ;;
+        repair) if [ "$count" -eq 2 ]; then mkdir -p "$LIBDIR"; touch "$LIBDIR/libcore-0.rlib" "$LIBDIR/libstd-0.rlib"; fi ;;
+    esac
+fi
+""",
+            encoding="utf-8",
+        )
+        fake_soldr.chmod(0o755)
+        command = ["bash", str(proof.REPO / "ci/ensure-rustup-target.sh")]
+        if toolchain:
+            command.append(toolchain)
+        command.append(proof.THREADS)
+        environment = dict(
+            os.environ,
+            PATH=f"{bin_dir}:{os.environ['PATH']}",
+            CALLS=str(calls),
+            LIBDIR=reported_libdir or str(libdir),
+            SYSROOT=reported_sysroot or str(sysroot),
+            EFFECTS=str(effects),
+            ADD_COUNT=str(add_count),
+        )
+        result = subprocess.run(command, check=False, capture_output=True, text=True, env=environment)
         manifest = sysroot / "lib" / "rustlib" / f"manifest-rust-std-{proof.THREADS}"
-        return [call[3] for call in calls if call[:3] == ["soldr", "rustup", "target"]], manifest
+        call_lines = calls.read_text(encoding="utf-8").splitlines()
+        return result, call_lines, manifest
+
+    def test_native_proof_delegates_to_the_shared_target_repair_helper(self):
+        with patch.object(proof, "capture") as capture:
+            proof.ensure_wasm_target(proof.THREADS)
+        capture.assert_called_once_with(["bash", "ci/ensure-rustup-target.sh", proof.THREADS])
 
     def test_healthy_toolchain_is_not_mutated(self):
-        self.assertEqual(self.repair([], healthy=True)[0], [])
+        result, calls, _ = self.repair("never", healthy=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any(call.startswith("rustup target") for call in calls))
 
     def test_missing_target_is_installed(self):
-        self.assertEqual(self.repair([True])[0], ["add"])
+        result, calls, _ = self.repair("immediate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sum(call.startswith("rustup target add") for call in calls), 1)
 
     def test_stale_bookkeeping_is_repaired_through_an_empty_manifest(self):
-        rustup, manifest = self.repair([False, False, True])
-        self.assertEqual(rustup, ["add", "remove", "add"])
+        result, calls, manifest = self.repair("repair", toolchain="nightly-test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(call.startswith("rustup run nightly-test rustc") for call in calls))
+        self.assertEqual(
+            [call.split()[2] for call in calls if call.startswith("rustup target")],
+            ["add", "remove", "add"],
+        )
         self.assertTrue(manifest.is_file())
 
     def test_unrepairable_target_fails_closed(self):
-        with self.assertRaisesRegex(ValueError, "still lacks"):
-            self.repair([False, False, False])
+        result, _, _ = self.repair("never")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still lacks core/std", result.stderr)
+
+    def test_relative_target_libdir_fails_closed(self):
+        result, _, _ = self.repair("never", reported_libdir="relative/lib")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rustc target-libdir is not absolute", result.stderr)
+
+    def test_relative_sysroot_fails_closed(self):
+        result, _, _ = self.repair("never", reported_sysroot="relative/sysroot")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rustc sysroot is not absolute", result.stderr)
 
 
 class GuestTests(unittest.TestCase):

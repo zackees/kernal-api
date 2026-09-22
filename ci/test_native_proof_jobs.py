@@ -278,5 +278,44 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertEqual(re.findall(r"(?m)^\s+cache: (\$\{\{.*\}\})", text), [])
 
 
+    def test_dylints_lints_all_cross_target_selected_code_from_linux(self):
+        """The resolving Dylint pass must select every locally viable target (#147)."""
+        targets = (
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+        )
+        dylints = self.job("dylints")
+        select_compiler = self.step("dylints", "Select the pinned Dylint compiler")
+        self.assertRegex(
+            dylints,
+            r"(?m)^      DYLINT_TOOLCHAIN: nightly-\d{4}-\d{2}-\d{2}$",
+        )
+        self.assertIn("dylint-toolchain: ${{ env.DYLINT_TOOLCHAIN }}", dylints)
+        self.assertIn('--toolchain "$DYLINT_TOOLCHAIN"', select_compiler)
+        for target in targets:
+            with self.subTest(target=target):
+                install = self.step(
+                    "dylints", f"Materialize the {target} target for the pinned Dylint toolchain"
+                )
+                windows_lint = self.step("dylints", f"Lint the {target}-selected code from Linux")
+                for step in (install, windows_lint):
+                    self.assertIn("if: runner.os == 'Linux'", step)
+                self.assertIn(
+                    f'bash ci/ensure-rustup-target.sh\n          "$DYLINT_TOOLCHAIN" {target}',
+                    install,
+                )
+                self.assertIn("soldr cargo dylint", windows_lint)
+                self.assertIn("CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo", windows_lint)
+                for flag in ("--all-features", "--all-targets", f"--target {target}"):
+                    self.assertIn(flag, windows_lint)
+        materializer = (WORKFLOW.parents[2] / "ci/ensure-rustup-target.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("manifest-rust-std-$target", materializer)
+        self.assertIn('soldr rustup target "$1" --toolchain "$toolchain" "$target"', materializer)
+        self.assertIn('soldr rustup target "$1" "$target"', materializer)
+
+
 if __name__ == "__main__":
     unittest.main()

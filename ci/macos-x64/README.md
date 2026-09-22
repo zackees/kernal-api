@@ -75,7 +75,7 @@ the stub never has to stand in for real source.
   constant. They assert on source text that is identical on every host and
   ci.yml's Linux `test-run` lanes already run them. This mirrors the exclusion
   the aarch64 lane carries in `ci.yml`.
-- **19 further tests**, excluded by name and grouped by cause in
+- **18 further tests**, excluded by name and grouped by cause in
   `recovery-guest.sh`. Each entry is named rather than pattern-matched, so the
   list stays reviewable, and each group carries the evidence observed in the
   guest. None of it is a blanket filter: a test that starts failing for a *new*
@@ -85,7 +85,6 @@ the stub never has to stand in for real source.
 |---|---|---|
 | `EXCLUDE_CAP_PRIMITIVES` | 12 | `cap-primitives` 4.0.3 panics converting a negative macOS `st_rdev` — `u64::try_from(stat.st_rdev).unwrap()` at `metadata_ext.rs:171`. The `dev` field two lines above guards the same signedness, so `dev_t` is known-signed here and only `rdev` was missed. Surfaces as `TryFromIntError(())`. No fixed 4.x exists. |
 | `EXCLUDE_MACOS_RENAME` | 2 | The readiness marker's no-clobber publish returns `ENOTSUP` (45). `tempfile` asks for `renameatx_np(RENAME_EXCL)`, which real macOS supports, so this most likely reflects the guest's virtualized filesystem rather than macOS. Test-only: `persist_noclobber` has no production caller. |
-| `EXCLUDE_ROOT` | 1 | The guest runs as **root**, so a `chmod 000` file stays readable and the test observes `Ok` where it asserts a permission error. |
 | `EXCLUDE_TTY` | 1 | A Recovery guest gives the script no controlling terminal to save and restore. |
 | `EXCLUDE_VM_TIMING` | 2 | Two cores in a VM are not representative for wall-clock assertions; a suspension window and a containment deadline elapsed before the work did. |
 | `EXCLUDE_CONTAINMENT_STATE` | 1 | **Investigate, not an artifact.** `real_worker_sequential_stress_leaves_no_parent_state` observed `ForcedContainment { trigger: Cancelled }` where it expects `Stopped(Cancelled)`. That is a state mismatch rather than an elapsed deadline, so it may be a genuine macOS containment difference. Excluded to keep the lane green while it is investigated (#283). |

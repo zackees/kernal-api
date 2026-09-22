@@ -455,9 +455,15 @@ def run_screenshot(root: Path, manifest: dict, guest_dir: Path, work: Path) -> N
     )
     require_passed(output, "the native screenshot proof")
     # The host-only graph admits the same guests without the worker binary.
+    # `--nocapture` matches every other proof invocation: without it libtest
+    # buffers the harness output, so a hung test dies into the step's timeout
+    # with zero lines logged (run 35702323046 lost 27 minutes that way).
     admission_env = role_env(root, manifest, "screenshot-admission", base)
     stream(
-        with_display([role_test(root, manifest, "screenshot-admission"), "--ignored", "--test-threads=1"], admission_env),
+        with_display(
+            [role_test(root, manifest, "screenshot-admission"), "--ignored", "--nocapture", "--test-threads=1"],
+            admission_env,
+        ),
         env=admission_env,
     )
 

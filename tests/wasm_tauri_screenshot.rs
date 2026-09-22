@@ -738,26 +738,57 @@ fn run_native_screenshot_proof(scenario: NativeScenario) {
     }
     // The ordinary user entry point must build and admit the real guest,
     // then execute it in containment. Keep a separate bounded build allowance.
-    let proof_bound = Duration::from_secs(if builds_guest { 300 } else { 90 });
+    //
+    // #316: an artifact proof carries no fixed wall-clock deadline. Measured
+    // over five green ARM runs plus x86, they finish in 2.7-35.6s, yet one
+    // still tripped the old 90s total bound. The fixture's Timeout scenario
+    // alone legitimately silences the runner for the production 30-second
+    // load hold (measured gap: 30.001s), so the bound is now runner progress:
+    // fail only once neither diagnostic log has grown for 90 seconds, three
+    // times the longest legitimate silence. The guest-building run keeps its
+    // wall-clock allowance because one amalgamated crate may compile longer
+    // than any silence the stall bound would accept.
+    let build_allowance = Duration::from_secs(300);
+    let stall_bound = Duration::from_secs(90);
+    let stdout_log = proof.join("runner.stdout.log");
+    let stderr_log = proof.join("runner.stderr.log");
     let mut child = Child(
         command
             .arg("--url")
             .arg(format!("http://{address}/"))
             .arg("--output")
             .arg(&output)
-            .stdout(std::fs::File::create(proof.join("runner.stdout.log")).unwrap())
-            .stderr(std::fs::File::create(proof.join("runner.stderr.log")).unwrap())
+            .stdout(std::fs::File::create(&stdout_log).unwrap())
+            .stderr(std::fs::File::create(&stderr_log).unwrap())
             .spawn()
             .unwrap(),
     );
+    let log_bytes = |path: &std::path::Path| -> u64 {
+        std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    };
+    let mut output_bytes = log_bytes(&stdout_log) + log_bytes(&stderr_log);
+    let mut last_progress = start;
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() >= proof_bound {
-            std::fs::write(proof.join("process.json"), "{\"outcome\":\"timeout\"}\n").unwrap();
+        let bytes = log_bytes(&stdout_log) + log_bytes(&stderr_log);
+        if bytes != output_bytes {
+            output_bytes = bytes;
+            last_progress = Instant::now();
+        }
+        if builds_guest {
+            if start.elapsed() >= build_allowance {
+                std::fs::write(proof.join("process.json"), "{\"outcome\":\"timeout\"}\n").unwrap();
+                panic!(
+                    "screenshot runner exceeded its build allowance; diagnostics: {}",
+                    proof.display()
+                );
+            }
+        } else if last_progress.elapsed() >= stall_bound {
+            std::fs::write(proof.join("process.json"), "{\"outcome\":\"stalled\"}\n").unwrap();
             panic!(
-                "screenshot runner exceeded its proof bound; diagnostics: {}",
+                "screenshot runner produced no output for {stall_bound:?}; diagnostics: {}",
                 proof.display()
             );
         }

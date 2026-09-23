@@ -1,5 +1,11 @@
 # Agent instructions
 
+- Ordinary PRs and pushes to `main` run minimal CI; the `ci-test` PR label adds
+  extended tests, and `ci-full` runs the complete platform matrix. Apply
+  `ci-full` to platform-, target-, ABI-, or toolchain-sensitive PRs. A release
+  must pass full CI on its exact candidate SHA before any tag or publication;
+  use the explicit release workflow, never a direct tag or version-bump trigger.
+  See the [fleet CI contract](https://github.com/zackees/soldr/issues/3345).
 - Route Rust toolchain commands through `soldr`, for example
   `soldr cargo test --all-features` and `soldr cargo fmt --all`.
 - Route Python tools through `uv run --no-project`; never invoke `python` or

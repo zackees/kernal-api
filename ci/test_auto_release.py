@@ -22,12 +22,16 @@ class AutoReleaseTests(unittest.TestCase):
 
     def test_workflow_has_safe_automatic_and_manual_entrypoints(self):
         workflow = (ROOT / ".github/workflows/auto-release.yml").read_text()
-        self.assertIn("branches: [main]", workflow)
+        self.assertNotIn("branches: [main]", workflow)
         self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("candidate_sha:", workflow)
+        self.assertIn("full_ci_run_id:", workflow)
+        self.assertIn("ci/release_ci_gate.py", workflow)
+        self.assertIn("needs: [prepare, full-ci-gate]", workflow)
         self.assertIn("default: true", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("uses: ./.github/workflows/release.yml", workflow)
-        self.assertIn("startsWith(github.ref, 'refs/tags/v')", workflow)
+        self.assertIn("ref: ${{ inputs.candidate_sha }}", workflow)
 
     def test_registry_publish_is_explicitly_opt_in(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
@@ -37,8 +41,8 @@ class AutoReleaseTests(unittest.TestCase):
         self.assertIn("needs: [validate-and-package, release-assets]", workflow)
         caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
         self.assertIn("vars.PUBLISH_CRATES_IO == 'true'", caller)
-        self.assertIn("needs: [prepare, release]", caller)
-        self.assertIn("!(github.event_name == 'workflow_dispatch' && inputs.dry_run)", caller)
+        self.assertIn("needs: [prepare, full-ci-gate, release]", caller)
+        self.assertIn("!inputs.dry_run", caller)
         self.assertIn("!inputs.dry_run", workflow)
         self.assertNotIn("--clobber", workflow)
         self.assertIn("path: registry-packages/*", workflow)

@@ -224,6 +224,20 @@ class NativeProofJobsTests(unittest.TestCase):
             with self.subTest(build=suffix):
                 self.assertIn(f"https://get.nexte.st/latest/{suffix} ;;", install)
 
+    def test_macos_replay_keeps_native_guarantee_tests(self):
+        # #347: these prove owner-death containment, verified-control refusal,
+        # PTY restoration and reaping on real Macs; excluding them would let
+        # the full gate pass without the guarantees it claims.
+        replay = self.step("test", "Run this host's prebuilt tests")
+        for test in (
+            "native_session_rejects_overlap_and_restores_mode",
+            "verified_child_is_killed_exactly_once",
+            "a_child_bound_to_another_owner_dies_when_that_owner_does",
+            "shutdown_does_not_hold_child_mutex_while_reaping",
+        ):
+            with self.subTest(test=test):
+                self.assertNotIn(test, replay)
+
     # -- Linux-only checks ---------------------------------------------------
 
     def test_proof_runner_checks_run_once_on_linux(self):

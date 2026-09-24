@@ -34,7 +34,53 @@ fn native_session_rejects_overlap_and_restores_mode() {
         assert_eq!(stdin_mode().c_lflag & libc::ICANON, 0);
         drop(session);
         let after = stdin_mode();
-        assert_eq!(before.c_iflag, after.c_iflag);
+        // Restoration is judged against what the kernel itself reports once
+        // the original mode is applied, not against the first read: a host
+        // may normalize an undocumented input bit on tcsetattr (Darwin drops
+        // 0x20000000, #347). Re-applying `before` directly isolates that
+        // normalization from a failed restore by the session.
+        // SAFETY: stdin is this child's live PTY and before is initialized.
+        let reapplied = unsafe { libc::tcsetattr(0, libc::TCSANOW, &before) };
+        let reapply_error = io::Error::last_os_error();
+        let kernel = stdin_mode();
+        eprintln!(
+            "termios before iflag={:#x} oflag={:#x} cflag={:#x} lflag={:#x}; \
+             after iflag={:#x} oflag={:#x} cflag={:#x} lflag={:#x}; \
+             reapplied rc={reapplied} ({reapply_error}) iflag={:#x} lflag={:#x}",
+            before.c_iflag as u64,
+            before.c_oflag as u64,
+            before.c_cflag as u64,
+            before.c_lflag as u64,
+            after.c_iflag as u64,
+            after.c_oflag as u64,
+            after.c_cflag as u64,
+            after.c_lflag as u64,
+            kernel.c_iflag as u64,
+            kernel.c_lflag as u64,
+        );
+        assert_eq!(reapplied, 0, "re-applying the original mode must succeed");
+        assert_eq!(kernel.c_iflag, after.c_iflag);
+        assert_eq!(kernel.c_oflag, after.c_oflag);
+        assert_eq!(kernel.c_cflag, after.c_cflag);
+        assert_eq!(kernel.c_lflag, after.c_lflag);
+        assert_eq!(kernel.c_cc, after.c_cc);
+        // Every documented input mode must survive exactly; only bits the
+        // kernel itself refuses to round-trip may differ from the first read.
+        let documented = libc::IGNBRK
+            | libc::BRKINT
+            | libc::IGNPAR
+            | libc::PARMRK
+            | libc::INPCK
+            | libc::ISTRIP
+            | libc::INLCR
+            | libc::IGNCR
+            | libc::ICRNL
+            | libc::IXON
+            | libc::IXOFF
+            | libc::IXANY
+            | libc::IMAXBEL
+            | libc::IUTF8;
+        assert_eq!(before.c_iflag & documented, after.c_iflag & documented);
         assert_eq!(before.c_oflag, after.c_oflag);
         assert_eq!(before.c_cflag, after.c_cflag);
         assert_eq!(before.c_lflag, after.c_lflag);

@@ -10,7 +10,7 @@ use kernal_api::daemon_identity::{
     DaemonEndpoint, DaemonIdentity, DaemonIdentityRecord, DaemonVerifyError, LegacyPrefix,
     ProbeMuxResult, ProbeResponder, ProbeSameEndpoint,
 };
-use kernal_api::platform::process::ProcessIdentityAction;
+use kernal_api::platform::process::{ProcessIdentityAction, ProcessIdentityUnavailable};
 
 const SLEEPER_ENV: &str = "KERNAL_API_DAEMON_CONTROL_SLEEPER";
 const SLEEPER_TEST: &str = "daemon_identity_control::sleeper_child";
@@ -323,8 +323,33 @@ fn verified_child_is_killed_exactly_once() {
     assert_eq!(verified.pid(), child.id());
     assert!(verified.is_alive());
     assert!(!verified.has_exited().expect("observe the running sleeper"));
+    let first = verified.force_kill();
+    if cfg!(target_os = "macos") {
+        // macOS has no handle that pins a process generation, and a check
+        // followed by kill(pid) can hit a reused PID, so control refuses
+        // explicitly rather than racing (#347). The refusal must not signal.
+        assert!(
+            matches!(
+                first,
+                Err(DaemonVerifyError::ControlUnavailable {
+                    reason: ProcessIdentityUnavailable::Unsupported,
+                    ..
+                })
+            ),
+            "macOS refuses identity-bound termination: {first:?}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            child.try_wait().expect("poll sleeper").is_none(),
+            "a refused kill leaves the verified process running"
+        );
+        assert!(!verified.has_exited().expect("observe the running sleeper"));
+        child.kill().expect("parent kills its own sleeper");
+        child.wait().expect("reap sleeper");
+        return;
+    }
     assert_eq!(
-        verified.force_kill().expect("kill verified sleeper"),
+        first.expect("kill verified sleeper"),
         ProcessIdentityAction::Performed
     );
     // A real daemon is not this process's child, so nothing reaps it here:

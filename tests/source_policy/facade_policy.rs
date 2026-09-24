@@ -210,9 +210,21 @@ fn process_substrate_is_exact_feature_minimal_and_private() {
         workflow_job(&auto_release, "release").contains("uses: ./.github/workflows/release.yml"),
         "auto-release's release job must run release.yml, where release-guard lives"
     );
+    let full_ci_gate = workflow_job(&auto_release, "full-ci-gate");
     assert!(
-        workflow_job(&auto_release, "publish-crates").contains("needs: [prepare, release]"),
-        "publish-crates must depend on the whole release workflow before cargo publish"
+        full_ci_gate.contains("ci/release_ci_gate.py")
+            && full_ci_gate.contains("CANDIDATE_SHA: ${{ inputs.candidate_sha }}")
+            && full_ci_gate.contains("FULL_CI_RUN_ID: ${{ inputs.full_ci_run_id }}"),
+        "full-ci-gate must verify full CI for the exact release candidate SHA"
+    );
+    assert!(
+        workflow_job(&auto_release, "release").contains("needs: [prepare, full-ci-gate]"),
+        "release must wait for exact-SHA full CI before tagging or publishing"
+    );
+    assert!(
+        workflow_job(&auto_release, "publish-crates")
+            .contains("needs: [prepare, full-ci-gate, release]"),
+        "publish-crates must depend on exact-SHA full CI and the whole release workflow"
     );
     assert!(
         !release_workflow.contains("cargo publish"),

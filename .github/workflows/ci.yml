@@ -2,10 +2,16 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
   # Retain a deterministic recovery path when GitHub drops or delays a
   # pull-request synchronize event for a draft branch. Manual dispatch runs
   # the exact same matrix at the explicitly selected ref.
   workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character commit SHA to validate with the complete matrix
+        required: true
+        type: string
   push:
     branches: [main]
 
@@ -18,7 +24,7 @@ on:
 # now has no run of its own; its content is covered by the run for the commit
 # that replaced it.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -26,8 +32,8 @@ permissions:
   actions: write
 
 jobs:
-  # The whole pipeline is four jobs. Each one is a runner that sets up once and
-  # does everything that belongs on it, as steps -- not a runner per check.
+  # Four work jobs set up once and do everything that belongs on each runner.
+  # Full mode adds one small coverage sentinel after those jobs finish.
   #
   #   linux          the gate: every Linux-only check and proof, then lint,
   #                  the full test suite, and the Wasm guests the hosts replay
@@ -51,12 +57,22 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      sha: ${{ steps.mode.outputs.sha }}
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Select CI mode and verify the checked-out commit
+        id: mode
+        run: uv run --no-project --python 3.12 ci/ci_mode.py
+      - name: Verify selected source SHA
+        run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
       - name: Install native webview packages and a virtual display
         run: >-
           sudo apt-get update && sudo apt-get install --yes
@@ -80,16 +96,27 @@ jobs:
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - run: soldr cargo fmt --all -- --check
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Check the CI guards and the guest build scripts
         run: |
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
+            ci.test_ci_modes ci.test_release_ci_gate \
             ci.test_nextest_config ci.test_deny_warnings ci.test_target_features
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
+      - name: Lint the default facade
+        if: steps.mode.outputs.mode != 'full'
+        run: soldr cargo clippy --locked --lib -- --deny warnings
+      - name: Test the default facade
+        if: steps.mode.outputs.mode != 'full'
+        # The build-ID assertion depends on the CI linker's note settings;
+        # the full Nextest lane retains it on its existing all-feature graph.
+        run: >-
+          soldr cargo test --locked --lib --
+          --skip platform_linux::tests::current_executable_exposes_a_gnu_build_id
       - name: Check the compilation boundary and the release tooling
+        if: steps.mode.outputs.mode == 'full'
         run: |
           uv run --no-project ci/check_compilation_boundary_dependencies.py
           uv run --no-project ci/test_release_package_features.py
@@ -98,6 +125,7 @@ jobs:
           uv run --no-project --python 3.12 ci/test_auto_release.py
           uv run --no-project --python 3.12 ci/test_crate_release.py
       - name: Test the Python package
+        if: steps.mode.outputs.mode == 'full'
         # Python 3.10 only: it is the floor AGENTS.md supports, and the
         # package has no version-specific code for a second interpreter to
         # catch.
@@ -113,10 +141,12 @@ jobs:
       # job, with a quiet daemon, it never did. This ordering is a
       # mitigation until #1597 is fixed, not a cure -- no job cap, no retry.
       - name: Verify checked-in guest, host, and ABI manifest generation
+        if: steps.mode.outputs.mode == 'full'
         run: |
           bash ci/check_wasm_abi_generation.sh
           soldr cargo test --locked --manifest-path tools/wasm-abi-generator/Cargo.toml
       - name: Check every feature in isolation
+        if: steps.mode.outputs.mode == 'full'
         run: |
           set -uo pipefail
           features=(
@@ -181,16 +211,19 @@ jobs:
             exit 1
           fi
       - name: Test JSON with unified arbitrary-precision backend feature
+        if: steps.mode.outputs.mode != 'minimal'
         run: >-
           soldr cargo test --locked --no-default-features
           --features json,serde_json/arbitrary_precision --test data
       - name: Verify HTTP wire semantics under backend feature unification
+        if: steps.mode.outputs.mode == 'full'
         # Resolves a backend feature outside the production graph, so it may
         # update the lockfile and cannot run `--locked`.
         run: >-
           soldr cargo test --features http-client,reqwest/gzip
           --test net http_client::encoded_responses_preserve_wire_bytes_and_headers
       - name: Check the external facade consumers
+        if: steps.mode.outputs.mode == 'full'
         run: |
           soldr cargo check --locked --manifest-path tests/daemon-registration-consumer/Cargo.toml
           soldr cargo check --locked --manifest-path tests/daemon-registration-v2-consumer/Cargo.toml
@@ -198,6 +231,7 @@ jobs:
           # feature split is asserted by check_compilation_boundary_dependencies.py.
           soldr cargo check --locked --manifest-path tests/build-resources-consumer/Cargo.toml
       - name: Run real semantic webview lifecycle and capture proofs
+        if: steps.mode.outputs.mode == 'full'
         # A unit test does not own process main on every harness, while Tauri
         # needs its event loop there, so these run the smoke binary under Xvfb.
         env:
@@ -223,8 +257,10 @@ jobs:
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- open-cancel
           dbus-run-session -- xvfb-run -a soldr cargo test --locked --all-features --lib live_webkit_viewport_png_completes_capture_operation -- --ignored --test-threads=1
       - name: Install the screenshot guest target
+        if: steps.mode.outputs.mode == 'full'
         run: uv run --no-project ci/native_proof.py wasm-target wasm32-wasip1-threads
       - name: Build, admit, and run the real guest through the default screenshot CLI
+        if: steps.mode.outputs.mode == 'full'
         env:
           GDK_BACKEND: x11
           LIBGL_ALWAYS_SOFTWARE: "1"
@@ -244,6 +280,7 @@ jobs:
       # Built once: the x86_64 Linux native proofs below use them in place, and
       # every other host's `test` job downloads them.
       - name: Build the target-independent Wasm guests once
+        if: steps.mode.outputs.mode == 'full'
         run: >-
           uv run --no-project ci/native_proof.py guests
           --out "${{ runner.temp }}/native-proof-guests"
@@ -256,6 +293,7 @@ jobs:
       # fixed-name upload in this workflow overwrites so a rerun can
       # always refresh what its dependents need.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.mode.outputs.mode == 'full'
         with:
           name: native-proof-guests
           path: ${{ runner.temp }}/native-proof-guests
@@ -263,11 +301,13 @@ jobs:
           retention-days: 1
           overwrite: true
       - name: Compile the x86_64 Linux native proofs
+        if: steps.mode.outputs.mode == 'full'
         run: >-
           uv run --no-project ci/native_proof.py build --target x86_64-unknown-linux-gnu
           --archive "${{ runner.temp }}/native-proof-x86_64-unknown-linux-gnu.tar"
           --work "${{ runner.temp }}/native-proof-build"
       - name: Run the x86_64 Linux compiler-policy proofs
+        if: steps.mode.outputs.mode == 'full'
         timeout-minutes: 20
         run: >-
           uv run --no-project ci/native_proof.py run compiler
@@ -276,6 +316,7 @@ jobs:
           --guests "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-run-compiler"
       - name: Run the x86_64 Linux screenshot and containment proofs
+        if: steps.mode.outputs.mode == 'full'
         timeout-minutes: 30
         env:
           GDK_BACKEND: x11
@@ -290,16 +331,18 @@ jobs:
           --guests "${{ runner.temp }}/native-proof-guests"
           --work "${{ runner.temp }}/native-proof-run-screenshot"
       - name: Lint every target
+        if: steps.mode.outputs.mode == 'full'
         run: >-
           soldr cargo clippy
           --locked --all-features --all-targets -- --deny warnings
       - name: Run the full test suite
+        if: steps.mode.outputs.mode == 'full'
         # One test per process. `--no-fail-fast` is about tests, not runners:
         # the suite is about thirty seconds of tests, so stopping at the first
         # failure saved no capacity and hid the rest until the next cycle.
         run: soldr cargo nextest run --locked --all-features --no-fail-fast
       - name: Preserve screenshot and process diagnostics
-        if: always()
+        if: always() && steps.mode.outputs.mode == 'full'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-screenshot-diagnostics
@@ -313,7 +356,7 @@ jobs:
       # anything. Pull requests only: on main a cancelled run would erase the
       # record of which job failed.
       - name: Cancel the run (this job failed)
-        if: failure() && github.event_name == 'pull_request'
+        if: failure() && github.event_name == 'pull_request' && steps.mode.outputs.mode != 'full'
         run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -324,10 +367,11 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     needs: linux
+    if: needs.linux.outputs.mode == 'full'
     strategy:
       # Every target compiles the same sources; the second failure teaches
       # nothing the first did not.
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           # aarch64 Linux builds natively on an ARM runner, so WebKitGTK uses
@@ -355,6 +399,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+          ref: ${{ needs.linux.outputs.sha }}
+      - name: Verify selected source SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"
       - name: Install native webview development packages
         if: matrix.cross == ''
         run: >-
@@ -504,7 +552,7 @@ jobs:
           overwrite: true
       # Stops the whole run on a failure here; see the step in `linux`.
       - name: Cancel the run (this job failed)
-        if: failure() && github.event_name == 'pull_request'
+        if: failure() && github.event_name == 'pull_request' && needs.linux.outputs.mode != 'full'
         run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -514,10 +562,11 @@ jobs:
   test:
     name: Test (${{ matrix.target }})
     needs: [linux, build]
+    if: needs.linux.outputs.mode == 'full'
     strategy:
       # One host's failure stops the others; a host-specific failure is
       # reproduced by re-running this job alone.
-      fail-fast: true
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-24.04-arm
@@ -536,6 +585,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
+          ref: ${{ needs.linux.outputs.sha }}
+      - name: Verify selected source SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"
       - name: Install the native webview runtime and a virtual display
         # The binaries link webkit2gtk at run time, and the screenshot proofs
         # need a display. Windows and macOS carry their webviews with the OS.
@@ -554,10 +607,7 @@ jobs:
         with:
           name: native-proof-${{ matrix.target }}
           path: ${{ runner.temp }}/native-proof-bundle
-      # The test-suite replay stays behind `ENABLE_MACOS_RUNNERS` on Apple
-      # hosts, as it was; the proofs below run on every host, as they did.
       - name: Install cargo-nextest
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         shell: bash
         run: |
           mkdir -p "$HOME/.cargo/bin"
@@ -579,7 +629,6 @@ jobs:
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Run this host's prebuilt tests
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -594,7 +643,6 @@ jobs:
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \
             --workspace-remap . --no-fail-fast "${filter[@]}" 2>&1 | tee nextest-output.txt
       - name: Prove this host ran its own code
-        if: ${{ !startsWith(matrix.os, 'macos') || vars.ENABLE_MACOS_RUNNERS == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -679,7 +727,7 @@ jobs:
           overwrite: true
       # Stops the whole run on a failure here; see the step in `linux`.
       - name: Cancel the run (this job failed)
-        if: failure() && github.event_name == 'pull_request'
+        if: failure() && github.event_name == 'pull_request' && needs.linux.outputs.mode != 'full'
         run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -695,12 +743,14 @@ jobs:
   # bodies without a Windows runner. macOS remains a host job because no Apple
   # cross-target RED/GREEN proof exists.
   dylints:
+    name: Dylint (${{ matrix.os }})
     # Gated on Linux: the `macos-15-intel` entry is the single most expensive
     # job in this workflow, and a lint finding is not worth an Apple runner
     # while the tests are red.
     needs: linux
     env:
       DYLINT_TOOLCHAIN: nightly-2026-05-28
+    if: needs.linux.outputs.mode == 'full'
     strategy:
       fail-fast: false
       matrix:
@@ -708,6 +758,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.linux.outputs.sha }}
+      - name: Verify selected source SHA
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"
       - name: Install native webview development packages
         if: runner.os == 'Linux'
         run: >-
@@ -813,9 +868,31 @@ jobs:
           --all-features --all-targets --target aarch64-apple-darwin
       # Stops the whole run on a failure here; see the step in `linux`.
       - name: Cancel the run (this job failed)
-        if: failure() && github.event_name == 'pull_request'
+        if: failure() && github.event_name == 'pull_request' && needs.linux.outputs.mode != 'full'
         # No checkout guaranteed, so `gh` cannot infer the repository.
         run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+
+  full-coverage:
+    name: Full coverage
+    needs: [linux, build, test, dylints]
+    if: ${{ always() && needs.linux.outputs.mode == 'full' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.linux.outputs.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify complete full-mode coverage
+        env:
+          EXPECTED_SHA: ${{ needs.linux.outputs.sha }}
+          CI_NEEDS_JSON: ${{ toJSON(needs) }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: CHECKED_OUT_SHA="$(git rev-parse HEAD)" uv run --no-project --python 3.12 ci/full_coverage.py

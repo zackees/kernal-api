@@ -1,8 +1,8 @@
 """Keep CI to a few jobs that compile on Linux and run on all six hosts.
 
-The workflow is four jobs: `linux` (the gate), `build` and `test` (one runner
-per other target each), and `dylints`; each ends in a step that cancels the run
-when that job fails. These
+The workflow has four work jobs: `linux` (the gate), `build` and `test` (one
+runner per other target each), and `dylints`. Full mode adds a small coverage
+sentinel after the work jobs. These
 guards pin the properties that shape was chosen for, one test per property, so
 a later edit that quietly undoes one fails here instead of on a runner bill.
 """
@@ -26,7 +26,7 @@ TARGETS = {target for _, target in HOSTS}
 # x86_64 Linux is the gate: its builder is its host, so it builds and runs in
 # `linux` rather than in the per-target matrices.
 GATE_TARGET = "x86_64-unknown-linux-gnu"
-EXPECTED_JOBS = {"linux", "build", "test", "dylints"}
+EXPECTED_JOBS = {"linux", "build", "test", "dylints", "full-coverage"}
 # `cargo-nextest` is the replay driver, not a compiler: it runs binaries out of
 # a prebuilt archive. `.cargo/bin` is a path. Everything else named here would
 # compile on the host running it.
@@ -57,7 +57,7 @@ class NativeProofJobsTests(unittest.TestCase):
 
     # -- the shape -----------------------------------------------------------
 
-    def test_the_pipeline_is_four_jobs(self):
+    def test_the_pipeline_is_four_work_jobs_and_coverage(self):
         """Checks are steps on a shared runner, not a runner each.
 
         This workflow was 20 job definitions and 52 runners per push. A new
@@ -95,26 +95,22 @@ class NativeProofJobsTests(unittest.TestCase):
                 self.assertIn("needs: linux", self.job(gated))
         self.assertIn("needs: [linux, build]", self.job("test"))
 
-    def test_a_failure_cancels_the_rest_of_the_run(self):
-        """`fail-fast` stops a matrix's siblings; each job's last step stops everything else.
-
-        A sentinel job that `needs` every other job cannot do this: `needs`
-        waits for all of them to finish, so a red `linux-checks` sat beside
-        five Build and two dylints runners that ran to completion.
-        """
-        for name in EXPECTED_JOBS:
+    def test_routine_failure_cancels_but_full_mode_reports_every_leg(self):
+        """Full validation completes all legs so its coverage job can report them."""
+        for name in ("linux", "build", "test", "dylints"):
             with self.subTest(job=name):
                 job = self.job(name)
                 steps = re.split(r"\n      - ", job.split("steps:", 1)[1])
                 last = steps[-1]
                 self.assertIn("name: Cancel the run (this job failed)", last)
                 self.assertIn("if: failure() && github.event_name == 'pull_request'", last)
+                self.assertIn("outputs.mode != 'full'", last)
                 self.assertIn("gh run cancel ${{ github.run_id }}", last)
                 self.assertIn("GH_REPO: ${{ github.repository }}", last)
         self.assertIn("actions: write", self.text().split("\njobs:\n", 1)[0])
         for matrix in ("build", "test"):
             with self.subTest(job=matrix):
-                self.assertIn("fail-fast: true", self.job(matrix))
+                self.assertIn("fail-fast: false", self.job(matrix))
 
     def test_no_job_caps_compile_concurrency(self):
         """soldr's admission gate owns concurrency, not a job-wide cap.
@@ -228,6 +224,20 @@ class NativeProofJobsTests(unittest.TestCase):
             with self.subTest(build=suffix):
                 self.assertIn(f"https://get.nexte.st/latest/{suffix} ;;", install)
 
+    def test_macos_replay_keeps_native_guarantee_tests(self):
+        # #347: these prove owner-death containment, verified-control refusal,
+        # PTY restoration and reaping on real Macs; excluding them would let
+        # the full gate pass without the guarantees it claims.
+        replay = self.step("test", "Run this host's prebuilt tests")
+        for test in (
+            "native_session_rejects_overlap_and_restores_mode",
+            "verified_child_is_killed_exactly_once",
+            "a_child_bound_to_another_owner_dies_when_that_owner_does",
+            "shutdown_does_not_hold_child_mutex_while_reaping",
+        ):
+            with self.subTest(test=test):
+                self.assertNotIn(test, replay)
+
     # -- Linux-only checks ---------------------------------------------------
 
     def test_proof_runner_checks_run_once_on_linux(self):
@@ -257,7 +267,7 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_linux_compiles_kernal_api_as_one_all_features_graph(self):
         """Every kernal-api build in `linux` shares the suite's graph.
 
-        Proofs used to compile their own feature sets -- the webview smoke,
+        In full mode, proofs used to compile their own feature sets -- the webview smoke,
         the screenshot CLI, six native-proof roles, a threaded-guest script
         that rebuilt the guest and three more graphs to rerun the native
         proofs -- about fourteen minutes of compiling beyond the suite. Now
@@ -272,6 +282,9 @@ class NativeProofJobsTests(unittest.TestCase):
         unification = ("serde_json/arbitrary_precision", "reqwest/gzip")
         for command in commands:
             with self.subTest(command=command):
+                if command.startswith("soldr cargo test --locked --lib --"):
+                    # The routine gate intentionally exercises the default graph.
+                    continue
                 if "--manifest-path" in command or any(feature in command for feature in unification):
                     continue
                 self.assertIn("--all-features", command)

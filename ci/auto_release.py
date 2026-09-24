@@ -28,8 +28,8 @@ def main() -> None:
         if os.environ["RELEASE_TAG"] != tag:
             raise ValueError("release tag does not match Cargo.toml")
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-        if head != os.environ["GITHUB_SHA"] or head != os.environ["RELEASE_SHA"]:
-            raise ValueError("release source must be the workflow commit")
+        if head != os.environ["RELEASE_SHA"]:
+            raise ValueError("release source must be the candidate commit")
         tags = subprocess.check_output(["git", "tag", "--list", tag], text=True)
         if tags.strip():
             tagged = subprocess.check_output(

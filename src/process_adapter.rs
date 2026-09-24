@@ -22,7 +22,7 @@
 
 use std::io;
 use std::process::ExitStatus;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use running_process::{
@@ -32,7 +32,7 @@ use running_process::{
 };
 
 use crate::platform::process::{
-    lifetime_enforcement_for, LifetimeEnforcement, LifetimeOwner, ProcessIdentityCapture,
+    lifetime_enforcement_for, LifetimeEnforcement, LifetimeOwner,
     ProcessInspectError, ProcessInspectErrorKind,
 };
 use crate::{
@@ -44,7 +44,9 @@ use crate::{
 
 /// Private child state from the selected native substrate.
 pub(crate) struct ProcessAdapter {
-    process: AsyncProcess,
+    // Shared only with the owner watcher, which holds a `Weak` so it can never
+    // extend the child's lifetime past this handle.
+    process: Arc<AsyncProcess>,
     pid: Option<u32>,
 }
 
@@ -53,7 +55,7 @@ pub(crate) struct ProcessSessionAdapter {
     // The native split keeps this lane as the sole terminal owner. Declaring
     // it before the receiver ensures drop activates lifecycle cleanup before
     // facade output detaches.
-    control: AsyncProcessSessionControl,
+    control: Arc<AsyncProcessSessionControl>,
     // The mutex establishes the facade's single output consumer without
     // serializing lifecycle methods behind a pending pipe read.
     output: tokio::sync::Mutex<AsyncProcessSessionOutput>,
@@ -136,7 +138,8 @@ pub(crate) async fn spawn(spec: SpawnSpec) -> io::Result<PlatformChild> {
         }
     }
     let pid = process.pid().await.map_err(process_error_to_io)?;
-    let lifetime = bind_lifetime(owner, watch, pid);
+    let process = Arc::new(process);
+    let lifetime = bind_lifetime(owner, watch, OwnedChild::Process(Arc::downgrade(&process)));
     Ok(PlatformChild::new(
         ProcessAdapter {
             process,
@@ -195,38 +198,58 @@ fn inspect_error_kind(error: &ProcessInspectError) -> io::ErrorKind {
 fn bind_lifetime(
     owner: Option<LifetimeOwner>,
     watch: Option<ProcessExitWatch>,
-    child_pid: u32,
+    child: OwnedChild,
 ) -> LifetimeBinding {
     let Some(owner) = owner else {
         return LifetimeBinding::unbound();
     };
     LifetimeBinding {
         enforcement: Some(lifetime_enforcement_for(owner)),
-        watcher: Mutex::new(watch.map(|watch| watch_owner(watch, child_pid))),
+        watcher: Mutex::new(watch.map(|watch| watch_owner(watch, child))),
+    }
+}
+
+/// The spawner's own handle to the child the watcher protects.
+///
+/// Killing through the handle that will reap the child is exact on every
+/// host: the PID cannot be reused while its parent has not reaped it, and
+/// the substrate knows whether it has. A PID-addressed kill needs a host
+/// primitive that pins the generation, which macOS does not provide (#347).
+enum OwnedChild {
+    Process(Weak<AsyncProcess>),
+    Session(Weak<AsyncProcessSessionControl>),
+}
+
+impl OwnedChild {
+    async fn kill(&self) -> Result<(), ProcessError> {
+        match self {
+            Self::Process(process) => match process.upgrade() {
+                Some(process) => process.kill().await,
+                None => Ok(()),
+            },
+            Self::Session(control) => match control.upgrade() {
+                Some(control) => control.kill().await,
+                None => Ok(()),
+            },
+        }
     }
 }
 
 /// Terminate exactly this child when exactly that owner exits.
 ///
 /// Both halves are pinned rather than re-resolved: the watch names the owner
-/// process, and the kill is addressed by the child's creation generation, so
+/// process, and the kill goes through the spawner's own child handle, so
 /// neither number being handed to someone else in between can redirect it. A
-/// child that exited first leaves the kill with nothing to do, which the
-/// identity check reports rather than acting on.
-fn watch_owner(watch: ProcessExitWatch, child_pid: u32) -> crate::async_engine::Task<()> {
-    let child = match crate::platform::process::capture_identity(child_pid) {
-        ProcessIdentityCapture::Found(identity) => Some(identity),
-        _ => None,
-    };
+/// dropped handle already ran its own cleanup, and a child that exited first
+/// leaves the kill with nothing to do.
+fn watch_owner(watch: ProcessExitWatch, child: OwnedChild) -> crate::async_engine::Task<()> {
     crate::async_engine::launch(async move {
         // An error here is "the host stopped answering", not "the owner
         // died"; killing the child on it would reap for the wrong reason.
         if watch.exited().await.is_err() {
             return;
         }
-        if let Some(identity) = child {
-            let _ = crate::platform::process::force_kill(identity);
-        }
+        let _ = child.kill().await;
     })
 }
 
@@ -251,7 +274,8 @@ pub(crate) async fn spawn_session(
     }
     let (control, output) = session.into_parts().map_err(process_error_to_io)?;
     let pid = control.pid();
-    let lifetime = bind_lifetime(owner, watch, pid);
+    let control = Arc::new(control);
+    let lifetime = bind_lifetime(owner, watch, OwnedChild::Session(Arc::downgrade(&control)));
     Ok(ProcessSession::new(
         ProcessSessionAdapter {
             control,

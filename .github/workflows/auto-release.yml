@@ -1,11 +1,16 @@
 name: Auto-Release
 
 on:
-  push:
-    branches: [main]
-    paths: [Cargo.toml]
   workflow_dispatch:
     inputs:
+      candidate_sha:
+        description: Exact commit SHA to release or dry-run
+        required: true
+        type: string
+      full_ci_run_id:
+        description: Successful exact-SHA full CI run ID (required to publish)
+        required: false
+        type: string
       dry_run:
         description: Verify and upload build artifacts without publishing anything
         type: boolean
@@ -23,8 +28,7 @@ concurrency:
 
 jobs:
   prepare:
-    # Existing-tag dispatch is the immutable registry recovery path after main advances.
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/v'))
+    # Explicit dispatch is the only release entry point.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -34,7 +38,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.candidate_sha }}
+      - name: Verify selected source SHA
+        run: test "$(git rev-parse HEAD)" = "${{ inputs.candidate_sha }}"
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - name: Detect version bump
         id: detect
@@ -43,14 +49,36 @@ jobs:
           RELEASE_BEFORE: ${{ github.event.before }}
         run: uv run --no-project --python 3.13 ci/auto_release.py
 
-  release:
+  full-ci-gate:
     needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
+    if: needs.prepare.outputs.should_release == 'true' && !inputs.dry_run
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.candidate_sha }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Verify exact-SHA full CI passed
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          FULL_CI_RUN_ID: ${{ inputs.full_ci_run_id }}
+        run: uv run --no-project --python 3.12 ci/release_ci_gate.py
+
+  release:
+    needs: [prepare, full-ci-gate]
+    if: >-
+      always() && needs.prepare.outputs.should_release == 'true'
+      && (inputs.dry_run || needs.full-ci-gate.result == 'success')
     uses: ./.github/workflows/release.yml
     with:
-      source_sha: ${{ github.sha }}
+      source_sha: ${{ inputs.candidate_sha }}
       tag: ${{ needs.prepare.outputs.tag }}
-      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+      dry_run: ${{ inputs.dry_run }}
+      full_ci_run_id: ${{ inputs.full_ci_run_id }}
     secrets: inherit
 
   publish-crates:
@@ -58,10 +86,11 @@ jobs:
     # the workflow registered as the crate's trusted publisher. `release`
     # completing means every release.yml job -- guard, validation,
     # packaging, GitHub assets -- succeeded.
-    needs: [prepare, release]
+    needs: [prepare, full-ci-gate, release]
     if: >-
       needs.prepare.outputs.should_release == 'true'
-      && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+      && !inputs.dry_run
+      && needs.full-ci-gate.result == 'success'
       && vars.PUBLISH_CRATES_IO == 'true'
     runs-on: ubuntu-latest
     environment: release
@@ -78,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.candidate_sha }}
           lfs: true
       - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
         with:

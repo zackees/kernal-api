@@ -432,7 +432,9 @@ mod tests {
         while waits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::yield_now();
         }
-        assert_eq!(waits.load(Ordering::SeqCst), 1, "fake wait never started");
+        // Shutdown polls until its deadline, so the count may exceed one on a
+        // slow host (#347); the property is only that reaping has begun.
+        assert!(waits.load(Ordering::SeqCst) >= 1, "fake wait never started");
 
         let child_mutex_available = child.try_lock().is_ok();
         release_wait(&wait_gate);

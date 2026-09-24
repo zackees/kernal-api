@@ -291,6 +291,14 @@ class RunTests(unittest.TestCase):
             name, value = assignment.split("=", 1)
             self.assertEqual(value, screenshot_env[name])
         self.assertEqual(screenshot[screenshot.index("--skip") + 1], proof.GUEST_BUILDING_SCREENSHOT_TEST)
+        # The admission phase reuses this harness without `--skip`; it must
+        # stream live too, or a hang there reaches the step timeout silently.
+        admission = next(
+            arguments
+            for arguments, _ in ignored
+            if "--skip" not in arguments and any("wasm_tauri_screenshot" in argument for argument in arguments)
+        )
+        self.assertIn("--nocapture", admission)
         containment_env = next(env for arguments, env in host.calls if "cargo_built_threaded_guest_" in arguments)
         self.assertTrue(containment_env["NEXTEST_BIN_EXE_kernal-wasm-worker"].endswith("worker-containment/kernal-wasm-worker"))
         parent_death = [arguments for arguments, _ in host.calls if proof.PARENT_DEATH_TEST in arguments and "--list" not in arguments]

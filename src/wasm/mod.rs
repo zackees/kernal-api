@@ -4126,8 +4126,11 @@ mod threaded_root_observation_tests {
 
     #[test]
     fn multi_thread_runtime_and_unrelated_same_engine_sketch_remain_isolated() {
+        // Cancellation, not the deadline, must end the looping sketch. A 50ms
+        // deadline raced the unrelated sketch's run on a slow hosted Intel Mac
+        // and reported DeadlineExceeded before cancel was ever sent.
         let compiler =
-            concurrent_epoch_compiler(Duration::from_millis(50), MAX_GUEST_THREADS_V1 + 1);
+            concurrent_epoch_compiler(Duration::from_secs(30), MAX_GUEST_THREADS_V1 + 1);
         let looping = admit_epoch_fixture(&compiler, root_fuel_fixture());
         let normal = admit_epoch_fixture(&compiler, threaded_yield_fixture());
         let runtime = crate::async_engine::RuntimeBuilder::multi_thread()

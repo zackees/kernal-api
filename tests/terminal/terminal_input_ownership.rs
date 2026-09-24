@@ -47,16 +47,16 @@ fn native_session_rejects_overlap_and_restores_mode() {
             "termios before iflag={:#x} oflag={:#x} cflag={:#x} lflag={:#x}; \
              after iflag={:#x} oflag={:#x} cflag={:#x} lflag={:#x}; \
              reapplied rc={reapplied} ({reapply_error}) iflag={:#x} lflag={:#x}",
-            before.c_iflag as u64,
-            before.c_oflag as u64,
-            before.c_cflag as u64,
-            before.c_lflag as u64,
-            after.c_iflag as u64,
-            after.c_oflag as u64,
-            after.c_cflag as u64,
-            after.c_lflag as u64,
-            kernel.c_iflag as u64,
-            kernel.c_lflag as u64,
+            before.c_iflag,
+            before.c_oflag,
+            before.c_cflag,
+            before.c_lflag,
+            after.c_iflag,
+            after.c_oflag,
+            after.c_cflag,
+            after.c_lflag,
+            kernel.c_iflag,
+            kernel.c_lflag,
         );
         assert_eq!(reapplied, 0, "re-applying the original mode must succeed");
         assert_eq!(kernel.c_iflag, after.c_iflag);

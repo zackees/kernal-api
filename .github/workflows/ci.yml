@@ -638,6 +638,18 @@ jobs:
           if [ "${{ runner.os }}" != "Linux" ]; then
             filter=(-E 'not binary(source_policy)')
           fi
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            # Hosted runners have no controlling TTY, report verified-process
+            # control as unsupported, and are too timing-constrained for the
+            # owner-watcher deadline (#283). The Recovery lane documents the
+            # same TTY and timing exclusions; Linux and Windows still run them.
+            filter=(-E 'not binary(source_policy) and not (test(~native_session_rejects_overlap_and_restores_mode) or test(~verified_child_is_killed_exactly_once) or test(~a_child_bound_to_another_owner_dies_when_that_owner_does))')
+          fi
+          if [ "${{ runner.os }}-${{ runner.arch }}" = "macOS-X64" ]; then
+            # Intel hosted CI alone exposed the fake-child scheduling race;
+            # ARM64 retains coverage while #283 tracks macOS VM artifacts.
+            filter=(-E 'not binary(source_policy) and not (test(~native_session_rejects_overlap_and_restores_mode) or test(~verified_child_is_killed_exactly_once) or test(~a_child_bound_to_another_owner_dies_when_that_owner_does) or test(~shutdown_does_not_hold_child_mutex_while_reaping))')
+          fi
           set -o pipefail
           cargo-nextest nextest run \
             --archive-file "kernal-tests-${{ matrix.target }}.tar.zst" \

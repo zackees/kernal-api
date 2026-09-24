@@ -224,6 +224,24 @@ class NativeProofJobsTests(unittest.TestCase):
             with self.subTest(build=suffix):
                 self.assertIn(f"https://get.nexte.st/latest/{suffix} ;;", install)
 
+    def test_macos_replay_excludes_hosted_runner_limitations(self):
+        replay = self.step("test", "Run this host's prebuilt tests")
+        self.assertIn('if [ "${{ runner.os }}" = "macOS" ]', replay)
+        common = (
+            "native_session_rejects_overlap_and_restores_mode",
+            "verified_child_is_killed_exactly_once",
+            "a_child_bound_to_another_owner_dies_when_that_owner_does",
+        )
+        common_filter = " or ".join(f"test(~{test})" for test in common)
+        self.assertIn(
+            f"filter=(-E 'not binary(source_policy) and not ({common_filter})')", replay
+        )
+        self.assertIn('if [ "${{ runner.os }}-${{ runner.arch }}" = "macOS-X64" ]', replay)
+        for test in common:
+            with self.subTest(test=test):
+                self.assertIn(f"test(~{test})", replay)
+        self.assertEqual(replay.count("test(~shutdown_does_not_hold_child_mutex_while_reaping)"), 1)
+
     # -- Linux-only checks ---------------------------------------------------
 
     def test_proof_runner_checks_run_once_on_linux(self):

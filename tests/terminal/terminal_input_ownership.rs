@@ -36,9 +36,9 @@ fn native_session_rejects_overlap_and_restores_mode() {
         let after = stdin_mode();
         // Restoration is judged against what the kernel itself reports once
         // the original mode is applied, not against the first read: a host
-        // may normalize an undocumented input bit on tcsetattr (Darwin drops
-        // 0x20000000, #347). Re-applying `before` directly isolates that
-        // normalization from a failed restore by the session.
+        // may add kernel-owned state on tcsetattr (Darwin sets PENDIN in
+        // c_lflag, #347). Re-applying `before` directly isolates that from a
+        // failed restore by the session.
         // SAFETY: stdin is this child's live PTY and before is initialized.
         let reapplied = unsafe { libc::tcsetattr(0, libc::TCSANOW, &before) };
         let reapply_error = io::Error::last_os_error();
@@ -83,7 +83,11 @@ fn native_session_rejects_overlap_and_restores_mode() {
         assert_eq!(before.c_iflag & documented, after.c_iflag & documented);
         assert_eq!(before.c_oflag, after.c_oflag);
         assert_eq!(before.c_cflag, after.c_cflag);
-        assert_eq!(before.c_lflag, after.c_lflag);
+        // PENDIN is kernel-owned state, not a mode: Darwin sets it when
+        // canonical mode resumes with input still queued, as this PTY's
+        // pre-written line is (#347). Every other local mode must survive.
+        let modes = !libc::PENDIN;
+        assert_eq!(before.c_lflag & modes, after.c_lflag & modes);
         assert_eq!(before.c_cc, after.c_cc);
         drop(kernal_api::TerminalInputSession::new().unwrap().unwrap());
         let mut keys = kernal_api::keys::TerminalKeys::new().unwrap().unwrap();
@@ -116,7 +120,7 @@ fn native_session_rejects_overlap_and_restores_mode() {
             io::ErrorKind::InvalidInput
         );
         drop(keys);
-        assert_eq!(before.c_lflag, stdin_mode().c_lflag);
+        assert_eq!(before.c_lflag & modes, stdin_mode().c_lflag & modes);
         return;
     }
 

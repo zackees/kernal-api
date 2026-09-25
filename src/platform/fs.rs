@@ -107,10 +107,10 @@ pub use async_io::AsyncFileIo;
 mod materialize;
 #[cfg(feature = "fs")]
 pub use materialize::{
-    allocated_bytes, apply_metadata_mode, await_no_writers, classify, file_change_marker, file_id_width,
+    allocated_bytes, apply_metadata_mode, await_no_writers, classify, extent_sharing, file_change_marker, file_id_width,
     hard_link_count, make_executable, metadata_mode, native_call_path, path_from_raw_bytes,
     set_readonly, symlink_file, sync_directory_if_supported, volume_identity_u128,
-    FileChangeMarker, LinkKind, WriterWait,
+    ExtentSharing, FileChangeMarker, LinkKind, WriterWait,
 };
 /// Path-observed file identity with the native identifier width.
 #[cfg(feature = "fs")]

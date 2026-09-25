@@ -563,3 +563,34 @@ fn await_no_writers_never_reports_clear_while_a_writer_is_open() {
         io::ErrorKind::NotFound
     );
 }
+
+#[test]
+fn extent_sharing_never_calls_a_reflinked_copy_exclusive() {
+    use kernal_api::platform::fs::{extent_sharing, reflink_file, ExtentSharing};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("source");
+    fs::write(&source, vec![7_u8; 256 * 1024]).expect("write");
+    let fresh = extent_sharing(&source).expect("observe fresh file");
+    assert_ne!(
+        fresh,
+        ExtentSharing::Shared,
+        "a fresh file shares no blocks"
+    );
+
+    let clone = dir.path().join("clone");
+    if reflink_file(&source, &clone).is_ok() {
+        // The volume can clone, so both names now share every extent.
+        for path in [&source, &clone] {
+            let observed = extent_sharing(path).expect("observe clone");
+            assert_ne!(observed, ExtentSharing::Exclusive, "{path:?}");
+        }
+    }
+
+    assert_eq!(
+        extent_sharing(&dir.path().join("missing"))
+            .expect_err("missing file")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}

@@ -17,7 +17,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
-use crate::platform::fs::LinkKind;
+use crate::platform::fs::{LinkKind, WriterWait};
 
 #[path = "fs_replacement.rs"]
 mod replacement;
@@ -195,6 +195,18 @@ fn decode_usn(record: &[u8]) -> Option<i64> {
             _ => None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Writers
+// ---------------------------------------------------------------------------
+
+/// Writers are not observed here. A Windows child inherits only handles
+/// marked inheritable, so a spawn cannot extend a write handle's lifetime the
+/// way a POSIX fork does.
+pub fn await_no_writers(path: &Path, _timeout: std::time::Duration) -> io::Result<WriterWait> {
+    std::fs::metadata(path)?;
+    Ok(WriterWait::Unobservable)
 }
 
 // ---------------------------------------------------------------------------

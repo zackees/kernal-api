@@ -130,6 +130,10 @@ class NativeProofJobsTests(unittest.TestCase):
                 self.assertNotIn("SOLDR_JOBS", text)
                 for pin in re.findall(r"zackees/setup-soldr@(\w+)", text):
                     self.assertNotEqual(pin, "bb28e96d2dc32c058242f56722297caf1efcbd90")
+        # The managed Bosn stack follows the same rule (#29): its old
+        # CARGO_BUILD_JOBS=1 stopgap predates soldr's in-daemon admission.
+        bosn = (WORKFLOW.parents[2] / "bosn.toml").read_text(encoding="utf-8")
+        self.assertNotRegex(bosn, r"(?m)^\s*(CARGO_BUILD_JOBS|SOLDR_JOBS)\s*=")
 
     # -- where things compile ------------------------------------------------
 

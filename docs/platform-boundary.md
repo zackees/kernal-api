@@ -97,6 +97,7 @@ declare trees of its own.
   `webkit2gtk`, `objc2`/`objc2_*`, `block2`, `core_foundation`,
   `core_graphics`, `nix`, `rustix`, `dispatch2` -- or at `std::os`/`core::os`,
   `tokio::{net,signal,process}::{unix,windows,Unix*}` and `interprocess::os`,
+  foreign import blocks (`extern "C" { .. }`) and `#[link]`,
   including renamed imports (`use libc as c`), `extern crate`, absolute
   `::libc` paths, braced `use std::{os::unix, ..}` trees and macro bodies.
 - `platform_imp`, `platform_win`, `platform_linux` and `platform_macos` as
@@ -144,10 +145,11 @@ targets. There is no occurrence baseline: the boundary debt is zero, and a
 new violation fails immediately.
 
 Every `Cargo.toml` in the repository is classified in
-`dylints/kernal_api_platform_boundary/src/lib.rs` as enforced (the
-workspace, the `tests/*-consumer` client fixtures, `tools/wasm-abi-generator`,
-`benchmarks/wasm-sketch/component-tools`) or excluded with a reason (the
-wasm guest crates and generated guest bindings, which never build for a
-native host, and the two lint crates, whose UI fixtures violate on purpose).
-Adding a manifest without classifying it fails
+`dylints/kernal_api_platform_boundary/src/lib.rs` as native (the workspace,
+the `tests/*-consumer` client fixtures, `tools/wasm-abi-generator`,
+`benchmarks/wasm-sketch/component-tools`), guest (the wasm guest crates and
+the generated guest ABI bindings, scanned under the guest rule so that guest
+predicates and wasm imports pass but native host selection does not, even
+when a native tool `include!`s them) or lint (the two lint crates, whose UI
+fixtures violate on purpose). Adding a manifest without classifying it fails
 `every_manifest_is_classified`.

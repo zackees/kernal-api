@@ -109,15 +109,18 @@ fn is_owner_library(
     let (Some(package), Some(manifest_dir)) = (package, manifest_dir) else {
         return false;
     };
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let manifest_dir = manifest_dir
-        .canonicalize()
-        .unwrap_or_else(|_| manifest_dir.to_path_buf());
+    // Compare as spelled, then with both sides canonical: canonicalizing
+    // only the side that exists would split a symlinked prefix (macOS
+    // `/var` is `/private/var`).
+    let is_root = |root: &Path, dir: &Path| {
+        root.strip_prefix(dir)
+            .is_ok_and(|rel| rel == Path::new("src/lib.rs"))
+    };
+    let canonical = || Some((root.canonicalize().ok()?, manifest_dir.canonicalize().ok()?));
     package == FACADE_OWNER
         && library
-        && root
-            .strip_prefix(&manifest_dir)
-            .is_ok_and(|rel| rel == Path::new("src/lib.rs"))
+        && (is_root(root, manifest_dir)
+            || canonical().is_some_and(|(root, dir)| is_root(&root, &dir)))
 }
 
 fn absolute(path: &Path) -> PathBuf {

@@ -151,6 +151,7 @@ pub struct Scanner<'a> {
 
 /// Scan a crate from its root file. `owner_library` is true only for the
 /// facade owner's library target: the one place a host selector is valid.
+#[cfg(test)]
 pub fn scan_crate(
     root: &Path,
     owner_library: bool,

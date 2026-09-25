@@ -532,3 +532,34 @@ fn directory_sync_is_best_effort_only_where_unsupported() {
         missing.expect_err("Unix opens the directory to flush it");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Writers
+// ---------------------------------------------------------------------------
+
+#[test]
+fn await_no_writers_never_reports_clear_while_a_writer_is_open() {
+    use kernal_api::platform::fs::{await_no_writers, WriterWait};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("artifact");
+    let writer = fs::File::create(&path).expect("create");
+    let open = await_no_writers(&path, Duration::from_millis(20)).expect("observe");
+    assert!(
+        matches!(open, WriterWait::TimedOut | WriterWait::Unobservable),
+        "{open:?}"
+    );
+    drop(writer);
+    let closed = await_no_writers(&path, Duration::from_secs(5)).expect("observe");
+    assert!(
+        matches!(closed, WriterWait::Clear { .. } | WriterWait::Unobservable),
+        "{closed:?}"
+    );
+    assert_eq!(
+        await_no_writers(&dir.path().join("missing"), Duration::ZERO)
+            .expect_err("missing file")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+}

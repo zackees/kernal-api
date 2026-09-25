@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use crate::platform::fs::LinkKind;
+use crate::platform::fs::{LinkKind, WriterWait};
 
 // ---------------------------------------------------------------------------
 // Replacement
@@ -101,6 +101,17 @@ pub fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
 /// macOS keeps no per-file change journal this crate can read.
 pub fn file_change_marker(_path: &Path) -> Option<i128> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// Writers
+// ---------------------------------------------------------------------------
+
+/// This host executes a file regardless of other processes' write
+/// descriptors, so there is nothing to wait for.
+pub fn await_no_writers(path: &Path, _timeout: std::time::Duration) -> io::Result<WriterWait> {
+    std::fs::metadata(path)?;
+    Ok(WriterWait::Unobservable)
 }
 
 // ---------------------------------------------------------------------------

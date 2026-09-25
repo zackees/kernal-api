@@ -9,7 +9,7 @@ use std::io;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
-use crate::platform::fs::LinkKind;
+use crate::platform::fs::{LinkKind, WriterWait};
 
 // ---------------------------------------------------------------------------
 // Replacement
@@ -113,6 +113,47 @@ pub fn file_change_marker(_path: &Path) -> Option<i128> {
 }
 
 // ---------------------------------------------------------------------------
+// Writers
+// ---------------------------------------------------------------------------
+
+/// A read lease is refused (`EAGAIN`) while any process holds the inode open
+/// for writing: the same condition under which `execve` fails with `ETXTBSY`.
+pub fn await_no_writers(path: &Path, timeout: std::time::Duration) -> io::Result<WriterWait> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    let fd = file.as_raw_fd();
+    let started = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_micros(50);
+    loop {
+        // SAFETY: `fd` is a valid descriptor owned by `file` for this call.
+        if unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_RDLCK) } == 0 {
+            // SAFETY: as above; releasing the lease just taken.
+            unsafe { libc::fcntl(fd, libc::F_SETLEASE, libc::F_UNLCK) };
+            return Ok(WriterWait::Clear {
+                waited: started.elapsed(),
+            });
+        }
+        match io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => {}
+            // Leases disabled, unsupported by the file system, or a file this
+            // user may not lease: writers cannot be observed.
+            _ => return Ok(WriterWait::Unobservable),
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Ok(WriterWait::TimedOut);
+        }
+        std::thread::sleep(pause.min(timeout - elapsed));
+        pause = (pause * 2).min(std::time::Duration::from_millis(5));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Links
 // ---------------------------------------------------------------------------
 
@@ -198,3 +239,7 @@ pub fn native_call_path(path: &Path) -> io::Result<PathBuf> {
 pub fn sync_directory_if_supported(directory: &Path) -> io::Result<()> {
     std::fs::File::open(directory)?.sync_all()
 }
+
+#[cfg(test)]
+#[path = "fs_materialize_tests.rs"]
+mod tests;

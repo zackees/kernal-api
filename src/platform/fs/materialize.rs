@@ -54,6 +54,40 @@ pub fn hard_link_count(path: &Path) -> io::Result<u64> {
     native::hard_link_count(path)
 }
 
+/// Result of [`await_no_writers`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriterWait {
+    /// No process held the file open for writing when last observed.
+    /// `waited` is how long other writers kept it open (zero when none did).
+    Clear {
+        /// Time spent waiting for other writers to close.
+        waited: std::time::Duration,
+    },
+    /// Some process still held the file open for writing at the deadline.
+    TimedOut,
+    /// This host or file system cannot report writers. Hosts that execute a
+    /// file regardless of writers report this without waiting.
+    Unobservable,
+}
+
+/// Wait up to `timeout` until no process (this one or any other) holds the
+/// file at `path` open for writing.
+///
+/// Publishing an executable is only safe to `exec` once every write
+/// descriptor on its inode is closed. A child forked while the publisher's
+/// write descriptor was open inherits that descriptor until its own `exec`,
+/// so closing the publisher's copy is not enough: Linux refuses to execute
+/// the file (`ETXTBSY`) for the child's fork-to-exec window. Call this after
+/// closing the file and before handing it to anything that will execute it.
+/// The file is opened read-only and no handle is retained.
+///
+/// # Errors
+///
+/// Returns the error from opening `path`.
+pub fn await_no_writers(path: &Path, timeout: std::time::Duration) -> io::Result<WriterWait> {
+    native::await_no_writers(path, timeout)
+}
+
 /// Create a symbolic link at `link` to the file `target`, which may not
 /// exist yet.
 ///

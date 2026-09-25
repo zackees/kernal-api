@@ -425,6 +425,16 @@ impl Scanner<'_> {
                             }
                         }
                     }
+                    // A foreign import block, `extern "ABI" { .. }`, declares native
+                    // symbols directly. (`extern "C" fn` callbacks are definitions.)
+                    if name == "extern" && !ctx.guest {
+                        let abi = usize::from(matches!(trees.get(i + 1), Some(TokenTree::Literal(_))));
+                        if let Some(TokenTree::Group(body)) = trees.get(i + 1 + abi) {
+                            if body.delimiter() == Delimiter::Brace {
+                                self.push(ctx, ident.span(), Kind::NativeApi, "extern block".to_owned());
+                            }
+                        }
+                    }
                     // `include!("file.rs")`
                     if name == "include" && is_punct(trees.get(i + 1), '!') {
                         if let Some(TokenTree::Group(group)) = trees.get(i + 2) {
@@ -543,6 +553,11 @@ impl Scanner<'_> {
 
     fn check_attribute(&mut self, group: &Group, ctx: &Ctx) {
         let trees: Vec<TokenTree> = group.stream().into_iter().collect();
+        if let Some(TokenTree::Ident(ident)) = trees.first() {
+            if ident == "link" && !ctx.guest {
+                self.push(ctx, ident.span(), Kind::NativeApi, "#[link]".to_owned());
+            }
+        }
         self.check_attribute_trees(&trees, ctx, group);
     }
 
@@ -910,6 +925,9 @@ mod tests {
                 type S = tokio::net::UnixStream;
                 use interprocess::os::windows::named_pipe;
                 use objc2_app_kit::NSView;
+                #[link(name = "kernel32")]
+                extern "system" { fn GetTickCount() -> u32; }
+                extern "C" fn callback() {}
                 "#,
             )],
             false,
@@ -917,7 +935,7 @@ mod tests {
         let constructs: Vec<&str> = found.iter().map(|f| f.2.as_str()).collect();
         assert_eq!(
             constructs,
-            ["libc", "std::os", "winapi", "windows_sys", "core::os", "tokio::net::UnixStream", "interprocess::os", "objc2_app_kit"],
+            ["libc", "std::os", "winapi", "windows_sys", "core::os", "tokio::net::UnixStream", "interprocess::os", "objc2_app_kit", "#[link]", "extern block"],
             "{found:?}"
         );
     }

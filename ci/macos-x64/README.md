@@ -75,7 +75,7 @@ the stub never has to stand in for real source.
   constant. They assert on source text that is identical on every host and
   ci.yml's Linux `test-run` lanes already run them. This mirrors the exclusion
   the aarch64 lane carries in `ci.yml`.
-- **18 further tests**, excluded by name and grouped by cause in
+- **16 further tests**, excluded by name and grouped by cause in
   `recovery-guest.sh`. Each entry is named rather than pattern-matched, so the
   list stays reviewable, and each group carries the evidence observed in the
   guest. None of it is a blanket filter: a test that starts failing for a *new*
@@ -83,27 +83,18 @@ the stub never has to stand in for real source.
 
 | Group | N | Why it cannot pass here |
 |---|---|---|
-| `EXCLUDE_CAP_PRIMITIVES` | 12 | `cap-primitives` 4.0.3 panics converting a negative macOS `st_rdev` — `u64::try_from(stat.st_rdev).unwrap()` at `metadata_ext.rs:171`. The `dev` field two lines above guards the same signedness, so `dev_t` is known-signed here and only `rdev` was missed. Surfaces as `TryFromIntError(())`. No fixed 4.x exists. |
-| `EXCLUDE_MACOS_RENAME` | 2 | The readiness marker's no-clobber publish returns `ENOTSUP` (45). `tempfile` asks for `renameatx_np(RENAME_EXCL)`, which real macOS supports, so this most likely reflects the guest's virtualized filesystem rather than macOS. Test-only: `persist_noclobber` has no production caller. |
-| `EXCLUDE_TTY` | 1 | A Recovery guest gives the script no controlling terminal to save and restore. |
-| `EXCLUDE_VM_TIMING` | 2 | Two cores in a VM are not representative for wall-clock assertions; a suspension window and a containment deadline elapsed before the work did. |
-| `EXCLUDE_CONTAINMENT_STATE` | 1 | **Investigate, not an artifact.** `real_worker_sequential_stress_leaves_no_parent_state` observed `ForcedContainment { trigger: Cancelled }` where it expects `Stopped(Cancelled)`. That is a state mismatch rather than an elapsed deadline, so it may be a genuine macOS containment difference. Excluded to keep the lane green while it is investigated (#283). |
+| `EXCLUDE_CAP_PRIMITIVES` | 12 | `cap-primitives` 4.0.3 panics converting a negative `st_rdev` — `u64::try_from(stat.st_rdev).unwrap()` at `metadata_ext.rs:171`. The `dev` field two lines above guards the same signedness; only `rdev` was missed. This guest reports negative device numbers; hosted Macs do not, and all 12 pass there. Upstream fix: bytecodealliance/cap-std#428 (we wait rather than `[patch]`, which would not reach our consumers). |
+| `EXCLUDE_MACOS_RENAME` | 3 | The guest's filesystem returns `ENOTSUP` (45) for `renameatx_np(RENAME_EXCL)` (readiness marker) and `renamex_np(RENAME_SWAP)` (`install_directory`, which documents returning the filesystem's error when exchange is unsupported). Real APFS supports both, and all three pass on hosted Macs. |
+| `EXCLUDE_VM_TIMING` | 1 | Two cores in a VM are not representative for wall-clock assertions; a suspension window elapsed before the work did. |
 
-**Three macOS portability findings this lane surfaced have since been fixed in
-the tests themselves** and are no longer excluded: the TLS fixture's 3650-day
-validity (now 820 days, under macOS's 825-day ceiling), the `/var` →
-`/private/var` canonicalization comparison in `context_file_observation`, and
-the invalid-UTF-8 file name in `tree_hash`, which APFS rejects with `EILSEQ`
-before the hash can ever see it. All three stayed invisible only because every
-macOS *test* lane in this repository is gated off — this lane is the first to
-run the suite there.
-
-**The `EXCLUDE_MACOS_RENAME` group is not in that category.** `tempfile`'s
-`persist_noclobber` asks for `renameatx_np(RENAME_EXCL)`, which real macOS
-supports, so the `ENOTSUP` is most likely a property of the guest's virtualized
-filesystem rather than of macOS. It is excluded as a guest artifact pending a
-check on real hardware (issue #283). **`EXCLUDE_CAP_PRIMITIVES` is an upstream
-bug**, not a test defect.
+**Every macOS portability finding this lane surfaced is resolved** (#283). The
+TLS fixture validity, the `/var` → `/private/var` comparison, and the
+invalid-UTF-8 name in `tree_hash` were fixed in the tests. The owner-bound
+child, verified-control, and PTY-restore failures were real and were fixed in
+#347. Everything still excluded is a property of this guest, not of macOS:
+each group passes on hosted Intel and Apple Silicon runners with no exclusions
+(exact-SHA full CI run
+[36067778414](https://github.com/zackees/kernal-api/actions/runs/36067778414)).
 
 ## Coverage assertion
 

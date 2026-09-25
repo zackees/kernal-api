@@ -87,6 +87,19 @@ pub enum Kind {
     Unreadable,
 }
 
+impl Kind {
+    /// The stable baseline spelling of this kind.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Kind::HostCfg => "host_cfg",
+            Kind::NativeApi => "native_api",
+            Kind::ConcreteTree => "concrete_tree",
+            Kind::Selector => "selector",
+            Kind::Unreadable => "unreadable",
+        }
+    }
+}
+
 impl fmt::Display for Kind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -377,7 +390,12 @@ impl Scanner<'_> {
                                     ctx,
                                     ident.span(),
                                     Kind::HostCfg,
-                                    format!("cfg!{}", compact(&TokenStream::from(TokenTree::Group(group.clone())))),
+                                    format!(
+                                        "cfg!{}",
+                                        compact(&TokenStream::from(TokenTree::Group(
+                                            group.clone()
+                                        )))
+                                    ),
                                 );
                             }
                             i += 3;
@@ -396,7 +414,13 @@ impl Scanner<'_> {
                     if name == "mod" {
                         if let Some(child) = ident_name(trees.get(i + 1)) {
                             if is_punct(trees.get(i + 2), ';') {
-                                self.out_of_line_module(ctx, &child, path_attr.take(), ident.span(), ctx.zone);
+                                self.out_of_line_module(
+                                    ctx,
+                                    &child,
+                                    path_attr.take(),
+                                    ident.span(),
+                                    ctx.zone,
+                                );
                                 i += 3;
                                 continue;
                             }
@@ -428,10 +452,16 @@ impl Scanner<'_> {
                     // A foreign import block, `extern "ABI" { .. }`, declares native
                     // symbols directly. (`extern "C" fn` callbacks are definitions.)
                     if name == "extern" && !ctx.guest {
-                        let abi = usize::from(matches!(trees.get(i + 1), Some(TokenTree::Literal(_))));
+                        let abi =
+                            usize::from(matches!(trees.get(i + 1), Some(TokenTree::Literal(_))));
                         if let Some(TokenTree::Group(body)) = trees.get(i + 1 + abi) {
                             if body.delimiter() == Delimiter::Brace {
-                                self.push(ctx, ident.span(), Kind::NativeApi, "extern block".to_owned());
+                                self.push(
+                                    ctx,
+                                    ident.span(),
+                                    Kind::NativeApi,
+                                    "extern block".to_owned(),
+                                );
                             }
                         }
                     }
@@ -441,12 +471,20 @@ impl Scanner<'_> {
                             let args: Vec<TokenTree> = group.stream().into_iter().collect();
                             if let Some(path) = string_literal(args.first()) {
                                 if args.len() == 1 && path.ends_with(".rs") {
-                                    let dir = ctx.file.parent().map(Path::to_path_buf).unwrap_or_default();
+                                    let dir = ctx
+                                        .file
+                                        .parent()
+                                        .map(Path::to_path_buf)
+                                        .unwrap_or_default();
                                     let child = Ctx {
                                         file: dir.join(&path),
                                         root_level: false,
                                         prefix: Vec::new(),
-                                        zone: if ctx.zone == Zone::OwnerRoot { Zone::Neutral } else { ctx.zone },
+                                        zone: if ctx.zone == Zone::OwnerRoot {
+                                            Zone::Neutral
+                                        } else {
+                                            ctx.zone
+                                        },
                                         ..ctx.clone()
                                     };
                                     let span = ident.span();
@@ -472,7 +510,10 @@ impl Scanner<'_> {
                     }
                 }
                 TokenTree::Group(group) => {
-                    let prefix = if group.delimiter() == Delimiter::Brace && i >= 2 && is_path_sep(&trees, i - 2) {
+                    let prefix = if group.delimiter() == Delimiter::Brace
+                        && i >= 2
+                        && is_path_sep(&trees, i - 2)
+                    {
                         path_prefix_before(&trees, i - 2, &ctx.prefix)
                     } else {
                         Vec::new()
@@ -480,7 +521,11 @@ impl Scanner<'_> {
                     let inner = Ctx {
                         root_level: false,
                         prefix,
-                        zone: if ctx.zone == Zone::OwnerRoot { Zone::Neutral } else { ctx.zone },
+                        zone: if ctx.zone == Zone::OwnerRoot {
+                            Zone::Neutral
+                        } else {
+                            ctx.zone
+                        },
                         ..ctx.clone()
                     };
                     self.walk(&group.stream(), &inner);
@@ -503,7 +548,10 @@ impl Scanner<'_> {
         let mut segments: Vec<(String, proc_macro2::Span)> = Vec::new();
         let mut j = i;
         while let Some(TokenTree::Ident(ident)) = trees.get(j) {
-            segments.push((ident.to_string().trim_start_matches("r#").to_owned(), ident.span()));
+            segments.push((
+                ident.to_string().trim_start_matches("r#").to_owned(),
+                ident.span(),
+            ));
             if is_path_sep(trees, j + 1) && matches!(trees.get(j + 3), Some(TokenTree::Ident(_))) {
                 j += 3;
             } else {
@@ -523,7 +571,9 @@ impl Scanner<'_> {
 
         // Concrete tree names.
         for (name, span) in &segments {
-            if CONCRETE_NAMES.contains(&name.as_str()) && !self.bridge_allowed(ctx, prev, name, &segments) {
+            if CONCRETE_NAMES.contains(&name.as_str())
+                && !self.bridge_allowed(ctx, prev, name, &segments)
+            {
                 self.push(ctx, *span, Kind::ConcreteTree, name.clone());
             }
         }
@@ -543,7 +593,13 @@ impl Scanner<'_> {
 
     /// `platform_imp` may be named only by the crate-root re-export bridge of
     /// the owner library: `use platform_imp::...` at the root level.
-    fn bridge_allowed(&self, ctx: &Ctx, prev: Option<&TokenTree>, name: &str, segments: &[(String, proc_macro2::Span)]) -> bool {
+    fn bridge_allowed(
+        &self,
+        ctx: &Ctx,
+        prev: Option<&TokenTree>,
+        name: &str,
+        segments: &[(String, proc_macro2::Span)],
+    ) -> bool {
         ctx.zone == Zone::OwnerRoot
             && ctx.root_level
             && name == "platform_imp"
@@ -566,13 +622,10 @@ impl Scanner<'_> {
             match tree {
                 TokenTree::Ident(ident) if ident == "cfg" || ident == "cfg_attr" => {
                     if let Some(TokenTree::Group(args)) = trees.get(i + 1) {
-                        if args.delimiter() == Delimiter::Parenthesis && names_host_selector(&args.stream(), ctx.guest) {
-                            self.push(
-                                ctx,
-                                ident.span(),
-                                Kind::HostCfg,
-                                compact(&whole.stream()),
-                            );
+                        if args.delimiter() == Delimiter::Parenthesis
+                            && names_host_selector(&args.stream(), ctx.guest)
+                        {
+                            self.push(ctx, ident.span(), Kind::HostCfg, compact(&whole.stream()));
                             return;
                         }
                     }
@@ -590,7 +643,14 @@ impl Scanner<'_> {
         }
     }
 
-    fn out_of_line_module(&mut self, ctx: &Ctx, child: &str, path: Option<String>, span: proc_macro2::Span, zone: Zone) {
+    fn out_of_line_module(
+        &mut self,
+        ctx: &Ctx,
+        child: &str,
+        path: Option<String>,
+        span: proc_macro2::Span,
+        zone: Zone,
+    ) {
         let candidates = match path {
             Some(path) => vec![ctx.path_dir.join(path)],
             None => vec![
@@ -603,9 +663,7 @@ impl Scanner<'_> {
             .find(|candidate| (self.read)(&normalize(candidate)).is_some())
             .cloned()
             .unwrap_or_else(|| candidates[0].clone());
-        let is_mod_rs = file
-            .file_name()
-            .is_some_and(|name| name == "mod.rs");
+        let is_mod_rs = file.file_name().is_some_and(|name| name == "mod.rs");
         let parent = file.parent().map(Path::to_path_buf).unwrap_or_default();
         let mod_dir = if is_mod_rs {
             parent.clone()
@@ -614,7 +672,11 @@ impl Scanner<'_> {
         };
         let child_ctx = Ctx {
             file,
-            zone: if zone == Zone::OwnerRoot { Zone::Neutral } else { zone },
+            zone: if zone == Zone::OwnerRoot {
+                Zone::Neutral
+            } else {
+                zone
+            },
             mod_dir,
             path_dir: parent,
             root_level: false,
@@ -632,7 +694,10 @@ impl Scanner<'_> {
                 // Both arms stay at the root level: the first holds the guest
                 // ABI tree, the fallback the native facade root.
                 for (index, (_, body)) in arms.iter().enumerate() {
-                    let arm = Ctx { guest: index == 0, ..ctx.clone() };
+                    let arm = Ctx {
+                        guest: index == 0,
+                        ..ctx.clone()
+                    };
                     self.walk(&body.stream(), &arm);
                 }
                 return;
@@ -654,13 +719,21 @@ impl Scanner<'_> {
                 self.push(
                     ctx,
                     span,
-                    if ctx.zone == Zone::OwnerRoot { Kind::Selector } else { Kind::HostCfg },
+                    if ctx.zone == Zone::OwnerRoot {
+                        Kind::Selector
+                    } else {
+                        Kind::HostCfg
+                    },
                     format!("cfg_select!{{{}=>..}}", compact(predicate)),
                 );
             }
             let inner = Ctx {
                 root_level: false,
-                zone: if ctx.zone == Zone::OwnerRoot { Zone::Neutral } else { ctx.zone },
+                zone: if ctx.zone == Zone::OwnerRoot {
+                    Zone::Neutral
+                } else {
+                    ctx.zone
+                },
                 ..ctx.clone()
             };
             self.walk(&body.stream(), &inner);
@@ -745,9 +818,7 @@ fn split_arms(stream: &TokenStream) -> Vec<(TokenStream, Group)> {
 }
 
 fn is_guest_selector(arms: &[(TokenStream, Group)]) -> bool {
-    arms.len() == 2
-        && compact(&arms[0].0) == "target_family=\"wasm\""
-        && compact(&arms[1].0) == "_"
+    arms.len() == 2 && compact(&arms[0].0) == "target_family=\"wasm\"" && compact(&arms[1].0) == "_"
 }
 
 /// The concrete modules declared by an exactly shaped host selector:
@@ -815,8 +886,14 @@ mod tests {
     fn owner(extra: &[(&str, &str)]) -> Vec<(String, Kind, String)> {
         let mut files = vec![
             ("src/lib.rs", SELECTOR),
-            ("src/platform_win.rs", "mod a; use windows_sys::X; #[cfg(target_arch = \"x86_64\")] fn f() {}"),
-            ("src/platform_win/a.rs", "use std::os::windows::io::AsRawHandle;"),
+            (
+                "src/platform_win.rs",
+                "mod a; use windows_sys::X; #[cfg(target_arch = \"x86_64\")] fn f() {}",
+            ),
+            (
+                "src/platform_win/a.rs",
+                "use std::os::windows::io::AsRawHandle;",
+            ),
             ("src/platform_linux.rs", "use libc::c_int;"),
             ("src/platform_macos.rs", "use mach2::port;"),
         ];
@@ -845,14 +922,24 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(found, [("src/neutral.rs".into(), Kind::HostCfg, "cfg!(windows)".into())]);
+        assert_eq!(
+            found,
+            [(
+                "src/neutral.rs".into(),
+                Kind::HostCfg,
+                "cfg!(windows)".into()
+            )]
+        );
     }
 
     #[test]
     fn inactive_out_of_line_modules_are_scanned() {
         let found = scan(
             &[
-                ("src/lib.rs", "#[cfg(windows)] #[path = \"win/only.rs\"] mod only; mod a;"),
+                (
+                    "src/lib.rs",
+                    "#[cfg(windows)] #[path = \"win/only.rs\"] mod only; mod a;",
+                ),
                 ("src/win/only.rs", "use std::os::windows::ffi::OsStrExt;"),
                 ("src/a.rs", "#[cfg(target_os = \"macos\")] mod b;"),
                 ("src/a/b.rs", "fn f() { unsafe { libc::getpid(); } }"),
@@ -863,7 +950,11 @@ mod tests {
             found,
             [
                 ("src/a/b.rs".into(), Kind::NativeApi, "libc".into()),
-                ("src/a.rs".into(), Kind::HostCfg, "cfg(target_os=\"macos\")".into()),
+                (
+                    "src/a.rs".into(),
+                    Kind::HostCfg,
+                    "cfg(target_os=\"macos\")".into()
+                ),
                 ("src/lib.rs".into(), Kind::HostCfg, "cfg(windows)".into()),
                 ("src/win/only.rs".into(), Kind::NativeApi, "std::os".into()),
             ]
@@ -873,7 +964,8 @@ mod tests {
     #[test]
     fn every_selector_and_cfg_form_is_detected() {
         for selector in SELECTORS {
-            let source = format!("#[cfg(all(feature = \"x\", not({selector} = \"y\")))] fn f() {{}}");
+            let source =
+                format!("#[cfg(all(feature = \"x\", not({selector} = \"y\")))] fn f() {{}}");
             assert_eq!(scan(&[("lib.rs", &source)], false).len(), 1, "{selector}");
         }
         let found = scan(
@@ -935,7 +1027,18 @@ mod tests {
         let constructs: Vec<&str> = found.iter().map(|f| f.2.as_str()).collect();
         assert_eq!(
             constructs,
-            ["libc", "std::os", "winapi", "windows_sys", "core::os", "tokio::net::UnixStream", "interprocess::os", "objc2_app_kit", "#[link]", "extern block"],
+            [
+                "libc",
+                "std::os",
+                "winapi",
+                "windows_sys",
+                "core::os",
+                "tokio::net::UnixStream",
+                "interprocess::os",
+                "objc2_app_kit",
+                "#[link]",
+                "extern block"
+            ],
             "{found:?}"
         );
     }
@@ -953,14 +1056,21 @@ mod tests {
                 ("src/platform_win.rs", ""),
                 ("src/platform_linux.rs", ""),
                 ("src/platform_macos.rs", ""),
-                ("src/n.rs", "use crate::platform_imp::x; use super::platform_win as w;"),
+                (
+                    "src/n.rs",
+                    "use crate::platform_imp::x; use super::platform_win as w;",
+                ),
             ],
             true,
         );
         assert_eq!(
             found,
             [
-                ("src/lib.rs".into(), Kind::ConcreteTree, "platform_imp".into()),
+                (
+                    "src/lib.rs".into(),
+                    Kind::ConcreteTree,
+                    "platform_imp".into()
+                ),
                 ("src/n.rs".into(), Kind::ConcreteTree, "platform_imp".into()),
                 ("src/n.rs".into(), Kind::ConcreteTree, "platform_win".into()),
             ]
@@ -977,10 +1087,17 @@ mod tests {
         ];
         for source in bad {
             let found = scan(&[("src/lib.rs", source)], true);
-            assert_eq!(found.first().map(|f| f.1), Some(Kind::Selector), "{source}: {found:?}");
+            assert_eq!(
+                found.first().map(|f| f.1),
+                Some(Kind::Selector),
+                "{source}: {found:?}"
+            );
         }
         // A second valid-looking selector is a violation; clients never get one.
-        let twice = format!("{SELECTOR}{}", SELECTOR.replace("pub use platform_imp::thing;", ""));
+        let twice = format!(
+            "{SELECTOR}{}",
+            SELECTOR.replace("pub use platform_imp::thing;", "")
+        );
         let found = scan(
             &[
                 ("src/lib.rs", &twice),
@@ -990,7 +1107,11 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(found.first().map(|f| f.1), Some(Kind::Selector), "{found:?}");
+        assert_eq!(
+            found.first().map(|f| f.1),
+            Some(Kind::Selector),
+            "{found:?}"
+        );
         let found = scan(
             &[
                 ("src/lib.rs", SELECTOR),
@@ -1017,9 +1138,22 @@ mod tests {
             ],
             true,
         );
-        assert_eq!(found, [("src/guest/inner.rs".into(), Kind::HostCfg, "cfg(windows)".into())]);
+        assert_eq!(
+            found,
+            [(
+                "src/guest/inner.rs".into(),
+                Kind::HostCfg,
+                "cfg(windows)".into()
+            )]
+        );
         let found = scan(
-            &[("src/lib.rs", "mod x;"), ("src/x.rs", "cfg_select! { target_family = \"wasm\" => {} _ => {} }")],
+            &[
+                ("src/lib.rs", "mod x;"),
+                (
+                    "src/x.rs",
+                    "cfg_select! { target_family = \"wasm\" => {} _ => {} }",
+                ),
+            ],
             true,
         );
         assert_eq!(found.len(), 1, "{found:?}");
@@ -1027,7 +1161,10 @@ mod tests {
 
     #[test]
     fn missing_or_unparsable_modules_are_reported() {
-        let found = scan(&[("lib.rs", "mod gone; mod bad;"), ("bad.rs", "fn f( {")], false);
+        let found = scan(
+            &[("lib.rs", "mod gone; mod bad;"), ("bad.rs", "fn f( {")],
+            false,
+        );
         let kinds: Vec<Kind> = found.iter().map(|f| f.1).collect();
         assert_eq!(kinds, [Kind::Unreadable, Kind::Unreadable], "{found:?}");
     }
@@ -1036,7 +1173,10 @@ mod tests {
     fn path_attributes_resolve_relative_to_the_declaring_file() {
         let found = scan(
             &[
-                ("tests/cat/main.rs", "mod a; #[path = \"../support/s.rs\"] mod s;"),
+                (
+                    "tests/cat/main.rs",
+                    "mod a; #[path = \"../support/s.rs\"] mod s;",
+                ),
                 ("tests/cat/a.rs", "mod b;"),
                 ("tests/cat/a/b.rs", "use libc::x;"),
                 ("tests/support/s.rs", "use std::os::unix::x;"),

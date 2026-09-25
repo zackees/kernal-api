@@ -89,7 +89,9 @@
   `soldr rustup run nightly-2026-05-28 cargo test --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml --lib`
   (a seconds-long source scan of every enforced package) and
   `soldr cargo dylint --all --workspace -- --all-features --all-targets`.
-  There is no baseline or waiver; a new violation fails CI.
+  The existing debt is an exact, shrink-only baseline
+  (`dylints/kernal_api_platform_boundary/src/baseline.txt`); a new violation
+  fails CI, and a fixed one must delete its baseline line. Never add a line.
 - Warnings are errors. The root manifest denies `warnings` for the workspace,
   and every standalone package denies it in its own `[lints.rust]` table;
   `ci/test_deny_warnings.py` fails if a package lacks one. Fix a warning, or

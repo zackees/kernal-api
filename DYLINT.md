@@ -92,8 +92,9 @@ soldr rustup run nightly-2026-05-28 cargo test \
 ```
 
 CI runs that test on every pull request and push; the full-mode `dylints`
-job adds the UI tests and the resolving passes above. There is no occurrence
-baseline or waiver file.
+job adds the UI tests and the resolving passes above. Existing debt is listed
+exactly in `src/baseline.txt`, which may only shrink; see
+[docs/platform-boundary.md](docs/platform-boundary.md). There are no waivers.
 
 The lint checks both the client manifest and resolved Rust code. An unused,
 aliased, target-specific, build, or test dependency on a facade-owned backend

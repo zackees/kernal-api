@@ -141,8 +141,21 @@ soldr rustup run nightly-2026-05-28 cargo test \
 
 CI runs that test in every mode, and the full-mode `dylints` job adds the
 UI tests and the resolving Dylint passes for Linux, macOS and both Windows
-targets. There is no occurrence baseline: the boundary debt is zero, and a
-new violation fails immediately.
+targets.
+
+Until the migration finishes, the existing debt is recorded in the exact
+occurrence baseline `dylints/kernal_api_platform_boundary/src/baseline.txt`
+(the format zccache used for its own migration). Each TAB-separated row is a
+repository-relative path, a kind (`host_cfg`, `native_api`, `concrete_tree`,
+`selector`, `unreadable`), the normalized construct, and its ordinal among
+identical constructs in that file; a `# total = N` header counts the rows.
+Line numbers are deliberately absent. The repository scan requires an exact
+match: a new occurrence fails (a second copy in a listed file takes the next
+ordinal; a moved file changes its path), and a stale, duplicate or unsorted
+entry fails too, so fixing a violation means deleting its line and
+decrementing the total. Never add a line. The resolving Dylint pass skips
+only baselined occurrences. Migrating to zero deletes the file and
+`src/baseline.rs`, as in Soldr and zccache.
 
 Every `Cargo.toml` in the repository is classified in
 `dylints/kernal_api_platform_boundary/src/lib.rs` as native (the workspace,

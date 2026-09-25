@@ -135,7 +135,31 @@ fn owned_group_termination_reaches_the_grandchild() {
         return;
     }
     result.expect("group kill");
-    let status = root.wait().expect("reap root");
+    // Keep the root's stdin open: `Child::wait` closes it first, and a root
+    // that read that EOF before the signal landed would exit 0 on its own,
+    // passing or failing for the wrong reason (#283).
+    let stdin = root.stdin.take();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = root.try_wait().expect("poll root") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the group kill never reached the root"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(stdin);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "root was killed: {status:?}"
+        );
+    }
     assert!(!status.success(), "root was killed");
     assert!(
         gone_within(grandchild, Duration::from_secs(5)),

@@ -44,10 +44,11 @@ POLICY_FILTER='not binary(source_policy)'
 # validity (now 820, under macOS's 825-day ceiling), the `/var` -> `/private/var`
 # canonicalization comparison in context_file_observation, and the invalid-UTF-8
 # file name in tree_hash, which APFS rejects with EILSEQ before the hash can see
-# it. The remaining entries are the upstream cap-primitives panic, one rename
-# that the guest's filesystem does not support, Recovery environment artifacts
-# (no tty, two-core timing), and one containment-state mismatch that is
-# still under investigation rather than explained. See issue #283.
+# it. The remaining entries are all properties of this guest, not of macOS:
+# each passes on hosted Intel and Apple Silicon runners with no exclusions
+# (exact-SHA full CI run 36067778414, #283). They are the upstream
+# cap-primitives panic on the guest's negative device numbers, one rename
+# flag the guest's filesystem lacks, and two-core VM timing.
 # ---------------------------------------------------------------------------
 
 # cap-primitives 4.0.3 panics converting a negative macOS st_rdev:
@@ -55,33 +56,24 @@ POLICY_FILTER='not binary(source_policy)'
 # cap-primitives-4.0.3/src/rustix/fs/metadata_ext.rs:171, surfacing as
 # `TryFromIntError(())`. The `dev` field two lines above guards the same
 # signedness, so `dev_t` is known-signed here and only `rdev` was missed.
-# APFS device numbers in this guest are negative; there is no fixed 4.x release.
+# APFS device numbers in this guest are negative; hosted Macs report
+# non-negative ones and these tests pass there. The fix is upstream
+# (bytecodealliance/cap-std#428); we wait for it rather than fork, because a
+# [patch] would not reach kernal-api's own consumers anyway.
 EXCLUDE_CAP_PRIMITIVES='commit_error_cleans_staging_after_destination_parent_is_renamed completed_symlink_is_not_published_or_followed missing_completed_output_preserves_destination_and_cleans_staging parent_discard_cleans_staging_after_destination_parent_is_renamed parent_discard_removes_worker_partial_and_completed_files replacement_failure_preserves_existing_directory_and_cleans_staging staged_output_is_invisible_until_parent_commit cancellation_after_parent_sync_preserves_output deadline_after_parent_sync_preserves_output_and_reports_cleanup_failure dispatcher_retry_releases_ownership_and_records_one_forced_reap output_cleanup_failure_reports_whether_publication_occurred parent_output_discards_on_failure_or_stop_and_commits_only_success'
 
-# The readiness marker's no-clobber publish returns ENOTSUP (45) in this guest.
-# `tempfile` asks for renameatx_np(RENAME_EXCL), which APFS and HFS+ support, so
-# this most likely reflects the guest's virtualized filesystem rather than
-# macOS. Not yet verified on real hardware (#283). Test-only: persist_noclobber
-# has no production caller.
-EXCLUDE_MACOS_RENAME='failed_marker_write_is_cleaned_up_and_existing_marker_is_preserved marker_is_invisible_until_payload_is_complete'
-
-# A Recovery guest gives this script no controlling terminal to save and
-# restore, so the termios flags it compares are not the ones it set.
-EXCLUDE_TTY='native_session_rejects_overlap_and_restores_mode'
+# The guest's filesystem returns ENOTSUP (45) for the atomic rename flags:
+# `tempfile`'s renameatx_np(RENAME_EXCL) in the readiness marker's no-clobber
+# publish, and renamex_np(RENAME_SWAP) in install_directory, which documents
+# returning the filesystem's error when exchange is unsupported. Real APFS
+# supports both; all three tests pass on hosted Intel and Apple Silicon runners.
+EXCLUDE_MACOS_RENAME='failed_marker_write_is_cleaned_up_and_existing_marker_is_preserved marker_is_invisible_until_payload_is_complete install_directory_replaces_an_existing_tree_and_removes_the_old_one'
 
 # Two cores in a VM are not representative for wall-clock assertions: a
-# suspension window and a containment deadline elapsed before the work did.
-EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends a_child_bound_to_another_owner_dies_when_that_owner_does'
+# suspension window elapsed before the work did.
+EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends'
 
-# NOT a known artifact -- investigate. The guest observed
-# `ForcedContainment { trigger: Cancelled }` where the test expects
-# `Stopped(Cancelled)`: containment was reached by force rather than by a
-# graceful stop. That is a state mismatch, not an elapsed deadline, so it may be
-# a genuine macOS containment difference. Excluded only to keep the lane green
-# while it is investigated (#283).
-EXCLUDE_CONTAINMENT_STATE='real_worker_sequential_stress_leaves_no_parent_state'
-
-EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_TTY $EXCLUDE_VM_TIMING $EXCLUDE_CONTAINMENT_STATE"
+EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_VM_TIMING"
 
 GUEST_EXCLUDE=''
 for name in $EXCLUDED_TESTS; do

@@ -299,6 +299,12 @@ class NativeProofJobsTests(unittest.TestCase):
         self.assertIn('for feature in "${features[@]}"', step)
         self.assertIn('failed+=("${feature}")', step)
 
+    def test_native_hosts_only_replay_prebuilt_binaries(self):
+        """Apple and Windows runners download and run; Linux compiles (#273)."""
+        test = self.job("test")
+        self.assertIsNone(re.search(r"setup-soldr|\bsoldr\b|\brustup\b|(?<![-\w])cargo\s", test))
+        self.assertIn("cargo-nextest nextest run", test)
+
     def test_ci_never_disables_the_soldr_cache(self):
         text = self.text()
         self.assertNotIn("--no-cache", text)

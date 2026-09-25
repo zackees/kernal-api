@@ -50,6 +50,17 @@ class AutoReleaseTests(unittest.TestCase):
             "cp target/package/kernal-api-*.crate dist/* registry-packages/", workflow
         )
 
+    def test_every_release_job_compiles_on_linux(self):
+        """No release build runs on an Apple or Windows host (#273)."""
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertNotRegex(workflow, r"(?m)^\s+(- )?os: (windows|macos)-")
+        self.assertNotRegex(workflow, r"(?m)^\s+runs-on: (windows|macos)-")
+        workers = workflow.split("\n  symbolizer-workers:\n", 1)[1].split("\n  publish-", 1)[0]
+        for target in ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"):
+            with self.subTest(target=target):
+                entry = workers.split(f"target: {target}", 1)[1].split("- os:", 1)[0]
+                self.assertIn("cross: true", entry)
+
     def test_release_stages_the_generated_conpty_manifest(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
         self.assertNotIn(

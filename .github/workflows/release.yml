@@ -156,12 +156,16 @@ jobs:
             target: aarch64-apple-darwin
             extension: ""
             cross: true
-          - os: windows-latest
+          # The Windows workers cross-compile on Linux too, through Soldr's
+          # managed xwin sysroot, as CI's `build` job does (#273).
+          - os: ubuntu-latest
             target: x86_64-pc-windows-msvc
             extension: .exe
-          - os: windows-latest
+            cross: true
+          - os: ubuntu-latest
             target: aarch64-pc-windows-msvc
             extension: .exe
+            cross: true
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -177,7 +181,8 @@ jobs:
           build-cache: false
           # Not covered by `cache: false`: the toolchain cache is separate.
           solo-toolchain-cache: false
-          # The Apple workers need Soldr's managed SDK prepared up front.
+          # The Apple and Windows workers need Soldr's managed SDK or sysroot
+          # prepared up front.
           cross-targets: ${{ matrix.cross && matrix.target || '' }}
       - name: Build isolated worker
         run: >-

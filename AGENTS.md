@@ -58,12 +58,19 @@
 - `0.0.0` is an unusable registry reservation and must never be restored as a
   dependency fallback or published from this source branch.
 - Keep host-platform selection structured: the one `std::cfg_select!` root in
-  `src/lib.rs` selects a private concrete platform tree. Ordinary modules use
-  the neutral crate-root facade and must not add `cfg(target_os = ...)`, name
-  `platform_imp`/a concrete platform tree, or reach into `std::os`/native OS
-  APIs. This does not prohibit host-neutral feature or test configuration;
-  the rule is about selecting a host implementation. Guest/WASM target
-  selection is a separate concern.
+  `src/lib.rs` selects a private concrete platform tree
+  (`src/platform_{win,linux,macos}{.rs,/**}`), and only root-level
+  `use platform_imp::...;` lines in `src/lib.rs` bridge it to the crate root.
+  Everything else -- the rest of `src/`, binaries, every file under `tests/`,
+  examples, and client crates -- is neutral: no host `cfg`, no `platform_imp`
+  or concrete-tree name, no `std::os`/native OS API, test code included.
+  Native tests live beside the implementation inside the tree; tests in
+  `tests/` assert through the public facade on every host. Host-neutral
+  feature, test and docs configuration stays legal; the rule is about
+  selecting a host implementation. Guest/WASM target selection is a separate
+  concern with its own root selector, and a requested build target (a
+  Linux-hosted Windows cross-build, a parsed target triple) is data, not host
+  selection.
 - Prefer duplication over a selector in the neutral facade. Every `cfg`
   selector the platform Dylint names -- `target_os`, `target_arch`, `unix`,
   `windows`, `target_env`, and the rest -- belongs in a concrete tree, even
@@ -75,10 +82,14 @@
   bridged name. Three identical copies are cheaper to own than one exception
   to the boundary.
 - Read [docs/platform-boundary.md](docs/platform-boundary.md) before changing
-  a platform capability. Its target structure and enforcement plan are tracked
-  by #152. Until that issue lands, the repository's platform Dylint deliberately
-  exempts `kernal-api` itself, so passing Dylint alone is not evidence that new
-  facade-owner source follows this boundary.
+  a platform capability; it is the one detailed guide (allowed locations,
+  examples, adding a capability). The `kernal_api_platform_boundary` Dylint
+  enforces it on this crate itself, cfg-elided modules included, and must
+  pass: run
+  `soldr rustup run nightly-2026-05-28 cargo test --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml --lib`
+  (a seconds-long source scan of every enforced package) and
+  `soldr cargo dylint --all --workspace -- --all-features --all-targets`.
+  There is no baseline or waiver; a new violation fails CI.
 - Warnings are errors. The root manifest denies `warnings` for the workspace,
   and every standalone package denies it in its own `[lints.rust]` table;
   `ci/test_deny_warnings.py` fails if a package lacks one. Fix a warning, or

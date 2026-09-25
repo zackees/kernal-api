@@ -71,8 +71,9 @@ It selects a private concrete platform tree and re-exports a neutral facade
 from the crate root. Capability modules consume that facade; they do not make
 their own `target_os` choices or name a concrete tree. Guest/WASM target
 selection is intentionally separate from native-host selection. The detailed
-authoring and validation guide is [docs/platform-boundary.md](docs/platform-boundary.md);
-issue #152 tracks completing Dylint enforcement of this architecture.
+authoring and validation guide is [docs/platform-boundary.md](docs/platform-boundary.md),
+and the `kernal_api_platform_boundary` Dylint enforces it on this crate, its
+tests and its clients alike (#152).
 
 Filesystem mechanics that cache materialization depends on -- native
 replacement with its Windows sharing-violation retry, link and reparse

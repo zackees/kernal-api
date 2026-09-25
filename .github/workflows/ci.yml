@@ -105,6 +105,20 @@ jobs:
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
+      # The platform boundary (#152) is a source rule, so its repository scan
+      # parses every enforced package's modules -- cfg-elided Windows and
+      # macOS files included -- without compiling the product. That makes it
+      # cheap enough to gate every mode; the `dylints` job adds the resolving
+      # passes and the UI tests in full mode.
+      - name: Scan the repository against the platform boundary
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-boundary-scan-cargo
+        run: |
+          soldr rustup toolchain install nightly-2026-05-28 --profile minimal \
+            --component rustc-dev,llvm-tools-preview,rust-src
+          soldr rustup run nightly-2026-05-28 cargo test --locked \
+            --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
+            --lib -- --skip ui
       - name: Lint the default facade
         if: steps.mode.outputs.mode != 'full'
         run: soldr cargo clippy --locked --lib -- --deny warnings

@@ -6,8 +6,8 @@ actual contained screenshot guest pass on Linux x86-64. This does not establish 
 capture acceptance or close #19.
 The adapter lives under `src/platform_linux/viewport_capture.rs`, selected by
 the existing root platform selector and gated only by `tauri-webview` in the
-concrete Linux tree. The broader cfg-boundary/Dylint/docs migration is tracked
-in [#152](https://github.com/zackees/kernal-api/issues/152).
+concrete Linux tree, as the platform boundary
+([#152](https://github.com/zackees/kernal-api/issues/152)) requires.
 
 The shared hub now has a private `NativeBlobEncoder` implementing `io::Write`.
 It copies encoder writes in configured chunks directly into quota-accounted

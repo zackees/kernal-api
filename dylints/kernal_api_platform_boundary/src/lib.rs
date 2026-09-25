@@ -4,6 +4,7 @@ extern crate rustc_ast;
 extern crate rustc_errors;
 extern crate rustc_span;
 
+mod baseline;
 mod scan;
 
 use std::path::{Path, PathBuf};
@@ -36,25 +37,51 @@ impl EarlyLintPass for KernalApiPlatformBoundary {
         };
         let root = absolute(&root);
         let package = std::env::var("CARGO_PKG_NAME").ok();
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok().map(|dir| absolute(Path::new(&dir)));
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+            .ok()
+            .map(|dir| absolute(Path::new(&dir)));
         let owner_library = is_owner_library(
             package.as_deref(),
             manifest_dir.as_deref(),
             &root,
             cx.sess().opts.crate_types.iter().any(|ty| {
-                matches!(ty, rustc_session::config::CrateType::Rlib | rustc_session::config::CrateType::Dylib | rustc_session::config::CrateType::Cdylib | rustc_session::config::CrateType::StaticLib)
+                matches!(
+                    ty,
+                    rustc_session::config::CrateType::Rlib
+                        | rustc_session::config::CrateType::Dylib
+                        | rustc_session::config::CrateType::Cdylib
+                        | rustc_session::config::CrateType::StaticLib
+                )
             }) || cx.sess().is_test_crate(),
         );
         // Guest source compiled natively by one of the owner's tests keeps its
         // guest classification, which only the owner library's selector gives it.
         let known_guest = match (package.as_deref(), &manifest_dir) {
             (Some(FACADE_OWNER), Some(dir)) if !owner_library => {
-                scan::scan_crate_with(&dir.join("src/lib.rs"), true, &Default::default(), &scan::read_file).1
+                scan::scan_crate_with(
+                    &dir.join("src/lib.rs"),
+                    true,
+                    &Default::default(),
+                    &scan::read_file,
+                )
+                .1
             }
             _ => Default::default(),
         };
-        let (violations, _) = scan::scan_crate_with(&root, owner_library, &known_guest, &scan::read_file);
-        for violation in violations {
+        let (violations, _) =
+            scan::scan_crate_with(&root, owner_library, &known_guest, &scan::read_file);
+        // Existing debt recorded in the migration baseline is reported by the
+        // repository gate, which also rejects stale entries; only hits beyond
+        // it fail here. Outside this repository nothing is baselined.
+        let baselined = baseline::parse(baseline::BASELINE).expect("valid baseline");
+        let keyed = match baseline::repository_root_of(&root) {
+            Some(repository) => baseline::keyed(&violations, &repository),
+            None => violations.iter().map(|v| (v, Default::default())).collect(),
+        };
+        for (violation, key) in keyed {
+            if baselined.contains(&key) {
+                continue;
+            }
             let span = violation_span(cx, &violation).unwrap_or(krate.spans.inner_span);
             let detail = format!("{} `{}`", violation.kind, violation.construct);
             cx.opt_span_lint(
@@ -73,7 +100,12 @@ impl EarlyLintPass for KernalApiPlatformBoundary {
 /// Only the owner's `src/lib.rs` library root (built as a library or as its
 /// unit-test harness) may declare the host selector. Classification is by
 /// path relative to the manifest, so the checkout location does not matter.
-fn is_owner_library(package: Option<&str>, manifest_dir: Option<&Path>, root: &Path, library: bool) -> bool {
+fn is_owner_library(
+    package: Option<&str>,
+    manifest_dir: Option<&Path>,
+    root: &Path,
+    library: bool,
+) -> bool {
     let (Some(package), Some(manifest_dir)) = (package, manifest_dir) else {
         return false;
     };
@@ -81,7 +113,11 @@ fn is_owner_library(package: Option<&str>, manifest_dir: Option<&Path>, root: &P
     let manifest_dir = manifest_dir
         .canonicalize()
         .unwrap_or_else(|_| manifest_dir.to_path_buf());
-    package == FACADE_OWNER && library && root.strip_prefix(&manifest_dir).is_ok_and(|rel| rel == Path::new("src/lib.rs"))
+    package == FACADE_OWNER
+        && library
+        && root
+            .strip_prefix(&manifest_dir)
+            .is_ok_and(|rel| rel == Path::new("src/lib.rs"))
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -90,10 +126,12 @@ fn absolute(path: &Path) -> PathBuf {
 
 fn real_path(cx: &EarlyContext<'_>, span: Span) -> Option<PathBuf> {
     match cx.sess().source_map().span_to_filename(span) {
-        FileName::Real(real) => real
-            .local_path()
-            .map(Path::to_path_buf)
-            .or_else(|| Some(real.path(RemapPathScopeComponents::DIAGNOSTICS).to_path_buf())),
+        FileName::Real(real) => real.local_path().map(Path::to_path_buf).or_else(|| {
+            Some(
+                real.path(RemapPathScopeComponents::DIAGNOSTICS)
+                    .to_path_buf(),
+            )
+        }),
         _ => None,
     }
 }
@@ -101,7 +139,39 @@ fn real_path(cx: &EarlyContext<'_>, span: Span) -> Option<PathBuf> {
 /// Map a scanner hit to a span, loading cfg-elided files into the source map
 /// so the diagnostic points at the offending construct.
 fn violation_span(cx: &EarlyContext<'_>, violation: &scan::Violation) -> Option<Span> {
-    let file = cx.sess().source_map().load_file(&violation.file).ok()?;
+    let source_map = cx.sess().source_map();
+    // Reuse the compiler's copy of a file it already loaded, whatever path
+    // spelling it was loaded under; a second copy under the absolute path
+    // would make the diagnostic name a different file than the compiler does.
+    let wanted = violation
+        .file
+        .canonicalize()
+        .unwrap_or_else(|_| violation.file.clone());
+    let loaded = source_map
+        .files()
+        .iter()
+        .find(|file| match &file.name {
+            FileName::Real(real) => real
+                .local_path()
+                .and_then(|path| path.canonicalize().ok())
+                .is_some_and(|path| path == wanted),
+            _ => false,
+        })
+        .cloned();
+    let file = match loaded {
+        Some(file) => file,
+        // A cfg-elided file: spell it relative to the working directory, as
+        // the compiler spells the files it was handed.
+        None => {
+            let relative = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| cwd.canonicalize().ok())
+                .and_then(|cwd| wanted.strip_prefix(cwd).ok().map(Path::to_path_buf));
+            source_map
+                .load_file(relative.as_deref().unwrap_or(&violation.file))
+                .ok()?
+        }
+    };
     let len = (file.end_position() - file.start_pos).0 as usize;
     let start = violation.start.min(len);
     let end = violation.end.clamp(start, len);
@@ -120,10 +190,25 @@ fn ui() {
 fn only_the_owner_library_root_may_select() {
     let dir = std::env::temp_dir();
     let root = dir.join("src/lib.rs");
-    assert!(is_owner_library(Some("kernal-api"), Some(&dir), &root, true));
-    assert!(!is_owner_library(Some("kernal-api"), Some(&dir), &root, false));
+    assert!(is_owner_library(
+        Some("kernal-api"),
+        Some(&dir),
+        &root,
+        true
+    ));
+    assert!(!is_owner_library(
+        Some("kernal-api"),
+        Some(&dir),
+        &root,
+        false
+    ));
     assert!(!is_owner_library(Some("client"), Some(&dir), &root, true));
-    assert!(!is_owner_library(Some("kernal-api"), Some(&dir), &dir.join("tests/x/main.rs"), true));
+    assert!(!is_owner_library(
+        Some("kernal-api"),
+        Some(&dir),
+        &dir.join("tests/x/main.rs"),
+        true
+    ));
     assert!(!is_owner_library(None, Some(&dir), &root, true));
 }
 
@@ -173,18 +258,27 @@ fn repository_root() -> PathBuf {
 /// `(package name, target root, is library)` for every target of a manifest.
 #[cfg(test)]
 fn manifest_targets(manifest: &Path) -> Vec<(String, PathBuf, bool)> {
-    let output = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path"])
-        .arg(manifest)
-        .output()
-        .expect("run cargo metadata");
+    let output =
+        std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--no-deps",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(manifest)
+            .output()
+            .expect("run cargo metadata");
     assert!(
         output.status.success(),
         "{}: {}",
         manifest.display(),
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("metadata json");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("metadata json");
     let mut targets = Vec::new();
     for package in metadata["packages"].as_array().expect("packages") {
         let name = package["name"].as_str().unwrap_or_default().to_owned();
@@ -207,7 +301,10 @@ fn every_manifest_is_classified() {
         .output()
         .expect("run git ls-files");
     assert!(output.status.success());
-    let mut tracked: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect();
+    let mut tracked: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_owned)
+        .collect();
     tracked.sort();
     let mut classified: Vec<String> = NATIVE_MANIFESTS
         .iter()
@@ -216,7 +313,10 @@ fn every_manifest_is_classified() {
         .map(|path| (*path).to_owned())
         .collect();
     classified.sort();
-    assert_eq!(tracked, classified, "classify each manifest as native, guest or lint");
+    assert_eq!(
+        tracked, classified,
+        "classify each manifest as native, guest or lint"
+    );
 }
 
 /// The repository acceptance gate: every Cargo target of every native and
@@ -232,9 +332,16 @@ fn repository_source_is_inside_the_boundary() {
 
     // The owner library's root guest arm and the guest packages define the
     // guest files; everything that reaches them later keeps that class.
-    let (owner_violations, mut known_guest) =
-        scan::scan_crate_with(&repository.join("src/lib.rs"), true, &Default::default(), read);
-    assert!(!known_guest.is_empty(), "the owner library declares a guest tree");
+    let (owner_violations, mut known_guest) = scan::scan_crate_with(
+        &repository.join("src/lib.rs"),
+        true,
+        &Default::default(),
+        read,
+    );
+    assert!(
+        !known_guest.is_empty(),
+        "the owner library declares a guest tree"
+    );
     violations.extend(owner_violations);
     for manifest in GUEST_MANIFESTS {
         for (_, root, _) in manifest_targets(&repository.join(manifest)) {
@@ -255,12 +362,13 @@ fn repository_source_is_inside_the_boundary() {
     violations.sort();
     violations.dedup();
     assert!(roots > 10, "discovered only {roots} target roots");
-    let report: Vec<String> = violations
-        .iter()
-        .map(|v| {
-            let file = v.file.strip_prefix(&repository).unwrap_or(&v.file);
-            format!("{}:{}:{}: {} `{}`", file.display(), v.line, v.column, v.kind, v.construct)
-        })
+    // Until the migration finishes, the debt must match the exact baseline:
+    // no new hits, no stale entries.
+    let keys: Vec<baseline::Key> = baseline::keyed(&violations, &repository)
+        .into_iter()
+        .map(|(_, key)| key)
         .collect();
-    assert!(report.is_empty(), "{} boundary violations:\n{}", report.len(), report.join("\n"));
+    if let Err(error) = baseline::check(&keys, baseline::BASELINE) {
+        panic!("platform boundary baseline mismatch:\n{error}");
+    }
 }

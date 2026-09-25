@@ -290,7 +290,9 @@ fn check_public_reexport(cx: &LateContext<'_>, item: &Item<'_>, path: &rustc_hir
     let tcx = cx.tcx;
     let exported = cx.effective_visibilities.is_exported(def_id)
         || (tcx.visibility(def_id).is_public()
-            && cx.effective_visibilities.is_exported(tcx.local_parent(def_id)));
+            && cx
+                .effective_visibilities
+                .is_exported(tcx.local_parent(def_id)));
     if !exported {
         return;
     }

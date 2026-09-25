@@ -334,6 +334,11 @@ class NativeProofJobsTests(unittest.TestCase):
             r"(?m)^      DYLINT_TOOLCHAIN: nightly-\d{4}-\d{2}-\d{2}$",
         )
         self.assertIn("dylint-toolchain: ${{ env.DYLINT_TOOLCHAIN }}", dylints)
+        # Each lint's rust-toolchain.toml is the pin; the job must agree.
+        pinned = re.search(r"(?m)^      DYLINT_TOOLCHAIN: (\S+)$", dylints).group(1)
+        for toolchain in sorted(Path("dylints").glob("*/rust-toolchain.toml")):
+            with self.subTest(toolchain=str(toolchain)):
+                self.assertIn(f'channel = "{pinned}"', toolchain.read_text())
         self.assertIn('--toolchain "$DYLINT_TOOLCHAIN"', select_compiler)
         for target in targets:
             with self.subTest(target=target):

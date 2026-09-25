@@ -113,12 +113,20 @@ jobs:
       - name: Scan the repository against the platform boundary
         env:
           CARGO_HOME: ${{ runner.temp }}/kernal-boundary-scan-cargo
+        # The lint's own rust-toolchain.toml is the one Dylint nightly pin.
         run: |
-          soldr rustup toolchain install nightly-2026-05-28 --profile minimal \
+          toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' \
+            dylints/kernal_api_platform_boundary/rust-toolchain.toml)"
+          soldr rustup toolchain install "$toolchain" --profile minimal \
             --component rustc-dev,llvm-tools-preview,rust-src
-          soldr rustup run nightly-2026-05-28 cargo test --locked \
+          soldr rustup run "$toolchain" cargo test --locked \
             --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
             --lib -- --skip ui
+      - name: Check the Dylint libraries' formatting
+        run: |
+          for manifest in dylints/*/Cargo.toml; do
+            soldr cargo fmt --manifest-path "$manifest" --all -- --check
+          done
       - name: Lint the default facade
         if: steps.mode.outputs.mode != 'full'
         run: soldr cargo clippy --locked --lib -- --deny warnings

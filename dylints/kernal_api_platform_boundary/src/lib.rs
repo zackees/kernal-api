@@ -127,36 +127,87 @@ fn only_the_owner_library_root_may_select() {
     assert!(!is_owner_library(None, Some(&dir), &root, true));
 }
 
-/// The repository acceptance gate: every Cargo target of every package in the
-/// kernal-api workspace, discovered through `cargo metadata`, scans clean.
-/// This needs no compilation of the product, so it catches a violation in a
-/// module no host compiles (a Windows-only file on Linux, say) within seconds.
+/// Native packages whose every Cargo target must scan clean, relative to the
+/// repository root: the facade owner's workspace, the client fixtures that
+/// consume it, and the native build tools.
+#[cfg(test)]
+const ENFORCED_MANIFESTS: [&str; 6] = [
+    "Cargo.toml",
+    "tests/build-resources-consumer/Cargo.toml",
+    "tests/daemon-registration-consumer/Cargo.toml",
+    "tests/daemon-registration-v2-consumer/Cargo.toml",
+    "tools/wasm-abi-generator/Cargo.toml",
+    "benchmarks/wasm-sketch/component-tools/Cargo.toml",
+];
+
+/// Packages outside native-host enforcement, each for a stated reason. The
+/// list is exact: an unlisted manifest fails `every_manifest_is_classified`.
+#[cfg(test)]
+const EXCLUDED_MANIFESTS: [(&str, &str); 7] = [
+    ("src/wasm/generated/v1/guest/Cargo.toml", "generated wasm guest ABI bindings"),
+    ("guests/threaded-smoke/Cargo.toml", "wasm guest fixture"),
+    ("examples/wasm-tauri-screenshot/guest/Cargo.toml", "wasm guest fixture"),
+    ("benchmarks/wasm-sketch/compiler-guest/Cargo.toml", "wasm guest benchmark"),
+    ("benchmarks/wasm-sketch/component-guest/Cargo.toml", "wasm guest benchmark"),
+    ("dylints/kernal_api_boundary/Cargo.toml", "lint implementation and its violating UI fixtures"),
+    ("dylints/kernal_api_platform_boundary/Cargo.toml", "lint implementation and its violating UI fixtures"),
+];
+
+#[cfg(test)]
+fn repository_root() -> PathBuf {
+    std::path::absolute(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("absolute")
+}
+
+#[test]
+fn every_manifest_is_classified() {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "*Cargo.toml"])
+        .current_dir(repository_root())
+        .output()
+        .expect("run git ls-files");
+    assert!(output.status.success());
+    let mut tracked: Vec<String> = String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).collect();
+    tracked.sort();
+    let mut classified: Vec<String> = ENFORCED_MANIFESTS
+        .iter()
+        .map(|path| (*path).to_owned())
+        .chain(EXCLUDED_MANIFESTS.iter().map(|(path, _)| (*path).to_owned()))
+        .collect();
+    classified.sort();
+    assert_eq!(tracked, classified, "classify each manifest as enforced or excluded, with a reason");
+}
+
+/// The repository acceptance gate: every Cargo target of every enforced
+/// package, discovered through `cargo metadata`, scans clean. It needs no
+/// product compilation, so a violation in a module no host compiles (a
+/// Windows-only file on Linux, say) fails within seconds.
 #[test]
 fn repository_source_is_inside_the_boundary() {
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
-    let output = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
-        .args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"])
-        .arg(&manifest)
-        .output()
-        .expect("run cargo metadata");
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("metadata json");
-    let owner_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/lib.rs");
-    let owner_root = std::path::absolute(owner_root).expect("absolute");
+    let repository = repository_root();
+    let owner_root = repository.join("src/lib.rs");
     let (_, known_guest) = scan::scan_crate_with(&owner_root, true, &Default::default(), &scan::read_file);
     assert!(!known_guest.is_empty(), "the owner library declares a guest tree");
     let mut violations = Vec::new();
     let mut roots = 0;
-    for package in metadata["packages"].as_array().expect("packages") {
-        let name = package["name"].as_str().unwrap_or_default();
-        for target in package["targets"].as_array().expect("targets") {
-            let root = PathBuf::from(target["src_path"].as_str().expect("src_path"));
-            let library = target["kind"]
-                .as_array()
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"));
-            let owner = name == FACADE_OWNER && library && root.ends_with("src/lib.rs");
-            roots += 1;
-            violations.extend(scan::scan_crate_with(&root, owner, &known_guest, &scan::read_file).0);
+    for manifest in ENFORCED_MANIFESTS {
+        let output = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["metadata", "--format-version", "1", "--no-deps", "--offline", "--manifest-path"])
+            .arg(repository.join(manifest))
+            .output()
+            .expect("run cargo metadata");
+        assert!(output.status.success(), "{manifest}: {}", String::from_utf8_lossy(&output.stderr));
+        let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).expect("metadata json");
+        for package in metadata["packages"].as_array().expect("packages") {
+            let name = package["name"].as_str().unwrap_or_default();
+            for target in package["targets"].as_array().expect("targets") {
+                let root = PathBuf::from(target["src_path"].as_str().expect("src_path"));
+                let library = target["kind"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|kind| kind == "lib"));
+                let owner = is_owner_library(Some(name), Some(&repository), &root, library);
+                roots += 1;
+                violations.extend(scan::scan_crate_with(&root, owner, &known_guest, &scan::read_file).0);
+            }
         }
     }
     violations.sort();
@@ -164,7 +215,10 @@ fn repository_source_is_inside_the_boundary() {
     assert!(roots > 10, "discovered only {roots} target roots");
     let report: Vec<String> = violations
         .iter()
-        .map(|v| format!("{}:{}:{}: {} `{}`", v.file.display(), v.line, v.column, v.kind, v.construct))
+        .map(|v| {
+            let file = v.file.strip_prefix(&repository).unwrap_or(&v.file);
+            format!("{}:{}:{}: {} `{}`", file.display(), v.line, v.column, v.kind, v.construct)
+        })
         .collect();
     assert!(report.is_empty(), "{} boundary violations:\n{}", report.len(), report.join("\n"));
 }

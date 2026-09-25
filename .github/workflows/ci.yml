@@ -85,7 +85,7 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           ci-tests: true
           cache-key-suffix: linux
@@ -430,7 +430,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
@@ -790,7 +790,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           toolchain: 1.95.0
           cache: true

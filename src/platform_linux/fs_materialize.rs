@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 use crate::platform::fs::{LinkKind, WriterWait};
 
+#[path = "fs_extent.rs"]
+mod extent;
+pub use extent::extent_sharing;
+
 // ---------------------------------------------------------------------------
 // Replacement
 // ---------------------------------------------------------------------------

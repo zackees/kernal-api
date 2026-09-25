@@ -19,6 +19,10 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use crate::platform::fs::{LinkKind, WriterWait};
 
+#[path = "fs_extent.rs"]
+mod extent;
+pub use extent::extent_sharing;
+
 #[path = "fs_replacement.rs"]
 mod replacement;
 pub use replacement::{

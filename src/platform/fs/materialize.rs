@@ -88,6 +88,42 @@ pub fn await_no_writers(path: &Path, timeout: std::time::Duration) -> io::Result
     native::await_no_writers(path, timeout)
 }
 
+/// Whether a file's storage blocks are shared with another file.
+///
+/// Reflinks (Linux `FICLONE`, macOS `clonefile`, Windows ReFS block
+/// cloning) and snapshots let two files share blocks while each has one
+/// hard link, so a link count alone cannot prove that deleting a file frees
+/// its space.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ExtentSharing {
+    /// No block of the file is shared: removing its last hard link frees
+    /// its allocation. Also reported on volumes that cannot share blocks at
+    /// all (ext4, tmpfs, HFS+, FAT, NTFS).
+    Exclusive,
+    /// At least one block is shared with another file or snapshot.
+    Shared,
+    /// The volume can share blocks but this host cannot tell whether this
+    /// file does (APFS, ReFS, and Linux volumes without `FIEMAP`). Callers
+    /// that need proof must treat this as possibly shared.
+    Unknown,
+}
+
+/// Report whether the regular file at `path` shares storage blocks with
+/// another file. Follows symbolic links and retains no handle.
+///
+/// Linux asks the file system for the file's extent map (`FIEMAP`) and
+/// looks for the shared-extent flag; a volume without an extent map is
+/// answered from its type. macOS and Windows answer from the volume's file
+/// system: one that cannot clone blocks is `Exclusive`, and APFS or ReFS is
+/// `Unknown`.
+///
+/// # Errors
+///
+/// Returns the metadata or native query error, including `NotFound`.
+pub fn extent_sharing(path: &Path) -> io::Result<ExtentSharing> {
+    native::extent_sharing(path)
+}
+
 /// Create a symbolic link at `link` to the file `target`, which may not
 /// exist yet.
 ///

@@ -650,6 +650,29 @@ jobs:
             curl -LsSf "$url" | tar zxf - -C "$HOME/.cargo/bin"
           fi
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The runner's volumes are NTFS, which cannot share blocks. Format a
+      # ReFS volume so the Windows extent-sharing tests prove block-clone
+      # reference counts rather than skip (KERNAL_REFS_TEST_DIR).
+      - name: Mount a ReFS volume for extent-sharing tests
+        if: matrix.os == 'windows-2025'
+        shell: pwsh
+        run: |
+          $vhd = Join-Path $env:RUNNER_TEMP 'refs.vhdx'
+          $script = Join-Path $env:RUNNER_TEMP 'refs-diskpart.txt'
+          @(
+            "create vdisk file=`"$vhd`" maximum=2048 type=expandable"
+            "select vdisk file=`"$vhd`""
+            'attach vdisk'
+            'create partition primary'
+            'format fs=refs quick label=KernalReFS'
+            'assign letter=R'
+          ) | Set-Content -Path $script -Encoding ascii
+          diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "diskpart failed: $LASTEXITCODE" }
+          $fs = (Get-Volume -DriveLetter R).FileSystem
+          if ($fs -ne 'ReFS') { throw "R: is $fs, not ReFS" }
+          New-Item -ItemType Directory -Path 'R:\kernal-refs' | Out-Null
+          'KERNAL_REFS_TEST_DIR=R:\kernal-refs' | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Run this host's prebuilt tests
         shell: bash
         run: |

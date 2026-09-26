@@ -62,6 +62,11 @@ jobs:
     needs: release-guard
     runs-on: ubuntu-latest
     environment: release
+    # Matches `linux` in ci.yml so this job's cook base is that job's (#355):
+    # the same target, dev profile and suffix restore one ~2.4 GB base
+    # instead of storing a second, `--release` one no step here compiles.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -70,8 +75,15 @@ jobs:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       # Caches are fine here: this job tests the release and packages the
       # sources (`.crate`, sdist, wheel), which no cache can change. The
-      # jobs that build shipped binaries restore nothing.
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      # jobs that build shipped binaries restore nothing. Every step here
+      # compiles the dev profile (`cargo test`, the package verification), so
+      # cook that profile and share the `linux` CI job's cook base (#355).
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+        with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
+          cache-key-suffix: linux
+          prebuild-deps-flags: ""
       - name: Install native webview development packages
         run: >-
           sudo apt-get update && sudo apt-get install --yes
@@ -171,8 +183,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
         with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
           # Shipped binaries restore nothing. Every cache is a key another job
           # can write -- the v0.1.14 aarch64 worker restored a toolchain whose
           # rustup records listed an aarch64 std that the saved archive did not

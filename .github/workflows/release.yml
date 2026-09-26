@@ -71,7 +71,7 @@ jobs:
       # Caches are fine here: this job tests the release and packages the
       # sources (`.crate`, sdist, wheel), which no cache can change. The
       # jobs that build shipped binaries restore nothing.
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
       - name: Install native webview development packages
         run: >-
           sudo apt-get update && sudo apt-get install --yes
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           # Shipped binaries restore nothing. Every cache is a key another job
           # can write -- the v0.1.14 aarch64 worker restored a toolchain whose

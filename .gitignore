@@ -23,3 +23,10 @@ __pycache__/
 /kernal-x64.tar.zst
 # setup-soldr writes its cache archives into the checkout root.
 /target.soldr-*
+
+# Dylint workspaces build beside their manifests. A local run with the Cargo
+# home beside the manifest leaves caches there too; only the checked-in
+# `.cargo/config.toml` belongs to the repository.
+/dylints/*/target/
+/dylints/*/.cargo/*
+!/dylints/*/.cargo/config.toml

@@ -1,10 +1,8 @@
-error: host-platform selection outside the kernal-api boundary: host cfg `cfg!(unix)`; use a platform-neutral kernal_api facade operation
-  --> $DIR/disallowed_private_and_statements.rs:2:1
+error: host-platform selection outside the kernal-api boundary: host cfg `cfg!(unix)`; use a platform-neutral facade operation
+  --> $DIR/disallowed_private_and_statements.rs:3:8
    |
-LL | / fn cfg_macro_in_private_body() -> u8 {
-LL | |     if cfg!(unix) { 1 } else { 2 }
-LL | | }
-   | |_^
+LL |     if cfg!(unix) { 1 } else { 2 }
+   |        ^^^
    |
    = note: `#[deny(kernal_api_platform_boundary)]` on by default
 

@@ -1,10 +1,8 @@
-error: host-platform selection outside the kernal-api boundary: native API `windows_sys`; use a platform-neutral kernal_api facade operation
-  --> $DIR/disallowed_native_test_code.rs:1:1
+error: host-platform selection outside the kernal-api boundary: native API `windows_sys`; use a platform-neutral facade operation
+  --> $DIR/disallowed_native_test_code.rs:5:9
    |
-LL | / fn test_helper() {
-LL | |     let windows_sys = ();
-LL | | }
-   | |_^
+LL |     use windows_sys::Win32::Foundation::CloseHandle;
+   |         ^^^^^^^^^^^
    |
    = note: `#[deny(kernal_api_platform_boundary)]` on by default
 

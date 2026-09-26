@@ -4,7 +4,8 @@ The suite contains two lints:
 
 - `kernal_api_boundary` rejects direct client use of implementation crates.
 - `kernal_api_platform_boundary` rejects host `cfg` selection and native OS
-  APIs outside the shared HAL, including code elided on the CI host.
+  APIs outside the private platform trees of `kernal-api`, in clients and in
+  `kernal-api` itself, including code elided on the CI host.
 
 Add the repository lints to a client workspace:
 
@@ -56,8 +57,8 @@ target bookkeeping.
 
 Linux ARM is not yet cross-linted: the all-feature graph needs an ARM GLib
 sysroot that the current managed Linux target toolchain does not provide. Its
-native ARM build lane still compiles the product graph, while the text scan
-below remains the guard for source that the resolving lint cannot select.
+native ARM build lane still compiles the product graph, and the platform
+boundary's source scan covers its selected files regardless.
 
 `tests/facade_policy.rs` still scans all source as text regardless of host. It
 joins a declaration wrapped across line breaks before matching it, so a backend
@@ -67,17 +68,33 @@ renames an owned crate requires the resolving lint coverage above. Narrowing
 the feature set or target set is a coverage decision, not a knob: if either is
 ever narrowed, say here exactly what remains covered.
 
-## Platform-boundary status
+## Platform boundary
 
-The intended platform layout is documented in
-[docs/platform-boundary.md](docs/platform-boundary.md). It has one structured
-`std::cfg_select!` host selector in the facade root and neutral capability
-modules below it. Do not treat the present Dylint as complete enforcement of
-that rule: `kernal_api_platform_boundary` currently exempts the `kernal-api`
-package so it can lint clients, and its CI job runs on Linux. Issue #152 owns
-removing that owner exemption with an AST/pre-expansion rule and adding a
-temporary exact occurrence baseline before taking it to zero. Until then,
-review new platform code against the guide as well as running the lint.
+`kernal_api_platform_boundary` enforces the layout in
+[docs/platform-boundary.md](docs/platform-boundary.md) on every crate it
+runs on, `kernal-api` included: the only host `cfg`, native OS APIs and
+concrete-tree names allowed are those inside the private platform trees that
+the one exactly shaped `std::cfg_select!` at the root of this library
+declares, plus that crate's root-level `use platform_imp::...;` bridge. A
+client cannot declare a selector of its own, because the selector is
+accepted only in the `kernal-api` library root.
+
+It is a pre-expansion lint that parses each module's source into token
+trees and follows every out-of-line `mod` whatever `cfg` guards it, so the
+Linux pass inspects Windows- and macOS-only files, unit and integration tests
+included; comments and string literals cannot match. The same scanner runs
+without compiling anything as the lint crate's repository test, over every
+target of every manifest the lint crate classifies as enforced:
+
+```console
+soldr rustup run nightly-2026-05-28 cargo test \
+  --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml --lib
+```
+
+CI runs that test on every pull request and push; the full-mode `dylints`
+job adds the UI tests and the resolving passes above. Existing debt is listed
+exactly in `src/baseline.txt`, which may only shrink; see
+[docs/platform-boundary.md](docs/platform-boundary.md). There are no waivers.
 
 The lint checks both the client manifest and resolved Rust code. An unused,
 aliased, target-specific, build, or test dependency on a facade-owned backend

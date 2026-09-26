@@ -85,7 +85,7 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           ci-tests: true
           cache-key-suffix: linux
@@ -105,6 +105,28 @@ jobs:
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
+      # The platform boundary (#152) is a source rule, so its repository scan
+      # parses every enforced package's modules -- cfg-elided Windows and
+      # macOS files included -- without compiling the product. That makes it
+      # cheap enough to gate every mode; the `dylints` job adds the resolving
+      # passes and the UI tests in full mode.
+      - name: Scan the repository against the platform boundary
+        env:
+          CARGO_HOME: ${{ runner.temp }}/kernal-boundary-scan-cargo
+        # The lint's own rust-toolchain.toml is the one Dylint nightly pin.
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"$/\1/p' \
+            dylints/kernal_api_platform_boundary/rust-toolchain.toml)"
+          soldr rustup toolchain install "$toolchain" --profile minimal \
+            --component rustc-dev,llvm-tools-preview,rust-src
+          soldr rustup run "$toolchain" cargo test --locked \
+            --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
+            --lib -- --skip ui
+      - name: Check the Dylint libraries' formatting
+        run: |
+          for manifest in dylints/*/Cargo.toml; do
+            soldr cargo fmt --manifest-path "$manifest" --all -- --check
+          done
       - name: Lint the default facade
         if: steps.mode.outputs.mode != 'full'
         run: soldr cargo clippy --locked --lib -- --deny warnings
@@ -408,7 +430,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
@@ -768,7 +790,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           toolchain: 1.95.0
           cache: true

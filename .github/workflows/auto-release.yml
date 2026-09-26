@@ -109,7 +109,7 @@ jobs:
         with:
           ref: ${{ inputs.candidate_sha }}
           lfs: true
-      - uses: zackees/setup-soldr@d6a0844c40b94f62cf104377b4cc90403c96f6ce # v0.9.75
+      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
         with:
           # A release restores nothing. Every cache is a key that another job
           # can write -- the v0.1.14 aarch64 worker restored a toolchain whose

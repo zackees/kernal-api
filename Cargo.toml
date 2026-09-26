@@ -509,7 +509,11 @@ targets = [
 workspace = true
 
 [workspace]
-exclude = ["src/wasm/generated/v1/guest"]
+exclude = [
+    "src/wasm/generated/v1/guest",
+    "dylints/kernal_api_boundary",
+    "dylints/kernal_api_platform_boundary",
+]
 
 # Every warning is an error, in every build of every package here: CI, local
 # builds, tests and clippy alike. Dependents pulling this crate from a

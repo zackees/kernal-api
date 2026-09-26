@@ -1,0 +1,16 @@
+error: host-platform selection outside the kernal-api boundary: native API `std::os`; use a platform-neutral facade operation
+  --> $DIR/auxiliary/windows_only.rs:1:5
+   |
+LL | use std::os::windows::ffi::OsStrExt;
+   |     ^^^
+   |
+   = note: `#[deny(kernal_api_platform_boundary)]` on by default
+
+error: host-platform selection outside the kernal-api boundary: host cfg `cfg(windows)`; use a platform-neutral facade operation
+  --> $DIR/disallowed_inactive_module.rs:3:3
+   |
+LL | #[cfg(windows)]
+   |   ^^^
+
+error: aborting due to 2 previous errors
+

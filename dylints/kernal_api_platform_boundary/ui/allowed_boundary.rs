@@ -1,23 +1,18 @@
-// The boundary's inside: host cfg in a file named like a concrete-tree
-// member is allowed, and feature/test cfg without a host selector is
-// allowed anywhere.
-
-#[cfg(target_os = "linux")]
-mod selected {
-    pub fn f() -> u8 {
-        1
-    }
-}
+// Host-neutral configuration stays legal everywhere: feature, test, docs and
+// debug predicates select no native host. Comments and strings that merely
+// mention `cfg(windows)` or `libc::getpid` are not code, and an ordinary
+// binding that happens to be called `windows` is not a path into the crate.
 
 #[cfg(feature = "tokio-console")]
 fn feature_gated() {}
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn neutral() {
-        assert_eq!(super::selected::f(), 1);
-    }
+#[cfg_attr(docsrs, doc = "documented")]
+#[cfg(any(test, debug_assertions))]
+fn debug_only() -> &'static str {
+    "cfg(windows) and libc::getpid() in a string"
 }
 
-fn main() {}
+fn main() {
+    let windows = [1_u8, 2];
+    let _ = (windows, cfg!(debug_assertions));
+}

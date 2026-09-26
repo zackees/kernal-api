@@ -27,6 +27,11 @@ SETUP_SOLDR = re.compile(
     r"^(?P<indent> *)- uses: zackees/setup-soldr@(?P<ref>\S+)(?P<comment>.*)$"
 )
 
+# Pin the runtime independently of the action SHA. A floating `latest` Soldr
+# release creates another cache generation and makes concurrent producers
+# disagree about which exact-only cook base they can restore.
+SOLDR_RUNTIME_VERSION = "0.9.23"
+
 # Every setup-soldr step, keyed by (workflow, job): the target it cooks for
 # and the profile it compiles. A new step must be classified here, so its
 # cook base is weighed against the others before it lands. `matrix` targets
@@ -152,6 +157,15 @@ class CachePolicyTests(unittest.TestCase):
         self.assertEqual(len(refs), 1, f"setup-soldr pins differ: {sorted(refs)}")
         (ref,) = refs
         self.assertRegex(ref, r"^[0-9a-f]{40}$", "pin setup-soldr to a full commit SHA")
+
+    def test_one_pinned_soldr_runtime_version(self):
+        for step in self.steps():
+            with self.subTest(workflow=step["workflow"], job=step["job"]):
+                self.assertEqual(
+                    step["inputs"].get("version"),
+                    SOLDR_RUNTIME_VERSION,
+                    "pin the Soldr runtime so main producers share one cache generation",
+                )
 
     def test_cook_flags_match_the_compiled_profile(self):
         for step in self.steps():

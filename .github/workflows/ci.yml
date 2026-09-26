@@ -60,6 +60,7 @@ jobs:
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
       sha: ${{ steps.mode.outputs.sha }}
+      soldr_version: ${{ steps.setup_soldr.outputs.soldr-version }}
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -86,7 +87,9 @@ jobs:
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
       - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
+        id: setup_soldr
         with:
+          version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
@@ -436,6 +439,7 @@ jobs:
           libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
@@ -822,6 +826,7 @@ jobs:
           libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
@@ -951,3 +956,40 @@ jobs:
           CI_NEEDS_JSON: ${{ toJSON(needs) }}
           GITHUB_TOKEN: ${{ github.token }}
         run: CHECKED_OUT_SHA="$(git rev-parse HEAD)" uv run --no-project --python 3.12 ci/full_coverage.py
+
+  # setup-soldr cook bases restore exact-only and include the runtime Soldr
+  # version in the key. After every producer job has completed its post-step,
+  # retire only main-ref bases from older Soldr versions; current-version
+  # target/feature shapes and all other cache families are preserved.
+  cache-retention:
+    name: Retire obsolete cook-base generations
+    needs: [linux, build, test, dylints, full-coverage]
+    if: >-
+      ${{
+        always() &&
+        github.event_name == 'push' &&
+        github.ref == 'refs/heads/main' &&
+        needs.linux.result == 'success' &&
+        (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+        (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+        (needs.dylints.result == 'success' || needs.dylints.result == 'skipped') &&
+        (needs['full-coverage'].result == 'success' || needs['full-coverage'].result == 'skipped')
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Retire obsolete cook bases and enforce the live cache budget
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOLDR_VERSION: ${{ needs.linux.outputs.soldr_version }}
+        run: >-
+          uv run --no-project ci/prune_obsolete_cook_caches.py
+          --version "${SOLDR_VERSION}" --apply

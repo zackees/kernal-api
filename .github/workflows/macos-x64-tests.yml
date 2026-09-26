@@ -62,6 +62,7 @@ jobs:
 
       - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto

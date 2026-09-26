@@ -2,9 +2,10 @@
 
 The workflow has four work jobs: `linux` (the gate), `build` and `test` (one
 runner per other target each), and `dylints`. Full mode adds a small coverage
-sentinel after the work jobs. These
-guards pin the properties that shape was chosen for, one test per property, so
-a later edit that quietly undoes one fails here instead of on a runner bill.
+sentinel after the work jobs. Main pushes add one non-compiling cache-retention
+job after all cache producers finish. These guards pin the properties that
+shape was chosen for, one test per property, so a later edit that quietly
+undoes one fails here instead of on a runner bill.
 """
 
 import re
@@ -26,7 +27,14 @@ TARGETS = {target for _, target in HOSTS}
 # x86_64 Linux is the gate: its builder is its host, so it builds and runs in
 # `linux` rather than in the per-target matrices.
 GATE_TARGET = "x86_64-unknown-linux-gnu"
-EXPECTED_JOBS = {"linux", "build", "test", "dylints", "full-coverage"}
+EXPECTED_JOBS = {
+    "linux",
+    "build",
+    "test",
+    "dylints",
+    "full-coverage",
+    "cache-retention",
+}
 # `cargo-nextest` is the replay driver, not a compiler: it runs binaries out of
 # a prebuilt archive. `.cargo/bin` is a path. Everything else named here would
 # compile on the host running it.
@@ -66,6 +74,14 @@ class NativeProofJobsTests(unittest.TestCase):
         """
         jobs = set(re.findall(r"(?m)^  ([\w-]+):\n", self.text().split("\njobs:\n", 1)[1]))
         self.assertEqual(jobs, EXPECTED_JOBS)
+
+    def test_cache_retention_is_an_after_producer_maintenance_job(self):
+        """Cache deletion must wait for all producer post-steps and run only on main."""
+        job = self.job("cache-retention")
+        self.assertIn("needs: [linux, build, test, dylints, full-coverage]", job)
+        self.assertIn("github.event_name == 'push'", job)
+        self.assertIn("github.ref == 'refs/heads/main'", job)
+        self.assertIn("actions: write", job)
 
     def test_only_python_310_is_tested(self):
         """The package is tested on its supported floor alone."""

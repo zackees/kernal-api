@@ -85,8 +85,10 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
         with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
           ci-tests: true
           cache-key-suffix: linux
           prebuild-deps-flags: ""
@@ -101,7 +103,8 @@ jobs:
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
             ci.test_ci_modes ci.test_release_ci_gate \
-            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features
+            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features \
+            ci.test_cache_policy
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
@@ -430,8 +433,10 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
         with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
@@ -813,8 +818,10 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
         with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
           toolchain: 1.95.0
           cache: true
           build-cache: false

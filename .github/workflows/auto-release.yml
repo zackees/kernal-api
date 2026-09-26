@@ -109,8 +109,10 @@ jobs:
         with:
           ref: ${{ inputs.candidate_sha }}
           lfs: true
-      - uses: zackees/setup-soldr@c2a3b964193132387c564430eb7d295af0a6d021 # v0.9.77
+      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
         with:
+          # No durable saves from pull requests (setup-soldr#527, #355).
+          save-cache: auto
           # A release restores nothing. Every cache is a key that another job
           # can write -- the v0.1.14 aarch64 worker restored a toolchain whose
           # rustup records listed an aarch64 std that the saved archive did not

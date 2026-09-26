@@ -78,8 +78,9 @@ jobs:
       # jobs that build shipped binaries restore nothing. Every step here
       # compiles the dev profile (`cargo test`, the package verification), so
       # cook that profile and share the `linux` CI job's cook base (#355).
-      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
           cache-key-suffix: linux
@@ -183,8 +184,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
-      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
           # Shipped binaries restore nothing. Every cache is a key another job

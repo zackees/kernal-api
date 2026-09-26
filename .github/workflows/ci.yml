@@ -85,8 +85,9 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
           ci-tests: true
@@ -433,8 +434,9 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
           ci-tests: true
@@ -818,8 +820,9 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@fabebf4ac3867b0008576797d566db0cb18d43c3 # v0.9.78
+      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
         with:
+          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
           save-cache: auto
           toolchain: 1.95.0

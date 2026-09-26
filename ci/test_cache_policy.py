@@ -11,7 +11,11 @@ properties that keep the footprint bounded:
   listed reason says why the graphs differ;
 - no step saves durable caches from a `pull_request` run, whose entries only
   that pull request can restore: every pin is v0.9.78+ with `save-cache: auto`
-  unless a listed reason needs `true`.
+  unless a listed reason needs `true`;
+- no step writes the per-commit cook-delta layer: one `cook-delta-v2-*`
+  generation per commit accumulated ~2.8 GB on main with nothing pruning it
+  (zackees/setup-soldr#528). Every step pins a release that honors
+  `cook-delta` and sets it to `false`; cook bases stay on.
 """
 
 import re
@@ -46,6 +50,14 @@ JUSTIFIED_SPLITS: dict[tuple[str, str], str] = {}
 # default `auto` skips every durable save on `pull_request`. Older pins save
 # unconditionally.
 SAVE_POLICY_MIN_VERSION = (0, 9, 78)
+
+# The first setup-soldr release whose main action honors `cook-delta`
+# (zackees/setup-soldr#528). Older pins always write the delta layer.
+COOK_DELTA_MIN_VERSION = (0, 9, 80)
+
+# Steps allowed to keep the cook-delta layer, with the reason (a measured
+# warm-build win and a retention bound). Empty today.
+COOK_DELTA_JUSTIFICATIONS: dict[tuple[str, str], str] = {}
 
 # Steps allowed `save-cache: "true"` on pull requests, with the reason: only
 # when a later job in the same run restores what this step saved. Empty
@@ -87,7 +99,8 @@ def setup_soldr_steps():
                     break
                 pair = re.match(r"^\s+([\w-]+):\s*(.*?)\s*$", body)
                 if pair and not body.lstrip().startswith("#") and pair.group(1) != "with":
-                    inputs[pair.group(1)] = pair.group(2).strip('"').strip("'")
+                    value = re.sub(r"\s+#.*$", "", pair.group(2))
+                    inputs[pair.group(1)] = value.strip('"').strip("'")
             yield {
                 "workflow": path.name,
                 "job": job,
@@ -202,6 +215,31 @@ class CachePolicyTests(unittest.TestCase):
             with self.subTest(workflow=where[0], job=where[1]):
                 self.assertTrue(reason.strip())
                 self.assertTrue(steps and all(saves_on_pull_request(s) for s in steps))
+
+    def test_no_step_writes_the_cook_delta_layer(self):
+        """The delta layer saves one generation per commit and is never pruned."""
+        for step in self.steps():
+            where = (step["workflow"], step["job"])
+            if where in COOK_DELTA_JUSTIFICATIONS:
+                continue
+            with self.subTest(workflow=where[0], job=where[1]):
+                self.assertEqual(
+                    step["inputs"].get("cook-delta"),
+                    "false",
+                    "set `cook-delta: false` (setup-soldr#528)",
+                )
+                version = pin_version(step)
+                self.assertIsNotNone(COOK_DELTA_MIN_VERSION)
+                self.assertTrue(
+                    version is not None and version >= COOK_DELTA_MIN_VERSION,
+                    f"setup-soldr {version} ignores `cook-delta`",
+                )
+
+    def test_cook_delta_justifications_are_live(self):
+        for where, reason in COOK_DELTA_JUSTIFICATIONS.items():
+            self.assertTrue(reason.strip(), where)
+            self.assertIn(where, COOK_SHAPES)
+
 
 if __name__ == "__main__":
     unittest.main()

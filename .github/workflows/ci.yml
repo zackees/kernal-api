@@ -91,8 +91,10 @@ jobs:
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # No durable saves from pull requests (setup-soldr#527, #355).
-          save-cache: auto
+          # Only main pushes write durable entries; PRs and manually selected
+          # candidate SHAs restore without racing main retention or stranding
+          # unreachable lock generations.
+          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
           ci-tests: true
           cache-key-suffix: linux
           prebuild-deps-flags: ""
@@ -441,8 +443,10 @@ jobs:
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # No durable saves from pull requests (setup-soldr#527, #355).
-          save-cache: auto
+          # Only main pushes write durable entries; PRs and manually selected
+          # candidate SHAs restore without racing main retention or stranding
+          # unreachable lock generations.
+          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
@@ -834,8 +838,10 @@ jobs:
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # No durable saves from pull requests (setup-soldr#527, #355).
-          save-cache: auto
+          # Only main pushes write durable entries; PRs and manually selected
+          # candidate SHAs restore without racing main retention or stranding
+          # unreachable lock generations.
+          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
           toolchain: 1.95.0
           cache: true
           build-cache: false
@@ -965,11 +971,11 @@ jobs:
 
   # setup-soldr cook bases restore exact-only and include the runtime Soldr
   # version in the key. After every producer job has completed its post-step,
-  # retire old Soldr versions and the five explicitly disabled cross-target
-  # build shapes. Preserve the active native xlinux cook and all other cache
-  # families.
+  # retire old Soldr versions, superseded lock-scoped entries with an exact
+  # same-shape replacement, and the five explicitly disabled cross-target
+  # cook shapes. Preserve the active native xlinux cook and all unique shapes.
   cache-retention:
-    name: Retire obsolete and disabled cook-base generations
+    name: Retire superseded and disabled cache generations
     needs: [linux, build, test, dylints, full-coverage]
     if: >-
       ${{

@@ -1,3 +1,4 @@
+import hashlib
 import unittest
 from pathlib import Path
 
@@ -6,15 +7,254 @@ from ci.prune_obsolete_cook_caches import (
     Cache,
     GitHub,
     cache_version,
+    checked_out_lock_hash,
+    lock_generation_shape,
     prune,
+    require_lock_generations_retired,
     require_single_current_generation,
     retired_cross_target_cook_bases,
     stale_cook_bases,
+    superseded_lock_generation_caches,
     version_tuple,
 )
 
 
 class CookCacheRetentionTests(unittest.TestCase):
+    CURRENT_FIXTURE_LOCK_HASH = "5e524d4298978a25"
+
+    def test_lock_generation_shape_removes_only_the_lock_dimension(self):
+        cook_old = Cache(
+            1,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            100,
+        )
+        cook_new = Cache(
+            2,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            110,
+        )
+        self.assertEqual(
+            lock_generation_shape(cook_old)[:2],
+            lock_generation_shape(cook_new)[:2],
+        )
+
+        build_old = Cache(
+            3,
+            "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-f594fff1c7c78900",
+            "refs/heads/main",
+            100,
+        )
+        build_new = Cache(
+            4,
+            "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-5e524d4298978a25",
+            "refs/heads/main",
+            110,
+        )
+        self.assertEqual(
+            lock_generation_shape(build_old)[:2], lock_generation_shape(build_new)[:2]
+        )
+
+        registry_old = Cache(
+            5,
+            "setup-soldr-cargoregistry-v1-linux-x64-f594fff1c7c78900-1bd06206b2843d4e",
+            "refs/heads/main",
+            100,
+        )
+        registry_new = Cache(
+            6,
+            "setup-soldr-cargoregistry-v1-linux-x64-5e524d4298978a25-1bd06206b2843d4e",
+            "refs/heads/main",
+            110,
+        )
+        self.assertEqual(
+            lock_generation_shape(registry_old)[:2],
+            lock_generation_shape(registry_new)[:2],
+        )
+
+    def test_only_older_main_generations_with_exact_replacements_are_retired(self):
+        main_native_old = Cache(
+            10,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            100,
+        )
+        main_native_current = Cache(
+            20,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            110,
+        )
+        main_build_old = Cache(
+            11,
+            "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-f594fff1c7c78900",
+            "refs/heads/main",
+            100,
+        )
+        main_build_current = Cache(
+            21,
+            "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-5e524d4298978a25",
+            "refs/heads/main",
+            110,
+        )
+        main_registry_old = Cache(
+            12,
+            "setup-soldr-cargoregistry-v1-linux-x64-f594fff1c7c78900-1bd06206b2843d4e",
+            "refs/heads/main",
+            100,
+        )
+        main_registry_current = Cache(
+            22,
+            "setup-soldr-cargoregistry-v1-linux-x64-5e524d4298978a25-1bd06206b2843d4e",
+            "refs/heads/main",
+            110,
+        )
+
+        # A separate target/job shape, an unmatched registry digest, and a PR
+        # generation are all preserved even though their lock hashes differ.
+        unique_target_old = Cache(
+            13,
+            "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-build-aarch64-unknown-linux-gnu-f594fff1c7c78900",
+            "refs/heads/main",
+            120,
+        )
+        unique_registry = Cache(
+            14,
+            "setup-soldr-cargoregistry-v1-linux-x64-f594fff1c7c78900-cc1ceb1e7de990c6",
+            "refs/heads/main",
+            130,
+        )
+        pr_old = Cache(
+            15,
+            main_native_old.key,
+            "refs/pull/361/merge",
+            140,
+        )
+
+        self.assertEqual(
+            superseded_lock_generation_caches(
+                [
+                    main_native_old,
+                    main_native_current,
+                    main_build_old,
+                    main_build_current,
+                    main_registry_old,
+                    main_registry_current,
+                    unique_target_old,
+                    unique_registry,
+                    pr_old,
+                ],
+                self.CURRENT_FIXTURE_LOCK_HASH,
+            ),
+            [main_native_old, main_build_old, main_registry_old],
+        )
+
+    def test_prior_generation_is_kept_until_same_shape_replacement_exists(self):
+        old = Cache(
+            1,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            100,
+        )
+        self.assertEqual(
+            superseded_lock_generation_caches([old], self.CURRENT_FIXTURE_LOCK_HASH),
+            [],
+        )
+
+        current = Cache(
+            2,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            110,
+        )
+        self.assertEqual(
+            superseded_lock_generation_caches(
+                [old, current], self.CURRENT_FIXTURE_LOCK_HASH
+            ),
+            [old],
+        )
+
+    def test_multiple_lock_changes_keep_only_the_latest_same_shape_entry(self):
+        entries = [
+            Cache(
+                10,
+                "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-f594fff1c7c78900",
+                "refs/heads/main",
+                100,
+            ),
+            Cache(
+                20,
+                "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-5e524d4298978a25",
+                "refs/heads/main",
+                110,
+            ),
+            Cache(
+                30,
+                "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-a1b2c3d4e5f60718",
+                "refs/heads/main",
+                120,
+            ),
+        ]
+
+        # Once a current replacement exists, retaining rollback-specific old
+        # lock caches is a bandwidth tradeoff, not correctness state. If a
+        # commit reverts Cargo.lock, the exact old cache can be rebuilt.
+        self.assertEqual(
+            superseded_lock_generation_caches(entries, "a1b2c3d4e5f60718"),
+            entries[:2],
+        )
+
+    def test_empty_latest_entry_is_not_accepted_as_a_replacement(self):
+        entries = [
+            Cache(
+                1,
+                "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                "refs/heads/main",
+                100,
+            ),
+            Cache(
+                2,
+                "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+                "refs/heads/main",
+                0,
+            ),
+        ]
+
+        self.assertEqual(
+            superseded_lock_generation_caches(entries, self.CURRENT_FIXTURE_LOCK_HASH),
+            [],
+        )
+        with self.assertRaisesRegex(ValueError, "no nonempty checked-out"):
+            require_lock_generations_retired(entries, self.CURRENT_FIXTURE_LOCK_HASH)
+
+    def test_checked_out_lock_hash_matches_setup_soldr_short_file_hash(self):
+        lockfile = Path(__file__).resolve().parents[1] / "Cargo.lock"
+        expected = hashlib.sha256(lockfile.read_bytes()).hexdigest()[:16]
+        self.assertEqual(checked_out_lock_hash(), expected)
+
+    def test_stale_producer_with_newer_cache_id_does_not_replace_current_lock(self):
+        current = Cache(
+            20,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            110,
+        )
+        stale_late_write = Cache(
+            30,
+            "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+            "refs/heads/main",
+            100,
+        )
+
+        self.assertEqual(
+            superseded_lock_generation_caches(
+                [current, stale_late_write], self.CURRENT_FIXTURE_LOCK_HASH
+            ),
+            [stale_late_write],
+        )
+        require_lock_generations_retired([current], self.CURRENT_FIXTURE_LOCK_HASH)
+
     def test_only_current_main_build_matrix_cross_cook_bases_are_retired(self):
         targets = (
             "aarch64-unknown-linux-gnu",
@@ -202,10 +442,150 @@ class CookCacheRetentionTests(unittest.TestCase):
                 return sum(entry.size for entry in self.entries)
 
         api = FakeGitHub()
-        deleted, reclaimed = prune(api, "0.9.23", apply=True)
+        deleted, reclaimed = prune(
+            api,
+            "0.9.23",
+            apply=True,
+            current_lock_hash=self.CURRENT_FIXTURE_LOCK_HASH,
+        )
 
         self.assertEqual((deleted, reclaimed), (2, 1_100))
         self.assertEqual([cache.cache_id for cache in api.entries], [2, 4, 5])
+
+    def test_prune_retires_only_lock_generations_with_same_shape_replacement(self):
+        class FakeGitHub:
+            def __init__(self):
+                self.entries = [
+                    Cache(
+                        1,
+                        "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                        "refs/heads/main",
+                        100,
+                    ),
+                    Cache(
+                        2,
+                        "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+                        "refs/heads/main",
+                        110,
+                    ),
+                    Cache(
+                        3,
+                        "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-f594fff1c7c78900",
+                        "refs/heads/main",
+                        120,
+                    ),
+                    Cache(
+                        4,
+                        "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-5e524d4298978a25",
+                        "refs/heads/main",
+                        130,
+                    ),
+                    Cache(
+                        5,
+                        "setup-soldr-cargoregistry-v1-linux-x64-f594fff1c7c78900-cc1ceb1e7de990c6",
+                        "refs/heads/main",
+                        140,
+                    ),
+                    Cache(
+                        6,
+                        "setup-soldr-cargoregistry-v1-linux-x64-5e524d4298978a25-1bd06206b2843d4e",
+                        "refs/heads/main",
+                        150,
+                    ),
+                    Cache(
+                        7,
+                        "setup-soldr-cargoregistry-v1-linux-x64-f594fff1c7c78900-23c34377df2e227d",
+                        "refs/heads/main",
+                        160,
+                    ),
+                    Cache(
+                        8,
+                        "cook-base-v2-linux-arm64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                        "refs/heads/main",
+                        170,
+                    ),
+                    Cache(
+                        9,
+                        "cook-base-v2-linux-arm64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+                        "refs/heads/main",
+                        180,
+                    ),
+                    Cache(
+                        10,
+                        "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                        "refs/pull/361/merge",
+                        190,
+                    ),
+                ]
+                self.deleted = []
+
+            def caches(self):
+                return list(self.entries)
+
+            def delete_cache(self, cache_id):
+                self.deleted.append(cache_id)
+                self.entries = [
+                    entry for entry in self.entries if entry.cache_id != cache_id
+                ]
+                return True
+
+            def usage_bytes(self):
+                return sum(entry.size for entry in self.entries)
+
+        api = FakeGitHub()
+        deleted, reclaimed = prune(
+            api,
+            "0.9.23",
+            apply=True,
+            current_lock_hash=self.CURRENT_FIXTURE_LOCK_HASH,
+        )
+
+        self.assertEqual(api.deleted, [1, 3, 8])
+        self.assertEqual((deleted, reclaimed), (3, 390))
+        self.assertEqual(
+            {entry.cache_id for entry in api.entries}, {2, 4, 5, 6, 7, 9, 10}
+        )
+
+    def test_prune_keeps_unique_generation_when_no_same_shape_replacement_exists(self):
+        class FakeGitHub:
+            def __init__(self):
+                self.entries = [
+                    Cache(
+                        1,
+                        "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                        "refs/heads/main",
+                        100,
+                    ),
+                    Cache(
+                        2,
+                        "setup-soldr-buildcache-v2-linux-x64-1bd06206b2843d4e-linux-f594fff1c7c78900",
+                        "refs/heads/main",
+                        120,
+                    ),
+                ]
+                self.deleted = []
+
+            def caches(self):
+                return list(self.entries)
+
+            def delete_cache(self, cache_id):
+                self.deleted.append(cache_id)
+                return True
+
+            def usage_bytes(self):
+                return sum(entry.size for entry in self.entries)
+
+        api = FakeGitHub()
+        self.assertEqual(
+            prune(
+                api,
+                "0.9.23",
+                apply=True,
+                current_lock_hash=self.CURRENT_FIXTURE_LOCK_HASH,
+            ),
+            (0, 0),
+        )
+        self.assertEqual(api.deleted, [])
 
     def test_concurrent_delete_404_is_idempotent_and_inventory_is_rechecked(self):
         from unittest.mock import patch
@@ -279,7 +659,11 @@ class CookCacheRetentionTests(unittest.TestCase):
             from ci.prune_obsolete_cook_caches import settled_usage
 
             usage, endpoint, listed = settled_usage(
-                FakeGitHub(), "0.9.23", polls=1, interval=0
+                FakeGitHub(),
+                "0.9.23",
+                "5e524d4298978a25",
+                polls=1,
+                interval=0,
             )
         self.assertEqual(
             (usage, endpoint, listed), (BUDGET_BYTES + 1, BUDGET_BYTES + 1, 10)
@@ -352,6 +736,51 @@ class CookCacheRetentionTests(unittest.TestCase):
         with patch("ci.prune_obsolete_cook_caches.time.sleep"):
             deleted, reclaimed = prune(api, "0.9.23", apply=True)
         self.assertEqual((deleted, reclaimed, api.asserted_id), (1, 900, 1))
+
+    def test_lock_generation_cleanup_waits_for_listing_and_usage_convergence(self):
+        from unittest.mock import patch
+
+        class LaggingGitHub:
+            def __init__(self):
+                self.read_count = 0
+                self.usage_reads = 0
+                self.old = Cache(
+                    1,
+                    "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-lf594fff1c7c78900-soldrv0.9.23-xlinux",
+                    "refs/heads/main",
+                    BUDGET_BYTES,
+                )
+                self.current = Cache(
+                    2,
+                    "cook-base-v2-linux-x64-glibc-rustc1.95.0-fnone-l5e524d4298978a25-soldrv0.9.23-xlinux",
+                    "refs/heads/main",
+                    10,
+                )
+                self.deleted = []
+
+            def caches(self):
+                self.read_count += 1
+                if self.read_count < 4:
+                    return [self.old, self.current]  # cache-list deletion lag
+                return [self.current]
+
+            def delete_cache(self, cache_id):
+                self.deleted.append(cache_id)
+                return True
+
+            def usage_bytes(self):
+                self.usage_reads += 1
+                if self.usage_reads < 3:
+                    return BUDGET_BYTES + 10  # usage endpoint deletion lag
+                return 10
+
+        api = LaggingGitHub()
+        with patch("ci.prune_obsolete_cook_caches.time.sleep"):
+            deleted, reclaimed = prune(api, "0.9.23", apply=True)
+
+        self.assertEqual((deleted, reclaimed), (1, BUDGET_BYTES))
+        self.assertEqual(api.deleted, [1])
+        self.assertEqual((api.read_count, api.usage_reads), (4, 3))
 
     def test_live_budget_retries_until_disabled_cross_cook_disappears(self):
         class LaggingGitHub:

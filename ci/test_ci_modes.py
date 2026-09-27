@@ -64,7 +64,8 @@ class ModeTests(unittest.TestCase):
         self.assertIn("name: Full coverage", text)
         self.assertIn("always() && needs.linux.outputs.mode == 'full'", text)
         self.assertIn("ci/full_coverage.py", text)
-        self.assertIn("name: Dylint (${{ matrix.os }})", text)
+        self.assertIn("name: Dylint workspace", text)
+        self.assertNotIn("name: Dylint (${{ matrix.os }})", text)
         sentinel = re.search(
             r"(?ms)^  dylint-coverage:\n(.*?)(?=^  [\w-]+:|\Z)", text
         ).group(1)
@@ -129,7 +130,8 @@ class FullCoverageTests(unittest.TestCase):
             set(re.findall(r"^            target: (\S+)$", test, re.MULTILINE)),
             set(full_coverage.TARGETS),
         )
-        self.assertIn("os: [ubuntu-latest, macos-15-intel]", dylints)
+        self.assertIn("runs-on: ubuntu-latest", dylints)
+        self.assertNotIn("matrix:", dylints)
 
     def test_all_required_legs_and_sha(self):
         sha = "a" * 40

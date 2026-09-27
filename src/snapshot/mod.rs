@@ -269,6 +269,7 @@ impl SessionResolver {
 
     /// Crash snapshots bound changed-stack unwinds per tick; ordinary
     /// snapshot sessions continue resolving every captured thread.
+    #[cfg(feature = "crash")]
     pub(crate) fn for_crash(config: &SnapshotConfig) -> Self {
         Self {
             unwind_limit: Some(16),

@@ -54,7 +54,10 @@ class ModeTests(unittest.TestCase):
         self.assertIn('"$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"', text)
         for job in ("build", "test", "dylints"):
             body = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  [\w-]+:|\Z)", text).group(1)
-            self.assertIn("needs.linux.outputs.mode == 'full'", body)
+            if job == "dylints":
+                self.assertNotIn("needs.linux.outputs.mode == 'full'", body)
+            else:
+                self.assertIn("needs.linux.outputs.mode == 'full'", body)
             self.assertIn("ref: ${{ needs.linux.outputs.sha }}", body)
         self.assertIn("steps.mode.outputs.mode != 'minimal'", text)
         self.assertIn("steps.mode.outputs.mode == 'full'", text)
@@ -62,6 +65,12 @@ class ModeTests(unittest.TestCase):
         self.assertIn("always() && needs.linux.outputs.mode == 'full'", text)
         self.assertIn("ci/full_coverage.py", text)
         self.assertIn("name: Dylint (${{ matrix.os }})", text)
+        sentinel = re.search(
+            r"(?ms)^  dylint-coverage:\n(.*?)(?=^  [\w-]+:|\Z)", text
+        ).group(1)
+        self.assertIn("needs: [linux, dylints]", sentinel)
+        self.assertIn("if: always()", sentinel)
+        self.assertIn('test "$LINUX_RESULT" = success && test "$DYLINT_RESULT" = success', sentinel)
         self.assertEqual(
             text.count('"$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"'), 3
         )

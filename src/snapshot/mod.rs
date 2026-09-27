@@ -302,6 +302,7 @@ impl SessionResolver {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // The inventory attribution test runs only on Linux.
     pub(crate) fn module_inventory(&self) -> &[modules::LoadedModule] {
         &self.modules
     }

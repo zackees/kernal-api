@@ -108,7 +108,7 @@ jobs:
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
             ci.test_ci_modes ci.test_release_ci_gate \
             ci.test_nextest_config ci.test_deny_warnings ci.test_target_features \
-            ci.test_cache_policy
+            ci.test_cache_policy ci.test_prune_obsolete_cook_caches
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
@@ -446,6 +446,12 @@ jobs:
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
+          # Exact-main full run 36281990983 recorded 0 cook hits in all five
+          # build targets; the five per-target cook bases totaled 11.31 GB.
+          # Keep build-cache, prepared-state, registry and toolchain caches;
+          # omitting only cook projects the settled family at 7–8.5 GB.
+          prebuild-deps: none
+          cargo-registry-cache: true
           prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       # Every feature except host-only build-script facilities, derived from
@@ -959,10 +965,11 @@ jobs:
 
   # setup-soldr cook bases restore exact-only and include the runtime Soldr
   # version in the key. After every producer job has completed its post-step,
-  # retire only main-ref bases from older Soldr versions; current-version
-  # target/feature shapes and all other cache families are preserved.
+  # retire old Soldr versions and the five explicitly disabled cross-target
+  # build shapes. Preserve the active native xlinux cook and all other cache
+  # families.
   cache-retention:
-    name: Retire obsolete cook-base generations
+    name: Retire obsolete and disabled cook-base generations
     needs: [linux, build, test, dylints, full-coverage]
     if: >-
       ${{
@@ -986,7 +993,7 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
-      - name: Retire obsolete cook bases and enforce the live cache budget
+      - name: Retire obsolete or disabled cook bases and enforce the live cache budget
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SOLDR_VERSION: ${{ needs.linux.outputs.soldr_version }}

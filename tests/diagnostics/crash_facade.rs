@@ -9,7 +9,8 @@
 
 #![cfg(feature = "crash")]
 
-use kernal_api::crash::{CrashMetadata, CrashPolicy};
+use kernal_api::crash::{CrashMetadata, CrashPolicy, CrashSamplerConfig, InstallError};
+use std::time::Duration;
 
 /// `install`'s argument type is nameable from `install`'s own module.
 #[test]
@@ -33,4 +34,29 @@ fn a_client_can_name_the_metadata_install_asks_for() {
     // Named here so the policy a client passes alongside it stays reachable
     // from the same place.
     assert_eq!(CrashPolicy::default(), CrashPolicy::On);
+
+    let defaults = CrashSamplerConfig::default();
+    assert_eq!(defaults.interval, Duration::from_millis(100));
+    assert_eq!(defaults.max_interval, Duration::from_secs(1));
+    let inert = kernal_api::crash::install_with_sampler_config(
+        CrashPolicy::Off,
+        metadata.clone(),
+        CrashSamplerConfig {
+            interval: Duration::from_millis(250),
+            max_interval: Duration::from_secs(2),
+        },
+    )
+    .expect("a client can select the cadence");
+    assert!(!inert.is_armed());
+    assert!(matches!(
+        kernal_api::crash::install_with_sampler_config(
+            CrashPolicy::On,
+            metadata,
+            CrashSamplerConfig {
+                interval: Duration::ZERO,
+                max_interval: Duration::from_secs(1),
+            },
+        ),
+        Err(InstallError::InvalidSamplerConfig)
+    ));
 }

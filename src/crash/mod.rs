@@ -79,6 +79,28 @@ pub enum CrashPolicy {
 /// Environment opt-out checked before any crash state is created.
 pub const NO_CRASH_HANDLER_ENV: &str = "KERNAL_API_NO_CRASH_HANDLER";
 
+/// Sampling cadence for native crash snapshots. The default starts at 100 ms
+/// and backs off exponentially to 1 s while captures are unchanged. A changed
+/// capture resets the cadence. The sampler can wait longer than
+/// `max_interval` when needed to preserve its one-percent CPU duty budget.
+#[derive(Clone, Copy, Debug)]
+pub struct CrashSamplerConfig {
+    /// Time before the first capture and between captures after a change.
+    pub interval: Duration,
+    /// Longest adaptive delay between unchanged captures, before the CPU
+    /// duty-cycle floor is applied.
+    pub max_interval: Duration,
+}
+
+impl Default for CrashSamplerConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_millis(100),
+            max_interval: Duration::from_secs(1),
+        }
+    }
+}
+
 /// Local failure while arming crash capture.
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -91,6 +113,9 @@ pub enum InstallError {
     /// The all-thread sampler could not be started.
     #[error("cannot start crash snapshot sampler: {0}")]
     Sampler(#[source] io::Error),
+    /// The sampling intervals must be positive and ordered.
+    #[error("crash sampler intervals must be positive, with max_interval >= interval")]
+    InvalidSamplerConfig,
     /// The platform SIGABRT predecessor chain could not be installed.
     #[cfg(any(windows, target_os = "macos"))]
     #[error("cannot chain the platform abort handler: {0}")]
@@ -284,8 +309,23 @@ impl Drop for TestSamplerDisabledGuard {
 
 /// Arm native crash capture unless policy or environment opts out.
 pub fn install(policy: CrashPolicy, metadata: CrashMetadata) -> Result<CrashGuard, InstallError> {
+    install_with_sampler_config(policy, metadata, CrashSamplerConfig::default())
+}
+
+/// Arm native crash capture with a caller-selected sampling cadence.
+///
+/// The first live registration sets the process-wide cadence until its final
+/// guard is dropped. An opt-out policy does not validate or start a sampler.
+pub fn install_with_sampler_config(
+    policy: CrashPolicy,
+    metadata: CrashMetadata,
+    config: CrashSamplerConfig,
+) -> Result<CrashGuard, InstallError> {
     if policy == CrashPolicy::Off || env_opted_out() {
         return Ok(CrashGuard::inert());
+    }
+    if config.interval.is_zero() || config.max_interval < config.interval {
+        return Err(InstallError::InvalidSamplerConfig);
     }
 
     let pid = std::process::id();
@@ -326,7 +366,7 @@ pub fn install(policy: CrashPolicy, metadata: CrashMetadata) -> Result<CrashGuar
         });
     }
 
-    let (runtime, registration_id) = Runtime::new(metadata)?;
+    let (runtime, registration_id) = Runtime::new(metadata, config)?;
     *weak = Arc::downgrade(&runtime);
     Ok(CrashGuard {
         runtime: Some(runtime),
@@ -352,7 +392,7 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn new(metadata: CrashMetadata) -> Result<(Arc<Self>, u64), InstallError> {
+    fn new(metadata: CrashMetadata, config: CrashSamplerConfig) -> Result<(Arc<Self>, u64), InstallError> {
         let (file, path, template) = spool::create_sink(&metadata).map_err(InstallError::Spool)?;
         let shared = Arc::new(Shared::new(file, template));
 
@@ -376,7 +416,7 @@ impl Runtime {
         let sampler = if sampler_disabled {
             None
         } else {
-            Some(match start_sampler(&shared, SAMPLE_INTERVAL) {
+            Some(match start_sampler(&shared, config) {
                 Ok(sampler) => sampler,
                 Err(error) => {
                     #[cfg(windows)]
@@ -485,14 +525,11 @@ impl Runtime {
     }
 }
 
-/// How often the sampler refreshes the bounded pre-crash snapshot.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
-
-fn start_sampler(shared: &Arc<Shared>, cadence: Duration) -> io::Result<JoinHandle<()>> {
+fn start_sampler(shared: &Arc<Shared>, config: CrashSamplerConfig) -> io::Result<JoinHandle<()>> {
     let sampler_state = Arc::clone(shared);
     std::thread::Builder::new()
         .name("rp-crash-sampler".into())
-        .spawn(move || sampler_loop(sampler_state, cadence))
+        .spawn(move || sampler_loop(sampler_state, config))
 }
 
 struct RegistrationState {
@@ -1155,13 +1192,25 @@ fn with_platform_fields<R>(
     })
 }
 
-fn sampler_loop(shared: Arc<Shared>, cadence: Duration) {
+fn sampler_loop(shared: Arc<Shared>, config: CrashSamplerConfig) {
+    let mut resolver = crate::snapshot::SessionResolver::for_crash(&crate::snapshot::SnapshotConfig::default());
+    let mut previous = None;
+    let mut cadence = config.interval;
     while !shared.stop.load(Ordering::Acquire) {
+        if shared.wait_for_stop(cadence) {
+            break;
+        }
         if !shared.reading.load(Ordering::Acquire) {
-            let sample = capture_sample();
+            let tick_start = std::time::Instant::now();
+            let sample = capture_sample(&mut resolver);
             // Recheck after the allocating capture: the callback may have
             // started while capture was in progress.
             if let Some(sample) = sample {
+                cadence = if previous.as_ref() == Some(&sample) {
+                    cadence.saturating_mul(2).min(config.max_interval)
+                } else {
+                    config.interval
+                };
                 if !shared.reading.load(Ordering::Acquire) {
                     let _publish = match shared.publish.lock() {
                         Ok(publish) => publish,
@@ -1182,13 +1231,13 @@ fn sampler_loop(shared: Arc<Shared>, cadence: Duration) {
                         .sample_thread_count
                         .store(sample.threads.len(), Ordering::Release);
                     shared.sample_ready.store(true, Ordering::Release);
+                    previous = Some(sample);
                 }
             }
-        }
-        // Teardown signals the wait, so process exit never has to sit out a
-        // cadence tick it cannot interrupt.
-        if shared.wait_for_stop(cadence) {
-            break;
+            // Preserve a one-percent duty-cycle headroom even when snapshots
+            // differ on every tick. This bounds sampler CPU without dropping
+            // threads from the last complete pre-crash capture.
+            cadence = cadence.max(tick_start.elapsed().saturating_mul(100));
         }
     }
 }
@@ -1197,18 +1246,10 @@ fn sampler_loop(shared: Arc<Shared>, cadence: Duration) {
     any(windows, target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn capture_sample() -> Option<CrashSample> {
-    use crate::snapshot::attribute::attribute;
-    use crate::snapshot::modules::enumerate_modules;
-    use crate::snapshot::{capture_and_resolve, SnapshotConfig};
-
-    let Ok(snapshot) = capture_and_resolve(&SnapshotConfig::default()) else {
+fn capture_sample(resolver: &mut crate::snapshot::SessionResolver) -> Option<CrashSample> {
+    let Ok(attributed) = resolver.capture_attributed() else {
         return None;
     };
-    let Ok(loaded) = enumerate_modules() else {
-        return None;
-    };
-    let attributed = attribute(&snapshot, &loaded);
     Some(CrashSample {
         modules: attributed
             .modules
@@ -1239,11 +1280,11 @@ fn capture_sample() -> Option<CrashSample> {
     any(windows, target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
-fn capture_sample() -> Option<CrashSample> {
+fn capture_sample(_resolver: &mut crate::snapshot::SessionResolver) -> Option<CrashSample> {
     None
 }
 
-#[derive(Default)]
+#[derive(Default, PartialEq, Eq)]
 struct CrashSample {
     modules: Vec<CrashModule>,
     threads: Vec<CrashThread>,
@@ -1591,7 +1632,10 @@ mod tests {
         // it out could not pass.
         shared.reading.store(true, Ordering::Release);
         let cadence = Duration::from_secs(30);
-        let sampler = start_sampler(&shared, cadence).unwrap();
+        let sampler = start_sampler(&shared, CrashSamplerConfig {
+            interval: cadence,
+            max_interval: cadence,
+        }).unwrap();
         // Not an assertion: this only gives the thread time to reach the wait
         // so an uninterruptible sleep reproduces as a failure rather than a
         // race against the loop's own stop check.
@@ -1610,5 +1654,26 @@ mod tests {
         // every handle is gone.
         drop(shared);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sampler_preserves_thread_frames_and_module_indices() {
+        let _state = process_state();
+        let mut resolver = crate::snapshot::SessionResolver::for_crash(
+            &crate::snapshot::SnapshotConfig::default(),
+        );
+        let Some(sample) = capture_sample(&mut resolver) else {
+            return; // Unsupported host/architecture has no native sampler.
+        };
+        assert!(!sample.threads.is_empty(), "sampler dropped every thread");
+        assert!(sample.threads.iter().all(|thread| !thread.frames.is_empty()));
+        assert!(sample.modules.iter().all(|module| !module.identity.is_empty()));
+        for thread in &sample.threads {
+            for frame in &thread.frames {
+                assert!(frame.module_index.is_none_or(|index| {
+                    usize::try_from(index).is_ok_and(|index| index < sample.modules.len())
+                }));
+            }
+        }
     }
 }

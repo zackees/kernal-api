@@ -558,14 +558,56 @@ pub struct FrameResolver {
     /// nothing and the first `refresh` builds unconditionally.
     built: bool,
     signature: u64,
-    modules: Vec<LoadedModule>,
+    modules: std::sync::Arc<Vec<LoadedModule>>,
     unwinder: ArchUnwinder<Vec<u8>>,
+    cached_threads: std::collections::BTreeMap<u64, CachedThread>,
+    next_unwind_index: usize,
     /// How many times the inventory has been rebuilt. Exists so a test can
     /// assert the cache's behaviour directly instead of inferring it from
     /// timing or from a module count that legitimately excludes images
     /// without resolvable unwind metadata.
     #[cfg(test)]
     rebuilds: u64,
+}
+
+// The neutral cache shape is shared source even where a host does not build
+// the Unix FrameResolver; selecting its OS in this file would violate the
+// platform boundary.
+#[allow(dead_code)]
+struct CachedThread {
+    instruction_pointer: u64,
+    stack_pointer: u64,
+    frame_pointer: u64,
+    link_register: Option<u64>,
+    truncated: bool,
+    stack_bytes: Vec<u8>,
+    frames: Vec<u64>,
+    fresh: bool,
+}
+
+#[allow(dead_code)]
+impl CachedThread {
+    fn matches(&self, sample: &super::ThreadSample) -> bool {
+        self.instruction_pointer == sample.instruction_pointer
+            && self.stack_pointer == sample.stack_pointer
+            && self.frame_pointer == sample.frame_pointer
+            && self.link_register == sample.link_register
+            && self.truncated == sample.truncated
+            && self.stack_bytes == sample.stack_bytes
+    }
+
+    fn from_sample(sample: &super::ThreadSample) -> Self {
+        Self {
+            instruction_pointer: sample.instruction_pointer,
+            stack_pointer: sample.stack_pointer,
+            frame_pointer: sample.frame_pointer,
+            link_register: sample.link_register,
+            truncated: sample.truncated,
+            stack_bytes: sample.stack_bytes.clone(),
+            frames: sample.frames.clone(),
+            fresh: true,
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -588,8 +630,10 @@ impl FrameResolver {
         Self {
             built: false,
             signature: 0,
-            modules: Vec::new(),
+            modules: std::sync::Arc::new(Vec::new()),
             unwinder: ArchUnwinder::new(),
+            cached_threads: std::collections::BTreeMap::new(),
+            next_unwind_index: 0,
             #[cfg(test)]
             rebuilds: 0,
         }
@@ -602,8 +646,10 @@ impl FrameResolver {
             return Ok(());
         }
         self.built = true;
-        self.modules = super::modules::enumerate_modules()?;
+        self.modules = std::sync::Arc::new(super::modules::enumerate_modules()?);
         self.unwinder = build_unix_unwinder(&self.modules);
+        self.cached_threads.clear();
+        self.next_unwind_index = 0;
         self.signature = signature;
         #[cfg(test)]
         {
@@ -614,11 +660,44 @@ impl FrameResolver {
 
     /// Resolve every raw sample in `snapshot` against the current images.
     pub fn resolve(&mut self, snapshot: &mut Snapshot) -> std::io::Result<()> {
+        self.resolve_with_limit(snapshot, None)
+    }
+
+    /// Bound changed-stack unwinds only for crash sampling. Unselected
+    /// changed threads outside the window report only their live IP.
+    pub(crate) fn resolve_with_limit(
+        &mut self,
+        snapshot: &mut Snapshot,
+        max_unwinds_per_tick: Option<usize>,
+    ) -> std::io::Result<()> {
         self.refresh()?;
         let mut cache = ArchCache::new();
-        for sample in &mut snapshot.threads {
-            sample.frames = unwind_sample(&self.unwinder, &mut cache, sample, &self.modules);
+        let mut next = std::collections::BTreeMap::new();
+        // The rotating window prevents busy low-TID threads from starving
+        // newer threads, while an uncached thread still contributes its IP.
+        let thread_count = snapshot.threads.len();
+        let start = self.next_unwind_index % thread_count.max(1);
+        for (index, sample) in snapshot.threads.iter_mut().enumerate() {
+            let previous = self.cached_threads.get(&sample.os_tid);
+            let unchanged = previous.is_some_and(|cached| cached.fresh && cached.matches(sample));
+            let in_window = max_unwinds_per_tick.is_none_or(|limit| {
+                (index + thread_count - start) % thread_count.max(1) < limit
+            });
+            let fresh = unchanged || in_window;
+            sample.frames = if unchanged {
+                previous.expect("unchanged implies cached").frames.clone()
+            } else if in_window {
+                unwind_sample(&self.unwinder, &mut cache, sample, &self.modules)
+            } else {
+                vec![sample.instruction_pointer]
+            };
+            let mut cached = CachedThread::from_sample(sample);
+            cached.fresh = fresh;
+            next.insert(sample.os_tid, cached);
         }
+        self.next_unwind_index = (start + max_unwinds_per_tick.unwrap_or(thread_count))
+            % thread_count.max(1);
+        self.cached_threads = next;
         snapshot.frames_resolved = true;
         Ok(())
     }
@@ -635,6 +714,11 @@ impl FrameResolver {
     /// than rebuilt, and so tests can assert the invalidation story.
     pub fn module_count(&self) -> usize {
         self.modules.len()
+    }
+
+    /// Reuse this resolver's inventory for frame attribution after capture.
+    pub(crate) fn modules(&self) -> std::sync::Arc<Vec<LoadedModule>> {
+        std::sync::Arc::clone(&self.modules)
     }
 }
 
@@ -743,7 +827,7 @@ mod tests {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod resolver_tests {
     use super::*;
-    use crate::snapshot::{capture_all_threads, SnapshotConfig};
+    use crate::snapshot::{capture_all_threads, CaptureKind, SnapshotConfig};
 
     fn capture() -> Snapshot {
         capture_all_threads(&SnapshotConfig::default()).expect("capture")
@@ -792,6 +876,35 @@ mod resolver_tests {
             resolver.resolve(&mut snapshot).expect("resolve");
             assert!(snapshot.frames_resolved, "round {round} left frames unresolved");
         }
+    }
+
+    #[test]
+    fn changed_thread_outside_unwind_window_reports_current_ip() {
+        let _serial = serial();
+        let mut resolver = FrameResolver::new();
+        let mut snapshot = Snapshot::default();
+        for tid in 1..=17 {
+            snapshot.threads.push(ThreadSample {
+                os_tid: tid,
+                stack_pointer: 0,
+                instruction_pointer: 0x1000,
+                frame_pointer: 0,
+                link_register: None,
+                stack_bytes: Vec::new(),
+                truncated: false,
+                kind: CaptureKind::RawContext,
+                frames: Vec::new(),
+            });
+        }
+        let mut stale = snapshot.threads[16].clone();
+        stale.instruction_pointer = 0x2000;
+        stale.frames = vec![0x2000, 0x3000];
+        resolver
+            .cached_threads
+            .insert(stale.os_tid, CachedThread::from_sample(&stale));
+        resolver.resolve_with_limit(&mut snapshot, Some(16)).expect("resolve");
+        assert_eq!(snapshot.threads[16].frames, vec![0x1000]);
+        assert!(!resolver.cached_threads[&17].fresh);
     }
 
     /// Once built, an unchanged image set is reused rather than rebuilt.

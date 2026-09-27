@@ -1,23 +1,28 @@
-"""Retire obsolete or intentionally disabled main-branch cook bases.
+"""Retire superseded main-branch cache generations.
 
 Cook-base keys include the Soldr version and use exact-only restore. Once all
 main-branch producers use a newer Soldr release, older-version cook bases are
 unreachable and only consume the repository Actions cache quota. Other cache
 families, refs, active current-version shapes, and future-version keys are
-never deleted. The five exact cross-target shapes in `ci.yml` are also retired
-after their producer opts out of cook; the native `xlinux` cook remains as a
-required current-generation sentinel.
+never deleted. The five exact cross-target shapes in `ci.yml` are retired after
+their producer opts out of cook; the native `xlinux` cook remains a required
+current-generation sentinel. For lock-scoped families, only an older cache is
+retired when a newer main cache exists for the identical non-lock shape. This
+keeps one reusable generation per producer shape without deleting unique
+platform, target, feature, or job caches.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -25,7 +30,11 @@ GIB = 1024**3
 BUDGET_BYTES = 19 * GIB // 2  # 9.5 GiB leaves room for ordinary cache growth.
 MAIN_REF = "refs/heads/main"
 COOK_BASE_PREFIX = "cook-base-v2-"
+BUILD_CACHE_PREFIX = "setup-soldr-buildcache-v2-"
+CARGO_REGISTRY_PREFIX = "setup-soldr-cargoregistry-v"
 VERSION_RE = re.compile(r"(?:^|-)soldrv(?P<version>\d+\.\d+\.\d+)(?:-|$)")
+LOCK_HASH_RE = re.compile(r"[0-9a-f]{16}")
+WORKSPACE_LOCKFILE = Path(__file__).resolve().parents[1] / "Cargo.lock"
 DISABLED_CROSS_TARGETS = frozenset(
     {
         "aarch64-unknown-linux-gnu",
@@ -43,6 +52,134 @@ class Cache:
     key: str
     ref: str
     size: int
+
+
+def lock_generation_shape(cache: Cache) -> tuple[str, str, str] | None:
+    """Return (family, non-lock shape, lock hash) for known immutable cache keys."""
+    key = cache.key
+    if key.startswith(COOK_BASE_PREFIX):
+        match = re.fullmatch(
+            r"(?P<shape>cook-base-v2-.+-f[^-]+)-l(?P<lock>[0-9a-f]{16})(?P<tail>-soldrv.+)",
+            key,
+        )
+        if match is None:
+            return None
+        return (
+            "cook-base",
+            match.group("shape") + match.group("tail"),
+            match.group("lock"),
+        )
+
+    if key.startswith(BUILD_CACHE_PREFIX):
+        shape, separator, lock_hash = key.rpartition("-")
+        if separator and LOCK_HASH_RE.fullmatch(lock_hash):
+            return "buildcache", shape, lock_hash
+        return None
+
+    if key.startswith(CARGO_REGISTRY_PREFIX):
+        # Registry keys have the stable format/runner prefix, then the lock
+        # hash, an optional validation namespace, and a final content digest.
+        # Retain the entire suffix after the lock so distinct namespaces and
+        # cache-content shapes never collapse together.
+        parts = key.split("-")
+        if len(parts) < 8 or parts[:3] != ["setup", "soldr", "cargoregistry"]:
+            return None
+        if not re.fullmatch(r"v[12]", parts[3]) or not LOCK_HASH_RE.fullmatch(
+            parts[-1]
+        ):
+            return None
+        lock_index = next(
+            (
+                index
+                for index in range(6, len(parts) - 1)
+                if LOCK_HASH_RE.fullmatch(parts[index])
+            ),
+            None,
+        )
+        if lock_index is None:
+            return None
+        lock_hash = parts[lock_index]
+        shape_parts = parts[:lock_index] + parts[lock_index + 1 :]
+        return "cargo-registry", "-".join(shape_parts), lock_hash
+
+    return None
+
+
+def checked_out_lock_hash() -> str:
+    """Return setup-soldr's short SHA-256 hash for this checkout's Cargo.lock."""
+    try:
+        contents = WORKSPACE_LOCKFILE.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"cannot read workspace Cargo.lock: {exc}") from exc
+    return hashlib.sha256(contents).hexdigest()[:16]
+
+
+def superseded_lock_generation_caches(
+    caches: list[Cache], current_lock_hash: str
+) -> list[Cache]:
+    """Retire non-current generations only when this checkout's exact shape exists.
+
+    Cache IDs do not identify the current lock generation: a delayed producer
+    for an older checkout can write later and receive a greater ID. The
+    checked-out Cargo.lock hash is the authority; only a nonempty main entry
+    with that hash makes other generations of the same shape replaceable.
+    """
+    groups: dict[tuple[str, str, str], list[tuple[str, Cache]]] = {}
+    for cache in caches:
+        if cache.ref != MAIN_REF:
+            continue
+        parsed = lock_generation_shape(cache)
+        if parsed is None:
+            continue
+        family, shape, lock_hash = parsed
+        groups.setdefault((cache.ref, family, shape), []).append((lock_hash, cache))
+
+    candidates = []
+    for entries in groups.values():
+        current = [
+            cache
+            for lock_hash, cache in entries
+            if lock_hash == current_lock_hash and cache.size > 0
+        ]
+        if not current:
+            continue
+        candidates.extend(
+            cache for lock_hash, cache in entries if lock_hash != current_lock_hash
+        )
+    return sorted(candidates, key=lambda cache: cache.cache_id)
+
+
+def require_lock_generations_retired(
+    caches: list[Cache], current_lock_hash: str
+) -> None:
+    groups: dict[tuple[str, str, str], list[tuple[str, Cache]]] = {}
+    for cache in caches:
+        if cache.ref != MAIN_REF:
+            continue
+        parsed = lock_generation_shape(cache)
+        if parsed is None:
+            continue
+        family, shape, lock_hash = parsed
+        groups.setdefault((cache.ref, family, shape), []).append((lock_hash, cache))
+
+    for entries in groups.values():
+        current_rows = [
+            cache for lock_hash, cache in entries if lock_hash == current_lock_hash
+        ]
+        stale = [
+            cache for lock_hash, cache in entries if lock_hash != current_lock_hash
+        ]
+        if not stale or not current_rows:
+            continue
+        current = [cache for cache in current_rows if cache.size > 0]
+        if not current:
+            raise ValueError(
+                "superseded lock-scoped caches have no nonempty checked-out "
+                f"Cargo.lock replacement (expected {current_lock_hash}): "
+                + ", ".join(f"{cache.cache_id}:{cache.key}" for cache in stale)
+            )
+        details = ", ".join(f"{cache.cache_id}:{cache.key}" for cache in stale)
+        raise ValueError(f"superseded lock-scoped cache generations remain: {details}")
 
 
 def version_tuple(value: str) -> tuple[int, int, int]:
@@ -158,7 +295,11 @@ def require_retained_native_cook_base(
             raise ValueError(
                 f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}"
             )
-        if version_tuple(found) == current and cache.key.endswith("-xlinux"):
+        if (
+            version_tuple(found) == current
+            and cache.key.endswith("-xlinux")
+            and cache.size > 0
+        ):
             return
     raise ValueError(
         f"refusing to prune cook bases: no retained native xlinux cook base exists for Soldr {current_version}"
@@ -242,6 +383,7 @@ class GitHub:
 def settled_usage(
     api: GitHub,
     current_version: str,
+    current_lock_hash: str,
     *,
     polls: int = 6,
     interval: int = 10,
@@ -258,6 +400,7 @@ def settled_usage(
             require_single_current_generation(caches, current_version)
             require_retained_native_cook_base(caches, current_version, [])
             require_disabled_cross_cooks_retired(caches, current_version)
+            require_lock_generations_retired(caches, current_lock_hash)
             last_policy_error = None
         except ValueError as exc:
             last_policy_error = exc
@@ -270,12 +413,25 @@ def settled_usage(
     return last
 
 
-def prune(api: GitHub, current_version: str, *, apply: bool) -> tuple[int, int]:
+def prune(
+    api: GitHub,
+    current_version: str,
+    *,
+    apply: bool,
+    current_lock_hash: str | None = None,
+) -> tuple[int, int]:
+    current_lock_hash = current_lock_hash or checked_out_lock_hash()
     before = api.caches()
     require_current_generation_present(before, current_version)
-    candidates = stale_cook_bases(
-        before, current_version
-    ) + retired_cross_target_cook_bases(before, current_version)
+    candidates_by_id = {
+        cache.cache_id: cache
+        for cache in (
+            stale_cook_bases(before, current_version)
+            + retired_cross_target_cook_bases(before, current_version)
+            + superseded_lock_generation_caches(before, current_lock_hash)
+        )
+    }
+    candidates = sorted(candidates_by_id.values(), key=lambda cache: cache.cache_id)
     require_retained_native_cook_base(before, current_version, candidates)
     reclaimed = sum(cache.size for cache in candidates)
     for cache in candidates:
@@ -290,12 +446,13 @@ def prune(api: GitHub, current_version: str, *, apply: bool) -> tuple[int, int]:
         )
 
     if apply:
-        usage, endpoint, listed = settled_usage(api, current_version)
+        usage, endpoint, listed = settled_usage(api, current_version, current_lock_hash)
     else:
         remaining = [c for c in before if c not in candidates]
         require_single_current_generation(remaining, current_version)
         require_retained_native_cook_base(remaining, current_version, [])
         require_disabled_cross_cooks_retired(remaining, current_version)
+        require_lock_generations_retired(remaining, current_lock_hash)
         endpoint = api.usage_bytes()
         listed = sum(cache.size for cache in before)
         usage = max(endpoint - reclaimed, listed - reclaimed)
@@ -320,7 +477,7 @@ def main() -> int:
         "--version", required=True, help="Soldr version from the producer action output"
     )
     parser.add_argument(
-        "--apply", action="store_true", help="actually delete obsolete main cook bases"
+        "--apply", action="store_true", help="delete superseded main cache entries"
     )
     args = parser.parse_args()
     token = os.environ.get("GITHUB_TOKEN", "")

@@ -63,6 +63,7 @@ JUSTIFIED_SPLITS: dict[tuple[str, str], str] = {}
 # default `auto` skips every durable save on `pull_request`. Older pins save
 # unconditionally.
 SAVE_POLICY_MIN_VERSION = (0, 9, 78)
+PUSH_ONLY_SAVE_POLICY = "${{ github.event_name == 'push' && 'auto' || 'false' }}"
 
 # The first setup-soldr release whose main action honors `cook-delta`
 # (zackees/setup-soldr#528). Older pins always write the delta layer.
@@ -154,7 +155,11 @@ def saves_on_pull_request(step):
     version = pin_version(step)
     if version is None or version < SAVE_POLICY_MIN_VERSION:
         return True
-    return inputs.get("save-cache", "auto") not in {"auto", "false"}
+    save_policy = inputs.get("save-cache", "auto")
+    if save_policy == PUSH_ONLY_SAVE_POLICY:
+        # Its expression evaluates to the string "false" on pull_request.
+        return False
+    return save_policy not in {"auto", "false"}
 
 
 class CachePolicyTests(unittest.TestCase):
@@ -260,7 +265,31 @@ class CachePolicyTests(unittest.TestCase):
         for step in self.steps():
             with self.subTest(workflow=step["workflow"], job=step["job"]):
                 self.assertIn(
-                    step["inputs"].get("save-cache"), {"auto", "true", "false"}
+                    step["inputs"].get("save-cache"),
+                    {"auto", "true", "false", PUSH_ONLY_SAVE_POLICY},
+                )
+
+    def test_release_validation_restores_without_racing_main_retention(self):
+        """Separate release runs may restore, but cannot save stale lock keys."""
+        steps = [
+            step
+            for step in self.steps()
+            if (step["workflow"], step["job"])
+            == ("release.yml", "validate-and-package")
+        ]
+        self.assertEqual(len(steps), 1)
+        self.assertEqual(steps[0]["inputs"].get("save-cache"), "false")
+        self.assertNotEqual(steps[0]["inputs"].get("cache"), "false")
+
+    def test_ci_writers_save_only_on_main_push(self):
+        """PR and arbitrary-SHA dispatch runs must not write main-scoped keys."""
+        steps = [step for step in self.steps() if step["workflow"] == "ci.yml"]
+        self.assertEqual(len(steps), 3)
+        for step in steps:
+            with self.subTest(job=step["job"]):
+                self.assertEqual(
+                    step["inputs"].get("save-cache"),
+                    PUSH_ONLY_SAVE_POLICY,
                 )
 
     def test_pr_save_justifications_are_live(self):

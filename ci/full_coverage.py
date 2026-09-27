@@ -17,8 +17,7 @@ REQUIRED_JOBS = (
     "linux",
     *(f"Build ({target})" for target in TARGETS),
     *(f"Test ({target})" for target in TARGETS),
-    "Dylint (ubuntu-latest)",
-    "Dylint (macos-15-intel)",
+    "Dylint workspace",
 )
 REQUIRED_NEEDS = ("linux", "build", "test", "dylints")
 REQUIRED_TEST_STEPS = (

@@ -16,6 +16,11 @@ properties that keep the footprint bounded:
   generation per commit accumulated ~2.8 GB on main with nothing pruning it
   (zackees/setup-soldr#528). Every step pins a release that honors
   `cook-delta` and sets it to `false`; cook bases stay on.
+- the five `ci.yml` build-matrix producers explicitly skip the full cook
+  layer: the exact-main run 36281990983 showed zero cook reuse in all five,
+  while their distinct target bases added 11.31 GB before registry, prepare,
+  and build-cache entries. The measured non-cook layers project to a stable
+  7–8.5 GB family; native Linux and Dylint cache policy is unchanged.
 """
 
 import re
@@ -38,7 +43,10 @@ SOLDR_RUNTIME_VERSION = "0.9.23"
 # carry `${{ matrix.target }}` in their suffix, one distinct target per entry.
 COOK_SHAPES = {
     ("ci.yml", "linux"): ("x86_64-unknown-linux-gnu", "dev"),
-    ("ci.yml", "build"): ("matrix", "dev"),
+    # These five target builds use the independent target-specific build-cache,
+    # prepared toolchain, registry, and toolchain layers; their full cook bases
+    # had 0 compile-cache hits in exact-main full run 36281990983.
+    ("ci.yml", "build"): ("matrix", "none"),
     ("ci.yml", "dylints"): ("dylint-nightly", "none"),
     ("release.yml", "validate-and-package"): ("x86_64-unknown-linux-gnu", "dev"),
     ("release.yml", "symbolizer-workers"): ("matrix", "none"),
@@ -92,7 +100,9 @@ def setup_soldr_steps():
         job = None
         for index, line in enumerate(lines):
             header = re.match(r"^  ([\w-]+):\s*$", line)
-            if header and text.find("\njobs:\n") < sum(len(x) + 1 for x in lines[:index]):
+            if header and text.find("\njobs:\n") < sum(
+                len(x) + 1 for x in lines[:index]
+            ):
                 job = header.group(1)
             match = SETUP_SOLDR.match(line)
             if not match:
@@ -103,7 +113,11 @@ def setup_soldr_steps():
                 if body.strip() and len(body) - len(body.lstrip()) <= step_indent:
                     break
                 pair = re.match(r"^\s+([\w-]+):\s*(.*?)\s*$", body)
-                if pair and not body.lstrip().startswith("#") and pair.group(1) != "with":
+                if (
+                    pair
+                    and not body.lstrip().startswith("#")
+                    and pair.group(1) != "with"
+                ):
                     value = re.sub(r"\s+#.*$", "", pair.group(2))
                     inputs[pair.group(1)] = value.strip('"').strip("'")
             yield {
@@ -118,7 +132,10 @@ def setup_soldr_steps():
 
 def cooks(step):
     inputs = step["inputs"]
-    return inputs.get("cache", "true") != "false" and inputs.get("prebuild-deps", "") != "none"
+    return (
+        inputs.get("cache", "true") != "false"
+        and inputs.get("prebuild-deps", "") != "none"
+    )
 
 
 def pin_version(step):
@@ -172,7 +189,9 @@ class CachePolicyTests(unittest.TestCase):
             target, profile = COOK_SHAPES[(step["workflow"], step["job"])]
             with self.subTest(workflow=step["workflow"], job=step["job"]):
                 if profile == "none":
-                    self.assertFalse(cooks(step), "classified as not cooking, but cooks")
+                    self.assertFalse(
+                        cooks(step), "classified as not cooking, but cooks"
+                    )
                     continue
                 self.assertTrue(cooks(step), "classified as cooking, but does not")
                 flags = step["inputs"].get("prebuild-deps-flags", DEFAULT_COOK_FLAGS)
@@ -180,6 +199,22 @@ class CachePolicyTests(unittest.TestCase):
                     self.assertIn("matrix.", step["inputs"].get("cache-key-suffix", ""))
                     continue
                 self.assertEqual(flags, PROFILE_FLAGS[profile])
+
+    def test_only_the_cross_build_matrix_skips_the_unreused_cook_layer(self):
+        """Keep the measured cook opt-out local to its five matrix targets."""
+        by_name = {(s["workflow"], s["job"]): s for s in self.steps()}
+        build = by_name[("ci.yml", "build")]
+        self.assertFalse(cooks(build))
+        self.assertEqual(build["inputs"].get("prebuild-deps"), "none")
+        self.assertEqual(build["inputs"].get("cargo-registry-cache"), "true")
+
+        linux = by_name[("ci.yml", "linux")]
+        self.assertTrue(cooks(linux))
+        self.assertNotEqual(linux["inputs"].get("prebuild-deps"), "none")
+
+        dylints = by_name[("ci.yml", "dylints")]
+        self.assertFalse(cooks(dylints))
+        self.assertEqual(dylints["inputs"].get("prebuild-deps"), "none")
 
     def test_one_suffix_per_target_and_graph(self):
         """Each cook base is ~2.4 GB; two suffixes for one graph store it twice."""
@@ -196,7 +231,9 @@ class CachePolicyTests(unittest.TestCase):
             if (target, profile) in JUSTIFIED_SPLITS:
                 continue
             with self.subTest(target=target, profile=profile):
-                self.assertEqual(len(by_suffix), 1, f"one graph, several suffixes: {by_suffix}")
+                self.assertEqual(
+                    len(by_suffix), 1, f"one graph, several suffixes: {by_suffix}"
+                )
 
     def test_justified_splits_are_live(self):
         for pair, reason in JUSTIFIED_SPLITS.items():
@@ -206,7 +243,9 @@ class CachePolicyTests(unittest.TestCase):
     def test_no_step_saves_on_pull_request(self):
         """A pull-request cache is restorable only by that pull request."""
         for step in self.steps():
-            if "pull_request" not in step["triggers"] or not saves_on_pull_request(step):
+            if "pull_request" not in step["triggers"] or not saves_on_pull_request(
+                step
+            ):
                 continue
             where = (step["workflow"], step["job"])
             with self.subTest(workflow=where[0], job=where[1]):
@@ -220,7 +259,9 @@ class CachePolicyTests(unittest.TestCase):
         """Every step names `save-cache`, so the policy is visible in review."""
         for step in self.steps():
             with self.subTest(workflow=step["workflow"], job=step["job"]):
-                self.assertIn(step["inputs"].get("save-cache"), {"auto", "true", "false"})
+                self.assertIn(
+                    step["inputs"].get("save-cache"), {"auto", "true", "false"}
+                )
 
     def test_pr_save_justifications_are_live(self):
         """Drop a justification once its step stops saving on pull requests."""

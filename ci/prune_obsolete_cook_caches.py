@@ -1,9 +1,12 @@
-"""Retire cook bases that the current Soldr release cannot restore.
+"""Retire obsolete or intentionally disabled main-branch cook bases.
 
 Cook-base keys include the Soldr version and use exact-only restore. Once all
 main-branch producers use a newer Soldr release, older-version cook bases are
 unreachable and only consume the repository Actions cache quota. Other cache
-families, refs, current-version keys, and future-version keys are never deleted.
+families, refs, active current-version shapes, and future-version keys are
+never deleted. The five exact cross-target shapes in `ci.yml` are also retired
+after their producer opts out of cook; the native `xlinux` cook remains as a
+required current-generation sentinel.
 """
 
 from __future__ import annotations
@@ -23,6 +26,15 @@ BUDGET_BYTES = 19 * GIB // 2  # 9.5 GiB leaves room for ordinary cache growth.
 MAIN_REF = "refs/heads/main"
 COOK_BASE_PREFIX = "cook-base-v2-"
 VERSION_RE = re.compile(r"(?:^|-)soldrv(?P<version>\d+\.\d+\.\d+)(?:-|$)")
+DISABLED_CROSS_TARGETS = frozenset(
+    {
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc",
+        "aarch64-pc-windows-msvc",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -53,14 +65,41 @@ def stale_cook_bases(caches: list[Cache], current_version: str) -> list[Cache]:
             continue
         found = cache_version(cache.key)
         if found is None:
-            raise ValueError(f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}")
+            raise ValueError(
+                f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}"
+            )
         version = version_tuple(found)
         if version < current:
             candidates.append(cache)
     return candidates
 
 
-def require_current_generation_present(caches: list[Cache], current_version: str) -> None:
+def retired_cross_target_cook_bases(
+    caches: list[Cache], current_version: str
+) -> list[Cache]:
+    """Select only current-version main cook shapes whose producer opted out."""
+    current = version_tuple(current_version)
+    candidates = []
+    for cache in caches:
+        if cache.ref != MAIN_REF or not cache.key.startswith(COOK_BASE_PREFIX):
+            continue
+        found = cache_version(cache.key)
+        if found is None:
+            raise ValueError(
+                f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}"
+            )
+        if version_tuple(found) != current:
+            continue
+        if any(
+            cache.key.endswith(f"-xbuild-{target}") for target in DISABLED_CROSS_TARGETS
+        ):
+            candidates.append(cache)
+    return candidates
+
+
+def require_current_generation_present(
+    caches: list[Cache], current_version: str
+) -> None:
     """Permit old-generation pruning only when a usable current generation exists."""
     current = version_tuple(current_version)
     versions = set()
@@ -69,10 +108,14 @@ def require_current_generation_present(caches: list[Cache], current_version: str
             continue
         found = cache_version(cache.key)
         if found is None:
-            raise ValueError(f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}")
+            raise ValueError(
+                f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}"
+            )
         parsed = version_tuple(found)
         if parsed > current:
-            raise ValueError(f"future Soldr cook-base generation {found} exceeds current {current_version}")
+            raise ValueError(
+                f"future Soldr cook-base generation {found} exceeds current {current_version}"
+            )
         versions.add(parsed)
     if current not in versions:
         raise ValueError(
@@ -80,7 +123,9 @@ def require_current_generation_present(caches: list[Cache], current_version: str
         )
 
 
-def require_single_current_generation(caches: list[Cache], current_version: str) -> None:
+def require_single_current_generation(
+    caches: list[Cache], current_version: str
+) -> None:
     current = version_tuple(current_version)
     versions = {
         cache_version(cache.key)
@@ -94,6 +139,40 @@ def require_single_current_generation(caches: list[Cache], current_version: str)
         actual = sorted(".".join(map(str, version)) for version in parsed)
         raise ValueError(
             f"main cook-base generations are {actual}, expected only {current_version}"
+        )
+
+
+def require_retained_native_cook_base(
+    caches: list[Cache], current_version: str, candidates: list[Cache]
+) -> None:
+    """Prove a current native Linux producer remains before deleting any cache."""
+    current = version_tuple(current_version)
+    candidate_ids = {cache.cache_id for cache in candidates}
+    for cache in caches:
+        if cache.ref != MAIN_REF or cache.cache_id in candidate_ids:
+            continue
+        if not cache.key.startswith(COOK_BASE_PREFIX):
+            continue
+        found = cache_version(cache.key)
+        if found is None:
+            raise ValueError(
+                f"cannot safely classify cook-base cache {cache.cache_id}: {cache.key}"
+            )
+        if version_tuple(found) == current and cache.key.endswith("-xlinux"):
+            return
+    raise ValueError(
+        f"refusing to prune cook bases: no retained native xlinux cook base exists for Soldr {current_version}"
+    )
+
+
+def require_disabled_cross_cooks_retired(
+    caches: list[Cache], current_version: str
+) -> None:
+    remaining = retired_cross_target_cook_bases(caches, current_version)
+    if remaining:
+        details = ", ".join(f"{cache.cache_id}:{cache.key}" for cache in remaining)
+        raise ValueError(
+            f"disabled cross-target cook bases remain in inventory: {details}"
         )
 
 
@@ -127,7 +206,7 @@ class GitHub:
             return {}
         value = json.loads(payload)
         if not isinstance(value, dict):
-            raise RuntimeError(f"GitHub API returned unexpected data for {path}")
+            raise TypeError(f"GitHub API returned unexpected data for {path}")
         return value
 
     def caches(self) -> list[Cache]:
@@ -137,7 +216,7 @@ class GitHub:
             response = self.request(f"/actions/caches?per_page=100&page={page}")
             entries = response.get("actions_caches", [])
             if not isinstance(entries, list):
-                raise RuntimeError("GitHub API cache listing had no actions_caches array")
+                raise TypeError("GitHub API cache listing had no actions_caches array")
             for entry in entries:
                 result.append(
                     Cache(
@@ -169,7 +248,7 @@ def settled_usage(
 ) -> tuple[int, int, int]:
     """Return (max usage, endpoint usage, listed usage) after deletion settles."""
     last = (0, 0, 0)
-    last_generation_error: ValueError | None = None
+    last_policy_error: ValueError | None = None
     for attempt in range(polls):
         endpoint = api.usage_bytes()
         caches = api.caches()
@@ -177,22 +256,27 @@ def settled_usage(
         last = (max(endpoint, listed), endpoint, listed)
         try:
             require_single_current_generation(caches, current_version)
-            last_generation_error = None
+            require_retained_native_cook_base(caches, current_version, [])
+            require_disabled_cross_cooks_retired(caches, current_version)
+            last_policy_error = None
         except ValueError as exc:
-            last_generation_error = exc
-        if last[0] <= BUDGET_BYTES and last_generation_error is None:
+            last_policy_error = exc
+        if last[0] <= BUDGET_BYTES and last_policy_error is None:
             return last
         if attempt + 1 < polls:
             time.sleep(interval)
-    if last_generation_error is not None:
-        raise last_generation_error
+    if last_policy_error is not None:
+        raise last_policy_error
     return last
 
 
 def prune(api: GitHub, current_version: str, *, apply: bool) -> tuple[int, int]:
     before = api.caches()
     require_current_generation_present(before, current_version)
-    candidates = stale_cook_bases(before, current_version)
+    candidates = stale_cook_bases(
+        before, current_version
+    ) + retired_cross_target_cook_bases(before, current_version)
+    require_retained_native_cook_base(before, current_version, candidates)
     reclaimed = sum(cache.size for cache in candidates)
     for cache in candidates:
         if apply:
@@ -210,6 +294,8 @@ def prune(api: GitHub, current_version: str, *, apply: bool) -> tuple[int, int]:
     else:
         remaining = [c for c in before if c not in candidates]
         require_single_current_generation(remaining, current_version)
+        require_retained_native_cook_base(remaining, current_version, [])
+        require_disabled_cross_cooks_retired(remaining, current_version)
         endpoint = api.usage_bytes()
         listed = sum(cache.size for cache in before)
         usage = max(endpoint - reclaimed, listed - reclaimed)
@@ -222,14 +308,20 @@ def prune(api: GitHub, current_version: str, *, apply: bool) -> tuple[int, int]:
         f"limit={BUDGET_BYTES} bytes; retired={len(candidates)} entries/{reclaimed} bytes"
     )
     if usage > BUDGET_BYTES:
-        raise RuntimeError(f"Actions cache usage {usage} exceeds {BUDGET_BYTES}-byte budget")
+        raise RuntimeError(
+            f"Actions cache usage {usage} exceeds {BUDGET_BYTES}-byte budget"
+        )
     return len(candidates), reclaimed
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", required=True, help="Soldr version from the producer action output")
-    parser.add_argument("--apply", action="store_true", help="actually delete obsolete main cook bases")
+    parser.add_argument(
+        "--version", required=True, help="Soldr version from the producer action output"
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="actually delete obsolete main cook bases"
+    )
     args = parser.parse_args()
     token = os.environ.get("GITHUB_TOKEN", "")
     repository = os.environ.get("GITHUB_REPOSITORY", "")
@@ -237,7 +329,7 @@ def main() -> int:
         parser.error("GITHUB_TOKEN and GITHUB_REPOSITORY must be set")
     try:
         prune(GitHub(repository, token), args.version, apply=args.apply)
-    except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+    except (RuntimeError, TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
         print(f"::error::{exc}", file=sys.stderr)
         return 1
     return 0

@@ -247,6 +247,11 @@ pub struct SessionResolver {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     resolver: unwind::FrameResolver,
     config: SnapshotConfig,
+    modules: std::sync::Arc<Vec<modules::LoadedModule>>,
+    // The Unix resolver consumes this; Windows still uses its existing
+    // one-shot unwind path and never reads the cap.
+    #[allow(dead_code)]
+    unwind_limit: Option<usize>,
 }
 
 impl SessionResolver {
@@ -257,6 +262,17 @@ impl SessionResolver {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             resolver: unwind::FrameResolver::new(),
             config: *config,
+            modules: std::sync::Arc::new(Vec::new()),
+            unwind_limit: None,
+        }
+    }
+
+    /// Crash snapshots bound changed-stack unwinds per tick; ordinary
+    /// snapshot sessions continue resolving every captured thread.
+    pub(crate) fn for_crash(config: &SnapshotConfig) -> Self {
+        Self {
+            unwind_limit: Some(16),
+            ..Self::new(config)
         }
     }
 
@@ -265,14 +281,28 @@ impl SessionResolver {
         let mut snapshot = capture_all_threads(&self.config)?;
         #[cfg(windows)]
         {
-            let modules = modules::enumerate_modules()?;
-            unwind::resolve_frames(&mut snapshot, &modules);
+            self.modules = std::sync::Arc::new(modules::enumerate_modules()?);
+            unwind::resolve_frames(&mut snapshot, &self.modules);
         }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        self.resolver.resolve(&mut snapshot)?;
+        {
+            self.resolver.resolve_with_limit(&mut snapshot, self.unwind_limit)?;
+            self.modules = self.resolver.modules();
+        }
         #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
         return Err(SnapshotError::Unsupported);
         Ok(snapshot)
+    }
+
+    /// Capture, resolve and attribute frames using one module inventory.
+    pub fn capture_attributed(&mut self) -> Result<attribute::AttributedCapture, SnapshotError> {
+        let snapshot = self.capture()?;
+        Ok(attribute::attribute(&snapshot, &self.modules))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn module_inventory(&self) -> &[modules::LoadedModule] {
+        &self.modules
     }
 }
 

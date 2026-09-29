@@ -74,7 +74,12 @@ jobs:
         run: uv run --no-project --python 3.12 ci/ci_mode.py
       - name: Verify selected source SHA
         run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
+      # Only full mode compiles the webview graph or drives a display. The
+      # minimal and test graphs (`default = []`, `json`) link no GTK, WebKit or
+      # soup library; `openssl-sys` in dev-dependencies uses the runner
+      # image's libssl-dev, which this step never installed.
       - name: Install native webview packages and a virtual display
+        if: steps.mode.outputs.mode == 'full'
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           dbus-x11 jq libgtk-3-dev libwebkit2gtk-4.1-dev xvfb xdotool

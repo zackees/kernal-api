@@ -68,6 +68,8 @@ jobs:
       mode: ${{ steps.mode.outputs.mode }}
       sha: ${{ steps.mode.outputs.sha }}
       soldr_version: ${{ steps.setup_soldr.outputs.soldr-version }}
+      cache_save: ${{ steps.plan.outputs.cache_save }}
+      cache_key_pr: ${{ steps.plan.outputs.cache_key_pr }}
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -76,11 +78,33 @@ jobs:
           lfs: true
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          # Before the plan exists: only a main push saves (ci.toml [cache].write-on).
+          save-cache: ${{ github.event_name == 'push' }}
+          cache-suffix: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || '' }}
       - name: Select CI mode and verify the checked-out commit
         id: mode
         run: uv run --no-project --python 3.12 ci/ci_mode.py
       - name: Verify selected source SHA
         run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
+      # ci.toml is the fleet CI contract (zackees/ci.yml#37), pinned to the
+      # exact ci-lint commit its `linter` key names. `plan` strictly loads it,
+      # prints this run's selection, and decides whether this run writes
+      # caches (`cache_save`: main pushes only, ci.toml [cache].write-on) --
+      # the save-cache every setup-soldr and setup-uv step here takes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: zackees/ci.yml
+          ref: 78506e7007650ddb11560a6d2289f51228cbf621
+          path: .ci-lint
+          persist-credentials: false
+      - name: Plan this run with the pinned ci-lint
+        id: plan
+        env:
+          PYTHONPATH: .ci-lint
+        run: >-
+          uv run --no-project python -m ci_lint plan --repo .
+          --event-name "${GITHUB_EVENT_NAME}" --sha "${{ steps.mode.outputs.sha }}" --github-output
       # Only full mode compiles the webview graph or drives a display. The
       # minimal and test graphs (`default = []`, `json`) link no GTK, WebKit or
       # soup library; `openssl-sys` in dev-dependencies uses the runner
@@ -98,15 +122,14 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      - uses: ./.github/actions/soldr # the one setup-soldr call site
         id: setup_soldr
         with:
-          version: 0.9.23
-          cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # Only main pushes write durable entries; PRs and manually selected
+          # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
+          save-cache: ${{ steps.plan.outputs.cache_save }}
+          cache-key-pr: ${{ steps.plan.outputs.cache_key_pr }}
           ci-tests: true
           cache-key-suffix: linux
           prebuild-deps-flags: ""
@@ -126,20 +149,6 @@ jobs:
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
-      # ci.toml is the fleet CI contract (zackees/ci.yml#37), pinned to the
-      # exact ci-lint commit its `linter` key names. `plan` strictly loads it
-      # and prints this run's selection; the full `precheck` gate follows once
-      # its findings are fixed (docs/case-studies/kernal-api-phase2.md there).
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          repository: zackees/ci.yml
-          ref: 78506e7007650ddb11560a6d2289f51228cbf621
-          path: .ci-lint
-          persist-credentials: false
-      - name: Validate ci.toml with the pinned ci-lint
-        env:
-          PYTHONPATH: .ci-lint
-        run: uv run --no-project python -m ci_lint plan --repo . --event-name "${GITHUB_EVENT_NAME}"
       # The platform boundary (#152) is a source rule, so its repository scan
       # parses every enforced package's modules -- cfg-elided Windows and
       # macOS files included -- without compiling the product. That makes it
@@ -468,14 +477,13 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      - uses: ./.github/actions/soldr # the one setup-soldr call site
         with:
-          version: 0.9.23
-          cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # Only main pushes write durable entries; PRs and manually selected
+          # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
+          save-cache: ${{ needs.linux.outputs.cache_save }}
+          cache-key-pr: ${{ needs.linux.outputs.cache_key_pr }}
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
           cross-targets: ${{ matrix.cross }}
@@ -487,6 +495,9 @@ jobs:
           cargo-registry-cache: true
           prebuild-deps-flags: ${{ matrix.cross && format('--target {0}', matrix.cross) || '' }}
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          save-cache: ${{ needs.linux.outputs.cache_save }}
+          cache-suffix: ${{ needs.linux.outputs.cache_key_pr }}
       # Every feature except host-only build-script facilities, derived from
       # Cargo.toml so a new feature is covered here automatically. This is a
       # graph linked for the TARGET; `build-resources` runs only in an
@@ -752,6 +763,9 @@ jobs:
           grep -F "${marker}" nextest-output.txt > /dev/null \
             || { echo "no ${marker} test ran: this host did not execute its own code"; exit 1; }
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          save-cache: ${{ needs.linux.outputs.cache_save }}
+          cache-suffix: ${{ needs.linux.outputs.cache_key_pr }}
       - name: Run actual Core and Component compiler-policy guest proofs
         timeout-minutes: 20
         shell: bash
@@ -865,20 +879,37 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          # Before the plan exists: only a main push saves (ci.toml [cache].write-on).
+          save-cache: ${{ github.event_name == 'push' }}
+          cache-suffix: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || '' }}
       - name: Select CI mode and verify the checked-out commit
         id: mode
         run: uv run --no-project --python 3.12 ci/ci_mode.py
       - name: Verify selected source SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
-      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      # Runs beside `linux`, so it plans its own cache saves the same way.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          version: 0.9.23
-          cook-delta: false # per-commit delta layer off (setup-soldr#528)
-          # Only main pushes write durable entries; PRs and manually selected
+          repository: zackees/ci.yml
+          ref: 78506e7007650ddb11560a6d2289f51228cbf621
+          path: .ci-lint
+          persist-credentials: false
+      - name: Plan this run with the pinned ci-lint
+        id: plan
+        env:
+          PYTHONPATH: .ci-lint
+        run: >-
+          uv run --no-project python -m ci_lint plan --repo .
+          --event-name "${GITHUB_EVENT_NAME}" --sha "${{ steps.mode.outputs.sha }}" --github-output
+      - uses: ./.github/actions/soldr # the one setup-soldr call site
+        with:
+          # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ github.event_name == 'push' && 'auto' || 'false' }}
+          save-cache: ${{ steps.plan.outputs.cache_save }}
+          cache-key-pr: ${{ steps.plan.outputs.cache_key_pr }}
           toolchain: 1.95.0
           cache: true
           build-cache: false
@@ -1008,6 +1039,9 @@ jobs:
           ref: ${{ needs.linux.outputs.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          save-cache: ${{ needs.linux.outputs.cache_save }}
+          cache-suffix: ${{ needs.linux.outputs.cache_key_pr }}
       - name: Verify complete full-mode coverage
         env:
           EXPECTED_SHA: ${{ needs.linux.outputs.sha }}
@@ -1045,6 +1079,9 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          save-cache: ${{ needs.linux.outputs.cache_save }}
+          cache-suffix: ${{ needs.linux.outputs.cache_key_pr }}
       - name: Retire obsolete or disabled cook bases and enforce the live cache budget
         env:
           GITHUB_TOKEN: ${{ github.token }}

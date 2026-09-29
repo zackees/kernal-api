@@ -139,7 +139,11 @@ class NativeProofJobsTests(unittest.TestCase):
         the amalgamation-sized units alone. Unset, soldr picks a
         topology-aware width.
         """
-        for workflow in WORKFLOW.parent.glob("*.yml"):
+        # Workflows and the setup-soldr wrapper they all call.
+        for workflow in [
+            *WORKFLOW.parent.glob("*.yml"),
+            *WORKFLOW.parents[1].glob("actions/*/action.yml"),
+        ]:
             text = workflow.read_text(encoding="utf-8")
             with self.subTest(workflow=workflow.name):
                 self.assertNotIn("CARGO_BUILD_JOBS", text)

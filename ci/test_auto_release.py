@@ -122,7 +122,7 @@ class AutoReleaseTests(unittest.TestCase):
         caller = (ROOT / ".github/workflows/auto-release.yml").read_text()
         for text, job in ((called, "symbolizer-workers"), (caller, "publish-crates")):
             body = text.split(f"\n  {job}:\n", 1)[1].split("\n\n  ", 1)[0]
-            steps = body.split("zackees/setup-soldr@")[1:]
+            steps = body.split("uses: ./.github/actions/soldr")[1:]
             with self.subTest(job=job):
                 self.assertTrue(steps)
                 for step in steps:

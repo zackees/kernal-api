@@ -1,8 +1,8 @@
 """Keep CI to a few jobs that compile on Linux and run on all six hosts.
 
 The workflow has four work jobs: `linux` (the gate), `build` and `test` (one
-runner per other target each), and `dylints`. Every mode adds a Dylint coverage
-sentinel; full mode adds a full-matrix coverage sentinel. Main pushes add one non-compiling cache-retention
+runner per other target each), and `dylints`, whose lint step is the Dylint
+aggregate; full mode adds a full-matrix coverage sentinel. Main pushes add one non-compiling cache-retention
 job after all cache producers finish. These guards pin the properties that
 shape was chosen for, one test per property, so a later edit that quietly
 undoes one fails here instead of on a runner bill.
@@ -32,7 +32,6 @@ EXPECTED_JOBS = {
     "build",
     "test",
     "dylints",
-    "dylint-coverage",
     "full-coverage",
     "cache-retention",
 }

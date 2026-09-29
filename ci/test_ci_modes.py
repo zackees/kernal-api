@@ -68,12 +68,14 @@ class ModeTests(unittest.TestCase):
         self.assertIn("ci/full_coverage.py", text)
         self.assertIn("name: Dylint workspace", text)
         self.assertNotIn("name: Dylint (${{ matrix.os }})", text)
-        sentinel = re.search(
-            r"(?ms)^  dylint-coverage:\n(.*?)(?=^  [\w-]+:|\Z)", text
-        ).group(1)
-        self.assertIn("needs: [linux, dylints]", sentinel)
-        self.assertIn("if: always()", sentinel)
-        self.assertIn('test "$LINUX_RESULT" = success && test "$DYLINT_RESULT" = success', sentinel)
+        # The Dylint aggregate (#363) is the lint step itself, not a `needs:`
+        # sentinel job that waits for a runner after Dylint finishes.
+        self.assertNotIn("  dylint-coverage:", text)
+        dylints = re.search(r"(?ms)^  dylints:\n(.*?)(?=^  [\w-]+:|\Z)", text).group(1)
+        self.assertNotRegex(dylints, r"(?m)^    if:")
+        self.assertNotIn("matrix:", dylints)
+        self.assertIn('echo "::error::Dylint lanes failed: ${failed[*]}"', dylints)
+        self.assertIn('test -s "$logs/workspace-dylint.log"', dylints)
         self.assertEqual(
             text.count('"$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"'), 2
         )

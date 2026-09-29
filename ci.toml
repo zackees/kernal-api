@@ -1,0 +1,110 @@
+# ci.toml -- kernal-api's CI contract, checked by ci-lint (zackees/ci.yml, schema 3).
+# Nothing here generates YAML: it describes what .github/workflows/ci.yml already
+# does so `ci-lint precheck` can bound it. Phase 2 of zackees/ci.yml#37; the
+# first slice only declares the real shape -- findings that the YAML does not
+# yet meet this contract are tracked in zackees/ci.yml, not silenced here.
+schema  = 3
+profile = "rust-library"                          # a Rust facade crate + a hatchling Python package; not a native-CLI PyPI app
+linter  = "zackees/ci.yml@0296e9b4381b94c2e8621519c6ba1bedda58db4a"
+
+# -- Platforms: the six hosts `linux` + `test` (x5) run on --------------------
+[platforms]
+linux-x64     = { target = "x86_64-unknown-linux-gnu",  runs-on = "ubuntu-24.04",     group = "linux" }
+linux-arm64   = { target = "aarch64-unknown-linux-gnu", runs-on = "ubuntu-24.04-arm", group = "linux" }
+windows-x64   = { target = "x86_64-pc-windows-msvc",    runs-on = "windows-2025",     group = "windows" }
+windows-arm64 = { target = "aarch64-pc-windows-msvc",   runs-on = "windows-11-arm",   group = "windows" }
+macos-arm64   = { target = "aarch64-apple-darwin",      runs-on = "macos-15",         group = "macos" }
+macos-x64     = { target = "x86_64-apple-darwin",       runs-on = "macos-15-intel",   group = "macos" }
+
+# -- Rust (§12): one public crate, no private crates yet ----------------------
+# AGENTS.md: private crates only when measured Soldr/Cargo timings justify them.
+[rust]
+public  = "."
+private = "crates/private/*"                      # none exist yet; the future home per AGENTS.md
+ship    = [["default"]]                           # the default facade (`default = []`); the all-features graph is a finding (ci.yml#37)
+
+[rust.tests]
+max-binary = "250MB"                              # AGENTS.md: ~180 MB per linked test binary
+max-total  = "700MB"                              # AGENTS.md: 619 MB for the category layout
+# One harness per tests/<category>/main.rs plus the three top-level binaries
+# AGENTS.md justifies (process-global state / shipped by name to native hosts).
+binaries = [
+  "kernal-api:lib",
+  "kernal-api:test:daemon",
+  "kernal-api:test:data",
+  "kernal-api:test:diagnostics",
+  "kernal-api:test:fs",
+  "kernal-api:test:net",
+  "kernal-api:test:process",
+  "kernal-api:test:source_policy",
+  "kernal-api:test:terminal",
+  "kernal-api:test:wasm",
+  "kernal-api:test:allocator_heap_profile",
+  "kernal-api:test:wasm_tauri_screenshot",
+  "kernal-api:test:wasm_worker_containment",
+  "kernal-api:bin:kernal-symbolize",
+  "kernal-api:bin:kernal-wasm-worker",
+  "kernal-api:bin:kernal-tauri-smoke",
+  "kernal-api:bin:kernal-api-wasm-tauri",
+]
+
+[lint.dylint]
+targets = "all-platforms"
+shape   = "measure"                               # `dylints` job; not yet measured against multi-target
+budget  = { warm = "300s", cold = "900s" }        # unverified placeholders -- see ci.yml#37 case study
+
+# -- Suites --------------------------------------------------------------------
+[suites]
+unit   = { run = "soldr cargo test", required = true }              # `linux` job: default facade + full suite
+python = { run = "uv run --no-project ci/test_ci_modes.py" }        # `linux` job: CI/Python guards
+native = { run = "ci/native_proof.py" }                             # `test` (x5): prebuilt archives + native proofs
+
+# -- Flows (mirrors ci/ci_mode.py: minimal / ci-test / ci-full) ---------------
+[flow.pr]
+platforms = ["linux-x64"]
+suites    = ["unit", "python"]
+dylint    = "all-platforms"
+
+[flow.main]
+extends = "pr"
+cache   = "write"
+
+[tags]
+ci-full = { add = { platforms = "all", suites = ["native"] } }
+ci-test = { add = { suites = ["native"] } }
+
+# -- Caches: every family live on main as of 2026-09-28 (9.21 GB / 40 entries) --
+[cache]
+budget   = "9.5GB"                                # ci/prune_obsolete_cook_caches.py BUDGET_BYTES
+write-on = ["main"]
+never    = ["linked-tests", "nextest-archives", "target-dir"]
+pr       = { mode = "none", families = [], max-per-pr = "0MB", budget = "0MB", trim = "on-close" }   # PRs never save today
+
+[cache.family]
+registry     = { via = "setup-soldr:cargo-registry", max = "300MB",  lockfile = true, per = "platform" }
+deps         = { via = "setup-soldr:cook",           max = "150MB",  lockfile = true, per = "none" }
+compile      = { via = "setup-soldr:build-cache",    max = "1400MB", lockfile = true, per = "platform", min = "1MB" }
+sdk          = { via = "setup-soldr:cross-targets",  max = "650MB",  per = "cross-platform" }
+toolchain    = { via = "setup-soldr:solo-toolchain", max = "210MB",  per = "platform" }
+dylint       = { via = "setup-soldr:dylint",         max = "550MB",  per = "none", min = "1MB" }
+dylint-out   = { via = "setup-soldr:dylint-output",  max = "600MB",  lockfile = true, per = "none", min = "1MB" }
+soldr-mini   = { via = "setup-soldr:soldr-mini",     max = "30MB",   per = "platform", min = "1MB" }
+uv           = { via = "setup-uv",                   max = "10MB",   per = "platform" }
+
+[local]
+runner = "bosn-act"
+lanes  = ["precheck"]
+cache  = "machine"
+
+[allow]
+workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "auto-release.yml" = ["workflow_dispatch"], "release.yml" = ["workflow_call"], "macos-x64-tests.yml" = ["schedule", "workflow_dispatch"] }
+actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]
+tools     = ["soldr", "uv", "git", "jq", "sudo"]
+secrets   = ["PYPI_API_TOKEN"]                    # a finding against the OIDC-only policy (SEC-005), declared rather than hidden
+setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false" } }   # no wrapper exists yet: CACHE-009 finding
+permissions = { "actions: write" = ["linux", "build", "test", "dylints", "cache-retention"] }
+platform-selector = "src/lib.rs"
+platform-code     = ["src/platform_win.rs", "src/platform_win/**", "src/platform_linux.rs", "src/platform_linux/**", "src/platform_macos.rs", "src/platform_macos/**"]
+
+[publish]
+pypi = { auth = "token", environment = "release", mode = "real" }

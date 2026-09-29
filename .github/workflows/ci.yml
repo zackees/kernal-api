@@ -114,6 +114,20 @@ jobs:
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
           pwsh -NoProfile -File tests/screenshot-target-repair.ps1
+      # ci.toml is the fleet CI contract (zackees/ci.yml#37), pinned to the
+      # exact ci-lint commit its `linter` key names. `plan` strictly loads it
+      # and prints this run's selection; the full `precheck` gate follows once
+      # its findings are fixed (docs/case-studies/kernal-api-phase2.md there).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: zackees/ci.yml
+          ref: 0296e9b4381b94c2e8621519c6ba1bedda58db4a
+          path: .ci-lint
+          persist-credentials: false
+      - name: Validate ci.toml with the pinned ci-lint
+        env:
+          PYTHONPATH: .ci-lint
+        run: uv run --no-project python -m ci_lint plan --repo . --event-name "${GITHUB_EVENT_NAME}"
       # The platform boundary (#152) is a source rule, so its repository scan
       # parses every enforced package's modules -- cfg-elided Windows and
       # macOS files included -- without compiling the product. That makes it

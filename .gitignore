@@ -30,3 +30,6 @@ __pycache__/
 /dylints/*/target/
 /dylints/*/.cargo/*
 !/dylints/*/.cargo/config.toml
+
+# ci-lint checkout used by the ci.toml validation step
+/.ci-lint/

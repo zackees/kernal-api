@@ -867,6 +867,11 @@ jobs:
           build-cache: false
           prebuild-deps: none
           dylint: true
+          # Every compiling step below sets its own CARGO_HOME (a partially
+          # restored registry is not trusted), so a restored ~/.cargo registry
+          # is never read. Extracting its 29k files was the slowest parallel
+          # restore (~41 s) and set this step's wall time.
+          cargo-registry-cache: false
           dylint-toolchain: ${{ env.DYLINT_TOOLCHAIN }}
           cargo-dylint-version: 6.0.3
           dylint-link-version: 6.0.3

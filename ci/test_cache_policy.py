@@ -341,6 +341,31 @@ class CachePolicyTests(unittest.TestCase):
                     PUSH_ONLY_SAVE_POLICIES,
                 )
 
+    def test_main_writers_are_linux_x64_only(self):
+        """ci.toml declares every cache family `per = "none"`: one writer shape.
+
+        A main push runs minimal mode, so the only jobs that can save there
+        are the ones that run in every mode: `linux` and `dylints`, both on
+        ubuntu-24.04 x64. The full-mode `build` matrix restores but never
+        reaches a push. If this fails, re-derive ci.toml [cache.family].
+        """
+        from ci import ci_mode
+
+        self.assertEqual(ci_mode.select("push", {}, "a" * 40)[0], "minimal")
+        text = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        for step in self.steps():
+            if step["inputs"].get("save-cache") not in PUSH_ONLY_SAVE_POLICIES:
+                continue
+            with self.subTest(workflow=step["workflow"], job=step["job"]):
+                self.assertEqual(step["workflow"], "ci.yml")
+                body = re.search(
+                    rf"(?ms)^  {step['job']}:\n(.*?)(?=^  [\w-]+:\n|\Z)", text
+                ).group(1)
+                if step["job"] in {"linux", "dylints"}:
+                    self.assertRegex(body, r"(?m)^    runs-on: ubuntu-24\.04$")
+                else:
+                    self.assertIn("if: needs.linux.outputs.mode == 'full'", body)
+
     def test_pr_save_justifications_are_live(self):
         """Drop a justification once its step stops saving on pull requests."""
         for where, reason in PR_SAVE_JUSTIFICATIONS.items():

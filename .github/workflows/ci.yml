@@ -849,33 +849,47 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=${DYLINT_TOOLCHAIN}" >> "${GITHUB_ENV}"
           chmod +x ci/dylint-shim/cargo
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
-      - name: Test facade boundary lint
-        env:
-          # Do not trust a partially restored global crates.io source tree.
-          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-        run: >-
-          soldr rustup run
-          "$DYLINT_TOOLCHAIN" cargo test
-          --manifest-path dylints/kernal_api_boundary/Cargo.toml
-      - name: Test platform boundary lint
-        env:
-          CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-        run: >-
-          soldr rustup run
-          "$DYLINT_TOOLCHAIN" cargo test
-          --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml
       # A Dylint pass only sees what the compiler compiles, and `default = []`.
       # Without `--all-features` every gated module -- `crash`, `wasm`,
       # `symbolize`, `profile`, `fs`, `ipc`, the platform watchers -- is invisible
       # to the boundary lints, so a green job would mean nothing beyond the
       # ungated core. Keep both flags: features widen the module set, targets
       # widen it to the integration tests and the two worker binaries.
+      #
+      # The two lint libraries' own test suites and the workspace pass share
+      # no target directory, so they run concurrently: sequentially they were
+      # ~70 s of this job's ~3.5 min critical path. Each lane logs to its own
+      # file, printed in a group once all three finish, and every failing
+      # lane is named.
       - name: Lint every client-style target
         env:
+          # Do not trust a partially restored global crates.io source tree.
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
-        run: >-
-          soldr cargo dylint
-          --all --workspace -- --all-features --all-targets
+        shell: bash
+        run: |
+          set -uo pipefail
+          logs="${RUNNER_TEMP}/dylint-lanes"
+          mkdir -p "$logs"
+          declare -A pids
+          soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
+            --manifest-path dylints/kernal_api_boundary/Cargo.toml \
+            >"$logs/facade-boundary-tests.log" 2>&1 & pids[facade-boundary-tests]=$!
+          soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
+            --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
+            >"$logs/platform-boundary-tests.log" 2>&1 & pids[platform-boundary-tests]=$!
+          soldr cargo dylint --all --workspace -- --all-features --all-targets \
+            >"$logs/workspace-dylint.log" 2>&1 & pids[workspace-dylint]=$!
+          failed=()
+          for lane in facade-boundary-tests platform-boundary-tests workspace-dylint; do
+            wait "${pids[$lane]}" || failed+=("$lane")
+            echo "::group::${lane}"
+            cat "$logs/${lane}.log"
+            echo "::endgroup::"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Dylint lanes failed: ${failed[*]}"
+            exit 1
+          fi
       # Stops a minimal PR run on a failure here; full runs report every leg.
       - name: Cancel the run (this job failed)
         if: failure() && github.event_name == 'pull_request' && steps.mode.outputs.mode != 'full'

@@ -77,7 +77,7 @@ jobs:
       # but never save here: this separate workflow can race main's post-
       # producer retention job with an older candidate lockfile. Its package
       # and test outputs do not need durable caches.
-      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
+      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
@@ -184,7 +184,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
-      - uses: zackees/setup-soldr@4df8db93438594f50505574d9dc8117505d33362 # v0.9.80
+      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)

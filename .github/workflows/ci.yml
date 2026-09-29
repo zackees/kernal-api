@@ -849,6 +849,30 @@ jobs:
           echo "RUSTUP_TOOLCHAIN=${DYLINT_TOOLCHAIN}" >> "${GITHUB_ENV}"
           chmod +x ci/dylint-shim/cargo
           echo "${GITHUB_WORKSPACE}/ci/dylint-shim" >> "${GITHUB_PATH}"
+      # The lint libraries' own suites (UI + unit tests) depend only on
+      # `dylints/**`; the platform lint's repository scan already runs in
+      # `linux`. Each suite is a ~70 s uncached nightly compile, so an
+      # ordinary PR that leaves the lints alone skips them. Main pushes, full
+      # mode, and any PR touching the lints, their shim, or this workflow run
+      # them. A stale base only widens the diff, so it errs toward running.
+      - name: Decide whether the lint libraries need their own tests
+        id: lint_libs
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "${GITHUB_EVENT_NAME}" = pull_request ] && [ "${{ steps.mode.outputs.mode }}" != full ]; then
+            # Any failure to fetch or diff keeps `run=true`.
+            if git fetch --quiet --depth=1 origin "${BASE_SHA}" &&
+              changed="$(git diff --name-only "${BASE_SHA}" HEAD)" &&
+              ! grep -qE '^(dylints/|ci/dylint-shim/|\.github/workflows/ci\.yml$)' <<<"${changed}"; then
+              run=false
+            fi
+          fi
+          echo "run=${run}" >> "${GITHUB_OUTPUT}"
+          echo "lint-library tests: ${run}"
       # A Dylint pass only sees what the compiler compiles, and `default = []`.
       # Without `--all-features` every gated module -- `crash`, `wasm`,
       # `symbolize`, `profile`, `fs`, `ipc`, the platform watchers -- is invisible
@@ -856,8 +880,8 @@ jobs:
       # ungated core. Keep both flags: features widen the module set, targets
       # widen it to the integration tests and the two worker binaries.
       #
-      # The two lint libraries' own test suites and the workspace pass share
-      # no target directory, so they run concurrently: sequentially they were
+      # When they run, the two lint libraries' own test suites and the
+      # workspace pass share no target directory, so they run concurrently: sequentially they were
       # ~70 s of this job's ~3.5 min critical path. Each lane logs to its own
       # file, printed in a group once all three finish, and every failing
       # lane is named.
@@ -865,22 +889,27 @@ jobs:
         env:
           # Do not trust a partially restored global crates.io source tree.
           CARGO_HOME: ${{ runner.temp }}/kernal-dylint-cargo
+          RUN_LINT_LIBRARY_TESTS: ${{ steps.lint_libs.outputs.run }}
         shell: bash
         run: |
           set -uo pipefail
           logs="${RUNNER_TEMP}/dylint-lanes"
           mkdir -p "$logs"
           declare -A pids
-          soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
-            --manifest-path dylints/kernal_api_boundary/Cargo.toml \
-            >"$logs/facade-boundary-tests.log" 2>&1 & pids[facade-boundary-tests]=$!
-          soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
-            --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
-            >"$logs/platform-boundary-tests.log" 2>&1 & pids[platform-boundary-tests]=$!
+          lanes=(workspace-dylint)
+          if [ "${RUN_LINT_LIBRARY_TESTS}" = true ]; then
+            lanes=(facade-boundary-tests platform-boundary-tests workspace-dylint)
+            soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
+              --manifest-path dylints/kernal_api_boundary/Cargo.toml \
+              >"$logs/facade-boundary-tests.log" 2>&1 & pids[facade-boundary-tests]=$!
+            soldr rustup run "$DYLINT_TOOLCHAIN" cargo test \
+              --manifest-path dylints/kernal_api_platform_boundary/Cargo.toml \
+              >"$logs/platform-boundary-tests.log" 2>&1 & pids[platform-boundary-tests]=$!
+          fi
           soldr cargo dylint --all --workspace -- --all-features --all-targets \
             >"$logs/workspace-dylint.log" 2>&1 & pids[workspace-dylint]=$!
           failed=()
-          for lane in facade-boundary-tests platform-boundary-tests workspace-dylint; do
+          for lane in "${lanes[@]}"; do
             wait "${pids[$lane]}" || failed+=("$lane")
             echo "::group::${lane}"
             cat "$logs/${lane}.log"

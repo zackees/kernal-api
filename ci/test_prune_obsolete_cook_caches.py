@@ -9,6 +9,7 @@ from ci.prune_obsolete_cook_caches import (
     cache_version,
     checked_out_lock_hash,
     lock_generation_shape,
+    over_budget_orphaned_lock_caches,
     prune,
     require_lock_generations_retired,
     require_single_current_generation,
@@ -834,6 +835,30 @@ class CookCacheRetentionTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn('--version "${SOLDR_VERSION}" --apply', workflow)
 
+
+    def test_orphaned_lock_generations_retire_only_over_budget_lru_first(self):
+        """Over budget, retire what GitHub's own LRU eviction would, never current."""
+        current = self.CURRENT_FIXTURE_LOCK_HASH
+        old = "f594fff1c7c78900"
+        prefix = "setup-soldr-buildcache-v2-linux-x64-"
+        caches = [
+            Cache(1, f"{prefix}aa-build-x86_64-apple-darwin-{old}", "refs/heads/main", 4, "2026-09-28T15:03"),
+            Cache(2, f"{prefix}bb-build-aarch64-apple-darwin-{old}", "refs/heads/main", 4, "2026-09-27T04:56"),
+            Cache(3, f"{prefix}cc-linux-{current}", "refs/heads/main", 4, "2026-09-01T00:00"),
+            Cache(4, f"{prefix}dd-build-x-{old}", "refs/pull/9/merge", 4, "2026-09-01T00:00"),
+            Cache(5, "setup-soldr-dylint-output-v2-linux-x64-75fcd49156e5685e", "refs/heads/main", 4, "2026-09-01T00:00"),
+        ]
+        self.assertEqual(over_budget_orphaned_lock_caches(caches, current, set(), budget=20), [])
+        self.assertEqual(
+            [c.cache_id for c in over_budget_orphaned_lock_caches(caches, current, set(), budget=16)],
+            [2],
+        )
+        self.assertEqual(
+            [c.cache_id for c in over_budget_orphaned_lock_caches(caches, current, set(), budget=1)],
+            [2, 1],
+        )
+        # Entries already chosen by another rule count as reclaimed.
+        self.assertEqual(over_budget_orphaned_lock_caches(caches, current, {2}, budget=16), [])
 
 if __name__ == "__main__":
     unittest.main()

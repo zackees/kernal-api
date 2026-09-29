@@ -828,6 +828,22 @@ jobs:
       DYLINT_TOOLCHAIN: nightly-2026-05-28
     runs-on: ubuntu-latest
     steps:
+      # The webview headers are needed only once something compiles, and the
+      # install shares nothing with checkout or setup-soldr. Start it first in
+      # the background (a step's background process lives until the job
+      # ends) and wait for it before the lint step: it overlaps setup-soldr's
+      # ~40 s instead of adding its own 22-46 s to the critical path.
+      - name: Start installing native webview development packages
+        shell: bash
+        run: |
+          # The step shell runs with `-e`; record the status either way so the
+          # wait below always ends.
+          (
+            set +e
+            sudo apt-get update && sudo apt-get install --yes \
+              libgtk-3-dev libwebkit2gtk-4.1-dev
+            echo $? >"${RUNNER_TEMP}/webview-packages.status"
+          ) >"${RUNNER_TEMP}/webview-packages.log" 2>&1 &
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
@@ -838,10 +854,6 @@ jobs:
       - name: Verify selected source SHA
         shell: bash
         run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
-      - name: Install native webview development packages
-        run: >-
-          sudo apt-get update && sudo apt-get install --yes
-          libgtk-3-dev libwebkit2gtk-4.1-dev
       - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           version: 0.9.23
@@ -892,6 +904,14 @@ jobs:
           fi
           echo "run=${run}" >> "${GITHUB_OUTPUT}"
           echo "lint-library tests: ${run}"
+      - name: Finish installing native webview development packages
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          status="${RUNNER_TEMP}/webview-packages.status"
+          until [ -s "$status" ]; do sleep 1; done
+          cat "${RUNNER_TEMP}/webview-packages.log"
+          test "$(cat "$status")" = 0
       # A Dylint pass only sees what the compiler compiles, and `default = []`.
       # Without `--all-features` every gated module -- `crash`, `wasm`,
       # `symbolize`, `profile`, `fs`, `ipc`, the platform watchers -- is invisible

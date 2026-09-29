@@ -5,7 +5,7 @@
 # yet meet this contract are tracked in zackees/ci.yml, not silenced here.
 schema  = 3
 profile = "rust-library"                          # a Rust facade crate + a hatchling Python package; not a native-CLI PyPI app
-linter  = "zackees/ci.yml@0296e9b4381b94c2e8621519c6ba1bedda58db4a"
+linter  = "zackees/ci.yml@78506e7007650ddb11560a6d2289f51228cbf621"
 
 # -- Platforms: the six hosts `linux` + `test` (x5) run on --------------------
 [platforms]
@@ -102,7 +102,11 @@ actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-ar
 tools     = ["soldr", "uv", "git", "jq", "sudo"]
 secrets   = ["PYPI_API_TOKEN"]                    # a finding against the OIDC-only policy (SEC-005), declared rather than hidden
 setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false" } }   # no wrapper exists yet: CACHE-009 finding
-permissions = { "actions: write" = ["linux", "build", "test", "dylints", "cache-retention"] }
+# Workflow defaults are read-only; these jobs grant themselves more. `actions: write`
+# = the "Cancel the run" step (and cache-retention's deletes); the auto-release
+# `release` call passes both writes down to release.yml, whose release-assets job
+# creates the GitHub release; publish-crates mints crates.io's OIDC token.
+permissions = { "actions: write" = ["linux", "build", "test", "dylints", "cache-retention", "release", "release-guard", "validate-and-package", "symbolizer-workers", "publish-pypi", "release-assets", "publish-crates"], "contents: write" = ["release", "release-assets"], "id-token: write" = ["publish-crates"] }
 platform-selector = "src/lib.rs"
 platform-code     = ["src/platform_win*.rs", "src/platform_win/**", "src/platform_linux*.rs", "src/platform_linux/**", "src/platform_macos*.rs", "src/platform_macos/**"]   # AGENTS.md concrete trees
 

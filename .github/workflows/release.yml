@@ -15,18 +15,34 @@ on:
       full_ci_run_id:
         required: false
         type: string
+    secrets:
+      PYPI_API_TOKEN:
+        required: false
 
+# Read-only by default (ci-lint SEC-002). Every job grants itself
+# `actions: write` so a failed job can cancel the rest of the release, and
+# `release-assets` also `contents: write`; ci.toml's [allow].permissions lists
+# exactly those jobs.
 permissions:
-  contents: write
-  # `actions: write` lets a failed job cancel the rest of the release.
-  actions: write
+  contents: read
+  actions: read
+
+# One release per tag. Not the caller's `kernal-api-release` group: a called
+# workflow sharing its caller's group would wait on the caller forever.
+concurrency:
+  group: kernal-api-release-call-${{ inputs.tag }}
+  cancel-in-progress: false
 
 env:
   SOURCE_DATE_EPOCH: "0"
 
 jobs:
   release-guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -60,8 +76,12 @@ jobs:
 
   validate-and-package:
     needs: release-guard
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
     environment: release
+    permissions:
+      contents: read
+      actions: write
     # Matches `linux` in ci.yml so this job's cook base is that job's (#355):
     # the same target, dev profile and suffix restore one ~2.4 GB base
     # instead of storing a second, `--release` one no step here compiles.
@@ -151,35 +171,34 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-gnu
             extension: ""
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-gnu
             extension: ""
           # The Apple workers cross-compile on Linux through Soldr's bundled
           # LLVM and managed macOS SDK, exactly as CI's `supported-targets`
           # builds its Apple lanes. No Apple-hosted runner is used and the
           # release still ships both darwin workers.
-          - os: ubuntu-latest
-            target: x86_64-apple-darwin
+          - target: x86_64-apple-darwin
             extension: ""
             cross: true
-          - os: ubuntu-latest
-            target: aarch64-apple-darwin
+          - target: aarch64-apple-darwin
             extension: ""
             cross: true
           # The Windows workers cross-compile on Linux too, through Soldr's
           # managed xwin sysroot, as CI's `build` job does (#273).
-          - os: ubuntu-latest
-            target: x86_64-pc-windows-msvc
+          - target: x86_64-pc-windows-msvc
             extension: .exe
             cross: true
-          - os: ubuntu-latest
-            target: aarch64-pc-windows-msvc
+          - target: aarch64-pc-windows-msvc
             extension: .exe
             cross: true
-    runs-on: ${{ matrix.os }}
+    # Every worker builds on Linux; the Apple and Windows ones cross-compile.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -228,8 +247,12 @@ jobs:
   publish-pypi:
     if: ${{ !inputs.dry_run && vars.PUBLISH_PYPI == 'true' }}
     needs: [validate-and-package, release-assets]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     environment: release
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -270,7 +293,12 @@ jobs:
   release-assets:
     if: ${{ !inputs.dry_run }}
     needs: [validate-and-package, symbolizer-workers]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Creates the GitHub release.
+    permissions:
+      contents: write
+      actions: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:

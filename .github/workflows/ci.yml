@@ -800,19 +800,25 @@ jobs:
           GH_REPO: ${{ github.repository }}
 
   # One cached Linux pass runs both custom Dylints for ordinary PRs.
+  # Starts beside `linux`, not after it: it is one Linux runner, so a red
+  # `linux` costs nothing scarce, and waiting added the gate's ~2.3 min to
+  # the PR critical path. It selects its own mode and SHA the same way.
   dylints:
     name: Dylint workspace
-    needs: linux
     env:
       DYLINT_TOOLCHAIN: nightly-2026-05-28
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.linux.outputs.sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Select CI mode and verify the checked-out commit
+        id: mode
+        run: uv run --no-project --python 3.12 ci/ci_mode.py
       - name: Verify selected source SHA
         shell: bash
-        run: test "$(git rev-parse HEAD)" = "${{ needs.linux.outputs.sha }}"
+        run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
       - name: Install native webview development packages
         run: >-
           sudo apt-get update && sudo apt-get install --yes
@@ -872,7 +878,7 @@ jobs:
           --all --workspace -- --all-features --all-targets
       # Stops a minimal PR run on a failure here; full runs report every leg.
       - name: Cancel the run (this job failed)
-        if: failure() && github.event_name == 'pull_request' && needs.linux.outputs.mode != 'full'
+        if: failure() && github.event_name == 'pull_request' && steps.mode.outputs.mode != 'full'
         run: gh run cancel ${{ github.run_id }}
         env:
           GH_TOKEN: ${{ github.token }}

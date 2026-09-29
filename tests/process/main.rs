@@ -19,6 +19,7 @@ mod process_session_control;
 mod process_session_streaming;
 mod process_target;
 mod process_usage;
+mod session_spawn_cost;
 mod spawn_mode_facade;
 mod sync_environment;
 mod termination_signal;

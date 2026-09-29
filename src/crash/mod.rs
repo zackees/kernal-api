@@ -571,6 +571,23 @@ impl Drop for Runtime {
         handler.take();
         self.shared.request_stop();
         if let Some(handle) = self.sampler.take() {
+            let detach = {
+                let mut handoff = match self.shared.handoff.lock() {
+                    Ok(handoff) => handoff,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let detach = !handoff.done && self.shared.sampling.load(Ordering::Acquire);
+                if detach {
+                    handoff.sink = Some(self.path.clone());
+                }
+                detach
+            };
+            if detach {
+                // The first sample can spend ~1 s symbolizing a debug binary;
+                // do not make process exit wait for it. The sampler removes
+                // the sink after dropping its handle to it.
+                return;
+            }
             let _ = handle.join();
         }
         // A cleanly dropped process never wrote the pre-opened file.
@@ -705,8 +722,22 @@ struct Shared {
     // sampler's check and its wait. The fatal callback touches neither.
     stop_wait: Mutex<()>,
     stop_signal: Condvar,
+    // True only while the sampler is inside its allocating capture, which
+    // symbolizes against the process binary and cannot be interrupted.
+    sampling: AtomicBool,
+    // Teardown never joins a sampler that is mid-capture: it hands the sink
+    // path here and detaches, and the sampler removes the sink itself once it
+    // has released `file`. `done` closes the race with a sampler that exits
+    // between teardown's check and its hand-off.
+    handoff: Mutex<SamplerHandoff>,
     file: File,
     pid: u32,
+}
+
+#[derive(Default)]
+struct SamplerHandoff {
+    done: bool,
+    sink: Option<PathBuf>,
 }
 
 // The sampler is the sole normal writer. The handler sets `reading` before
@@ -729,6 +760,8 @@ impl Shared {
             sample_thread_count: AtomicUsize::new(0),
             stop_wait: Mutex::new(()),
             stop_signal: Condvar::new(),
+            sampling: AtomicBool::new(false),
+            handoff: Mutex::new(SamplerHandoff::default()),
             file,
             pid: std::process::id(),
         }
@@ -1202,7 +1235,9 @@ fn sampler_loop(shared: Arc<Shared>, config: CrashSamplerConfig) {
         }
         if !shared.reading.load(Ordering::Acquire) {
             let tick_start = std::time::Instant::now();
+            shared.sampling.store(true, Ordering::Release);
             let sample = capture_sample(&mut resolver);
+            shared.sampling.store(false, Ordering::Release);
             // Recheck after the allocating capture: the callback may have
             // started while capture was in progress.
             if let Some(sample) = sample {
@@ -1239,6 +1274,20 @@ fn sampler_loop(shared: Arc<Shared>, config: CrashSamplerConfig) {
             // threads from the last complete pre-crash capture.
             cadence = cadence.max(tick_start.elapsed().saturating_mul(100));
         }
+    }
+    let sink = {
+        let mut handoff = match shared.handoff.lock() {
+            Ok(handoff) => handoff,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        handoff.done = true;
+        handoff.sink.take()
+    };
+    if let Some(sink) = sink {
+        // Teardown detached instead of joining; Windows only deletes the sink
+        // once every handle is gone, so release ours first.
+        drop(shared);
+        let _ = std::fs::remove_file(sink);
     }
 }
 
@@ -1619,6 +1668,43 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, &raw mut status, 0) }, child);
         assert_eq!(status, 0, "child touched inherited crash state");
         drop(guard);
+    }
+
+    #[test]
+    fn teardown_detaches_from_a_sampler_that_is_mid_capture() {
+        let _state = process_state();
+        let _no_sampler = disable_test_sampler();
+        let (runtime, _id) = Runtime::new(metadata("sampler-detach"), CrashSamplerConfig::default()).unwrap();
+        let mut runtime = Arc::try_unwrap(runtime).ok().expect("sole runtime owner");
+        let path = runtime.path.clone();
+        // Stand in for the first sample's uninterruptible symbolization: the
+        // thread reports it is capturing, holds that for well over the
+        // ceiling below, then runs the real loop, which sees the stop request
+        // and performs the sink hand-off.
+        let capturing = Arc::clone(&runtime.shared);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        runtime.sampler = Some(std::thread::spawn(move || {
+            capturing.sampling.store(true, Ordering::Release);
+            entered_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            capturing.sampling.store(false, Ordering::Release);
+            sampler_loop(capturing, CrashSamplerConfig::default());
+        }));
+        entered_rx.recv().unwrap();
+
+        let start = std::time::Instant::now();
+        drop(runtime);
+        let teardown = start.elapsed();
+        assert!(
+            teardown < Duration::from_millis(500),
+            "teardown joined an in-flight capture instead of detaching ({teardown:?})"
+        );
+        // The detached sampler removes the sink once it releases its handle.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while path.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!path.exists(), "detached sampler left the crash sink behind");
     }
 
     #[test]

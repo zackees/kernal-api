@@ -107,9 +107,9 @@ class NativeProofJobsTests(unittest.TestCase):
     def test_every_other_platform_waits_for_linux(self):
         """A red Linux run must not cost an Apple or Windows runner."""
         self.assertNotIn("needs:", self.job("linux").split("steps:", 1)[0])
-        for gated in ("build", "dylints"):
-            with self.subTest(job=gated):
-                self.assertIn("needs: linux", self.job(gated))
+        self.assertIn("needs: linux", self.job("build"))
+        # Dylint is one Linux runner, so it starts beside the gate.
+        self.assertNotIn("needs:", self.job("dylints").split("steps:", 1)[0])
         self.assertIn("needs: [linux, build]", self.job("test"))
 
     def test_routine_failure_cancels_but_full_mode_reports_every_leg(self):

@@ -2,7 +2,8 @@ name: CI
 
 on:
   pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    # `edited`: a title-only tag edit re-selects the run (ci-lint TAG-003).
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited]
   # Retain a deterministic recovery path when GitHub drops or delays a
   # pull-request synchronize event for a draft branch. Manual dispatch runs
   # the exact same matrix at the explicitly selected ref.
@@ -27,9 +28,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.ref }}
   cancel-in-progress: true
 
+# Read-only by default (ci-lint SEC-002). Each job whose last step cancels
+# the run on failure grants itself `actions: write`; ci.toml's
+# [allow].permissions lists exactly those jobs.
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 jobs:
   # Four work jobs set up once and do everything that belongs on each runner.
@@ -57,6 +61,9 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    permissions:
+      contents: read
+      actions: write
     outputs:
       mode: ${{ steps.mode.outputs.mode }}
       sha: ${{ steps.mode.outputs.sha }}
@@ -126,7 +133,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 0296e9b4381b94c2e8621519c6ba1bedda58db4a
+          ref: 78506e7007650ddb11560a6d2289f51228cbf621
           path: .ci-lint
           persist-credentials: false
       - name: Validate ci.toml with the pinned ci-lint
@@ -443,6 +450,9 @@ jobs:
             cross: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.builder }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
@@ -643,6 +653,9 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -826,7 +839,11 @@ jobs:
     name: Dylint workspace
     env:
       DYLINT_TOOLCHAIN: nightly-2026-05-28
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: write
     steps:
       # The webview headers are needed only once something compiles, and the
       # install shares nothing with checkout or setup-soldr. Start it first in

@@ -147,7 +147,17 @@ class AutoReleaseTests(unittest.TestCase):
                     self.assertIn("name: Cancel the run (this job failed)", last)
                     self.assertIn("if: failure()", last)
                     self.assertIn("gh run cancel ${{ github.run_id }}", last)
-            self.assertIn("actions: write", text.split("\njobs:\n", 1)[0])
+                    # Each job grants itself the cancel permission; the
+                    # workflow default stays read-only (ci-lint SEC-002).
+                    self.assertIn("actions: write", body.split("\n    steps:\n", 1)[0])
+            self.assertIn(
+                "\npermissions:\n  contents: read\n  actions: read\n",
+                text.split("\njobs:\n", 1)[0],
+            )
+        # A called workflow gets no more than its caller grants.
+        release_call = caller.split("\n  release:\n", 1)[1].split("\n\n  ", 1)[0]
+        self.assertIn("actions: write", release_call)
+        self.assertIn("contents: write", release_call)
 
     def verify_source(self, tag="v0.1.0", sha="a" * 40, tagged_sha=None):
         env = {"RELEASE_TAG": tag, "RELEASE_SHA": sha, "GITHUB_SHA": "a" * 40}

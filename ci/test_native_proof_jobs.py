@@ -340,7 +340,7 @@ class NativeProofJobsTests(unittest.TestCase):
         """One required Dylint pass uses the matching published nightly."""
         dylints = self.job("dylints")
         select_compiler = self.step("dylints", "Select the pinned Dylint compiler")
-        self.assertIn("runs-on: ubuntu-latest", dylints)
+        self.assertIn("runs-on: ubuntu-24.04", dylints)
         self.assertNotIn("matrix:", dylints)
         self.assertRegex(
             dylints,

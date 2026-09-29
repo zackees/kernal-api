@@ -16,11 +16,11 @@ on:
         type: boolean
         default: true
 
+# Read-only by default (ci-lint SEC-002); each job grants itself what it
+# needs, and ci.toml's [allow].permissions lists exactly those jobs.
 permissions:
-  contents: write
-  # release.yml's jobs cancel the run when one fails; a called workflow gets
-  # no more than its caller grants.
-  actions: write
+  contents: read
+  actions: read
 
 concurrency:
   group: kernal-api-release
@@ -29,7 +29,7 @@ concurrency:
 jobs:
   prepare:
     # Explicit dispatch is the only release entry point.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       should_release: ${{ steps.detect.outputs.should_release }}
@@ -52,7 +52,8 @@ jobs:
   full-ci-gate:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true' && !inputs.dry_run
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read
@@ -74,12 +75,20 @@ jobs:
       always() && needs.prepare.outputs.should_release == 'true'
       && (inputs.dry_run || needs.full-ci-gate.result == 'success')
     uses: ./.github/workflows/release.yml
+    # A called workflow gets no more than its caller grants: release.yml's
+    # `release-assets` creates the GitHub release (contents: write), and every
+    # release job cancels the run when it fails (actions: write).
+    permissions:
+      contents: write
+      actions: write
     with:
       source_sha: ${{ inputs.candidate_sha }}
       tag: ${{ needs.prepare.outputs.tag }}
       dry_run: ${{ inputs.dry_run }}
       full_ci_run_id: ${{ inputs.full_ci_run_id }}
-    secrets: inherit
+    # Only the one secret release.yml declares, not every caller secret.
+    secrets:
+      PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
 
   publish-crates:
     # Here, in the top-level workflow, rather than in release.yml: this is
@@ -92,7 +101,8 @@ jobs:
       && !inputs.dry_run
       && needs.full-ci-gate.result == 'success'
       && vars.PUBLISH_CRATES_IO == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     environment: release
     # crates.io trusted publishing: no stored token. The job exchanges its
     # GitHub OIDC token for a short-lived crates.io token, which crates.io

@@ -41,7 +41,7 @@ class ModeTests(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]",
+            "types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled, edited]",
             text,
         )
         self.assertIn("candidate_sha:", text)
@@ -134,7 +134,7 @@ class FullCoverageTests(unittest.TestCase):
             set(re.findall(r"^            target: (\S+)$", test, re.MULTILINE)),
             set(full_coverage.TARGETS),
         )
-        self.assertIn("runs-on: ubuntu-latest", dylints)
+        self.assertIn("runs-on: ubuntu-24.04", dylints)
         self.assertNotIn("matrix:", dylints)
 
     def test_all_required_legs_and_sha(self):

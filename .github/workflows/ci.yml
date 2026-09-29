@@ -86,7 +86,7 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: zackees/setup-soldr@a07bab94f16124b5c6857b137a237a53a61e06d1 # v0.9.82
+      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         id: setup_soldr
         with:
           version: 0.9.23
@@ -439,7 +439,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@a07bab94f16124b5c6857b137a237a53a61e06d1 # v0.9.82
+      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)
@@ -817,7 +817,7 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install --yes
           libgtk-3-dev libwebkit2gtk-4.1-dev
-      - uses: zackees/setup-soldr@a07bab94f16124b5c6857b137a237a53a61e06d1 # v0.9.82
+      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
         with:
           version: 0.9.23
           cook-delta: false # per-commit delta layer off (setup-soldr#528)

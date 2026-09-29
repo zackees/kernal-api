@@ -4,8 +4,9 @@ One pull request once offered about 23 GB of cache entries, 14.6 GB of them
 ~2.4 GB cook bases (#355, zackees/setup-soldr#528). These guards pin the
 properties that keep the footprint bounded:
 
-- every setup-soldr step runs one pinned revision, so two versions never
-  write two copies of the same key;
+- every job reaches setup-soldr through the one wrapper,
+  `.github/actions/soldr`, which pins one revision and one Soldr runtime, so
+  two versions never write two copies of the same key;
 - steps that cook the same graph for the same target share one
   `cache-key-suffix` (the suffix is part of the cook-base key), unless a
   listed reason says why the graphs differ;
@@ -27,9 +28,14 @@ import re
 import unittest
 from pathlib import Path
 
-WORKFLOWS = Path(__file__).resolve().parents[1] / ".github/workflows"
-SETUP_SOLDR = re.compile(
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ROOT / ".github/workflows"
+WRAPPER = ROOT / ".github/actions/soldr/action.yml"
+DIRECT_SETUP_SOLDR = re.compile(
     r"^(?P<indent> *)- uses: zackees/setup-soldr@(?P<ref>\S+)(?P<comment>.*)$"
+)
+SETUP_SOLDR = re.compile(
+    r"^(?P<indent> *)- uses: \./\.github/actions/soldr(?P<comment>.*)$"
 )
 
 # Pin the runtime independently of the action SHA. A floating `latest` Soldr
@@ -63,7 +69,12 @@ JUSTIFIED_SPLITS: dict[tuple[str, str], str] = {}
 # default `auto` skips every durable save on `pull_request`. Older pins save
 # unconditionally.
 SAVE_POLICY_MIN_VERSION = (0, 9, 78)
-PUSH_ONLY_SAVE_POLICY = "${{ github.event_name == 'push' && 'auto' || 'false' }}"
+# The ci-lint plan's `cache_save` (ci.toml [cache].write-on): "true" only on
+# a main push, "false" on pull requests and dispatched candidate SHAs.
+PUSH_ONLY_SAVE_POLICIES = {
+    "${{ steps.plan.outputs.cache_save }}",
+    "${{ needs.linux.outputs.cache_save }}",
+}
 
 # The first setup-soldr release whose main action honors `cook-delta`
 # (zackees/setup-soldr#528). Older pins always write the delta layer.
@@ -92,8 +103,40 @@ def workflow_triggers(text):
     return set(re.findall(r"(?m)^  ([\w-]+):", block.group(1))) if block else set()
 
 
+def step_inputs(lines, index, step_indent):
+    inputs = {}
+    for body in lines[index + 1 :]:
+        if body.strip() and len(body) - len(body.lstrip()) <= step_indent:
+            break
+        pair = re.match(r"^\s+([\w-]+):\s*(.*?)\s*$", body)
+        if pair and not body.lstrip().startswith("#") and pair.group(1) != "with":
+            value = re.sub(r"\s+#.*$", "", pair.group(2))
+            inputs[pair.group(1)] = value.strip('"').strip("'")
+    return inputs
+
+
+def wrapper_call():
+    """The wrapper's one setup-soldr step: its ref, pin comment and fixed inputs."""
+    lines = WRAPPER.read_text(encoding="utf-8").splitlines()
+    calls = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := DIRECT_SETUP_SOLDR.match(line))
+    ]
+    assert len(calls) == 1, "the wrapper calls setup-soldr exactly once"
+    index, match = calls[0]
+    fixed = {
+        name: value
+        for name, value in step_inputs(lines, index, len(match.group("indent"))).items()
+        if "inputs." not in value and name != "id"
+    }
+    return match.group("ref"), match.group("comment"), fixed
+
+
 def setup_soldr_steps():
-    """Yield one dict per setup-soldr step across every workflow."""
+    """Yield one dict per wrapper call across every workflow, with the
+    wrapper's fixed inputs merged in."""
+    ref, comment, fixed = wrapper_call()
     for path in sorted(WORKFLOWS.glob("*.yml")):
         text = path.read_text(encoding="utf-8")
         triggers = workflow_triggers(text)
@@ -108,25 +151,16 @@ def setup_soldr_steps():
             match = SETUP_SOLDR.match(line)
             if not match:
                 continue
-            step_indent = len(match.group("indent"))
-            inputs = {}
-            for body in lines[index + 1 :]:
-                if body.strip() and len(body) - len(body.lstrip()) <= step_indent:
-                    break
-                pair = re.match(r"^\s+([\w-]+):\s*(.*?)\s*$", body)
-                if (
-                    pair
-                    and not body.lstrip().startswith("#")
-                    and pair.group(1) != "with"
-                ):
-                    value = re.sub(r"\s+#.*$", "", pair.group(2))
-                    inputs[pair.group(1)] = value.strip('"').strip("'")
+            inputs = step_inputs(lines, index, len(match.group("indent")))
+            inputs.pop("id", None)
+            overlap = set(inputs) & set(fixed)
+            assert not overlap, f"the wrapper fixes {sorted(overlap)}"
             yield {
                 "workflow": path.name,
                 "job": job,
-                "ref": match.group("ref"),
-                "comment": match.group("comment"),
-                "inputs": inputs,
+                "ref": ref,
+                "comment": comment,
+                "inputs": {**inputs, **fixed},
                 "triggers": triggers,
             }
 
@@ -156,7 +190,7 @@ def saves_on_pull_request(step):
     if version is None or version < SAVE_POLICY_MIN_VERSION:
         return True
     save_policy = inputs.get("save-cache", "auto")
-    if save_policy == PUSH_ONLY_SAVE_POLICY:
+    if save_policy in PUSH_ONLY_SAVE_POLICIES:
         # Its expression evaluates to the string "false" on pull_request.
         return False
     return save_policy not in {"auto", "false"}
@@ -172,6 +206,19 @@ class CachePolicyTests(unittest.TestCase):
         """A new setup-soldr step names its target and profile here first."""
         found = {(s["workflow"], s["job"]) for s in self.steps()}
         self.assertEqual(found, set(COOK_SHAPES))
+
+    def test_only_the_wrapper_calls_setup_soldr(self):
+        """One call site keeps one revision and one runtime (ci-lint CACHE-009)."""
+        for path in sorted(WORKFLOWS.glob("*.yml")):
+            with self.subTest(workflow=path.name):
+                self.assertFalse(
+                    [
+                        line
+                        for line in path.read_text(encoding="utf-8").splitlines()
+                        if DIRECT_SETUP_SOLDR.match(line)
+                    ],
+                    "call ./.github/actions/soldr instead of zackees/setup-soldr",
+                )
 
     def test_one_pinned_revision(self):
         """Mixed setup-soldr versions write duplicate keys."""
@@ -268,7 +315,7 @@ class CachePolicyTests(unittest.TestCase):
             with self.subTest(workflow=step["workflow"], job=step["job"]):
                 self.assertIn(
                     step["inputs"].get("save-cache"),
-                    {"auto", "true", "false", PUSH_ONLY_SAVE_POLICY},
+                    {"false"} | PUSH_ONLY_SAVE_POLICIES,
                 )
 
     def test_release_validation_restores_without_racing_main_retention(self):
@@ -289,9 +336,9 @@ class CachePolicyTests(unittest.TestCase):
         self.assertEqual(len(steps), 3)
         for step in steps:
             with self.subTest(job=step["job"]):
-                self.assertEqual(
+                self.assertIn(
                     step["inputs"].get("save-cache"),
-                    PUSH_ONLY_SAVE_POLICY,
+                    PUSH_ONLY_SAVE_POLICIES,
                 )
 
     def test_pr_save_justifications_are_live(self):

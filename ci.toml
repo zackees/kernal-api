@@ -101,7 +101,10 @@ workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "au
 actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]
 tools     = ["soldr", "uv", "git", "jq", "sudo"]
 secrets   = ["PYPI_API_TOKEN"]                    # a finding against the OIDC-only policy (SEC-005), declared rather than hidden
-setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false" } }   # no wrapper exists yet: CACHE-009 finding
+# The one setup-soldr call site; its save-cache passes through the ci-lint plan's
+# cache_save (true only on a main push) from every caller.
+setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false", save-cache = "plan" } }
+setup-uv    = { require = { save-cache = "plan" } }
 # Workflow defaults are read-only; these jobs grant themselves more. `actions: write`
 # = the "Cancel the run" step (and cache-retention's deletes); the auto-release
 # `release` call passes both writes down to release.yml, whose release-assets job
@@ -112,3 +115,11 @@ platform-code     = ["src/platform_win*.rs", "src/platform_win/**", "src/platfor
 
 [publish]
 pypi = { auth = "token", environment = "release", mode = "real" }
+
+# -- Exceptions ----------------------------------------------------------------
+[[exceptions]]
+rule    = "RUST-013"
+path    = ".github/actions/soldr/action.yml"
+reason  = "One Soldr runtime for every job (ci/test_cache_policy.py SOLDR_RUNTIME_VERSION): a runtime is a cache generation, and producers on two runtimes cannot restore each other's exact-only cook bases. Owner: zackees. Bump path in the issue."
+issue   = "https://github.com/zackees/ci.yml/issues/130"
+expires = "2026-12-31"

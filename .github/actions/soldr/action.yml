@@ -1,0 +1,116 @@
+name: soldr setup
+description: >-
+  The only `zackees/setup-soldr` call site in this repository (ci.toml
+  [allow].setup-soldr.only-in; ci-lint CACHE-009/RUST-001). It fixes the
+  inputs every job must share -- one Soldr runtime version and no cook-delta
+  layer -- and takes `save-cache` from the ci-lint plan, so a job cannot
+  write a durable cache outside the flows ci.toml [cache].write-on names.
+  ci/test_cache_policy.py checks every caller.
+
+inputs:
+  save-cache:
+    description: >-
+      The ci-lint plan's cache_save output: "true" on a main push, "false"
+      on pull requests and dispatched runs. A job that never writes caches
+      (release, the nightly macOS guest) passes "false". Required, so no
+      caller falls back to setup-soldr's own "auto".
+    required: true
+  cache-key-pr:
+    description: >-
+      The ci-lint plan's cache_key_pr output: "pr-N" on a pull request and
+      empty everywhere else. It is appended to cache-key-suffix only when
+      this step saves, so a PR-context save carries its PR number
+      (ci-lint CACHE-013) and the janitor can delete it after the PR closes.
+    required: false
+    default: ""
+  cache-key-suffix:
+    description: Forwarded to setup-soldr. It is part of the cook-base key.
+    required: false
+    default: ""
+  ci-tests:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "false"
+  cache:
+    description: Forwarded to setup-soldr (the umbrella restore/save switch).
+    required: false
+    default: "true"
+  build-cache:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: ""
+  cargo-registry-cache:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: ""
+  solo-toolchain-cache:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "true"
+  prebuild-deps:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "soldr-cook"
+  prebuild-deps-flags:
+    description: >-
+      Forwarded to setup-soldr. It must match the profile the job compiles,
+      or the cook base is never reused.
+    required: false
+    default: "--release"
+  cross-targets:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: ""
+  toolchain:
+    description: Forwarded to setup-soldr. Empty reads rust-toolchain.toml.
+    required: false
+    default: ""
+  dylint:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "false"
+  dylint-toolchain:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: ""
+  cargo-dylint-version:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "6.0.3"
+  dylint-link-version:
+    description: Forwarded to setup-soldr.
+    required: false
+    default: "6.0.3"
+
+outputs:
+  soldr-version:
+    description: The Soldr runtime version setup-soldr installed.
+    value: ${{ steps.setup.outputs.soldr-version }}
+
+runs:
+  using: composite
+  steps:
+    - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      id: setup
+      with:
+        # One pinned Soldr runtime for every job: a new runtime is a new cache
+        # generation, and concurrent producers on two runtimes cannot restore
+        # each other's exact-only cook bases. ci.toml records this as an
+        # [[exceptions]] entry for ci-lint RUST-013.
+        version: 0.9.23
+        cook-delta: false # per-commit delta layer off (setup-soldr#528)
+        save-cache: ${{ inputs.save-cache }}
+        cache-key-suffix: ${{ inputs.save-cache == 'true' && inputs.cache-key-pr != '' && (inputs.cache-key-suffix != '' && format('{0}-{1}', inputs.cache-key-suffix, inputs.cache-key-pr) || inputs.cache-key-pr) || inputs.cache-key-suffix }}
+        ci-tests: ${{ inputs.ci-tests }}
+        cache: ${{ inputs.cache }}
+        build-cache: ${{ inputs.build-cache }}
+        cargo-registry-cache: ${{ inputs.cargo-registry-cache }}
+        solo-toolchain-cache: ${{ inputs.solo-toolchain-cache }}
+        prebuild-deps: ${{ inputs.prebuild-deps }}
+        prebuild-deps-flags: ${{ inputs.prebuild-deps-flags }}
+        cross-targets: ${{ inputs.cross-targets }}
+        toolchain: ${{ inputs.toolchain }}
+        dylint: ${{ inputs.dylint }}
+        dylint-toolchain: ${{ inputs.dylint-toolchain }}
+        cargo-dylint-version: ${{ inputs.cargo-dylint-version }}
+        dylint-link-version: ${{ inputs.dylint-link-version }}

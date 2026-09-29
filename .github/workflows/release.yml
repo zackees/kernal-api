@@ -50,6 +50,9 @@ jobs:
           lfs: true
           fetch-depth: 0
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          # Release runs never write caches (ci.toml [cache].write-on = main).
+          save-cache: false
       - name: Verify immutable release source and tag
         env:
           RELEASE_SHA: ${{ inputs.source_sha }}
@@ -93,16 +96,17 @@ jobs:
           ref: ${{ inputs.source_sha }}
           lfs: true
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          # Release runs never write caches (ci.toml [cache].write-on = main).
+          save-cache: false
       # Restore the exact main CI generation to keep release validation warm,
       # but never save here: this separate workflow can race main's post-
       # producer retention job with an older candidate lockfile. Its package
       # and test outputs do not need durable caches.
-      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      - uses: ./.github/actions/soldr # the one setup-soldr call site
         with:
-          version: 0.9.23
-          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # Restore only; don't race the main retention job with an old lock.
-          save-cache: false
+          save-cache: "false"
           cache-key-suffix: linux
           prebuild-deps-flags: ""
       - name: Install native webview development packages
@@ -203,12 +207,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.source_sha }}
-      - uses: zackees/setup-soldr@v0 # v0.9.82 or later (floating major)
+      - uses: ./.github/actions/soldr # the one setup-soldr call site
         with:
-          version: 0.9.23
-          cook-delta: false # per-commit delta layer off (setup-soldr#528)
           # No durable saves from pull requests (setup-soldr#527, #355).
-          save-cache: auto
+          save-cache: "false"
           # Shipped binaries restore nothing. Every cache is a key another job
           # can write -- the v0.1.14 aarch64 worker restored a toolchain whose
           # rustup records listed an aarch64 std that the saved archive did not
@@ -255,6 +257,9 @@ jobs:
       actions: write
     steps:
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+        with:
+          # Release runs never write caches (ci.toml [cache].write-on = main).
+          save-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: registry-packages

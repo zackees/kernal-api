@@ -52,6 +52,7 @@ class Cache:
     key: str
     ref: str
     size: int
+    last_accessed: str = ""
 
 
 def lock_generation_shape(cache: Cache) -> tuple[str, str, str] | None:
@@ -147,6 +148,41 @@ def superseded_lock_generation_caches(
             cache for lock_hash, cache in entries if lock_hash != current_lock_hash
         )
     return sorted(candidates, key=lambda cache: cache.cache_id)
+
+
+def over_budget_orphaned_lock_caches(
+    caches: list[Cache],
+    current_lock_hash: str,
+    excluded: set[int],
+    budget: int = BUDGET_BYTES,
+) -> list[Cache]:
+    """Retire non-current lock generations with no replacement, only over budget.
+
+    A shape whose producer has not run since `Cargo.lock` changed -- a
+    full-mode cross target, say -- keeps its last generation, which a restore
+    can still use as a prefix fallback. That is worth its space until the
+    repository is over budget. Past that point GitHub itself evicts the least
+    recently used entries, and those orphans are exactly what it would pick,
+    so retire them here in the same order: deterministically, and never a
+    current-lock entry.
+    """
+    usage = sum(cache.size for cache in caches if cache.cache_id not in excluded)
+    if usage <= budget:
+        return []
+    orphans = []
+    for cache in caches:
+        if cache.ref != MAIN_REF or cache.cache_id in excluded:
+            continue
+        parsed = lock_generation_shape(cache)
+        if parsed is not None and parsed[2] != current_lock_hash:
+            orphans.append(cache)
+    retired = []
+    for cache in sorted(orphans, key=lambda c: (c.last_accessed, c.cache_id)):
+        if usage <= budget:
+            break
+        retired.append(cache)
+        usage -= cache.size
+    return retired
 
 
 def require_lock_generations_retired(
@@ -365,6 +401,7 @@ class GitHub:
                         key=str(entry["key"]),
                         ref=str(entry["ref"]),
                         size=int(entry["size_in_bytes"]),
+                        last_accessed=str(entry.get("last_accessed_at", "")),
                     )
                 )
             if len(entries) < 100:
@@ -431,6 +468,10 @@ def prune(
             + superseded_lock_generation_caches(before, current_lock_hash)
         )
     }
+    for cache in over_budget_orphaned_lock_caches(
+        before, current_lock_hash, set(candidates_by_id)
+    ):
+        candidates_by_id[cache.cache_id] = cache
     candidates = sorted(candidates_by_id.values(), key=lambda cache: cache.cache_id)
     require_retained_native_cook_base(before, current_version, candidates)
     reclaimed = sum(cache.size for cache in candidates)

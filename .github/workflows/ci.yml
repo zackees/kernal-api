@@ -934,10 +934,15 @@ jobs:
             cat "$logs/${lane}.log"
             echo "::endgroup::"
           done
+          # This step is the required Dylint aggregate (#363): it fails when any
+          # lane fails, and the workspace pass always runs. A separate
+          # `needs:` sentinel job added 0.5-3 min of runner queue after this
+          # job finished; `linux` reports its own check.
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::Dylint lanes failed: ${failed[*]}"
             exit 1
           fi
+          test -s "$logs/workspace-dylint.log"
       # Stops a minimal PR run on a failure here; full runs report every leg.
       - name: Cancel the run (this job failed)
         if: failure() && github.event_name == 'pull_request' && steps.mode.outputs.mode != 'full'
@@ -945,18 +950,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-
-  dylint-coverage:
-    name: Dylint coverage
-    needs: [linux, dylints]
-    if: always()
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require unified Dylint pass
-        env:
-          LINUX_RESULT: ${{ needs.linux.result }}
-          DYLINT_RESULT: ${{ needs.dylints.result }}
-        run: test "$LINUX_RESULT" = success && test "$DYLINT_RESULT" = success
 
   full-coverage:
     name: Full coverage

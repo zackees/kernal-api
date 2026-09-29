@@ -73,23 +73,30 @@ cache   = "write"
 ci-full = { add = { platforms = "all", suites = ["native"] } }
 ci-test = { add = { suites = ["native"] } }
 
-# -- Caches: every family live on main as of 2026-09-28 (9.21 GB / 40 entries) --
+# -- Caches: what main writes (zackees/ci.yml#93) --------------------------------
+# A main push runs minimal mode (ci/ci_mode.py): only `linux` and `dylints`, both
+# on ubuntu-24.04 x64, and the ci-lint plan's cache_save is true only there. Full
+# mode (ci-full PRs, dispatched candidate SHAs) restores but never saves, and the
+# release and nightly macOS lanes pass save-cache "false". So every family below
+# has exactly one writer shape, on linux-x64: per = "none". The cross-target
+# build-cache, prepared-SDK and cargo-registry entries on main came from an older
+# policy that saved from full-mode runs; nothing writes them now, so they are not
+# declared, and `ci-lint cache janitor` retires them as undeclared.
+# Sizes: measured on main 2026-09-29 (largest live entry), rounded up.
 [cache]
 budget   = "9.5GB"                                # ci/prune_obsolete_cook_caches.py BUDGET_BYTES
 write-on = ["main"]
 never    = ["linked-tests", "nextest-archives", "target-dir"]
-pr       = { mode = "none", families = [], max-per-pr = "0MB", budget = "0MB", trim = "on-close" }   # PRs never save today
+pr       = { mode = "none", families = [], max-per-pr = "0MB", budget = "0MB", trim = "on-close" }   # PRs never save
 
 [cache.family]
-registry     = { via = "setup-soldr:cargo-registry", max = "300MB",  lockfile = true, per = "platform" }
-deps         = { via = "setup-soldr:cook",           max = "150MB",  lockfile = true, per = "none" }
-compile      = { via = "setup-soldr:build-cache",    max = "1400MB", lockfile = true, per = "platform", min = "1MB" }
-sdk          = { via = "setup-soldr:cross-targets",  max = "650MB",  per = "cross-platform" }
-toolchain    = { via = "setup-soldr:solo-toolchain", max = "210MB",  per = "platform" }
-dylint       = { via = "setup-soldr:dylint",         max = "550MB",  per = "none", min = "1MB" }
-dylint-out   = { via = "setup-soldr:dylint-output",  max = "600MB",  lockfile = true, per = "none", min = "1MB" }
-soldr-mini   = { via = "setup-soldr:soldr-mini",     max = "30MB",   per = "platform", min = "1MB" }
-uv           = { via = "setup-uv",                   max = "10MB",   per = "platform" }
+deps         = { via = "setup-soldr:cook",           max = "150MB",  lockfile = true, per = "none" }             # linux cook base, 127,235,799 B
+compile      = { via = "setup-soldr:build-cache",    max = "150MB",  lockfile = true, per = "none", min = "1MB" } # linux thin (ci-tests) build cache, 89,412,879 B
+toolchain    = { via = "setup-soldr:solo-toolchain", max = "210MB",  per = "none" }                              # linux-x64 tnone, 179,728,890 B
+dylint       = { via = "setup-soldr:dylint",         max = "600MB",  per = "none", min = "1MB" }                 # 544,405,988 B
+dylint-out   = { via = "setup-soldr:dylint-output",  max = "700MB",  lockfile = true, per = "none", min = "1MB" } # 619,590,808 B
+soldr-mini   = { via = "setup-soldr:soldr-mini",     max = "15MB",   per = "none", min = "1MB" }                 # linux-x64, 10,727,008 B
+uv           = { via = "setup-uv",                   max = "5MB",    per = "none" }                              # linux-x64, <= 1,474,015 B
 
 [local]
 runner = "bosn-act"

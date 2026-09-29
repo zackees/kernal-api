@@ -104,7 +104,7 @@ secrets   = ["PYPI_API_TOKEN"]                    # a finding against the OIDC-o
 setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false" } }   # no wrapper exists yet: CACHE-009 finding
 permissions = { "actions: write" = ["linux", "build", "test", "dylints", "cache-retention"] }
 platform-selector = "src/lib.rs"
-platform-code     = ["src/platform_win.rs", "src/platform_win/**", "src/platform_linux.rs", "src/platform_linux/**", "src/platform_macos.rs", "src/platform_macos/**"]
+platform-code     = ["src/platform_win*.rs", "src/platform_win/**", "src/platform_linux*.rs", "src/platform_linux/**", "src/platform_macos*.rs", "src/platform_macos/**"]   # AGENTS.md concrete trees
 
 [publish]
 pypi = { auth = "token", environment = "release", mode = "real" }

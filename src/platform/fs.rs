@@ -190,6 +190,9 @@ pub struct ContextPathMetadata {
     pub modified: Option<SystemTime>,
     /// Stable identity when observed from an open regular-file handle.
     pub identity: Option<FileIdentity>,
+    /// A regular file with any Unix execute bit set. Always `false` for other
+    /// kinds, and on Windows, which has no per-file execute bit.
+    pub executable: bool,
 }
 
 /// A bounded regular-file read together with its final-handle observation.
@@ -247,6 +250,7 @@ pub(crate) fn context_regular_file_metadata(
         len: Some(metadata.len()),
         modified: Some(metadata.modified()?),
         identity: Some(identity),
+        executable: crate::native_fs_materialize::metadata_executable(metadata),
     })
 }
 
@@ -263,6 +267,7 @@ pub fn context_path_metadata_no_follow(path: &Path) -> io::Result<ContextPathMet
         len: (kind == ContextPathKind::RegularFile).then_some(metadata.len()),
         modified: metadata.modified().ok(),
         identity: None,
+        executable: crate::native_fs_materialize::metadata_executable(&metadata),
     })
 }
 

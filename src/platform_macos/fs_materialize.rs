@@ -148,6 +148,10 @@ pub fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode()
 }
 
+pub fn metadata_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
 pub fn apply_metadata_mode(path: &Path, mode: u32) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }

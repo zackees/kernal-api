@@ -194,3 +194,39 @@ fn bounded_context_read_refuses_synthetic_regular_file_with_incoherent_length() 
         ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn context_metadata_reports_whether_a_regular_file_is_executable() {
+    use kernal_api::platform::fs::{context_path_metadata_no_follow, make_executable};
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("tool");
+    fs::write(&file, b"#!/bin/sh\n").unwrap();
+    assert!(!context_path_metadata_no_follow(&file).unwrap().executable);
+    assert!(
+        !read_context_regular_file_bounded(&file, 16)
+            .unwrap()
+            .metadata
+            .executable
+    );
+
+    make_executable(&file).unwrap();
+    // Windows has no per-file execute bit, so nothing there is executable.
+    let expected = !kernal_api::platform::host::target_is_windows();
+    assert_eq!(
+        context_path_metadata_no_follow(&file).unwrap().executable,
+        expected
+    );
+    assert_eq!(
+        read_context_regular_file_bounded(&file, 16)
+            .unwrap()
+            .metadata
+            .executable,
+        expected
+    );
+    assert!(
+        !context_path_metadata_no_follow(directory.path())
+            .unwrap()
+            .executable
+    );
+}

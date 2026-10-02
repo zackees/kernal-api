@@ -239,6 +239,7 @@ fn an_owner_executable_private_file_stays_private() {
     };
     use std::io::Write as _;
 
+    let windows = kernal_api::platform::host::target_is_windows();
     let directory = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
     let file = directory.path().join("tool");
     create_private_file(&file)
@@ -247,11 +248,15 @@ fn an_owner_executable_private_file_stays_private() {
         .unwrap();
     make_owner_executable(&file).unwrap();
     assert_eq!(
-        read_private_regular_file_bounded(&file, 16).unwrap(),
-        b"#!/bin/sh\n"
-    );
-    assert_eq!(
         context_path_metadata_no_follow(&file).unwrap().executable,
-        !kernal_api::platform::host::target_is_windows()
+        !windows
     );
+    // Windows has no execute bit to add, and its private reads also require a
+    // protected-DACL parent that this temporary directory does not have.
+    if !windows {
+        assert_eq!(
+            read_private_regular_file_bounded(&file, 16).unwrap(),
+            b"#!/bin/sh\n"
+        );
+    }
 }

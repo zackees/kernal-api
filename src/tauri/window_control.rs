@@ -218,11 +218,15 @@ impl WebviewHandle {
     /// handle returns [`WebviewError::WindowClosed`].
     pub async fn set_size(&self, width: u32, height: u32) -> Result<(), WebviewError> {
         validate_size(width, height).map_err(WebviewError::InvalidWindowOptions)?;
-        self.window_operation(move |window| {
-            window.set_size(tauri_runtime::dpi::Size::Logical(
-                tauri_runtime::dpi::LogicalSize::new(f64::from(width), f64::from(height)),
-            ))
-        })
+        self.native_operation(
+            Authority::Window,
+            move |window| {
+                window.set_size(tauri_runtime::dpi::Size::Logical(
+                    tauri_runtime::dpi::LogicalSize::new(f64::from(width), f64::from(height)),
+                ))
+            },
+            move |window| crate::native_webview_window::settle_size(window, width, height),
+        )
         .await
     }
 
@@ -238,12 +242,24 @@ impl WebviewHandle {
     pub async fn set_position(&self, x: i32, y: i32) -> Result<BestEffort, WebviewError> {
         validate_position(x, y).map_err(WebviewError::InvalidWindowOptions)?;
         let support = self.service.backend.support.position;
-        self.window_operation(move |window| match support {
-            BestEffort::Unsupported => Ok(()),
-            BestEffort::Requested => window.set_position(tauri_runtime::dpi::Position::Logical(
-                tauri_runtime::dpi::LogicalPosition::new(f64::from(x), f64::from(y)),
-            )),
-        })
+        let requested = support == BestEffort::Requested;
+        self.native_operation(
+            Authority::Window,
+            move |window| {
+                if requested {
+                    window.set_position(tauri_runtime::dpi::Position::Logical(
+                        tauri_runtime::dpi::LogicalPosition::new(f64::from(x), f64::from(y)),
+                    ))?;
+                }
+                Ok(())
+            },
+            move |window| {
+                if requested {
+                    crate::native_webview_window::settle_position(window, x, y)?;
+                }
+                Ok(())
+            },
+        )
         .await?;
         Ok(support)
     }
@@ -255,7 +271,6 @@ impl WebviewHandle {
     /// revoked or closed handle returns [`WebviewError::WindowClosed`].
     pub async fn show(&self) -> Result<(), WebviewError> {
         let skip_taskbar = self.skips_taskbar()?;
-        let (window, _) = self.native_window()?;
         self.native_operation(
             Authority::Window,
             |window| {
@@ -265,9 +280,9 @@ impl WebviewHandle {
                 }
                 Ok(())
             },
-            move || {
+            move |window| {
                 if skip_taskbar {
-                    crate::native_webview_window::exclude_from_taskbar(&window)?;
+                    crate::native_webview_window::exclude_from_taskbar(window)?;
                 }
                 Ok(())
             },
@@ -317,7 +332,7 @@ impl WebviewHandle {
         self.native_operation(
             Authority::Navigate,
             |_| Ok(()),
-            move || {
+            move |_| {
                 UI_WEBVIEWS.with(|webviews| {
                     webviews
                         .borrow()
@@ -347,7 +362,7 @@ impl WebviewHandle {
         &self,
         apply: impl FnOnce(&WryWindowDispatcher<()>) -> Result<(), tauri_runtime::Error>,
     ) -> Result<(), WebviewError> {
-        self.native_operation(Authority::Window, apply, || Ok(()))
+        self.native_operation(Authority::Window, apply, |_| Ok(()))
             .await
     }
 
@@ -355,12 +370,13 @@ impl WebviewHandle {
     // through the Wry dispatcher; the hub owns the operation, and a
     // concurrent revocation completes it with the revocation's terminal.
     // `apply` dispatches through the window; `on_ui` then runs on the event
-    // loop thread after it, so completion means the loop processed both.
+    // loop thread after it, with the same window, so completion means the
+    // loop processed both.
     async fn native_operation(
         &self,
         authority: Authority,
         apply: impl FnOnce(&WryWindowDispatcher<()>) -> Result<(), tauri_runtime::Error>,
-        on_ui: impl FnOnce() -> Result<(), String> + Send + 'static,
+        on_ui: impl FnOnce(&WryWindowDispatcher<()>) -> Result<(), String> + Send + 'static,
     ) -> Result<(), WebviewError> {
         let operation = authority
             .begin(&self.service.hub, self.store, self.resource)
@@ -373,9 +389,10 @@ impl WebviewHandle {
             }
             Ok((window, _)) => {
                 let (sender, receiver) = async_engine::oneshot_channel();
+                let ui_window = window.clone();
                 let dispatched = apply(&window).and_then(|()| {
                     window.run_on_main_thread(move || {
-                        let _ = sender.send(on_ui());
+                        let _ = sender.send(on_ui(&ui_window));
                     })
                 });
                 match dispatched {

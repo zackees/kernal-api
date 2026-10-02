@@ -42,6 +42,28 @@ fn compositor_places_windows(display_type: &str) -> bool {
     display_type == "GdkWaylandDisplay"
 }
 
+/// tao applies a size request synchronously on its event loop; nothing to
+/// settle.
+pub(crate) fn settle_size(
+    window: &tauri_runtime_wry::WryWindowDispatcher<()>,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let _ = (window, width, height);
+    Ok(())
+}
+
+/// tao applies a position request synchronously on its event loop; nothing
+/// to settle.
+pub(crate) fn settle_position(
+    window: &tauri_runtime_wry::WryWindowDispatcher<()>,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    let _ = (window, x, y);
+    Ok(())
+}
+
 /// GTK keeps the skip-taskbar hint tao set at creation across hide and show,
 /// so there is nothing to re-assert.
 pub(crate) fn exclude_from_taskbar(

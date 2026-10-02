@@ -100,6 +100,10 @@ const EXTERNAL_WEBVIEW_RIGHT_CAPTURE: u8 = 0b10;
 // Native presentation control: resize, show, hide, and focus. Granted with
 // every opened view; it confers no navigation, script, or IPC authority.
 const EXTERNAL_WEBVIEW_RIGHT_WINDOW: u8 = 0b100;
+// Replace the top-level page with a URL the native facade has already
+// validated (`WebviewUrlGrant`). Separate from presentation so resizing a
+// view never implies authority to move it to another page.
+const EXTERNAL_WEBVIEW_RIGHT_NAVIGATE: u8 = 0b1000;
 const BLOB_RESOURCE_KIND: u8 = 3;
 const BLOB_RIGHT_READ: u8 = 0b01;
 const BLOB_RIGHT_WRITE: u8 = 0b10;
@@ -815,7 +819,8 @@ impl OperationHub {
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
             EXTERNAL_WEBVIEW_RIGHT_LOAD
                 | EXTERNAL_WEBVIEW_RIGHT_CAPTURE
-                | EXTERNAL_WEBVIEW_RIGHT_WINDOW,
+                | EXTERNAL_WEBVIEW_RIGHT_WINDOW
+                | EXTERNAL_WEBVIEW_RIGHT_NAVIGATE,
             false,
             ResourceValue::ExternalWebview,
         )?;
@@ -882,7 +887,8 @@ impl OperationHub {
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
             EXTERNAL_WEBVIEW_RIGHT_LOAD
                 | EXTERNAL_WEBVIEW_RIGHT_CAPTURE
-                | EXTERNAL_WEBVIEW_RIGHT_WINDOW,
+                | EXTERNAL_WEBVIEW_RIGHT_WINDOW
+                | EXTERNAL_WEBVIEW_RIGHT_NAVIGATE,
             false,
             ResourceValue::ExternalWebview,
         )?;
@@ -929,6 +935,16 @@ impl OperationHub {
         resource: OpaqueToken,
     ) -> Result<OpaqueToken, HubError> {
         self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_WINDOW)
+    }
+
+    /// Reserve one top-level navigation of an open view. The URL itself was
+    /// validated by the native facade; the hub owns only the operation.
+    pub(crate) fn begin_external_webview_navigate(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_NAVIGATE)
     }
 
     fn begin_external_webview_operation(
@@ -5281,6 +5297,53 @@ mod tests {
         );
         assert_eq!(
             hub.begin_external_webview_window(7, resource),
+            Err(HubError::Closed)
+        );
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(snapshot.live_resources, 0);
+    }
+
+    #[test]
+    fn navigation_needs_its_own_right_and_a_live_generation() {
+        let hub = OperationHub::new(4, 2).unwrap();
+        let (resource, open) = hub.begin_external_webview_open(7).unwrap();
+        hub.finish_external_open(open, resource);
+        assert!(hub.observe_terminal(7, open).unwrap().is_some());
+        let navigate = hub.begin_external_webview_navigate(7, resource).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_navigate(8, resource),
+            Err(HubError::WrongRights),
+            "another logical instance cannot navigate this view"
+        );
+        hub.finish_external_operation(navigate, Terminal::Completed);
+        assert!(hub.observe_terminal(7, navigate).unwrap().is_some());
+        // Presentation authority alone does not confer navigation.
+        let window_only = hub
+            .create_resource_value(
+                7,
+                EXTERNAL_WEBVIEW_RESOURCE_KIND,
+                EXTERNAL_WEBVIEW_RIGHT_LOAD | EXTERNAL_WEBVIEW_RIGHT_WINDOW,
+                false,
+                ResourceValue::ExternalWebview,
+            )
+            .unwrap();
+        hub.state
+            .lock()
+            .unwrap()
+            .resources
+            .get_mut(&window_only)
+            .unwrap()
+            .reserved = false;
+        assert_eq!(
+            hub.begin_external_webview_navigate(7, window_only),
+            Err(HubError::WrongRights)
+        );
+        hub.close_resource(window_only).unwrap();
+        hub.revoke_external_resource(resource, Terminal::Closed)
+            .unwrap();
+        assert_eq!(
+            hub.begin_external_webview_navigate(7, resource),
             Err(HubError::Closed)
         );
         let snapshot = hub.snapshot();

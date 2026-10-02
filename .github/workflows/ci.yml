@@ -608,7 +608,7 @@ jobs:
             --manifest-path tests/build-resources-consumer/Cargo.toml \
             --target "${TARGET}"
       - name: Build the native webview smoke binary
-        if: endsWith(matrix.target, '-pc-windows-msvc')
+        if: endsWith(matrix.target, '-pc-windows-msvc') || endsWith(matrix.target, '-apple-darwin')
         run: >-
           soldr cargo build
           --locked --features "${KERNAL_TARGET_FEATURES}" --target ${{ matrix.target }}
@@ -624,6 +624,7 @@ jobs:
           path: |
             kernal-tests-${{ matrix.target }}.tar.zst
             target/${{ matrix.target }}/debug/kernal-tauri-smoke.exe
+            target/${{ matrix.target }}/debug/kernal-tauri-smoke
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -834,6 +835,14 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe widget
+      # AppKit proof of the same controls (keep-above level, accessory
+      # activation policy, placement, navigate), from the Linux-built binary.
+      - name: Verify native macOS widget window controls
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          chmod +x target/${{ matrix.target }}/debug/kernal-tauri-smoke
+          target/${{ matrix.target }}/debug/kernal-tauri-smoke widget
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

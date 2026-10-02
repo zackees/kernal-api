@@ -5,6 +5,9 @@
 //! while Tauri requires the event loop to be initialized by the process main
 //! thread on every supported desktop host.
 
+#[path = "kernal-tauri-smoke/widget.rs"]
+mod widget;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::mpsc;
@@ -13,8 +16,9 @@ use std::time::Duration;
 use kernal_api::async_engine;
 use kernal_api::webview::{
     ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPageBootstrap,
-    WebviewPermissions, WebviewTestPresentation, WebviewWindowOptions, WindowOptionsError,
+    WebviewPermissions, WebviewUrlGrant, WebviewWindowOptions,
 };
+use widget::{widget_controls, widget_options, NAVIGATED_QUERY, WIDGET_APP_ID};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scenario = SmokeScenario::from_args()?;
@@ -73,29 +77,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::thread::sleep(Duration::from_secs(1));
             return Ok(());
         }
-        let (mut stream, request) = accept_http_request(&accept, deadline)
-            .map_err(socket_stage("read document request"))?;
-        if !request.starts_with("GET /finished HTTP/1.") {
-            return Err(std::io::Error::other(format!(
-                "unexpected document request: {request:?}"
-            )));
+        serve_isolated_page(&accept, deadline, "/finished", &page)?;
+        if scenario == SmokeScenario::Widget {
+            // The widget then navigates the same view in place; the new page
+            // must report the same absence of host bridges.
+            serve_isolated_page(
+                &accept,
+                deadline,
+                &format!("/finished{NAVIGATED_QUERY}"),
+                &page,
+            )?;
         }
-        write!(
-            stream,
-            "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
-            page.len()
-        )
-        .map_err(socket_stage("write document response"))?;
-        let (mut report, report_request) = accept_http_request(&accept, deadline)
-            .map_err(socket_stage("read isolation request"))?;
-        if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
-            return Err(std::io::Error::other(format!(
-                "page observed a prohibited host bridge: {report_request:?}"
-            )));
-        }
-        report
-            .write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")
-            .map_err(socket_stage("write isolation response"))?;
         Ok(())
     });
 
@@ -135,11 +127,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This process main thread owns the Wry/Tauri event loop. The awaited
     // operation above uses the same caller-provided kernal-api runtime.
     host.run();
-    server.join().map_err(|_| "loopback server panicked")??;
-    result_receiver
+    // A failed lifecycle leaves the server waiting for a page that never
+    // comes; report the lifecycle's own error rather than that consequence.
+    let lifecycle = result_receiver
         .recv_timeout(Duration::from_secs(60))
-        .map_err(|_| "webview lifecycle task did not exit")?
-        .map_err(host_error)?;
+        .map_err(|_| "webview lifecycle task did not exit")?;
+    lifecycle.map_err(host_error)?;
+    server.join().map_err(|_| "loopback server panicked")??;
     Ok(())
 }
 
@@ -338,7 +332,7 @@ async fn lifecycle(
             webview.verify_window_options_for_test(&expected)?;
             webview.close().await
         }
-        (SmokeScenario::Widget, Ok(())) => widget_controls(client, webview).await,
+        (SmokeScenario::Widget, Ok(())) => widget_controls(client, webview, url).await,
         (SmokeScenario::Cancel, Ok(())) => {
             webview.cancel();
             if webview.wait_for_terminal().await != Err(WebviewError::Cancelled) {
@@ -432,12 +426,15 @@ async fn lifecycle(
 }
 
 async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(), WebviewError> {
+    let grant = WebviewUrlGrant::new("http://127.0.0.1:9/stale")?;
     let outcomes = [
         webview.wait_until_loaded(Duration::ZERO).await,
         webview.set_size(320, 240).await,
+        webview.set_position(10, 10).await.map(|_| ()),
         webview.hide().await,
         webview.show().await,
         webview.focus().await,
+        webview.navigate(&grant).await,
     ];
     if outcomes
         .iter()
@@ -449,99 +446,6 @@ async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(
             "revoked webview handle remained usable: {outcomes:?}"
         )))
     }
-}
-
-const WIDGET_APP_ID: &str = "dev.kernal-api.smoke-widget";
-
-fn widget_options() -> Result<WebviewWindowOptions, WebviewError> {
-    Ok(WebviewWindowOptions::new("kernal-api widget", 360, 240)
-        .map_err(|error| WebviewError::HostFailure(error.to_string()))?
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true))
-}
-
-// On an X11 or Wayland display, keep-above is the window manager's or
-// compositor's decision: Wayland compositors ignore the request, and a bare
-// Xvfb has no window manager to grant it. The toolkit then reports what the
-// display decided, so only a host without such a display (WebView2, AppKit)
-// must report it. This reads the launch environment, not the host OS.
-fn keep_above_is_display_policy() -> bool {
-    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-}
-
-async fn await_presentation(
-    webview: &kernal_api::webview::WebviewHandle,
-    what: &str,
-    ready: impl Fn(&WebviewTestPresentation) -> bool,
-) -> Result<WebviewTestPresentation, WebviewError> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let presentation = webview.presentation_for_test()?;
-        if ready(&presentation) {
-            return Ok(presentation);
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(WebviewError::HostFailure(format!(
-                "window did not become {what}: {presentation:?}"
-            )));
-        }
-        async_engine::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-/// Undecorated, transparent, keep-above, skip-taskbar window with an app id:
-/// verify the toolkit received each option, then resize, hide, show, focus,
-/// and close it, leaving no semantic or native state behind. The loopback
-/// server has already required the no-IPC isolation report for this page.
-async fn widget_controls(
-    client: &ExternalWebviewClient,
-    webview: kernal_api::webview::WebviewHandle,
-) -> Result<(), WebviewError> {
-    let options = widget_options()?;
-    webview.verify_window_options_for_test(&options)?;
-    let initial = webview.presentation_for_test()?;
-    eprintln!("widget initial presentation: {initial:?}");
-    if initial.decorated {
-        return Err(WebviewError::HostFailure(
-            "undecorated widget reports decorations".into(),
-        ));
-    }
-    if !keep_above_is_display_policy() && !initial.always_on_top {
-        return Err(WebviewError::HostFailure(
-            "keep-above request did not reach the native window".into(),
-        ));
-    }
-    if webview.set_size(0, 240).await
-        != Err(WebviewError::InvalidWindowOptions(
-            WindowOptionsError::InvalidSize,
-        ))
-    {
-        return Err(WebviewError::HostFailure(
-            "invalid resize was not rejected before native effects".into(),
-        ));
-    }
-    webview.set_size(480, 320).await?;
-    let resized = await_presentation(&webview, "480x320", |presentation| {
-        (presentation.logical_width - 480.0).abs() <= 1.0
-            && (presentation.logical_height - 320.0).abs() <= 1.0
-    })
-    .await?;
-    eprintln!("widget resized: {resized:?}");
-    webview.hide().await?;
-    await_presentation(&webview, "hidden", |presentation| !presentation.visible).await?;
-    webview.show().await?;
-    await_presentation(&webview, "visible", |presentation| presentation.visible).await?;
-    webview.focus().await?;
-    let observation = client.test_observation();
-    if observation.live_resources != 1 || observation.native_backings != 1 {
-        return Err(WebviewError::HostFailure(format!(
-            "presentation operations changed view ownership: {observation:?}"
-        )));
-    }
-    webview.close().await?;
-    assert_clean(client)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,6 +579,38 @@ document.body.append(frame);
         report.write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")?;
     }
     Ok(())
+}
+
+/// Serve one document at `path`, then require its no-IPC isolation report.
+fn serve_isolated_page(
+    accept: &impl Fn() -> std::io::Result<(std::net::TcpStream, std::net::SocketAddr)>,
+    deadline: std::time::Instant,
+    path: &str,
+    page: &str,
+) -> std::io::Result<()> {
+    let (mut stream, request) =
+        accept_http_request(accept, deadline).map_err(socket_stage("read document request"))?;
+    if !request.starts_with(&format!("GET {path} HTTP/1.")) {
+        return Err(std::io::Error::other(format!(
+            "unexpected document request: {request:?}, expected {path}"
+        )));
+    }
+    write!(
+        stream,
+        "HTTP/1.0 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{page}",
+        page.len()
+    )
+    .map_err(socket_stage("write document response"))?;
+    let (mut report, report_request) =
+        accept_http_request(accept, deadline).map_err(socket_stage("read isolation request"))?;
+    if !report_request.starts_with("GET /_isolation?ipc=0&tauri=0&platform=0 ") {
+        return Err(std::io::Error::other(format!(
+            "page observed a prohibited host bridge: {report_request:?}"
+        )));
+    }
+    report
+        .write_all(b"HTTP/1.0 204 No Content\r\nContent-Length: 0\r\n\r\n")
+        .map_err(socket_stage("write isolation response"))
 }
 
 fn assert_clean(client: &ExternalWebviewClient) -> Result<(), WebviewError> {

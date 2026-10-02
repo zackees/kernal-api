@@ -60,7 +60,21 @@ use crate::operations::{HubError, OpaqueToken, OperationHub, Terminal};
 pub(crate) mod capture;
 #[cfg(feature = "tauri-webview-test-support")]
 mod trace;
+mod window_control;
+mod window_options;
 pub use capture::{ViewportCaptureLimits, WebviewSnapshot, WebviewSnapshotChunk};
+#[cfg(feature = "tauri-webview-test-support")]
+pub(crate) use window_control::ExpectedPresentation;
+#[cfg(feature = "tauri-webview-test-support")]
+pub use window_control::WebviewTestPresentation;
+#[cfg(test)]
+use window_control::navigation_grant_target;
+#[cfg(test)]
+use window_options::MAX_APP_ID_BYTES;
+use window_options::validate_app_id;
+pub use window_options::{
+    BestEffort, WebviewWindowOptions, WebviewWindowSupport, WindowOptionsError,
+};
 #[cfg(feature = "tauri-webview-test-support")]
 pub use trace::WebviewTestTraceEvent;
 
@@ -168,6 +182,8 @@ pub(crate) struct NativeWebviewLoop {
 pub(crate) struct NativeWebviewBackend {
     async_runtime: RuntimeHandle,
     wry: WryHandle<()>,
+    // Decided once on the UI thread after the toolkit initialized.
+    support: WebviewWindowSupport,
 }
 
 impl NativeWebviewLoop {
@@ -180,11 +196,16 @@ impl NativeWebviewLoop {
     ) -> Result<(Self, NativeWebviewBackend), NativeWebviewError> {
         #[cfg(target_os = "linux")]
         linux_webkitgtk::prepare_renderer_environment();
-        let runtime = Wry::new(crate::native_webview_window::runtime_init_args(app_id))
+        let init_args = crate::native_webview_window::runtime_init_args(app_id)
+            .map_err(NativeWebviewError::HostFailure)?;
+        let runtime = Wry::new(init_args)
             .map_err(|error| NativeWebviewError::HostFailure(error.to_string()))?;
         let backend = NativeWebviewBackend {
             async_runtime,
             wry: runtime.handle(),
+            support: WebviewWindowSupport::for_host(
+                crate::native_webview_window::display_places_windows(),
+            ),
         };
         Ok((Self { runtime }, backend))
     }
@@ -245,7 +266,7 @@ impl NativeWebviewBackend {
         let created_sender = Arc::new(Mutex::new(Some(created_sender)));
         let native_id = NEXT_LABEL.fetch_add(1, Ordering::Relaxed);
         let label = format!("kernal-api-webview-{native_id}");
-        let window_builder = native_window_builder(request.window.as_ref());
+        let window_builder = native_window_builder(request.window.as_ref(), self.support);
         let pending_window = match PendingWindow::<(), Wry<()>>::new(window_builder, label) {
             Ok(window) => window,
             Err(error) => {
@@ -310,6 +331,11 @@ impl NativeWebviewBackend {
                 .window
                 .as_ref()
                 .is_some_and(WebviewWindowOptions::is_transparent);
+            let skip_taskbar = request
+                .window
+                .as_ref()
+                .is_some_and(WebviewWindowOptions::skips_taskbar);
+            let bootstrap_origin = request.bootstrap.as_ref().map(|_| request.url.origin());
             let result = build_isolated_webview(
                 &window_for_ui,
                 request.url,
@@ -328,15 +354,33 @@ impl NativeWebviewBackend {
                     UI_WEBVIEWS.with(|webviews| {
                         webviews.borrow_mut().insert(native_id, webview);
                     });
-                    let _ = created_sender.send(Ok(NativeWebview {
-                        window: window_for_ui,
-                        native_id,
-                        completion,
-                        load_waiter: Some(load_waiter),
-                        terminal_waiter: Some(terminal_waiter),
-                        close_waiter: Some(close_waiter),
-                        close_requested: AtomicBool::new(false),
-                    }));
+                    let excluded = if skip_taskbar {
+                        crate::native_webview_window::exclude_from_taskbar(&window_for_ui)
+                    } else {
+                        Ok(())
+                    };
+                    match excluded {
+                        Ok(()) => {
+                            let _ = created_sender.send(Ok(NativeWebview {
+                                window: window_for_ui,
+                                native_id,
+                                completion,
+                                load_waiter: Some(load_waiter),
+                                terminal_waiter: Some(terminal_waiter),
+                                close_waiter: Some(close_waiter),
+                                close_requested: AtomicBool::new(false),
+                                skip_taskbar,
+                                bootstrap_origin,
+                            }));
+                        }
+                        Err(error) => {
+                            let removed = UI_WEBVIEWS
+                                .with(|webviews| webviews.borrow_mut().remove(&native_id));
+                            drop(removed);
+                            let _ = window_for_ui.close();
+                            let _ = created_sender.send(Err(NativeWebviewError::HostFailure(error)));
+                        }
+                    }
                 }
                 (Ok(webview), _) => {
                     // Cancellation during UI construction leaves no resource
@@ -376,9 +420,19 @@ pub(crate) struct NativeWebview {
     terminal_waiter: Option<OneshotReceiver<Result<(), NativeWebviewError>>>,
     close_waiter: Option<OneshotReceiver<()>>,
     close_requested: AtomicBool,
+    // Re-asserted on every show: Windows re-adds a taskbar button.
+    skip_taskbar: bool,
+    // A bootstrap view's navigation stays on this origin.
+    bootstrap_origin: Option<url::Origin>,
 }
 
 impl NativeWebview {
+    /// Point the load waiter at a navigated page. A still-pending waiter
+    /// for the previous page ends without a result.
+    pub(crate) fn rearm_load(&mut self, target: Url) {
+        self.load_waiter = Some(self.completion.rearm(target));
+    }
+
     /// Installs one waiter for the requested navigation's finished load.
     /// A resource can have one generated operation waiting at a time.
     pub(crate) fn wait_until_loaded(
@@ -441,8 +495,13 @@ impl Drop for NativeWebview {
 }
 
 struct LoadCompletion {
-    target: Url,
-    sender: Mutex<Option<OneshotSender<Result<Instant, NativeWebviewError>>>>,
+    state: Mutex<LoadTarget>,
+}
+
+// The page a load waiter is waiting for, and its one-shot result channel.
+struct LoadTarget {
+    url: Url,
+    sender: Option<OneshotSender<Result<Instant, NativeWebviewError>>>,
 }
 
 struct TerminalCompletion {
@@ -509,19 +568,33 @@ impl LoadCompletion {
         let (sender, receiver) = async_engine::oneshot_channel();
         (
             Arc::new(Self {
-                target,
-                sender: Mutex::new(Some(sender)),
+                state: Mutex::new(LoadTarget {
+                    url: target,
+                    sender: Some(sender),
+                }),
             }),
             receiver,
         )
     }
 
+    /// Wait for a different page from now on; the previous waiter's sender
+    /// is dropped, so a pending wait for it ends instead of hanging.
+    fn rearm(&self, target: Url) -> OneshotReceiver<Result<Instant, NativeWebviewError>> {
+        let (sender, receiver) = async_engine::oneshot_channel();
+        *self.state.lock().expect("load completion lock poisoned") = LoadTarget {
+            url: target,
+            sender: Some(sender),
+        };
+        receiver
+    }
+
     fn finish(&self, result: Result<(), NativeWebviewError>) {
         let result = result.map(|()| Instant::now());
         let sender = self
-            .sender
+            .state
             .lock()
             .expect("load completion lock poisoned")
+            .sender
             .take();
         if let Some(sender) = sender {
             let _ = sender.send(result);
@@ -529,12 +602,20 @@ impl LoadCompletion {
     }
 
     fn matches_requested(&self, loaded: &Url) -> bool {
-        self.target == *loaded
+        self.state
+            .lock()
+            .expect("load completion lock poisoned")
+            .url
+            == *loaded
     }
 }
 
 /// Carry every validated presentation option into the native window builder.
-fn native_window_builder(options: Option<&WebviewWindowOptions>) -> WindowBuilderWrapper {
+/// A position the display leaves to the compositor is not sent.
+fn native_window_builder(
+    options: Option<&WebviewWindowOptions>,
+    support: WebviewWindowSupport,
+) -> WindowBuilderWrapper {
     let Some(options) = options else {
         return WindowBuilderWrapper::new().title("kernal-api external-content proof");
     };
@@ -544,6 +625,10 @@ fn native_window_builder(options: Option<&WebviewWindowOptions>) -> WindowBuilde
         .decorations(options.decorations)
         .always_on_top(options.always_on_top)
         .skip_taskbar(options.skip_taskbar);
+    let builder = match (options.position, support.position) {
+        (Some((x, y)), BestEffort::Requested) => builder.position(f64::from(x), f64::from(y)),
+        _ => builder,
+    };
     crate::native_webview_window::transparent_window(builder, options.transparent)
 }
 
@@ -801,159 +886,6 @@ impl WebviewPageBootstrap {
     }
 }
 
-/// Invalid presentation options, rejected before allocating native resources.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum WindowOptionsError {
-    #[error("webview title exceeds 1024 UTF-8 bytes or contains a control character")]
-    InvalidTitle,
-    #[error("webview logical width and height must each be between 1 and 16384")]
-    InvalidSize,
-    #[error(
-        "webview app id must be 1 to 255 bytes of dot-separated [A-Za-z0-9_-] elements, \
-         at least two, none empty or starting with a digit"
-    )]
-    InvalidAppId,
-}
-
-/// Longest accepted application id, matching GLib's application-id bound.
-const MAX_APP_ID_BYTES: usize = 255;
-
-/// Validate a reverse-DNS application id before any native effect.
-///
-/// The accepted alphabet is `[A-Za-z0-9._-]`, 1 to 255 bytes. Because GTK
-/// refuses (and tao would then panic on) an id that is not a valid GLib
-/// application id, the id must also have at least two dot-separated elements,
-/// none empty and none starting with a digit. The rule is the same on every
-/// host so a caller's id cannot be valid on one desktop and not another.
-fn validate_app_id(app_id: &str) -> Result<(), WindowOptionsError> {
-    let valid = (1..=MAX_APP_ID_BYTES).contains(&app_id.len())
-        && app_id.contains('.')
-        && app_id.split('.').all(|element| {
-            element
-                .bytes()
-                .next()
-                .is_some_and(|first| !first.is_ascii_digit())
-                && element
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(WindowOptionsError::InvalidAppId)
-    }
-}
-
-/// Validated initial window presentation, independent of page permissions.
-///
-/// Dimensions are logical client-area pixels, not physical screen pixels or
-/// a guarantee of the page's CSS viewport. Desktop window managers may constrain
-/// the requested size. This supplies no script execution or native IPC authority.
-///
-/// The widget builders ([`Self::decorations`], [`Self::transparent`],
-/// [`Self::always_on_top`], [`Self::skip_taskbar`]) only record a request;
-/// nothing native happens until an open. Keep-above and taskbar exclusion are
-/// best effort: a compositor or window manager may ignore them (notably
-/// Wayland). See `docs/tauri-external-content-isolation.md` for the per-host
-/// table.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WebviewWindowOptions {
-    title: String,
-    width: u32,
-    height: u32,
-    decorations: bool,
-    transparent: bool,
-    always_on_top: bool,
-    skip_taskbar: bool,
-}
-
-impl WebviewWindowOptions {
-    /// Validate before copying: title is at most 1024 UTF-8 bytes, with no
-    /// Unicode control characters; each logical dimension is 1 through 16384.
-    /// An empty title is allowed. These are input bounds, not GPU-memory quotas.
-    pub fn new(title: &str, width: u32, height: u32) -> Result<Self, WindowOptionsError> {
-        if title.len() > 1024 || title.chars().any(char::is_control) {
-            return Err(WindowOptionsError::InvalidTitle);
-        }
-        if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
-            return Err(WindowOptionsError::InvalidSize);
-        }
-        Ok(Self {
-            title: title.to_owned(),
-            width,
-            height,
-            decorations: true,
-            transparent: false,
-            always_on_top: false,
-            skip_taskbar: false,
-        })
-    }
-
-    /// Request native title bar and borders (`true`, the default) or an
-    /// undecorated window (`false`).
-    #[must_use]
-    pub const fn decorations(mut self, decorations: bool) -> Self {
-        self.decorations = decorations;
-        self
-    }
-
-    /// Request a transparent window and page background, so only what the
-    /// page paints is visible. Default `false`. On macOS only the page
-    /// background becomes transparent; the window keeps its opaque backing.
-    #[must_use]
-    pub const fn transparent(mut self, transparent: bool) -> Self {
-        self.transparent = transparent;
-        self
-    }
-
-    /// Best effort: ask to keep the window above ordinary windows. Default
-    /// `false`. Wayland compositors decide this themselves and usually ignore
-    /// the request; use a compositor window rule keyed on the host app id.
-    #[must_use]
-    pub const fn always_on_top(mut self, always_on_top: bool) -> Self {
-        self.always_on_top = always_on_top;
-        self
-    }
-
-    /// Best effort: ask to keep the window out of the taskbar. Default
-    /// `false`. Ignored on macOS and by Wayland compositors.
-    #[must_use]
-    pub const fn skip_taskbar(mut self, skip_taskbar: bool) -> Self {
-        self.skip_taskbar = skip_taskbar;
-        self
-    }
-
-    /// Whether native decorations were requested.
-    pub const fn has_decorations(&self) -> bool {
-        self.decorations
-    }
-
-    /// Whether a transparent window and page background were requested.
-    pub const fn is_transparent(&self) -> bool {
-        self.transparent
-    }
-
-    /// Whether keep-above was requested.
-    pub const fn is_always_on_top(&self) -> bool {
-        self.always_on_top
-    }
-
-    /// Whether taskbar exclusion was requested.
-    pub const fn skips_taskbar(&self) -> bool {
-        self.skip_taskbar
-    }
-
-    /// Requested initial native-window title.
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
-    /// Requested initial client-area width and height in logical pixels.
-    pub const fn logical_size(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-}
-
 /// Process-main-thread owner of the opt-in native event loop.
 ///
 /// Construct this on the UI/main thread, hand [`ExternalWebviewClient`] to
@@ -1052,34 +984,6 @@ pub struct WebviewTestObservation {
     pub live_resources: usize,
     /// Pending semantic operations in the shared hub.
     pub pending_operations: usize,
-}
-
-/// Acceptance-only window state as the native toolkit reports it.
-///
-/// These are toolkit observations, not compositor guarantees: on Wayland the
-/// compositor decides keep-above and may never report it.
-#[cfg(feature = "tauri-webview-test-support")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct WebviewTestPresentation {
-    /// Whether the toolkit reports the window as shown.
-    pub visible: bool,
-    /// Whether the window has native decorations.
-    pub decorated: bool,
-    /// Whether the toolkit reports the window as kept above others.
-    pub always_on_top: bool,
-    /// Client-area width in logical pixels.
-    pub logical_width: f64,
-    /// Client-area height in logical pixels.
-    pub logical_height: f64,
-}
-
-/// What the concrete platform tree checks against its native window.
-#[cfg(feature = "tauri-webview-test-support")]
-pub(crate) struct ExpectedPresentation<'a> {
-    pub(crate) app_id: Option<&'a str>,
-    pub(crate) decorations: bool,
-    pub(crate) transparent: bool,
-    pub(crate) skip_taskbar: bool,
 }
 
 struct WebviewService {
@@ -1404,199 +1308,6 @@ impl ExternalWebviewClient {
 }
 
 impl WebviewHandle {
-    fn native_window(&self) -> Result<(WryWindowDispatcher<()>, u64), WebviewError> {
-        // Clone the dispatcher before native synchronous queries: never hold
-        // the backing-table lock while waiting for the UI thread.
-        let native = self
-            .service
-            .native
-            .lock()
-            .map_err(|_| WebviewError::HostFailure("native backing table poisoned".into()))?;
-        let native = native.get(&self.resource).ok_or(WebviewError::WindowClosed)?;
-        Ok((native.window.clone(), native.native_id))
-    }
-
-    /// Acceptance-only check of the native title, logical client-area size,
-    /// decorations, and the host's own evidence for the remaining options.
-    /// Allows one logical pixel of native rounding. Intended for controlled
-    /// desktops: a window manager may legitimately constrain production sizes.
-    ///
-    /// On Linux this also reads back the GTK application id, the GTK
-    /// skip-taskbar hint, and the RGBA visual and transparent WebKit
-    /// background: proof the toolkit received each request, not that a
-    /// compositor honoured it. Keep-above is observed separately through
-    /// [`Self::presentation_for_test`] because a Wayland compositor may refuse it.
-    #[cfg(feature = "tauri-webview-test-support")]
-    pub fn verify_window_options_for_test(
-        &self,
-        expected: &WebviewWindowOptions,
-    ) -> Result<(), WebviewError> {
-        let (window, native_id) = self.native_window()?;
-        let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
-        let title = window.title().map_err(host_error)?;
-        let size = window.inner_size().map_err(host_error)?;
-        let scale = window.scale_factor().map_err(host_error)?;
-        let decorated = window.is_decorated().map_err(host_error)?;
-        if !scale.is_finite()
-            || scale <= 0.0
-            || title != expected.title
-            || decorated != expected.decorations
-            || (f64::from(size.width) / scale - f64::from(expected.width)).abs() > 1.0
-            || (f64::from(size.height) / scale - f64::from(expected.height)).abs() > 1.0
-        {
-            return Err(WebviewError::HostFailure(format!(
-                "window presentation mismatch: title={title:?}, decorated={decorated}, physical_size={size:?}, scale={scale}, expected={expected:?}"
-            )));
-        }
-        let app_id = self.service.app_id.clone();
-        let decorations = expected.decorations;
-        let transparent = expected.transparent;
-        let skip_taskbar = expected.skip_taskbar;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let ui_window = window.clone();
-        window
-            .run_on_main_thread(move || {
-                let expected = ExpectedPresentation {
-                    app_id: app_id.as_deref(),
-                    decorations,
-                    transparent,
-                    skip_taskbar,
-                };
-                let result = UI_WEBVIEWS.with(|webviews| {
-                    crate::native_webview_window::verify_presentation(
-                        &ui_window,
-                        webviews.borrow().get(&native_id),
-                        &expected,
-                    )
-                });
-                let _ = sender.send(result);
-            })
-            .map_err(host_error)?;
-        receiver
-            .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| WebviewError::HostFailure("native presentation check did not run".into()))?
-            .map_err(|mismatch| {
-                WebviewError::HostFailure(format!("native presentation mismatch: {mismatch}"))
-            })
-    }
-
-    /// Acceptance-only snapshot of the window state the native toolkit reports.
-    #[cfg(feature = "tauri-webview-test-support")]
-    pub fn presentation_for_test(&self) -> Result<WebviewTestPresentation, WebviewError> {
-        let (window, _) = self.native_window()?;
-        let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
-        let size = window.inner_size().map_err(host_error)?;
-        let scale = window.scale_factor().map_err(host_error)?;
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(WebviewError::HostFailure(format!(
-                "invalid native scale factor {scale}"
-            )));
-        }
-        Ok(WebviewTestPresentation {
-            visible: window.is_visible().map_err(host_error)?,
-            decorated: window.is_decorated().map_err(host_error)?,
-            always_on_top: window.is_always_on_top().map_err(host_error)?,
-            logical_width: f64::from(size.width) / scale,
-            logical_height: f64::from(size.height) / scale,
-        })
-    }
-
-    /// Request a new logical client-area size, bounded like
-    /// [`WebviewWindowOptions::new`] (each dimension 1 through 16384).
-    ///
-    /// Completes once the native event loop has processed the request. The
-    /// window manager may still constrain the final size. A revoked or closed
-    /// handle returns [`WebviewError::WindowClosed`].
-    pub async fn set_size(&self, width: u32, height: u32) -> Result<(), WebviewError> {
-        if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) {
-            return Err(WebviewError::InvalidWindowOptions(
-                WindowOptionsError::InvalidSize,
-            ));
-        }
-        self.window_operation(move |window| {
-            window.set_size(tauri_runtime::dpi::Size::Logical(
-                tauri_runtime::dpi::LogicalSize::new(f64::from(width), f64::from(height)),
-            ))
-        })
-        .await
-    }
-
-    /// Show the window. Completes once the native event loop has processed
-    /// the request. A revoked or closed handle returns
-    /// [`WebviewError::WindowClosed`].
-    pub async fn show(&self) -> Result<(), WebviewError> {
-        self.window_operation(|window| window.show()).await
-    }
-
-    /// Hide the window without closing it or revoking the handle; the page
-    /// keeps running. Completes once the native event loop has processed the
-    /// request. A revoked or closed handle returns [`WebviewError::WindowClosed`].
-    pub async fn hide(&self) -> Result<(), WebviewError> {
-        self.window_operation(|window| window.hide()).await
-    }
-
-    /// Best effort: ask to focus the window. Window managers may refuse focus
-    /// stealing (Wayland compositors usually do), so success means only that
-    /// the native event loop processed the request. A revoked or closed
-    /// handle returns [`WebviewError::WindowClosed`].
-    pub async fn focus(&self) -> Result<(), WebviewError> {
-        self.window_operation(|window| window.set_focus()).await
-    }
-
-    // One hub-owned presentation operation. Like `close`, the native work is
-    // routed through the Wry dispatcher; the hub owns the operation, and a
-    // concurrent revocation completes it with the revocation's terminal.
-    async fn window_operation(
-        &self,
-        apply: impl FnOnce(&WryWindowDispatcher<()>) -> Result<(), tauri_runtime::Error>,
-    ) -> Result<(), WebviewError> {
-        let operation = self
-            .service
-            .hub
-            .begin_external_webview_window(self.store, self.resource)
-            .map_err(map_hub)?;
-        let mut failure = None;
-        let terminal = match self.native_window() {
-            Err(error) => {
-                failure = Some(error);
-                Terminal::Closed
-            }
-            Ok((window, _)) => {
-                let (sender, receiver) = async_engine::oneshot_channel();
-                // The marker closure follows the request through the event
-                // loop, so completion means the loop has processed it.
-                let dispatched = apply(&window).and_then(|()| {
-                    window.run_on_main_thread(move || {
-                        let _ = sender.send(());
-                    })
-                });
-                match dispatched {
-                    Err(error) => {
-                        failure = Some(WebviewError::HostFailure(error.to_string()));
-                        Terminal::Trapped
-                    }
-                    Ok(()) => match receiver.await {
-                        Ok(()) => Terminal::Completed,
-                        Err(_) => Terminal::Closed,
-                    },
-                }
-            }
-        };
-        self.service
-            .hub
-            .finish_external_operation(operation, terminal);
-        match self.service.hub.observe_terminal(self.store, operation) {
-            Ok(Some(result)) if result.terminal == Terminal::Completed => Ok(()),
-            // A revocation that raced this request owns the typed reason.
-            Ok(Some(result)) if result.terminal != terminal => Err(map_terminal(result.terminal)),
-            Ok(Some(result)) => Err(failure.unwrap_or_else(|| map_terminal(result.terminal))),
-            Ok(None) => Err(WebviewError::HostFailure(
-                "window operation did not complete".into(),
-            )),
-            Err(error) => Err(map_hub(error)),
-        }
-    }
-
     /// Await the requested top-level page's matching `Finished` event.
     /// A timeout revokes this handle and closes the backing native window.
     pub async fn wait_until_loaded(&self, timeout: Duration) -> Result<(), WebviewError> {
@@ -2004,7 +1715,7 @@ mod tests {
     }
 
     #[test]
-    fn app_id_accepts_reverse_dns_up_to_the_glib_bound() {
+    fn app_id_accepts_reverse_dns_up_to_the_shared_bound() {
         let longest = format!("dev.{}", "a".repeat(MAX_APP_ID_BYTES - 4));
         assert_eq!(longest.len(), MAX_APP_ID_BYTES);
         for valid in [
@@ -2034,6 +1745,52 @@ mod tests {
                 "{invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn window_support_reports_compositor_placed_controls_as_unsupported() {
+        let compositor = WebviewWindowSupport::for_host(true);
+        assert_eq!(compositor.position, BestEffort::Unsupported);
+        assert_eq!(compositor.keep_above, BestEffort::Unsupported);
+        assert_eq!(compositor.skip_taskbar, BestEffort::Unsupported);
+        let client_placed = WebviewWindowSupport::for_host(false);
+        assert_eq!(client_placed.position, BestEffort::Requested);
+        assert_eq!(client_placed.keep_above, BestEffort::Requested);
+        assert_eq!(client_placed.skip_taskbar, BestEffort::Requested);
+    }
+
+    #[test]
+    fn navigation_grant_keeps_a_bootstrap_view_on_its_origin() {
+        let origin = Url::parse("http://127.0.0.1:8080/start").unwrap().origin();
+        let same = WebviewUrlGrant::new("http://127.0.0.1:8080/runs/7").unwrap();
+        let other = WebviewUrlGrant::new("http://127.0.0.1:9090/runs/7").unwrap();
+        assert_eq!(
+            navigation_grant_target(&same, Some(&origin)).unwrap().as_str(),
+            "http://127.0.0.1:8080/runs/7"
+        );
+        assert!(matches!(
+            navigation_grant_target(&other, Some(&origin)),
+            Err(WebviewError::RejectedNavigation(_))
+        ));
+        // A script-free view may move to any prevalidated HTTP(S) grant.
+        assert!(navigation_grant_target(&other, None).is_ok());
+    }
+
+    #[test]
+    fn rearmed_load_completion_tracks_only_the_navigated_page() {
+        let first = Url::parse("http://127.0.0.1:8080/a").unwrap();
+        let second = Url::parse("http://127.0.0.1:8080/b").unwrap();
+        let (completion, mut initial) = LoadCompletion::new(first.clone());
+        let mut rearmed = completion.rearm(second.clone());
+        // The superseded waiter ends without a result rather than hanging.
+        assert!(matches!(
+            initial.try_recv(),
+            Err(crate::async_engine::TryRecvError::Disconnected)
+        ));
+        assert!(!completion.matches_requested(&first));
+        assert!(completion.matches_requested(&second));
+        completion.finish(Ok(()));
+        assert!(matches!(rearmed.try_recv(), Ok(Ok(_))));
     }
 
     #[test]

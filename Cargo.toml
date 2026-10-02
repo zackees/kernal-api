@@ -180,6 +180,7 @@ tauri-webview = [
   "dep:windows",
   "dep:windows-core",
   "dep:block2",
+  "dep:objc2",
   "dep:objc2-app-kit",
   "dep:objc2-foundation",
   "dep:objc2-core-foundation",
@@ -404,7 +405,8 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = { version = "=0.6.2", optional = true }
-objc2-app-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSImage", "NSImageRep", "NSGraphicsContext", "NSView", "NSWindow", "objc2-core-graphics"] }
+objc2 = { version = "=0.6.4", optional = true }
+objc2-app-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSApplication", "NSImage", "NSImageRep", "NSGraphicsContext", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "objc2-core-graphics"] }
 objc2-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSError"] }
 objc2-core-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CFString"] }
 objc2-core-graphics = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGDataConsumer", "CGImage"] }
@@ -416,7 +418,7 @@ mach2 = "=0.4.3"
 
 [target.'cfg(windows)'.dependencies]
 webview2-com = { version = "=0.39.1", optional = true }
-windows = { version = "=0.62.2", optional = true, features = ["Win32_System_Com", "Win32_Foundation"] }
+windows = { version = "=0.62.2", optional = true, features = ["Win32_System_Com", "Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows-core = { version = "=0.62.2", optional = true }
 libc = "=0.2.189"
 object = { version = "=0.36.7", default-features = false, features = ["read", "std"], optional = true }

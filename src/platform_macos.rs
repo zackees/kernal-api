@@ -8,6 +8,10 @@ pub(crate) mod scratch_directory;
 #[path = "platform_macos/viewport_capture.rs"]
 pub(crate) mod viewport_capture;
 
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_macos/webview_window.rs"]
+pub(crate) mod webview_window;
+
 #[path = "platform_macos/autostart.rs"]
 pub(crate) mod autostart;
 

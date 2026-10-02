@@ -60,6 +60,8 @@ impl SketchWebviews {
             service: Arc::new(WebviewService {
                 #[cfg(feature = "tauri-webview-test-support")]
                 trace: Arc::clone(&client.service.trace),
+                #[cfg(feature = "tauri-webview-test-support")]
+                app_id: client.service.app_id.clone(),
                 runtime: runtime.clone(),
                 backend: client.service.backend.clone(),
                 hub,

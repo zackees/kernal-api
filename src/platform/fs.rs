@@ -108,7 +108,7 @@ mod materialize;
 #[cfg(feature = "fs")]
 pub use materialize::{
     allocated_bytes, apply_metadata_mode, await_no_writers, classify, extent_sharing, file_change_marker, file_id_width,
-    hard_link_count, make_executable, metadata_mode, native_call_path, path_from_raw_bytes,
+    hard_link_count, make_executable, make_owner_executable, metadata_mode, native_call_path, path_from_raw_bytes,
     set_readonly, symlink_file, sync_directory_if_supported, volume_identity_u128,
     ExtentSharing, FileChangeMarker, LinkKind, WriterWait,
 };

@@ -338,6 +338,11 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
 }
 
 /// Windows has no per-file executable bit.
+pub fn make_owner_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Windows has no per-file executable bit.
 pub fn make_executable(_path: &Path) -> io::Result<()> {
     Ok(())
 }

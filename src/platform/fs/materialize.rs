@@ -185,6 +185,17 @@ pub fn make_executable(path: &Path) -> io::Result<()> {
     native::make_executable(path)
 }
 
+/// Add only the owner's Unix execute bit, retaining the other mode bits, so an
+/// owner-private file (no group or other bits) stays private. Windows has no
+/// per-file execute bit and performs no filesystem operation.
+///
+/// # Errors
+///
+/// On Unix, returns the metadata or permission-change error.
+pub fn make_owner_executable(path: &Path) -> io::Result<()> {
+    native::make_owner_executable(path)
+}
+
 // ---------------------------------------------------------------------------
 // Change markers
 // ---------------------------------------------------------------------------

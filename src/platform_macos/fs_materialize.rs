@@ -167,6 +167,12 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     std::fs::set_permissions(path, permissions)
 }
 
+pub fn make_owner_executable(path: &Path) -> io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o100);
+    std::fs::set_permissions(path, permissions)
+}
+
 pub fn make_executable(path: &Path) -> io::Result<()> {
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_mode(permissions.mode() | 0o111);

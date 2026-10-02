@@ -17,13 +17,38 @@ use tauri_runtime_wry::WindowBuilderWrapper;
 /// Call once, on the UI thread, immediately before the event loop is created.
 /// With an id, this sets GLib's process-wide program name to it; the host owns
 /// the process's only GTK event loop, so no other toolkit user is renamed.
-pub(crate) fn runtime_init_args(app_id: Option<&str>) -> RuntimeInitArgs {
+pub(crate) fn runtime_init_args(app_id: Option<&str>) -> Result<RuntimeInitArgs, String> {
     if let Some(app_id) = app_id {
         gtk::glib::set_prgname(Some(app_id));
     }
-    RuntimeInitArgs {
+    Ok(RuntimeInitArgs {
         app_id: app_id.map(str::to_owned),
-    }
+    })
+}
+
+/// Whether this display's compositor alone places and stacks windows. Call
+/// on the UI thread after the event loop has initialized GTK.
+pub(crate) fn display_places_windows() -> bool {
+    use gtk::glib::prelude::ObjectExt as _;
+
+    gtk::gdk::Display::default()
+        .is_some_and(|display| compositor_places_windows(display.type_().name()))
+}
+
+/// Wayland (xdg-shell) gives a client no say in position or stacking, and
+/// KWin, Mutter and wlroots ignore GTK's keep-above and skip-taskbar hints
+/// there. X11 and Broadway let the client ask.
+fn compositor_places_windows(display_type: &str) -> bool {
+    display_type == "GdkWaylandDisplay"
+}
+
+/// GTK keeps the skip-taskbar hint tao set at creation across hide and show,
+/// so there is nothing to re-assert.
+pub(crate) fn exclude_from_taskbar(
+    window: &tauri_runtime_wry::WryWindowDispatcher<()>,
+) -> Result<(), String> {
+    let _ = window;
+    Ok(())
 }
 
 /// Request an RGBA visual and an app-paintable GTK window.
@@ -104,4 +129,24 @@ pub(crate) fn verify_presentation(
         }
     }
     Ok(())
+}
+
+/// Acceptance-only: tao's inner size is current here.
+#[cfg(feature = "tauri-webview-test-support")]
+pub(crate) fn client_logical_size(
+    window: &tauri_runtime_wry::WryWindowDispatcher<()>,
+) -> Result<Option<(f64, f64)>, String> {
+    let _ = window;
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_wayland_displays_leave_placement_to_the_compositor() {
+        assert!(super::compositor_places_windows("GdkWaylandDisplay"));
+        for client_placed in ["GdkX11Display", "GdkBroadwayDisplay", ""] {
+            assert!(!super::compositor_places_windows(client_placed));
+        }
+    }
 }

@@ -1,7 +1,8 @@
 #![cfg(feature = "tauri-webview")]
 
 use kernal_api::webview::{
-    ExternalWebviewHost, WebviewError, WebviewWindowOptions, WindowOptionsError,
+    BestEffort, ExternalWebviewHost, WebviewError, WebviewWindowOptions, WebviewWindowSupport,
+    WindowOptionsError,
 };
 
 #[test]
@@ -78,7 +79,8 @@ fn invalid_app_ids_are_rejected_before_any_native_host_exists() {
     let runtime = kernal_api::async_engine::RuntimeBuilder::current_thread()
         .build()
         .unwrap();
-    let too_long = format!("dev.{}", "a".repeat(252));
+    // One byte over the AppUserModelID bound shared by every host.
+    let too_long = format!("dev.{}", "a".repeat(125));
     for app_id in [
         "",
         "nodots",
@@ -101,4 +103,48 @@ fn invalid_app_ids_are_rejected_before_any_native_host_exists() {
             "{app_id:?} must be rejected before native effects"
         );
     }
+}
+
+#[test]
+fn initial_position_is_recorded_and_bounded_before_native_effects() {
+    let options = WebviewWindowOptions::new("widget", 72, 72).unwrap();
+    assert_eq!(options.logical_position(), None);
+    let placed = options.clone().initial_position(-1920, 40).unwrap();
+    assert_eq!(placed.logical_position(), Some((-1920, 40)));
+    assert_ne!(placed, options);
+    assert_eq!(
+        options
+            .clone()
+            .initial_position(-32768, 32767)
+            .unwrap()
+            .logical_position(),
+        Some((-32768, 32767))
+    );
+    for (x, y) in [(i32::MIN, 0), (0, i32::MAX), (32768, 0), (0, -32769)] {
+        assert_eq!(
+            options.clone().initial_position(x, y),
+            Err(WindowOptionsError::InvalidPosition),
+            "({x}, {y}) must be rejected before native effects"
+        );
+    }
+}
+
+#[test]
+fn best_effort_outcomes_are_typed_and_distinguish_unsupported() {
+    // A caller matches on the outcome instead of probing strings; an
+    // unsupported request is not an error and not a silent success.
+    let describe = |outcome: BestEffort| match outcome {
+        BestEffort::Requested => "requested",
+        BestEffort::Unsupported => "unsupported",
+    };
+    assert_eq!(describe(BestEffort::Requested), "requested");
+    assert_eq!(describe(BestEffort::Unsupported), "unsupported");
+    assert_ne!(BestEffort::Requested, BestEffort::Unsupported);
+    let support = WebviewWindowSupport {
+        position: BestEffort::Unsupported,
+        keep_above: BestEffort::Unsupported,
+        skip_taskbar: BestEffort::Requested,
+    };
+    assert_eq!(support.position, BestEffort::Unsupported);
+    assert_eq!(support.clone(), support);
 }

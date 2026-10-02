@@ -95,6 +95,47 @@ pub(crate) fn navigation_grant_target(
     }
 }
 
+#[cfg(feature = "tauri-webview-test-support")]
+fn native_scale(window: &WryWindowDispatcher<()>) -> Result<f64, WebviewError> {
+    let scale = window
+        .scale_factor()
+        .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+    if scale.is_finite() && scale > 0.0 {
+        Ok(scale)
+    } else {
+        Err(WebviewError::HostFailure(format!(
+            "invalid native scale factor {scale}"
+        )))
+    }
+}
+
+/// The client area in logical pixels as the window system lays it out. The
+/// platform tree answers on the UI thread where the toolkit's own getter is
+/// stale (macOS: Wry replaces the content view tao measures); otherwise
+/// tao's inner size is used.
+#[cfg(feature = "tauri-webview-test-support")]
+fn logical_client_size(window: &WryWindowDispatcher<()>) -> Result<(f64, f64), WebviewError> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let ui_window = window.clone();
+    window
+        .run_on_main_thread(move || {
+            let _ = sender.send(crate::native_webview_window::client_logical_size(&ui_window));
+        })
+        .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+    let native = receiver
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|_| WebviewError::HostFailure("native size query did not run".into()))?
+        .map_err(WebviewError::HostFailure)?;
+    if let Some(size) = native {
+        return Ok(size);
+    }
+    let scale = native_scale(window)?;
+    let size = window
+        .inner_size()
+        .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
+    Ok((f64::from(size.width) / scale, f64::from(size.height) / scale))
+}
+
 impl ExternalWebviewClient {
     /// Which best-effort window controls this host's display honours.
     ///
@@ -140,18 +181,15 @@ impl WebviewHandle {
         let (window, native_id) = self.native_window()?;
         let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
         let title = window.title().map_err(host_error)?;
-        let size = window.inner_size().map_err(host_error)?;
-        let scale = window.scale_factor().map_err(host_error)?;
+        let size = logical_client_size(&window)?;
         let decorated = window.is_decorated().map_err(host_error)?;
-        if !scale.is_finite()
-            || scale <= 0.0
-            || title != expected.title
+        if title != expected.title
             || decorated != expected.decorations
-            || (f64::from(size.width) / scale - f64::from(expected.width)).abs() > 1.0
-            || (f64::from(size.height) / scale - f64::from(expected.height)).abs() > 1.0
+            || (size.0 - f64::from(expected.width)).abs() > 1.0
+            || (size.1 - f64::from(expected.height)).abs() > 1.0
         {
             return Err(WebviewError::HostFailure(format!(
-                "window presentation mismatch: title={title:?}, decorated={decorated}, physical_size={size:?}, scale={scale}, expected={expected:?}"
+                "window presentation mismatch: title={title:?}, decorated={decorated}, logical_size={size:?}, expected={expected:?}"
             )));
         }
         let app_id = self.service.app_id.clone();
@@ -191,20 +229,15 @@ impl WebviewHandle {
     pub fn presentation_for_test(&self) -> Result<WebviewTestPresentation, WebviewError> {
         let (window, _) = self.native_window()?;
         let host_error = |error: tauri_runtime::Error| WebviewError::HostFailure(error.to_string());
-        let size = window.inner_size().map_err(host_error)?;
+        let (logical_width, logical_height) = logical_client_size(&window)?;
         let position = window.outer_position().map_err(host_error)?;
-        let scale = window.scale_factor().map_err(host_error)?;
-        if !scale.is_finite() || scale <= 0.0 {
-            return Err(WebviewError::HostFailure(format!(
-                "invalid native scale factor {scale}"
-            )));
-        }
+        let scale = native_scale(&window)?;
         Ok(WebviewTestPresentation {
             visible: window.is_visible().map_err(host_error)?,
             decorated: window.is_decorated().map_err(host_error)?,
             always_on_top: window.is_always_on_top().map_err(host_error)?,
-            logical_width: f64::from(size.width) / scale,
-            logical_height: f64::from(size.height) / scale,
+            logical_width,
+            logical_height,
             logical_x: f64::from(position.x) / scale,
             logical_y: f64::from(position.y) / scale,
         })
@@ -218,15 +251,11 @@ impl WebviewHandle {
     /// handle returns [`WebviewError::WindowClosed`].
     pub async fn set_size(&self, width: u32, height: u32) -> Result<(), WebviewError> {
         validate_size(width, height).map_err(WebviewError::InvalidWindowOptions)?;
-        self.native_operation(
-            Authority::Window,
-            move |window| {
-                window.set_size(tauri_runtime::dpi::Size::Logical(
-                    tauri_runtime::dpi::LogicalSize::new(f64::from(width), f64::from(height)),
-                ))
-            },
-            move |window| crate::native_webview_window::settle_size(window, width, height),
-        )
+        self.window_operation(move |window| {
+            window.set_size(tauri_runtime::dpi::Size::Logical(
+                tauri_runtime::dpi::LogicalSize::new(f64::from(width), f64::from(height)),
+            ))
+        })
         .await
     }
 
@@ -242,24 +271,12 @@ impl WebviewHandle {
     pub async fn set_position(&self, x: i32, y: i32) -> Result<BestEffort, WebviewError> {
         validate_position(x, y).map_err(WebviewError::InvalidWindowOptions)?;
         let support = self.service.backend.support.position;
-        let requested = support == BestEffort::Requested;
-        self.native_operation(
-            Authority::Window,
-            move |window| {
-                if requested {
-                    window.set_position(tauri_runtime::dpi::Position::Logical(
-                        tauri_runtime::dpi::LogicalPosition::new(f64::from(x), f64::from(y)),
-                    ))?;
-                }
-                Ok(())
-            },
-            move |window| {
-                if requested {
-                    crate::native_webview_window::settle_position(window, x, y)?;
-                }
-                Ok(())
-            },
-        )
+        self.window_operation(move |window| match support {
+            BestEffort::Unsupported => Ok(()),
+            BestEffort::Requested => window.set_position(tauri_runtime::dpi::Position::Logical(
+                tauri_runtime::dpi::LogicalPosition::new(f64::from(x), f64::from(y)),
+            )),
+        })
         .await?;
         Ok(support)
     }

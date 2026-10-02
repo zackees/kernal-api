@@ -407,9 +407,9 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_40"], optional = true }
 block2 = { version = "=0.6.2", optional = true }
 objc2 = { version = "=0.6.4", optional = true }
 objc2-app-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSApplication", "NSImage", "NSImageRep", "NSGraphicsContext", "NSResponder", "NSRunningApplication", "NSView", "NSWindow", "objc2-core-graphics"] }
-objc2-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSError", "NSGeometry"] }
+objc2-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "NSError"] }
 objc2-core-foundation = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CFString"] }
-objc2-core-graphics = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGDataConsumer", "CGDirectDisplay", "CGImage"] }
+objc2-core-graphics = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGDataConsumer", "CGImage"] }
 objc2-image-io = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "CGImageDestination", "objc2-core-graphics"] }
 objc2-web-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["std", "WKWebView", "WKSnapshotConfiguration", "block2"] }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

@@ -7,20 +7,12 @@
 //! per-window form: it switches the application to the accessory activation
 //! policy (no Dock icon, no menu bar). A transparent NSWindow needs Tauri's
 //! `macos-private-api` feature, which this crate does not enable; only the
-//! WKWebView background is made transparent. tao applies size and position
-//! through an asynchronous main-queue dispatch that the hosted macOS runner
-//! never drained within seconds, so both are also applied directly here, on
-//! the main thread, once the event loop has processed the request.
+//! WKWebView background is made transparent.
 
-use objc2::rc::Retained;
 use objc2::MainThreadMarker;
-use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSView, NSWindow};
-use objc2_core_graphics::{CGDisplayPixelsHigh, CGMainDisplayID};
-use objc2_foundation::{NSPoint, NSSize};
+use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use tauri_runtime::RuntimeInitArgs;
-use tauri_runtime::WindowDispatch as _;
 use tauri_runtime_wry::{WindowBuilderWrapper, WryWindowDispatcher};
-use wry::raw_window_handle::RawWindowHandle;
 
 /// Event-loop arguments. The app id has no macOS effect.
 pub(crate) fn runtime_init_args(app_id: Option<&str>) -> Result<RuntimeInitArgs, String> {
@@ -42,39 +34,30 @@ pub(crate) fn transparent_window(
     builder
 }
 
-fn ns_window(window: &WryWindowDispatcher<()>) -> Result<Retained<NSWindow>, String> {
+/// Acceptance-only: Wry replaces the window's content view with its own
+/// parent view, so tao's inner size measures a detached view and stays at
+/// the creation size. Measure the live content view instead.
+#[cfg(feature = "tauri-webview-test-support")]
+pub(crate) fn client_logical_size(
+    window: &WryWindowDispatcher<()>,
+) -> Result<Option<(f64, f64)>, String> {
+    use objc2_app_kit::NSView;
+    use tauri_runtime::WindowDispatch as _;
+    use wry::raw_window_handle::RawWindowHandle;
+
     let handle = window.window_handle().map_err(|error| error.to_string())?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
         return Err("unexpected native window handle".into());
     };
-    // SAFETY: the AppKit handle's `ns_view` is this live window's content
-    // view, and this runs on the main thread that owns it.
+    // SAFETY: the AppKit handle's `ns_view` is this live window's view, and
+    // this runs on the main thread that owns it.
     let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
-    view.window()
-        .ok_or_else(|| "the content view has no window".to_owned())
-}
-
-/// Apply the logical client-area size now, on the main thread.
-pub(crate) fn settle_size(
-    window: &WryWindowDispatcher<()>,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    ns_window(window)?.setContentSize(NSSize::new(f64::from(width), f64::from(height)));
-    Ok(())
-}
-
-/// Move the outer top-left corner now, on the main thread, using tao's
-/// conversion from top-left logical coordinates to AppKit's bottom-left
-/// screen space (the main display's height).
-pub(crate) fn settle_position(
-    window: &WryWindowDispatcher<()>,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    let top = CGDisplayPixelsHigh(CGMainDisplayID()) as f64;
-    ns_window(window)?.setFrameTopLeftPoint(NSPoint::new(f64::from(x), top - f64::from(y)));
-    Ok(())
+    let content = view
+        .window()
+        .and_then(|window| window.contentView())
+        .ok_or("the view has no window content view")?;
+    let size = content.frame().size;
+    Ok(Some((size.width, size.height)))
 }
 
 /// Hide the application from the Dock and the app switcher. Runs on the

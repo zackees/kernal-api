@@ -52,28 +52,6 @@ fn hwnd(window: &WryWindowDispatcher<()>) -> Result<HWND, String> {
     }
 }
 
-/// tao applies a size request synchronously on its event loop; nothing to
-/// settle.
-pub(crate) fn settle_size(
-    window: &WryWindowDispatcher<()>,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    let _ = (window, width, height);
-    Ok(())
-}
-
-/// tao applies a position request synchronously on its event loop; nothing
-/// to settle.
-pub(crate) fn settle_position(
-    window: &WryWindowDispatcher<()>,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    let _ = (window, x, y);
-    Ok(())
-}
-
 /// Make the window a tool window without an app-window bit, so the taskbar
 /// and Alt+Tab skip it.
 pub(crate) fn exclude_from_taskbar(window: &WryWindowDispatcher<()>) -> Result<(), String> {
@@ -131,4 +109,13 @@ pub(crate) fn verify_presentation(
         ));
     }
     Ok(())
+}
+
+/// Acceptance-only: tao's inner size is current here.
+#[cfg(feature = "tauri-webview-test-support")]
+pub(crate) fn client_logical_size(
+    window: &WryWindowDispatcher<()>,
+) -> Result<Option<(f64, f64)>, String> {
+    let _ = window;
+    Ok(None)
 }

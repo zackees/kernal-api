@@ -124,10 +124,10 @@ adds `kernal-api` a second time, as a build-dependency with only this feature:
 
 ```toml
 [dependencies]
-kernal-api = { version = "=0.1.23", features = ["window-icon"] }
+kernal-api = { version = "=0.1.24", features = ["window-icon"] }
 
 [build-dependencies]
-kernal-api = { version = "=0.1.23", default-features = false, features = ["build-resources"] }
+kernal-api = { version = "=0.1.24", default-features = false, features = ["build-resources"] }
 ```
 
 Features enabled in the `[dependencies]` entry never reach the build script:

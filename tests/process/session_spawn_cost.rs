@@ -9,7 +9,10 @@
 //! the substrate installs both in `pre_exec`, which takes std off its
 //! `posix_spawn` path onto `fork`+`exec`; that fork scales with the parent's
 //! resident size. Spawn admission is free.
-#![cfg(unix)]
+//!
+//! The child is this test binary listing a filter that matches nothing: it
+//! exists on every host and exits 0, and std and every session spawn the same
+//! child, so the reported overhead is comparable across options.
 
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -17,9 +20,16 @@ use std::time::Instant;
 use kernal_api::{ProcessPriority, ProcessSessionOptions, SpawnAdmission, SpawnSpec, StreamMode};
 
 const SPAWNS: u32 = 200;
+const TRIVIAL_ARGS: [&str; 2] = ["--list", "__session_spawn_cost_matches_nothing__"];
+
+fn trivial_child() -> std::path::PathBuf {
+    std::env::current_exe().expect("test binary path")
+}
 
 fn piped() -> SpawnSpec {
-    SpawnSpec::new("true")
+    TRIVIAL_ARGS
+        .iter()
+        .fold(SpawnSpec::new(trivial_child()), |spec, arg| spec.arg(*arg))
         .stdout(StreamMode::Piped)
         .stderr(StreamMode::Piped)
 }
@@ -43,7 +53,8 @@ async fn session_spawn_overhead_against_std_command() {
     for round in 0..3 {
         let start = Instant::now();
         for _ in 0..SPAWNS {
-            let out = Command::new("true")
+            let out = Command::new(trivial_child())
+                .args(TRIVIAL_ARGS)
                 .stdin(Stdio::null())
                 .output()
                 .expect("std spawn");

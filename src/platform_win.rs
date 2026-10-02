@@ -8,6 +8,10 @@ pub(crate) mod scratch_directory;
 #[path = "platform_win/viewport_capture.rs"]
 pub(crate) mod viewport_capture;
 
+#[cfg(feature = "tauri-webview")]
+#[path = "platform_win/webview_window.rs"]
+pub(crate) mod webview_window;
+
 #[path = "platform_win/autostart.rs"]
 pub(crate) mod autostart;
 

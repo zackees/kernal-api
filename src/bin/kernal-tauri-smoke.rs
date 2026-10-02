@@ -13,7 +13,7 @@ use std::time::Duration;
 use kernal_api::async_engine;
 use kernal_api::webview::{
     ExternalWebviewClient, ExternalWebviewHost, WebviewError, WebviewPageBootstrap,
-    WebviewPermissions, WebviewWindowOptions,
+    WebviewPermissions, WebviewTestPresentation, WebviewWindowOptions, WindowOptionsError,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,7 +103,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .worker_threads(2)
         .build()?;
-    let host = ExternalWebviewHost::new(runtime.handle()).map_err(host_error)?;
+    let host = if scenario == SmokeScenario::Widget {
+        ExternalWebviewHost::with_app_id(runtime.handle(), WIDGET_APP_ID)
+    } else {
+        ExternalWebviewHost::new(runtime.handle())
+    }
+    .map_err(host_error)?;
     let client = host.client();
     let url = format!("http://{address}/finished");
     let (result_sender, result_receiver) = mpsc::channel();
@@ -164,7 +169,11 @@ async fn lifecycle(
             ))),
         };
     }
-    let webview = if scenario == SmokeScenario::Close {
+    let webview = if scenario == SmokeScenario::Widget {
+        client
+            .open_webview_with_options(url, widget_options()?, WebviewPermissions::deny_all())
+            .await?
+    } else if scenario == SmokeScenario::Close {
         let window = WebviewWindowOptions::new("kernal-api configured window", 800, 600)
             .map_err(|error| WebviewError::HostFailure(error.to_string()))?;
         client
@@ -329,6 +338,7 @@ async fn lifecycle(
             webview.verify_window_options_for_test(&expected)?;
             webview.close().await
         }
+        (SmokeScenario::Widget, Ok(())) => widget_controls(client, webview).await,
         (SmokeScenario::Cancel, Ok(())) => {
             webview.cancel();
             if webview.wait_for_terminal().await != Err(WebviewError::Cancelled) {
@@ -422,17 +432,121 @@ async fn lifecycle(
 }
 
 async fn require_stale(webview: &kernal_api::webview::WebviewHandle) -> Result<(), WebviewError> {
-    if webview.wait_until_loaded(Duration::ZERO).await == Err(WebviewError::WindowClosed) {
+    let outcomes = [
+        webview.wait_until_loaded(Duration::ZERO).await,
+        webview.set_size(320, 240).await,
+        webview.hide().await,
+        webview.show().await,
+        webview.focus().await,
+    ];
+    if outcomes
+        .iter()
+        .all(|outcome| *outcome == Err(WebviewError::WindowClosed))
+    {
         Ok(())
     } else {
-        Err(WebviewError::HostFailure(
-            "revoked webview handle remained usable".into(),
-        ))
+        Err(WebviewError::HostFailure(format!(
+            "revoked webview handle remained usable: {outcomes:?}"
+        )))
     }
+}
+
+const WIDGET_APP_ID: &str = "dev.kernal-api.smoke-widget";
+
+fn widget_options() -> Result<WebviewWindowOptions, WebviewError> {
+    Ok(WebviewWindowOptions::new("kernal-api widget", 360, 240)
+        .map_err(|error| WebviewError::HostFailure(error.to_string()))?
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true))
+}
+
+// On an X11 or Wayland display, keep-above is the window manager's or
+// compositor's decision: Wayland compositors ignore the request, and a bare
+// Xvfb has no window manager to grant it. The toolkit then reports what the
+// display decided, so only a host without such a display (WebView2, AppKit)
+// must report it. This reads the launch environment, not the host OS.
+fn keep_above_is_display_policy() -> bool {
+    std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+async fn await_presentation(
+    webview: &kernal_api::webview::WebviewHandle,
+    what: &str,
+    ready: impl Fn(&WebviewTestPresentation) -> bool,
+) -> Result<WebviewTestPresentation, WebviewError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let presentation = webview.presentation_for_test()?;
+        if ready(&presentation) {
+            return Ok(presentation);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(WebviewError::HostFailure(format!(
+                "window did not become {what}: {presentation:?}"
+            )));
+        }
+        async_engine::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Undecorated, transparent, keep-above, skip-taskbar window with an app id:
+/// verify the toolkit received each option, then resize, hide, show, focus,
+/// and close it, leaving no semantic or native state behind. The loopback
+/// server has already required the no-IPC isolation report for this page.
+async fn widget_controls(
+    client: &ExternalWebviewClient,
+    webview: kernal_api::webview::WebviewHandle,
+) -> Result<(), WebviewError> {
+    let options = widget_options()?;
+    webview.verify_window_options_for_test(&options)?;
+    let initial = webview.presentation_for_test()?;
+    eprintln!("widget initial presentation: {initial:?}");
+    if initial.decorated {
+        return Err(WebviewError::HostFailure(
+            "undecorated widget reports decorations".into(),
+        ));
+    }
+    if !keep_above_is_display_policy() && !initial.always_on_top {
+        return Err(WebviewError::HostFailure(
+            "keep-above request did not reach the native window".into(),
+        ));
+    }
+    if webview.set_size(0, 240).await
+        != Err(WebviewError::InvalidWindowOptions(
+            WindowOptionsError::InvalidSize,
+        ))
+    {
+        return Err(WebviewError::HostFailure(
+            "invalid resize was not rejected before native effects".into(),
+        ));
+    }
+    webview.set_size(480, 320).await?;
+    let resized = await_presentation(&webview, "480x320", |presentation| {
+        (presentation.logical_width - 480.0).abs() <= 1.0
+            && (presentation.logical_height - 320.0).abs() <= 1.0
+    })
+    .await?;
+    eprintln!("widget resized: {resized:?}");
+    webview.hide().await?;
+    await_presentation(&webview, "hidden", |presentation| !presentation.visible).await?;
+    webview.show().await?;
+    await_presentation(&webview, "visible", |presentation| presentation.visible).await?;
+    webview.focus().await?;
+    let observation = client.test_observation();
+    if observation.live_resources != 1 || observation.native_backings != 1 {
+        return Err(WebviewError::HostFailure(format!(
+            "presentation operations changed view ownership: {observation:?}"
+        )));
+    }
+    webview.close().await?;
+    assert_clean(client)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SmokeScenario {
+    Widget,
     OpenCancel,
     CaptureCancel,
     Capture,
@@ -450,6 +564,7 @@ impl SmokeScenario {
         match std::env::args().nth(1).as_deref() {
             Some("bootstrap") => Ok(Self::Bootstrap),
             None | Some("close") => Ok(Self::Close),
+            Some("widget") => Ok(Self::Widget),
             Some("capture") => Ok(Self::Capture),
             Some("capture-cancel") => Ok(Self::CaptureCancel),
             Some("open-cancel") => Ok(Self::OpenCancel),
@@ -459,7 +574,7 @@ impl SmokeScenario {
             Some("cancel") => Ok(Self::Cancel),
             Some("window-close") => Ok(Self::WindowClose),
             Some(other) => Err(format!(
-                "unknown smoke scenario {other:?}; use bootstrap, capture, capture-cancel, open-cancel, close, popup, redirect, timeout, cancel, or window-close"
+                "unknown smoke scenario {other:?}; use bootstrap, capture, capture-cancel, open-cancel, close, widget, popup, redirect, timeout, cancel, or window-close"
             )
             .into()),
         }
@@ -468,6 +583,7 @@ impl SmokeScenario {
     fn page(self, address: &str) -> String {
         let action = match self {
             Self::Close
+            | Self::Widget
             | Self::Bootstrap
             | Self::Capture
             | Self::CaptureCancel

@@ -307,6 +307,7 @@ jobs:
           WEBKIT_DISABLE_COMPOSITING_MODE: "1"
         run: |
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- close
+          dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- widget
           dbus-run-session -- xvfb-run -a soldr cargo run --locked --all-features --bin kernal-tauri-smoke -- bootstrap
           # Expand fixture variables inside the child Bash, not this step shell.
           # shellcheck disable=SC2016
@@ -829,6 +830,10 @@ jobs:
         if: matrix.target == 'x86_64-pc-windows-msvc'
         shell: bash
         run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe window-close
+      - name: Verify native Windows widget window controls
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: target/x86_64-pc-windows-msvc/debug/kernal-tauri-smoke.exe widget
       - name: Preserve screenshot and process diagnostics
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

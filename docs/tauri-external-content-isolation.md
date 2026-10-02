@@ -82,7 +82,7 @@ binary from the ephemeral shell rather than from a Nix-wrapped derivation:
 nix-shell -p pkg-config gtk3 webkitgtk_4_1 xorg-server xauth xvfb-run --run 'LD_LIBRARY_PATH=$(printf "%s" "$NIX_LDFLAGS" | tr " " "\n" | sed -n "s/^-L//p" | paste -sd:); export LD_LIBRARY_PATH; GDK_BACKEND=x11 xvfb-run -a soldr --jobs 2 cargo run --locked --features tauri-webview-test-support --bin kernal-tauri-smoke -j 1 -- close'
 ```
 
-Replace `close` with `bootstrap`, `popup`, `redirect`, `timeout`, `cancel`,
+Replace `close` with `widget`, `bootstrap`, `popup`, `redirect`, `timeout`, `cancel`,
 `window-close`, `capture`, `capture-cancel`, or `open-cancel` to exercise
 isolation and cleanup paths. The test-support feature is accepted only for
 this executable proof and exposes aggregate semantic counts, never backend
@@ -129,3 +129,70 @@ of the tested IPC bridges, and rejection of cross-origin navigation. The HTTP
 fixture permits automatic favicon requests without counting them as an expected
 page request; it still rejects other unexpected paths. The fixture regression
 tests that distinction independently of native browser scheduling.
+
+## Widget window controls (#384, first slice)
+
+`WebviewWindowOptions` records four more presentation requests. They are
+plain values and have no native effect until an open; the existing title and
+size bounds still apply. None of them adds script, navigation, or IPC
+authority, and the loopback no-IPC proof runs with all of them enabled.
+
+```rust
+let options = WebviewWindowOptions::new("bosn", 360, 240)?
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true);
+let host = ExternalWebviewHost::with_app_id(runtime.handle(), "dev.bosn.widget")?;
+```
+
+`ExternalWebviewHost::with_app_id` validates the id before any native effect:
+1 to 255 bytes of `[A-Za-z0-9._-]`, at least two dot-separated elements, none
+empty and none starting with a digit. The narrower element rule is GLib's: GTK
+refuses any other id, and tao would panic on it, so the facade rejects it on
+every host with `WindowOptionsError::InvalidAppId`.
+
+After an open, `WebviewHandle::set_size`, `show`, `hide`, and `focus` each
+reserve a hub operation under a dedicated window right, dispatch through the
+Wry window dispatcher, and complete once the native event loop has processed
+the request. A revoked or closed handle returns `WebviewError::WindowClosed`,
+like every other operation on a stale generation. `hide` keeps the page alive
+and the handle valid. `set_size` uses the same 1-16384 logical-pixel bound as
+the options and rejects other values before native effects.
+
+What each request does depends on the host. "Toolkit" means the request
+reaches the native toolkit; the compositor or window manager can still
+refuse it.
+
+| Request | Linux Wayland (GTK 3) | Linux X11 | Windows | macOS |
+| --- | --- | --- | --- | --- |
+| app id | `xdg_toplevel` app id | `WM_CLASS` from GLib program name | ignored | ignored (bundle id comes from `Info.plist`) |
+| `decorations(false)` | applied (GTK draws no CSD) | applied | applied | applied |
+| `transparent(true)` | RGBA window and WebKit background | same, needs a compositing WM | layered window and WebView2 background | WKWebView background only; the NSWindow stays opaque (needs Tauri's `macos-private-api`) |
+| `always_on_top(true)` | ignored by the compositor; use a KWin window rule keyed on the app id | honoured by an EWMH window manager | `HWND_TOPMOST` | floating window level |
+| `skip_taskbar(true)` | ignored (no protocol); use a window rule | `_NET_WM_STATE_SKIP_TASKBAR` | removed from the taskbar | ignored |
+| `set_size` | applied | applied | applied | applied |
+| `show` / `hide` | applied (hide unmaps the toplevel) | applied | applied | applied |
+| `focus` | the compositor may refuse | WM focus-stealing policy applies | foreground rules apply | applied |
+
+On Linux the app id is used twice before GTK initializes: as the GTK
+application id, which GTK registers on the D-Bus session bus, and as GLib's
+process-wide program name, which is what GTK 3 actually sends as the Wayland
+app id and uses for the X11 `WM_CLASS`. Run one process per app id. The host
+owns the process's GTK event loop, so renaming the program affects only it.
+
+The `widget` smoke scenario opens an undecorated, transparent, keep-above,
+skip-taskbar window under an app id. The loopback server requires the no-IPC
+report from the page, and `verify_window_options_for_test` reads back the GTK
+application id, program name, decoration, skip-taskbar hint, RGBA visual and
+app-paintable state, and the WebKit background alpha. The scenario then
+rejects an out-of-range resize, resizes, hides, shows, focuses, closes, and
+requires that no semantic or native state remains. Keep-above is required
+only on hosts without an X11 or Wayland display: a bare Xvfb has no window
+manager to grant it, and Wayland compositors ignore it. The stale-handle
+checks in `timeout`, `cancel`, and `window-close` also require all four
+operations to return `WindowClosed`.
+
+Not in this slice: `set_position`, `initial_position`, a typed `Unsupported`
+result for keep-above on Wayland, layer-shell anchoring, `navigate`, and real
+Windows/macOS app-id and macOS window transparency.

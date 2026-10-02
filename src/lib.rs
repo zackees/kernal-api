@@ -164,6 +164,8 @@ mod tauri;
 
 #[cfg(feature = "tauri-webview")]
 pub(crate) use platform_imp::viewport_capture as native_viewport_capture;
+#[cfg(feature = "tauri-webview")]
+pub(crate) use platform_imp::webview_window as native_webview_window;
 
 #[cfg(feature = "wasm-sketch-worker")]
 pub(crate) use platform_imp::scratch_directory::Anchor as ScratchDirectoryAnchor;
@@ -181,6 +183,8 @@ pub mod webview {
     pub use crate::tauri::capture::WebviewTestUiPause;
     #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestObservation;
+    #[cfg(feature = "tauri-webview-test-support")]
+    pub use crate::tauri::WebviewTestPresentation;
     #[cfg(feature = "tauri-webview-test-support")]
     pub use crate::tauri::WebviewTestTraceEvent;
     pub use crate::tauri::{

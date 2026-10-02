@@ -97,6 +97,9 @@ const SYNTHETIC_RESOURCE_KIND: u8 = 1;
 pub(crate) const EXTERNAL_WEBVIEW_RESOURCE_KIND: u8 = 2;
 const EXTERNAL_WEBVIEW_RIGHT_LOAD: u8 = 0b01;
 const EXTERNAL_WEBVIEW_RIGHT_CAPTURE: u8 = 0b10;
+// Native presentation control: resize, show, hide, and focus. Granted with
+// every opened view; it confers no navigation, script, or IPC authority.
+const EXTERNAL_WEBVIEW_RIGHT_WINDOW: u8 = 0b100;
 const BLOB_RESOURCE_KIND: u8 = 3;
 const BLOB_RIGHT_READ: u8 = 0b01;
 const BLOB_RIGHT_WRITE: u8 = 0b10;
@@ -810,7 +813,9 @@ impl OperationHub {
         let resource = self.create_resource_value(
             store,
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
-            EXTERNAL_WEBVIEW_RIGHT_LOAD | EXTERNAL_WEBVIEW_RIGHT_CAPTURE,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD
+                | EXTERNAL_WEBVIEW_RIGHT_CAPTURE
+                | EXTERNAL_WEBVIEW_RIGHT_WINDOW,
             false,
             ResourceValue::ExternalWebview,
         )?;
@@ -875,7 +880,9 @@ impl OperationHub {
         let resource = self.create_resource_value(
             store,
             EXTERNAL_WEBVIEW_RESOURCE_KIND,
-            EXTERNAL_WEBVIEW_RIGHT_LOAD | EXTERNAL_WEBVIEW_RIGHT_CAPTURE,
+            EXTERNAL_WEBVIEW_RIGHT_LOAD
+                | EXTERNAL_WEBVIEW_RIGHT_CAPTURE
+                | EXTERNAL_WEBVIEW_RIGHT_WINDOW,
             false,
             ResourceValue::ExternalWebview,
         )?;
@@ -911,6 +918,17 @@ impl OperationHub {
         resource: OpaqueToken,
     ) -> Result<OpaqueToken, HubError> {
         self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_CAPTURE)
+    }
+
+    /// Reserve one native presentation change (resize, show, hide, focus).
+    /// Like close, physical work belongs to the private backend; the hub
+    /// owns the operation and wakes it with the revocation's terminal reason.
+    pub(crate) fn begin_external_webview_window(
+        &self,
+        store: u64,
+        resource: OpaqueToken,
+    ) -> Result<OpaqueToken, HubError> {
+        self.begin_external_webview_operation(store, resource, EXTERNAL_WEBVIEW_RIGHT_WINDOW)
     }
 
     fn begin_external_webview_operation(
@@ -5204,6 +5222,70 @@ mod tests {
             assert_eq!(snapshot.pending_operations, 0, "{terminal:?}");
             assert_eq!(snapshot.live_resources, 0, "{terminal:?}");
         }
+    }
+
+    #[test]
+    fn window_presentation_operations_need_their_own_right_and_a_live_generation() {
+        let hub = OperationHub::new(4, 2).unwrap();
+        let (resource, open) = hub.begin_external_webview_open(7).unwrap();
+        hub.finish_external_open(open, resource);
+        assert!(hub.observe_terminal(7, open).unwrap().is_some());
+        let window = hub.begin_external_webview_window(7, resource).unwrap();
+        assert_eq!(
+            hub.begin_external_webview_window(8, resource),
+            Err(HubError::WrongRights),
+            "another logical instance cannot resize, show, hide, or focus this view"
+        );
+        hub.finish_external_operation(window, Terminal::Completed);
+        assert_eq!(
+            hub.observe_terminal(7, window),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Completed,
+                resource: None,
+            }))
+        );
+        // A view reserved without the window right (load-only authority)
+        // cannot be repositioned through presentation operations.
+        let load_only = hub
+            .create_resource_value(
+                7,
+                EXTERNAL_WEBVIEW_RESOURCE_KIND,
+                EXTERNAL_WEBVIEW_RIGHT_LOAD,
+                false,
+                ResourceValue::ExternalWebview,
+            )
+            .unwrap();
+        hub.state
+            .lock()
+            .unwrap()
+            .resources
+            .get_mut(&load_only)
+            .unwrap()
+            .reserved = false;
+        assert_eq!(
+            hub.begin_external_webview_window(7, load_only),
+            Err(HubError::WrongRights)
+        );
+        hub.close_resource(load_only).unwrap();
+        // A pending presentation operation observes the revocation's typed
+        // terminal, and the stale generation then reports Closed.
+        let pending = hub.begin_external_webview_window(7, resource).unwrap();
+        hub.revoke_external_resource(resource, Terminal::Closed)
+            .unwrap();
+        assert_eq!(
+            hub.observe_terminal(7, pending),
+            Ok(Some(TerminalResult {
+                terminal: Terminal::Closed,
+                resource: None,
+            }))
+        );
+        assert_eq!(
+            hub.begin_external_webview_window(7, resource),
+            Err(HubError::Closed)
+        );
+        let snapshot = hub.snapshot();
+        assert_eq!(snapshot.pending_operations, 0);
+        assert_eq!(snapshot.live_resources, 0);
     }
 
     #[test]

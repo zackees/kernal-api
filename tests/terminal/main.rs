@@ -11,3 +11,5 @@ mod terminal_keys;
 mod terminal_style;
 mod webview_page_bootstrap;
 mod webview_window_options;
+
+mod system_tray;

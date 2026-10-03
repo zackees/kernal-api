@@ -200,3 +200,15 @@ It does not rename or combine third-party source files.
 ## License
 
 BSD 3-Clause, matching the platform implementation from running-process.
+
+### Desktop status area
+
+The optional `system-tray` feature exposes `system_tray::{TrayOptions, TrayHandle,
+TrayEvent}` without exporting toolkit or D-Bus types. Register from an existing
+`async_engine` runtime; registration and status updates are bounded. Linux uses
+the KDE/freedesktop StatusNotifierItem protocol. Windows and macOS currently
+return `TrayError::Unsupported`, so callers retain their existing status window.
+Keep a visible fallback whenever `is_online()` becomes false; a returning desktop
+host reclaims the same item. Activation/menu events use a bounded queue, and
+dropping the handle unregisters the item. The icon remains `Active` while idle so
+the desktop can keep it visible; user tray visibility preferences still apply.

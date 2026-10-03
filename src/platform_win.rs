@@ -1,5 +1,10 @@
 //! Windows implementation root for the process capability.
 
+#[cfg(feature = "system-tray")]
+#[path = "platform_win/system_tray.rs"]
+pub(crate) mod system_tray;
+
+
 #[cfg(feature = "wasm-sketch-worker")]
 #[path = "platform_win/scratch_directory.rs"]
 pub(crate) mod scratch_directory;

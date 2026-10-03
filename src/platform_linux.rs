@@ -1,5 +1,10 @@
 //! Linux implementation root for the process capability.
 
+#[cfg(feature = "system-tray")]
+#[path = "platform_linux/system_tray.rs"]
+pub(crate) mod system_tray;
+
+
 #[cfg(feature = "wasm-sketch-worker")]
 #[path = "platform/scratch_directory.rs"]
 pub(crate) mod scratch_directory;

@@ -142,11 +142,37 @@ def document(argv: list[str]) -> dict[str, JsonValue]:
     return raw
 
 
+def run_fast_guards() -> None:
+    """Catch workflow and source guard failures before paying for an engine."""
+    subprocess.run(
+        [
+            "uv",
+            "run",
+            "--no-project",
+            "--python",
+            "3.12",
+            "python",
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            "ci",
+            "-p",
+            "test_*.py",
+        ],
+        cwd=ROOT,
+        check=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--job", choices=("linux", "dylints"), default="linux")
     args = parser.parse_args()
     verify_pr_base(output(["git", "symbolic-ref", "refs/remotes/origin/HEAD"]).strip())
+    if output(["git", "status", "--porcelain", "--untracked-files=normal"]).strip():
+        raise ValueError("commit the worktree before running its local gate")
+    run_fast_guards()
     verify_native_host(
         native_host(
             output(
@@ -154,8 +180,6 @@ def main() -> None:
             ).strip(),
         )
     )
-    if output(["git", "status", "--porcelain", "--untracked-files=normal"]).strip():
-        raise ValueError("commit the worktree before running its local gate")
     sha = output(["git", "rev-parse", "HEAD"]).strip()
     submitted = document(
         [

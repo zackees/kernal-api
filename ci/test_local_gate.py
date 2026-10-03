@@ -1,16 +1,47 @@
 """The local gate accepts only completed, source-bound act2 evidence."""
 
+import subprocess
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from ci.local_gate import (
     NativeHost,
     RunProof,
+    main,
     verify_native_host,
     verify_pr_base,
     verify_run,
 )
+
+
+class FastPreflightTests(unittest.TestCase):
+    def test_failing_guards_never_submit_an_engine_run(self):
+        with (
+            patch("sys.argv", ["local_gate.py"]),
+            patch(
+                "ci.local_gate.output",
+                side_effect=[
+                    "refs/remotes/origin/main",
+                    "",
+                    "linux/x86_64",
+                    "a" * 40,
+                ],
+            ),
+            patch(
+                "ci.local_gate.native_host",
+                return_value=NativeHost("Linux", "x86_64", "linux/x86_64"),
+            ),
+            patch("ci.local_gate.document", return_value={"run": "stub"}) as submit,
+            patch(
+                "ci.local_gate.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, ["guards"]),
+            ),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                main()
+            submit.assert_not_called()
 
 
 class PrBaseTests(unittest.TestCase):

@@ -364,9 +364,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0ff903e7b61396a074648fc6301668492de90aea4b5d09cc914eee9389e9b"
+checksum = "c040ca81d60235a6027ef3115629049829464758e1011500902c8a2355727812"
 dependencies = [
  "libc",
  "running-process-platform-internal",
@@ -379,11 +379,12 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e5db04a966dfead09ff660b704c2461a05e8477249b8f10532b41a22219348"
+checksum = "0ef39418f8c71399ea811c5daba36f2325516cc02c3b2169473400411941ed5f"
 dependencies = [
  "libc",
+ "miniz_oxide",
  "sysinfo",
  "thiserror",
  "tokio",

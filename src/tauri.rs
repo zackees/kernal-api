@@ -254,6 +254,10 @@ impl NativeWebviewBackend {
         })?
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn create_on_wry_thread(
         &self,
         request: NativeWebviewRequest,

@@ -129,6 +129,13 @@ fn make_operation_yield_async(output: &Path) -> std::io::Result<()> {
         },
     )?;"#;
     let source = source.replace(old, new);
+    // The generated dispatch linker exceeds Clippy's default line ceiling.
+    // Keep its measured expectation generator-owned so regeneration preserves
+    // the function-level ratchet rather than a whole generated-file waiver.
+    let source = source.replace(
+        "pub(crate) fn link_kernal_api_v1<T>",
+        "#[expect(\n    clippy::too_many_lines,\n    reason = \"Existing function complexity measured at ratchet adoption\"\n)]\npub(crate) fn link_kernal_api_v1<T>",
+    );
     fs::write(path, format!("{}\n", source.trim_end()))
 }
 

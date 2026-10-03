@@ -164,6 +164,10 @@ struct Tracee {
     origin: Option<TraceOriginArtifact>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn trace_loop(
     mut child: Child,
     shared: Arc<Shared>,

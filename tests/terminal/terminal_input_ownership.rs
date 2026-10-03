@@ -15,6 +15,11 @@ fn stdin_mode() -> libc::termios {
 }
 
 #[test]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn native_session_rejects_overlap_and_restores_mode() {
     if std::env::var_os("KERNAL_INPUT_OWNERSHIP_CHILD").is_some() {
         let before = stdin_mode();

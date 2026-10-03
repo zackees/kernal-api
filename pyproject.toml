@@ -34,3 +34,6 @@ include = [
   "/LICENSE",
   "/README.md",
 ]
+
+[tool.ruff.lint]
+select = ["C901", "RUF100"]

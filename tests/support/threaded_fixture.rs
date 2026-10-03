@@ -29,6 +29,10 @@ pub(crate) fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) {
     body.extend(contents);
     section(0, body, output);
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 pub(crate) fn threaded_root_wasm(
     proc_exit: Option<i32>,
     rejected: bool,

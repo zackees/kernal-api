@@ -143,7 +143,7 @@ def build_resources_consumer_failures() -> list[str]:
     return failures
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901 -- Existing dependency-boundary checks; ratchet complexity 13.
     default_graph = tree("")
     failures: list[str] = []
     # TOML already builds the kernel's catalog. Only its runtime edge is opt-in.

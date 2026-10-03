@@ -369,6 +369,10 @@ mod tests {
     /// capture and deferred unwinding as a raw return address.
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn known_blocked_stack_contains_marker_frame() {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::mpsc;

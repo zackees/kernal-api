@@ -101,6 +101,11 @@ impl Default for F {
         }
     }
 }
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn wasm(f: F) -> Vec<u8> {
     let mut w = b"\0asm\x01\0\0\0".to_vec();
     let mut t = Vec::new();

@@ -550,6 +550,10 @@ fn daemon_registration_remains_opt_in_and_client_free() {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn daemon_registration_v2_remains_opt_in_and_client_free() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("read manifest");

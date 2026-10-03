@@ -155,6 +155,11 @@ fn actual_screenshot_guest_native_capture_quota_failure_drains_containment() {
 }
 
 #[cfg(all(feature = "wasm-sketch-worker", feature = "tauri-webview-test-support"))]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn run_contained_screenshot(scenario: ContainedScenario) {
     use kernal_api::wasm::{SketchEpochLimits, SketchWorkerConfig, SketchWorkerTerminal};
     use std::io::{Read, Write};
@@ -591,6 +596,11 @@ fn default_screenshot_cli_publication_failure_cleans_staging() {
 
 #[cfg(feature = "tauri-webview-test-support")]
 #[cfg(feature = "wasm-sketch-worker")]
+#[expect(
+    clippy::cognitive_complexity,
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn run_native_screenshot_proof(scenario: NativeScenario) {
     use std::io::{Read, Write};
     use std::sync::{

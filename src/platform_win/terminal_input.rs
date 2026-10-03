@@ -273,6 +273,7 @@ pub(crate) fn trace_translated_console_key_event(
 
 #[cfg(windows)]
 /// Translates a Windows console key event into PTY input bytes.
+#[expect(clippy::too_many_lines, reason = "Existing console-key translation is 221 lines")]
 pub(crate) fn translate_console_key_event(
     record: &winapi::um::wincontypes::KEY_EVENT_RECORD,
 ) -> Option<TerminalInputEventRecord> {

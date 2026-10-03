@@ -525,6 +525,10 @@ exclude = [
 [workspace.lints.rust]
 warnings = "deny"
 
+[workspace.lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
 # The six supported targets, identical to ci.toml's [platforms] (ci-lint
 # CT-006). Soldr reads this only for `soldr lint`'s cross-target Clippy.
 [workspace.metadata.soldr]

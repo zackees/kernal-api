@@ -55,6 +55,10 @@ impl OperationHub {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn read_next_archive_entry(
         self: &Arc<Self>,
         store: u64,

@@ -72,6 +72,10 @@ fn run_with_io<R: io::Read, W: io::Write>(
     Ok(Some((request_id, metadata, module)))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn execute_request(
     request_id: u64,
     metadata: ExecuteMetadata,

@@ -1081,6 +1081,7 @@ enum CreateMode {
 /// closed; child is running). For [`CreateMode::Contained`]: child is
 /// still suspended; the caller must assign it to a Job Object then call
 /// `ResumeThread(thread_handle)` and `CloseHandle(thread_handle)`.
+#[expect(clippy::too_many_lines, reason = "Existing Windows process creation is 121 lines")]
 fn create_process_inner(
     command: &mut Command,
     stdin: &OwnedHandle,

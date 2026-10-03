@@ -191,6 +191,10 @@ fn custom(name: &str, contents: &[u8], output: &mut Vec<u8>) {
 // intentionally unexported: Wasmtime runs it during instantiate, not by
 // calling exported `_start` or `kernal-api-run` separately.
 #[allow(dead_code)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn legacy_threaded_root_wasm(
     proc_exit: Option<i32>,
     assert_thread_spawn_rejection: bool,

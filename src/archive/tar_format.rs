@@ -192,6 +192,10 @@ impl<R: Read> Read for Guard<R> {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 pub(super) fn extract_tar(
     file: File,
     dest: &Path,

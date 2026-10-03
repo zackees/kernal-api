@@ -55,6 +55,10 @@ fn build_guest() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(admitted)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args_os().skip(1);
     let (mut url, mut output, mut module) = (None, None, None);

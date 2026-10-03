@@ -1022,6 +1022,8 @@ jobs:
       # ~70 s of this job's ~3.5 min critical path. Each lane logs to its own
       # file, printed in a group once all three finish, and every failing
       # lane is named.
+      - name: Verify nightly checksum invalidation
+        run: uv run --no-project --python 3.12 python ci/dylint_freshness.py
       - name: Lint every client-style target
         env:
           # Do not trust a partially restored global crates.io source tree.

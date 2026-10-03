@@ -7,6 +7,7 @@ jobs remain remote until their complete coverage has local evidence.
 from __future__ import annotations
 
 import json
+import platform
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -15,6 +16,25 @@ from pathlib import Path
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ".github/workflows/ci.yml"
+
+
+@dataclass(frozen=True)
+class NativeHost:
+    system: str
+    machine: str
+    docker_platform: str
+
+
+def verify_native_host(host: NativeHost) -> None:
+    """This lane cannot attest x64 tests through ARM emulation or another OS."""
+    if (
+        host.system != "Linux"
+        or host.machine.lower() not in {"x86_64", "amd64"}
+        or host.docker_platform.lower() not in {"linux/x86_64", "linux/amd64"}
+    ):
+        raise ValueError(
+            "minimal Linux attestation requires a native Linux x64 host and Docker daemon"
+        )
 
 
 @dataclass(frozen=True)
@@ -115,6 +135,15 @@ def document(argv: list[str]) -> dict[str, JsonValue]:
 
 
 def main() -> None:
+    verify_native_host(
+        NativeHost(
+            platform.system(),
+            platform.machine(),
+            output(
+                ["docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"]
+            ).strip(),
+        )
+    )
     if output(["git", "status", "--porcelain", "--untracked-files=normal"]).strip():
         raise ValueError("commit the worktree before running its local gate")
     sha = output(["git", "rev-parse", "HEAD"]).strip()

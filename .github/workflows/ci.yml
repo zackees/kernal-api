@@ -53,10 +53,11 @@ jobs:
           ref: 9e44971219cd870a2263fa694debc94f57722405
           path: .ci-lint
           persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
       - name: Verify local gate attestation (shadow)
         env:
           PYTHONPATH: .ci-lint
-        run: python3 -m ci_lint local-gate verify --repo .
+        run: uv run --no-project --python 3.12 python -m ci_lint local-gate verify --repo .
 
   # Four work jobs set up once and do everything that belongs on each runner.
   # Full mode adds one small coverage sentinel after those jobs finish.

@@ -4,7 +4,23 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from ci.local_gate import RunProof, verify_run
+from ci.local_gate import NativeHost, RunProof, verify_native_host, verify_run
+
+
+class NativeHostTests(unittest.TestCase):
+    def test_linux_x64_host_and_daemon_pass(self):
+        verify_native_host(NativeHost("Linux", "x86_64", "linux/x86_64"))
+        verify_native_host(NativeHost("Linux", "amd64", "linux/amd64"))
+
+    def test_arm_emulation_remote_arm_and_other_os_fail(self):
+        for host in (
+            NativeHost("Linux", "aarch64", "linux/x86_64"),
+            NativeHost("Linux", "x86_64", "linux/aarch64"),
+            NativeHost("Darwin", "x86_64", "linux/x86_64"),
+            NativeHost("Linux", "x86_64", "unknown"),
+        ):
+            with self.subTest(host=host), self.assertRaises(ValueError):
+                verify_native_host(host)
 
 
 class RunProofTests(unittest.TestCase):

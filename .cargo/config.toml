@@ -1,0 +1,6 @@
+# Dylint already uses a pinned nightly. Compare source contents after a fresh
+# checkout instead of rebuilding identical sources just because mtimes changed.
+# Stable Cargo ignores this nightly-only setting. Build-script inputs retain
+# Cargo's normal mtime invalidation; never rewrite restored cache timestamps.
+[unstable]
+checksum-freshness = true

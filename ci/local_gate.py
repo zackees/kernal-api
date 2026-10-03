@@ -7,22 +7,19 @@ jobs remain remote until their complete coverage has local evidence.
 from __future__ import annotations
 
 import json
-import platform
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+if __package__:
+    from .platform_host import NativeHost, native_host
+else:
+    from platform_host import NativeHost, native_host
+
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ".github/workflows/ci.yml"
-
-
-@dataclass(frozen=True)
-class NativeHost:
-    system: str
-    machine: str
-    docker_platform: str
 
 
 def verify_native_host(host: NativeHost) -> None:
@@ -136,9 +133,7 @@ def document(argv: list[str]) -> dict[str, JsonValue]:
 
 def main() -> None:
     verify_native_host(
-        NativeHost(
-            platform.system(),
-            platform.machine(),
+        native_host(
             output(
                 ["docker", "info", "--format", "{{.OSType}}/{{.Architecture}}"]
             ).strip(),

@@ -188,7 +188,7 @@ pub fn spawn_sync_daemon(
 
     crate::platform::process::configure_sync_daemon_command(command)?;
 
-    let child = command.spawn()?;
+    let child = crate::ape::spawn_std(command, |command| command.spawn())?;
     let pid = child.id();
     Ok(crate::platform::process::DaemonChild {
         pid,
@@ -208,7 +208,7 @@ pub fn spawn_sync(
 
     crate::platform::process::configure_sync_contained_command(command)?;
 
-    let mut child = command.spawn()?;
+    let mut child = crate::ape::spawn_std(command, |command| command.spawn())?;
     let pid = child.id();
     let pgid = pid as i32;
 

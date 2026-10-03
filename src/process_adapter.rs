@@ -318,9 +318,9 @@ pub(crate) fn run_bounded(
         )));
     }
     let fallback = priority_fallback(&spec);
-    match run_bounded_once(spec, timeout, output_limit) {
+    match run_bounded_once(&spec, timeout, output_limit) {
         Err(error) if priority_refused(&error) => match fallback {
-            Some(fallback) => run_bounded_once(fallback, timeout, output_limit),
+            Some(fallback) => run_bounded_once(&fallback, timeout, output_limit),
             None => Err(error),
         },
         result => result,
@@ -334,7 +334,7 @@ pub(crate) fn run_bounded(
 }
 
 fn run_bounded_once(
-    spec: SpawnSpec,
+    spec: &SpawnSpec,
     timeout: Option<Duration>,
     output_limit: usize,
 ) -> Result<running_process::RunOutput, ProcessError> {
@@ -594,7 +594,7 @@ fn stdio(mode: StreamMode) -> AsyncStdio {
     }
 }
 
-fn std_command(spec: SpawnSpec) -> (std::process::Command, bool, crate::ProcessPriority) {
+fn std_command(spec: &SpawnSpec) -> (std::process::Command, bool, crate::ProcessPriority) {
     let SpawnSpec {
         program,
         args,
@@ -610,17 +610,43 @@ fn std_command(spec: SpawnSpec) -> (std::process::Command, bool, crate::ProcessP
         priority_policy: _,
         admission: _,
     } = spec;
-    let kill_when_owner_dies = binds_to_spawner(lifetime_owner);
-    let mut command = std::process::Command::new(program);
-    command.args(args);
+    let kill_when_owner_dies = binds_to_spawner(*lifetime_owner);
+    // An APE image runs through its planned loader on a host that cannot
+    // exec it. Planned here rather than after a refusal: the bounded
+    // runner's containment hooks route std through `execvp`, which would
+    // hand a refused image to `/bin/sh` without reporting the refusal.
+    let options = crate::ape::ApeOptions::with_overrides(
+        *clear_env,
+        env.iter()
+            .map(|(key, value)| (key.as_os_str(), Some(value.as_os_str()))),
+    );
+    let mut ape_path = None;
+    let mut command = match crate::ape::plan_launch(program, current_dir.as_deref(), &options) {
+        Some(launch) => {
+            ape_path = launch.child_path(options.path.as_deref());
+            let mut command = std::process::Command::new(launch.loader());
+            command.args(launch.args(args));
+            command
+        }
+        None => {
+            let mut command = std::process::Command::new(program);
+            command.args(args);
+            command
+        }
+    };
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
     }
-    if clear_env {
+    if *clear_env {
         command.env_clear();
     }
-    command.envs(env);
-    (command, kill_when_owner_dies, priority)
+    command.envs(env.iter().map(|(key, value)| (key, value)));
+    // Last, so the loader's `ape` directory leads whatever search path the
+    // caller set: APE programs the child spawns in turn find a loader there.
+    if let Some(path) = ape_path {
+        command.env("PATH", path);
+    }
+    (command, kill_when_owner_dies, *priority)
 }
 
 fn process_capture_error(error: ProcessError) -> ProcessCaptureError {

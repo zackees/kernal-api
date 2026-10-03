@@ -20,7 +20,8 @@ class Result:
 
 def check(root: Path, *, value: str = "A", feature: bool = False) -> Result:
     """Capture to a file so an inherited pipe cannot hold the caller open."""
-    env = dict(os.environ, PROBE_VALUE=value)
+    # setup-soldr enables colour globally; fixture diagnostics are machine-read.
+    env = dict(os.environ, PROBE_VALUE=value, CARGO_TERM_COLOR="never")
     command = [
         "soldr",
         "rustup",

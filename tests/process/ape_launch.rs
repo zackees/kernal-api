@@ -304,10 +304,15 @@ fn command_routes_a_real_image_through_its_loader() {
     if ape::runs_natively() {
         return;
     }
+    // Plan first, then hold the fork lock only across the spawn: planning
+    // may install the loader under the exclusive half of the same lock.
+    let mut command = std::process::Command::new("unused");
     let output = when_idle(
         || {
+            command = ape::command(hello());
+            command.arg("cmd");
             let _fork = ape::fork_guard();
-            ape::command(hello()).arg("cmd").output()
+            command.output()
         },
         io_busy,
     )

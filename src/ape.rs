@@ -218,6 +218,8 @@ pub fn plan_launch(
 /// its planned loader, with this process's environment as the child's. Use in
 /// place of `Command::new` for an external tool. A relative `program` path
 /// resolves against this process's working directory.
+///
+/// Call it without holding a [`ForkGuard`]: planning may install a loader.
 pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
     running_process::ape::command(program)
 }
@@ -226,8 +228,12 @@ pub fn command(program: impl AsRef<OsStr>) -> std::process::Command {
 ///
 /// Hold it across a spawn this crate does not perform, so a loader being
 /// written by another thread cannot leak into the forked child and make the
-/// loader's own launch fail with "Text file busy". Never hold it while
-/// planning a launch.
+/// loader's own launch fail with "Text file busy".
+///
+/// Never hold it while planning a launch ([`plan_launch`], [`command`]):
+/// planning may install a loader under the exclusive half of the same lock,
+/// and the thread would deadlock waiting on itself. Build the command first,
+/// then take the guard for the spawn alone.
 pub struct ForkGuard {
     _guard: std::sync::RwLockReadGuard<'static, ()>,
 }

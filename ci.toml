@@ -103,6 +103,17 @@ runner = "bosn-act"
 lanes  = ["precheck"]
 cache  = "machine"
 
+# First rollout lane: the exact remote minimal Linux job in bosn/act2.
+# Remote jobs keep running until verifier wiring and coverage are validated.
+[local.gate]
+run = ["uv", "run", "--no-project", "--python", "3.12", "python", "ci/local_gate.py"]
+mode = "shadow"
+verify = "ci.yml:verify"
+
+[local.gate.lanes.linux-minimal]
+run = ["uv", "run", "--no-project", "--python", "3.12", "python", "ci/local_gate.py"]
+tools = ["bosn", "uv"]
+
 [allow]
 workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "auto-release.yml" = ["workflow_dispatch"], "release.yml" = ["workflow_call"], "macos-x64-tests.yml" = ["schedule", "workflow_dispatch"] }
 actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]
@@ -118,7 +129,10 @@ setup-uv    = { require = { save-cache = "plan" } }
 # creates the GitHub release; publish-crates mints crates.io's OIDC token.
 permissions = { "actions: write" = ["linux", "build", "test", "dylints", "cache-retention", "release", "release-guard", "validate-and-package", "symbolizer-workers", "publish-pypi", "release-assets", "publish-crates"], "contents: write" = ["release", "release-assets"], "id-token: write" = ["publish-crates"] }
 platform-selector = "src/lib.rs"
-platform-code     = ["src/platform_win*.rs", "src/platform_win/**", "src/platform_linux*.rs", "src/platform_linux/**", "src/platform_macos*.rs", "src/platform_macos/**"]   # AGENTS.md concrete trees
+# The CI host-facts facade owns Python host queries for GATE-011 fidelity;
+# callers consume its typed record. Production Rust selectors remain confined
+# to the concrete trees below (LAYOUT-001).
+platform-code     = ["src/platform_win*.rs", "src/platform_win/**", "src/platform_linux*.rs", "src/platform_linux/**", "src/platform_macos*.rs", "src/platform_macos/**", "ci/platform_host.py"]
 
 [publish]
 pypi = { auth = "token", environment = "release", mode = "real" }

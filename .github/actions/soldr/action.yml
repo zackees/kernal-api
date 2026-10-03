@@ -97,7 +97,9 @@ runs:
         # generation, and concurrent producers on two runtimes cannot restore
         # each other's exact-only cook bases. ci.toml records this as an
         # [[exceptions]] entry for ci-lint RUST-013.
-        version: 0.9.23
+        # Includes soldr#3430: resolve/fetch managed clang and lld when the
+        # host has neither, rather than generating a broken `exec clang` shim.
+        version: 0.9.29
         cook-delta: false # per-commit delta layer off (setup-soldr#528)
         save-cache: ${{ inputs.save-cache }}
         cache-key-suffix: ${{ inputs.save-cache == 'true' && inputs.cache-key-pr != '' && (inputs.cache-key-suffix != '' && format('{0}-{1}', inputs.cache-key-suffix, inputs.cache-key-pr) || inputs.cache-key-pr) || inputs.cache-key-suffix }}

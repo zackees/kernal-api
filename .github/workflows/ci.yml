@@ -36,6 +36,29 @@ permissions:
   actions: read
 
 jobs:
+  # Shadow rollout: measure missing/stale local proof while preserving all
+  # existing remote checks. No job is skipped on the strength of this stamp.
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: zackees/ci.yml
+          ref: 9e44971219cd870a2263fa694debc94f57722405
+          path: .ci-lint
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+      - name: Verify local gate attestation (shadow)
+        env:
+          PYTHONPATH: .ci-lint
+        run: uv run --no-project --python 3.12 python -m ci_lint local-gate verify --repo .
+
   # Four work jobs set up once and do everything that belongs on each runner.
   # Full mode adds one small coverage sentinel after those jobs finish.
   #
@@ -59,6 +82,7 @@ jobs:
   # removes. On Linux the builder is the host, so everything runs in place,
   # on one runner: the Linux-only checks first, then lint and the full suite.
   linux:
+    needs: verify
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -144,7 +168,7 @@ jobs:
           uv run --no-project -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
             ci.test_ci_modes ci.test_release_ci_gate \
-            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features \
+            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features ci.test_local_gate \
             ci.test_cache_policy ci.test_prune_obsolete_cook_caches
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
@@ -864,6 +888,7 @@ jobs:
   # `linux` costs nothing scarce, and waiting added the gate's ~2.3 min to
   # the PR critical path. It selects its own mode and SHA the same way.
   dylints:
+    needs: verify
     name: Dylint workspace
     env:
       DYLINT_TOOLCHAIN: nightly-2026-05-28

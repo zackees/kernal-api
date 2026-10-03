@@ -1,0 +1,9 @@
+# The minimal Linux workflow lane proves exactly these checks. Full-feature,
+# Dylint and other native platforms still need their own successful local lanes.
+# No remote job is mapped yet: linux also serves full mode, whose coverage this
+# minimal lane cannot prove. Every remote check continues to run.
+version: 1
+gates:
+  general/all/ci-guards: {lane: linux-minimal, fidelity: native}
+  rust/x86_64-unknown-linux-gnu/default-facade-clippy: {lane: linux-minimal, fidelity: native}
+  rust/x86_64-unknown-linux-gnu/default-facade-test: {lane: linux-minimal, fidelity: native}

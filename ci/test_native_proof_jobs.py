@@ -28,6 +28,7 @@ TARGETS = {target for _, target in HOSTS}
 # `linux` rather than in the per-target matrices.
 GATE_TARGET = "x86_64-unknown-linux-gnu"
 EXPECTED_JOBS = {
+    "verify",
     "linux",
     "build",
     "test",
@@ -74,6 +75,10 @@ class NativeProofJobsTests(unittest.TestCase):
         """
         jobs = set(re.findall(r"(?m)^  ([\w-]+):\n", self.text().split("\njobs:\n", 1)[1]))
         self.assertEqual(jobs, EXPECTED_JOBS)
+        verifier = self.job("verify")
+        self.assertIn("local-gate verify", verifier)
+        self.assertNotRegex(verifier.split("steps:", 1)[0], r"(?m)^    if:")
+        self.assertNotRegex(verifier, COMPILES)
 
     def test_cache_retention_is_an_after_producer_maintenance_job(self):
         """Cache deletion must wait for all producer post-steps and run only on main."""
@@ -105,10 +110,10 @@ class NativeProofJobsTests(unittest.TestCase):
 
     def test_every_other_platform_waits_for_linux(self):
         """A red Linux run must not cost an Apple or Windows runner."""
-        self.assertNotIn("needs:", self.job("linux").split("steps:", 1)[0])
+        self.assertIn("needs: verify", self.job("linux").split("steps:", 1)[0])
         self.assertIn("needs: linux", self.job("build"))
-        # Dylint is one Linux runner, so it starts beside the gate.
-        self.assertNotIn("needs:", self.job("dylints").split("steps:", 1)[0])
+        # Dylint starts beside Linux after the non-compiling verifier.
+        self.assertIn("needs: verify", self.job("dylints").split("steps:", 1)[0])
         self.assertIn("needs: [linux, build]", self.job("test"))
 
     def test_routine_failure_cancels_but_full_mode_reports_every_leg(self):

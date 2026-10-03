@@ -235,7 +235,13 @@ fn a_refused_image_that_is_not_ape_keeps_its_error() {
 /// The cosmocc hello-world (`tests/fixtures/ape-hello`): a fat x86_64 +
 /// aarch64 APE image that prints `hello world` and its arguments.
 fn hello() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ape-hello/hello.com")
+    // The runtime variable, not `env!`: CI runs these tests from an archive
+    // built on another host, and nextest's `--workspace-remap` sets this to
+    // the checkout the fixture actually lives in.
+    let root = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    root.join("tests/fixtures/ape-hello/hello.com")
 }
 
 /// Whether this host runs the real image through its own embedded loader,

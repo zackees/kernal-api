@@ -41,7 +41,7 @@ SETUP_SOLDR = re.compile(
 # Pin the runtime independently of the action SHA. A floating `latest` Soldr
 # release creates another cache generation and makes concurrent producers
 # disagree about which exact-only cook base they can restore.
-SOLDR_RUNTIME_VERSION = "0.9.23"
+SOLDR_RUNTIME_VERSION = "0.9.29"
 
 # Every setup-soldr step, keyed by (workflow, job): the target it cooks for
 # and the profile it compiles. A new step must be classified here, so its

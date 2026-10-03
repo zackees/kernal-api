@@ -213,6 +213,12 @@ jobs:
           soldr cargo test --locked --lib --
           --skip platform_linux::tests::current_executable_exposes_a_gnu_build_id
       - name: Test the Linux desktop status facade
+        if: steps.mode.outputs.mode != 'full'
+        run: |
+          soldr cargo test --locked --no-default-features --features system-tray --lib system_tray
+          soldr cargo test --locked --no-default-features --features system-tray --test terminal system_tray
+      - name: Test the full Linux desktop status facade
+        if: steps.mode.outputs.mode == 'full'
         run: |
           soldr cargo test --locked --all-features --lib system_tray
           soldr cargo test --locked --all-features --test terminal system_tray

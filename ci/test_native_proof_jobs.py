@@ -314,6 +314,9 @@ class NativeProofJobsTests(unittest.TestCase):
                 if command.startswith("soldr cargo test --locked --lib --"):
                     # The routine gate intentionally exercises the default graph.
                     continue
+                if command.startswith("soldr cargo test --locked --no-default-features --features system-tray "):
+                    # The routine desktop facade graph deliberately excludes GTK.
+                    continue
                 if "--manifest-path" in command or any(feature in command for feature in unification):
                     continue
                 self.assertIn("--all-features", command)
@@ -321,6 +324,17 @@ class NativeProofJobsTests(unittest.TestCase):
         # against prebuilt binaries; the script stays a local entry point.
         self.assertNotIn("build-threaded-smoke", linux)
         self.assertNotIn("build-threaded-smoke", self.job("test"))
+
+    def test_desktop_status_preserves_minimal_and_full_feature_graphs(self):
+        minimal = self.step("linux", "Test the Linux desktop status facade")
+        full = self.step("linux", "Test the full Linux desktop status facade")
+        self.assertIn("if: steps.mode.outputs.mode != 'full'", minimal)
+        self.assertIn("if: steps.mode.outputs.mode == 'full'", full)
+        for selector in ("--lib system_tray", "--test terminal system_tray"):
+            self.assertIn(f"--features system-tray {selector}", minimal)
+            self.assertIn(f"--all-features {selector}", full)
+        self.assertIn("--no-default-features", minimal)
+        self.assertNotIn("--all-features", minimal)
 
     def test_feature_isolation_checks_share_one_runner(self):
         """36 isolated `cargo check`s are one step, not 36 runners."""

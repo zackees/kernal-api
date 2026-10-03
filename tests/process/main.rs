@@ -5,6 +5,7 @@
 //! crate's whole graph. Test IDs are now `process::<module>::<test>`.
 //! See AGENTS.md for the rule.
 
+mod ape_launch;
 mod executable_naming;
 mod foreground_command;
 mod interrupt_notification;

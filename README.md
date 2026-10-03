@@ -6,7 +6,7 @@ native/process substrate, and adds stable application contracts for async
 execution, hashing, diagnostics, profiling, symbolization, allocation,
 networking, storage, and other common capabilities. The private
 `running-process` phase-1 adapter has landed: this crate depends on the exact
-published `running-process` 4.10.14 registry release unconditionally. Like
+published `running-process` 4.10.16 registry release unconditionally. Like
 Tokio, it is a private backend: no `running-process` type appears in this
 crate's public API, including the facade-owned placement contract behind the
 explicit `independent-spawn` feature.
@@ -27,6 +27,9 @@ package and repository identity on crates.io, PyPI, and GitHub.
 - `kernal_api::async_engine`, backed by exactly Tokio 1.53.1 in this release
 - `kernal_api::hash`, with kernel-owned BLAKE3 byte, reader, and file digest
   operations
+- `kernal_api::ape`, which runs Cosmopolitan Actually Portable Executables on
+  hosts with no APE `binfmt_misc` handler (stock NixOS, containers, macOS)
+  through their own embedded loader; every spawn path applies it
 
 The async facade also owns cooperative cancellation plus separate connection
 and transfer-progress timeout policies. A connection is bounded by a fixed
@@ -46,7 +49,7 @@ direct use of implementation crates owned by this package.
 ## Rust features
 
 The base crate contains the async process/host facade. Its bounded process
-adapter uses `running-process` 4.10.14; that dependency is mandatory, not
+adapter uses `running-process` 4.10.16; that dependency is mandatory, not
 feature-gated. Backend types, `running-process` included, remain private.
 With `independent-spawn`,
 `SpawnMode::Inherited` remains the default; `SpawnMode::Independent` requires
@@ -124,10 +127,10 @@ adds `kernal-api` a second time, as a build-dependency with only this feature:
 
 ```toml
 [dependencies]
-kernal-api = { version = "=0.1.25", features = ["window-icon"] }
+kernal-api = { version = "=0.1.26", features = ["window-icon"] }
 
 [build-dependencies]
-kernal-api = { version = "=0.1.25", default-features = false, features = ["build-resources"] }
+kernal-api = { version = "=0.1.26", default-features = false, features = ["build-resources"] }
 ```
 
 Features enabled in the `[dependencies]` entry never reach the build script:

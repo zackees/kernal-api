@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -148,7 +154,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kernal-api"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "blake3",
  "libc",
@@ -204,6 +210,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
 ]
 
 [[package]]
@@ -278,9 +293,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0ff903e7b61396a074648fc6301668492de90aea4b5d09cc914eee9389e9b"
+checksum = "c040ca81d60235a6027ef3115629049829464758e1011500902c8a2355727812"
 dependencies = [
  "libc",
  "running-process-platform-internal",
@@ -293,11 +308,12 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e5db04a966dfead09ff660b704c2461a05e8477249b8f10532b41a22219348"
+checksum = "0ef39418f8c71399ea811c5daba36f2325516cc02c3b2169473400411941ed5f"
 dependencies = [
  "libc",
+ "miniz_oxide",
  "sysinfo",
  "thiserror",
  "tokio",

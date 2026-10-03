@@ -108,7 +108,7 @@ mod materialize;
 #[cfg(feature = "fs")]
 pub use materialize::{
     allocated_bytes, apply_metadata_mode, await_no_writers, classify, extent_sharing, file_change_marker, file_id_width,
-    hard_link_count, make_executable, metadata_mode, native_call_path, path_from_raw_bytes,
+    hard_link_count, make_executable, make_owner_executable, metadata_mode, native_call_path, path_from_raw_bytes,
     set_readonly, symlink_file, sync_directory_if_supported, volume_identity_u128,
     ExtentSharing, FileChangeMarker, LinkKind, WriterWait,
 };
@@ -190,6 +190,9 @@ pub struct ContextPathMetadata {
     pub modified: Option<SystemTime>,
     /// Stable identity when observed from an open regular-file handle.
     pub identity: Option<FileIdentity>,
+    /// A regular file with any Unix execute bit set. Always `false` for other
+    /// kinds, and on Windows, which has no per-file execute bit.
+    pub executable: bool,
 }
 
 /// A bounded regular-file read together with its final-handle observation.
@@ -247,6 +250,7 @@ pub(crate) fn context_regular_file_metadata(
         len: Some(metadata.len()),
         modified: Some(metadata.modified()?),
         identity: Some(identity),
+        executable: crate::native_fs_materialize::metadata_executable(metadata),
     })
 }
 
@@ -263,6 +267,7 @@ pub fn context_path_metadata_no_follow(path: &Path) -> io::Result<ContextPathMet
         len: (kind == ContextPathKind::RegularFile).then_some(metadata.len()),
         modified: metadata.modified().ok(),
         identity: None,
+        executable: crate::native_fs_materialize::metadata_executable(&metadata),
     })
 }
 

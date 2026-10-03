@@ -194,3 +194,69 @@ fn bounded_context_read_refuses_synthetic_regular_file_with_incoherent_length() 
         ErrorKind::InvalidData
     );
 }
+
+#[test]
+fn context_metadata_reports_whether_a_regular_file_is_executable() {
+    use kernal_api::platform::fs::{context_path_metadata_no_follow, make_executable};
+
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("tool");
+    fs::write(&file, b"#!/bin/sh\n").unwrap();
+    assert!(!context_path_metadata_no_follow(&file).unwrap().executable);
+    assert!(
+        !read_context_regular_file_bounded(&file, 16)
+            .unwrap()
+            .metadata
+            .executable
+    );
+
+    make_executable(&file).unwrap();
+    // Windows has no per-file execute bit, so nothing there is executable.
+    let expected = !kernal_api::platform::host::target_is_windows();
+    assert_eq!(
+        context_path_metadata_no_follow(&file).unwrap().executable,
+        expected
+    );
+    assert_eq!(
+        read_context_regular_file_bounded(&file, 16)
+            .unwrap()
+            .metadata
+            .executable,
+        expected
+    );
+    assert!(
+        !context_path_metadata_no_follow(directory.path())
+            .unwrap()
+            .executable
+    );
+}
+
+#[test]
+fn an_owner_executable_private_file_stays_private() {
+    use kernal_api::platform::fs::{
+        context_path_metadata_no_follow, create_private_file, make_owner_executable,
+        read_private_regular_file_bounded,
+    };
+    use std::io::Write as _;
+
+    let windows = kernal_api::platform::host::target_is_windows();
+    let directory = kernal_api::platform::fs::TemporaryDirectory::new().unwrap();
+    let file = directory.path().join("tool");
+    create_private_file(&file)
+        .unwrap()
+        .write_all(b"#!/bin/sh\n")
+        .unwrap();
+    make_owner_executable(&file).unwrap();
+    assert_eq!(
+        context_path_metadata_no_follow(&file).unwrap().executable,
+        !windows
+    );
+    // Windows has no execute bit to add, and its private reads also require a
+    // protected-DACL parent that this temporary directory does not have.
+    if !windows {
+        assert_eq!(
+            read_private_regular_file_bounded(&file, 16).unwrap(),
+            b"#!/bin/sh\n"
+        );
+    }
+}

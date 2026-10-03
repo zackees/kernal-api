@@ -319,6 +319,11 @@ pub fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
     u32::from(metadata.permissions().readonly())
 }
 
+/// Windows has no per-file executable bit.
+pub fn metadata_executable(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 pub fn apply_metadata_mode(path: &Path, mode: u32) -> io::Result<()> {
     set_readonly(path, mode != 0)
 }
@@ -330,6 +335,11 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     }
     permissions.set_readonly(readonly);
     std::fs::set_permissions(path, permissions)
+}
+
+/// Windows has no per-file executable bit.
+pub fn make_owner_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 /// Windows has no per-file executable bit.

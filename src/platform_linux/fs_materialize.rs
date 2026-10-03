@@ -187,6 +187,10 @@ pub fn metadata_mode(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode()
 }
 
+pub fn metadata_executable(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
+
 pub fn apply_metadata_mode(path: &Path, mode: u32) -> io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
@@ -199,6 +203,12 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
         permissions.mode() | 0o200
     };
     permissions.set_mode(mode);
+    std::fs::set_permissions(path, permissions)
+}
+
+pub fn make_owner_executable(path: &Path) -> io::Result<()> {
+    let mut permissions = std::fs::metadata(path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o100);
     std::fs::set_permissions(path, permissions)
 }
 

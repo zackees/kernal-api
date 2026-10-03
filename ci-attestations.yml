@@ -1,9 +1,13 @@
-# The minimal Linux workflow lane proves exactly these checks. Full-feature,
-# Dylint and other native platforms still need their own successful local lanes.
-# No remote job is mapped yet: linux also serves full mode, whose coverage this
-# minimal lane cannot prove. Every remote check continues to run.
+# The minimal Linux and Dylint workflow lanes prove these checks. Extended/full
+# mode and other native platforms still need their own successful local lanes.
+# Jobs are mapped only for minimal mode: the base's trust policy forces remote
+# execution for ci-test/ci-full. Shadow mode still runs every remote check.
 version: 1
 gates:
   general/all/ci-guards: {lane: linux-minimal, fidelity: native}
   rust/x86_64-unknown-linux-gnu/default-facade-clippy: {lane: linux-minimal, fidelity: native}
   rust/x86_64-unknown-linux-gnu/default-facade-test: {lane: linux-minimal, fidelity: native}
+  rust/x86_64-unknown-linux-gnu/dylint-all-features-all-targets: {lane: dylint-minimal, fidelity: native}
+jobs:
+  ci.yml:linux: [general/all/ci-guards, rust/x86_64-unknown-linux-gnu/default-facade-clippy, rust/x86_64-unknown-linux-gnu/default-facade-test]
+  ci.yml:dylints: [rust/x86_64-unknown-linux-gnu/dylint-all-features-all-targets]

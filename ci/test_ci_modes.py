@@ -60,7 +60,9 @@ class ModeTests(unittest.TestCase):
         dylints = re.search(r"(?ms)^  dylints:\n(.*?)(?=^  [\w-]+:|\Z)", text).group(1)
         self.assertNotIn("needs.linux", dylints)
         self.assertIn("python 3.12 ci/ci_mode.py", dylints)
-        self.assertIn('"$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"', dylints)
+        self.assertIn(
+            '"$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"', dylints
+        )
         self.assertIn("steps.mode.outputs.mode != 'minimal'", text)
         self.assertIn("steps.mode.outputs.mode == 'full'", text)
         self.assertIn("name: Full coverage", text)
@@ -72,7 +74,12 @@ class ModeTests(unittest.TestCase):
         # sentinel job that waits for a runner after Dylint finishes.
         self.assertNotIn("  dylint-coverage:", text)
         dylints = re.search(r"(?ms)^  dylints:\n(.*?)(?=^  [\w-]+:|\Z)", text).group(1)
-        self.assertNotRegex(dylints, r"(?m)^    if:")
+        # Only a valid per-job attestation may suppress this job. The trust
+        # policy forces extended/full labels to execute it remotely.
+        self.assertEqual(
+            re.findall(r"(?m)^    if: (.*)$", dylints),
+            ["needs.verify.outputs.skip_dylints != 'true'"],
+        )
         self.assertNotIn("matrix:", dylints)
         self.assertIn('echo "::error::Dylint lanes failed: ${failed[*]}"', dylints)
         self.assertIn('test -s "$logs/workspace-dylint.log"', dylints)

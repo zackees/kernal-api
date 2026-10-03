@@ -1,10 +1,57 @@
 """The local gate accepts only completed, source-bound act2 evidence."""
 
+import subprocess
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
-from ci.local_gate import NativeHost, RunProof, verify_native_host, verify_run
+from ci.local_gate import (
+    NativeHost,
+    RunProof,
+    main,
+    verify_native_host,
+    verify_pr_base,
+    verify_run,
+)
+
+
+class FastPreflightTests(unittest.TestCase):
+    def test_failing_guards_never_submit_an_engine_run(self):
+        with (
+            patch("sys.argv", ["local_gate.py"]),
+            patch(
+                "ci.local_gate.output",
+                side_effect=[
+                    "refs/remotes/origin/main",
+                    "",
+                    "linux/x86_64",
+                    "a" * 40,
+                ],
+            ),
+            patch(
+                "ci.local_gate.native_host",
+                return_value=NativeHost("Linux", "x86_64", "linux/x86_64"),
+            ),
+            patch("ci.local_gate.document", return_value={"run": "stub"}) as submit,
+            patch(
+                "ci.local_gate.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, ["guards"]),
+            ),
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                main()
+            submit.assert_not_called()
+
+
+class PrBaseTests(unittest.TestCase):
+    def test_main_base_passes(self):
+        verify_pr_base("refs/remotes/origin/main")
+
+    def test_feature_or_unknown_base_is_rejected(self):
+        for ref in ("refs/remotes/origin/feature", "", "refs/heads/main"):
+            with self.subTest(ref=ref), self.assertRaises(ValueError):
+                verify_pr_base(ref)
 
 
 class NativeHostTests(unittest.TestCase):
@@ -46,6 +93,12 @@ class RunProofTests(unittest.TestCase):
 
     def test_completed_matching_run_passes(self):
         verify_run(self.proof, self.workspace, self.sha)
+
+    def test_completed_dylint_run_proves_only_dylint(self):
+        proof = replace(self.proof, job="dylints")
+        verify_run(proof, self.workspace, self.sha, job="dylints")
+        with self.assertRaises(ValueError):
+            verify_run(proof, self.workspace, self.sha)
 
     def test_incomplete_wrong_tree_and_upstream_act_fail(self):
         for changes in (

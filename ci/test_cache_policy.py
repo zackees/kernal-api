@@ -190,13 +190,35 @@ def saves_on_pull_request(step):
     if version is None or version < SAVE_POLICY_MIN_VERSION:
         return True
     save_policy = inputs.get("save-cache", "auto")
-    if save_policy in PUSH_ONLY_SAVE_POLICIES:
+    if save_policy == "false":
+        return False
+    remote_policy = inputs.get("save-cache-remote", "auto")
+    if remote_policy in PUSH_ONLY_SAVE_POLICIES or remote_policy == "false":
         # Its expression evaluates to the string "false" on pull_request.
         return False
+    if remote_policy == "true":
+        return True
     return save_policy not in {"auto", "false"}
 
 
 class CachePolicyTests(unittest.TestCase):
+    def test_remote_plan_does_not_globally_disable_local_ci_saves(self):
+        steps = [step for step in self.steps() if step["workflow"] == "ci.yml"]
+        self.assertEqual(len(steps), 3)
+        for step in steps:
+            with self.subTest(job=step["job"]):
+                self.assertNotIn("save-cache", step["inputs"])
+                self.assertIn(
+                    step["inputs"].get("save-cache-remote"), PUSH_ONLY_SAVE_POLICIES
+                )
+        wrapper = WRAPPER.read_text(encoding="utf-8")
+        self.assertIn("save-cache: ${{ inputs.save-cache }}", wrapper)
+        self.assertIn("save-cache-remote: ${{ inputs.save-cache-remote }}", wrapper)
+        global_input = wrapper.split("  save-cache:\n", 1)[1].split(
+            "  save-cache-remote:\n", 1
+        )[0]
+        self.assertIn('default: "auto"', global_input)
+
     def steps(self):
         steps = list(setup_soldr_steps())
         self.assertTrue(steps, "found no setup-soldr steps")
@@ -310,13 +332,16 @@ class CachePolicyTests(unittest.TestCase):
                 )
 
     def test_every_step_states_its_save_policy(self):
-        """Every step names `save-cache`, so the policy is visible in review."""
+        """Every step names a planned remote policy or explicit global disable."""
         for step in self.steps():
             with self.subTest(workflow=step["workflow"], job=step["job"]):
-                self.assertIn(
-                    step["inputs"].get("save-cache"),
-                    {"false"} | PUSH_ONLY_SAVE_POLICIES,
-                )
+                global_policy = step["inputs"].get("save-cache", "auto")
+                self.assertIn(global_policy, {"auto", "false"})
+                if global_policy != "false":
+                    self.assertIn(
+                        step["inputs"].get("save-cache-remote"),
+                        PUSH_ONLY_SAVE_POLICIES,
+                    )
 
     def test_release_validation_restores_without_racing_main_retention(self):
         """Separate release runs may restore, but cannot save stale lock keys."""
@@ -337,7 +362,7 @@ class CachePolicyTests(unittest.TestCase):
         for step in steps:
             with self.subTest(job=step["job"]):
                 self.assertIn(
-                    step["inputs"].get("save-cache"),
+                    step["inputs"].get("save-cache-remote"),
                     PUSH_ONLY_SAVE_POLICIES,
                 )
 

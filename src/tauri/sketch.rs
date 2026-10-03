@@ -193,6 +193,10 @@ impl SketchWebviews {
         Ok(operation.wire())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     async fn execute(
         self: &Arc<Self>,
         store: u64,

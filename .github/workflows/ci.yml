@@ -168,6 +168,8 @@ jobs:
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
       - run: soldr cargo fmt --all -- --check
+      - name: Check Python function complexity
+        run: uv run --no-project --with ruff==0.16.7 ruff check .
       - name: Check the CI guards and the guest build scripts
         run: |
           uv run --no-project -m unittest \

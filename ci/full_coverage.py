@@ -28,7 +28,7 @@ REQUIRED_TEST_STEPS = (
 )
 
 
-def failures(expected_sha, checked_out_sha, needs, jobs):
+def failures(expected_sha, checked_out_sha, needs, jobs):  # noqa: C901 -- Existing full-coverage aggregation; ratchet complexity 13.
     errors = []
     if not re.fullmatch(r"[0-9a-fA-F]{40}", expected_sha):
         errors.append("source SHA is missing or invalid")

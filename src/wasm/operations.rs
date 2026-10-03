@@ -656,6 +656,10 @@ impl OperationHub {
     /// native backend submit this closed request type through the caller's
     /// RuntimeHandle; neither path can create an ambient runtime or bypass
     /// quota/identity accounting.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     pub(crate) fn dispatch(
         self: &Arc<Self>,
         runtime: crate::async_engine::RuntimeHandle,

@@ -102,7 +102,7 @@ def dependency_tables_at(
     return tables
 
 
-def running_process_release_violations(manifest: Mapping[str, Any]) -> List[str]:
+def running_process_release_violations(manifest: Mapping[str, Any]) -> List[str]:  # noqa: C901 -- Existing release bindings scan; ratchet complexity 12.
     """Return every non-release-ready `running-process` manifest binding."""
 
     tables: List[Tuple[Mapping[str, Any], str, bool]] = []

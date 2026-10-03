@@ -149,6 +149,10 @@ mod tests {
         execute_artifact("KERNAL_COMPONENT_COMPILER_WASM", false, true);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn execute_artifact(
         variable: &str,
         expect_lowering_trap: bool,

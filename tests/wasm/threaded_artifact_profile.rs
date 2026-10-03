@@ -55,6 +55,10 @@ struct RawThreaded {
     memory_maximum: u32,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn raw_threaded_wasm(options: RawThreaded) -> Vec<u8> {
     let mut wasm = b"\0asm\x01\0\0\0".to_vec();
 
@@ -243,6 +247,10 @@ fn threaded_policy(bytes: &[u8]) -> SketchModulePolicy {
 }
 
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn raw_threaded_profile_admits_and_rejections_do_not_compile() {
     let positive = raw_threaded_wasm(RawThreaded::default());
     let compiler = SketchCompiler::new(SketchCompilerConfig::default()).expect("compiler");

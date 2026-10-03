@@ -139,6 +139,10 @@ pub(crate) trait KernalApiV1Imports {
     fn stream_close(&mut self, stream: u64) -> wasmtime::Result<i32>;
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 pub(crate) fn link_kernal_api_v1<T>(linker: &mut wasmtime::Linker<T>) -> wasmtime::Result<()>
 where
     T: KernalApiV1Imports + Send + 'static,

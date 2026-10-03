@@ -881,6 +881,10 @@ impl AdmittedSketch {
         }
         outcome
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     async fn execute_threaded_root_async(
         &self,
         runtime: crate::async_engine::RuntimeHandle,
@@ -1084,6 +1088,10 @@ impl AdmittedSketch {
         webview_cleanup?;
         Ok(result)
     }
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn prepare_threaded_root_with_permit(
         &self,
     ) -> Result<(Arc<PreparedThreadedRoot>, LogicalRootPermit), SketchExecutionError> {
@@ -2148,6 +2156,11 @@ impl generated_v1::KernalApiV1Imports for ThreadStoreState {
         }
     }
 
+    #[cfg_attr(
+        test,
+        expect(clippy::cognitive_complexity, reason = "Existing test dispatch complexity")
+    )]
+    #[expect(clippy::too_many_lines, reason = "Existing dispatch line count")]
     fn operation_submit(&mut self, kind: u32, arg0: u64, arg1: u64) -> wasmtime::Result<u64> {
         if let Some(result) = compiler_dispatch::dispatch(self, kind, arg0, arg1) {
             return Ok(result);
@@ -3202,6 +3215,10 @@ struct RootExecutionObservation {
 #[error("private kernal-api proc_exit sentinel ({0})")]
 struct ProcExitSentinel(i32);
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn define_closed_imports(
     linker: &mut Linker<ThreadStoreState>,
 ) -> Result<(), SketchExecutionError> {
@@ -4286,6 +4303,10 @@ mod threaded_root_observation_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::cognitive_complexity, clippy::too_many_lines,
+        reason = "Existing function complexity measured at ratchet adoption"
+    )]
     fn supplied_threaded_artifact_admits_and_executes_the_public_profile() {
         // This is deliberately supplied by the explicit diagnostic workflow:
         // ordinary source-only test runs must neither build a cross-target
@@ -5750,6 +5771,10 @@ enum TypeEntry {
     NonFunction,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn preflight(
     bytes: &[u8],
     policy: SketchModulePolicy,
@@ -5955,6 +5980,10 @@ fn check_memory(
 // Rust's wasi1 threads target has a deliberately closed compatibility import
 // surface. These names are recorded here, but this admission slice links none
 // of them and grants no filesystem, clock, environment, or process authority.
+#[expect(
+    clippy::too_many_lines,
+    reason = "Existing function complexity measured at ratchet adoption"
+)]
 fn preflight_threaded_rust(
     bytes: &[u8],
     policy: SketchModulePolicy,

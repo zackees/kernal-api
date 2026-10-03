@@ -76,8 +76,10 @@ ci-test = { add = { suites = ["native"] } }
 # -- Caches: what main writes (zackees/ci.yml#93) --------------------------------
 # A main push runs minimal mode (ci/ci_mode.py): only `linux` and `dylints`, both
 # on ubuntu-24.04 x64, and the ci-lint plan's cache_save is true only there. Full
-# mode (ci-full PRs, dispatched candidate SHAs) restores but never saves, and the
-# release and nightly macOS lanes pass save-cache "false". So every family below
+# mode (ci-full PRs, dispatched candidate SHAs) restores but never saves remotely; the
+# release and nightly macOS lanes pass global save-cache "false". The shared
+# action owns automatic local saves; remote write permission stays plan-driven.
+# So every family below
 # has exactly one writer shape, on linux-x64: per = "none". The cross-target
 # build-cache, prepared-SDK and cargo-registry entries on main came from an older
 # policy that saved from full-mode runs; nothing writes them now, so they are not
@@ -132,9 +134,9 @@ workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "au
 actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]
 tools     = ["soldr", "uv", "git", "jq", "sudo"]
 secrets   = ["PYPI_API_TOKEN"]                    # a finding against the OIDC-only policy (SEC-005), declared rather than hidden
-# The one setup-soldr call site; its save-cache passes through the ci-lint plan's
+# The one setup-soldr call site; its remote permission passes through the ci-lint plan's
 # cache_save (true only on a main push) from every caller.
-setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false", save-cache = "plan" } }
+setup-soldr = { only-in = ".github/actions/soldr", require = { cook-delta = "false", save-cache-remote = "plan" } }
 setup-uv    = { require = { save-cache = "plan" } }
 # Workflow defaults are read-only; these jobs grant themselves more. `actions: write`
 # = the "Cancel the run" step (and cache-retention's deletes); the auto-release

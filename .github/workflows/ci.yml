@@ -120,7 +120,7 @@ jobs:
       # exact ci-lint commit its `linter` key names. `plan` strictly loads it,
       # prints this run's selection, and decides whether this run writes
       # caches (`cache_save`: main pushes only, ci.toml [cache].write-on) --
-      # the save-cache every setup-soldr and setup-uv step here takes.
+      # the remote write permission every setup-soldr and setup-uv step takes.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
@@ -157,7 +157,7 @@ jobs:
           # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ steps.plan.outputs.cache_save }}
+          save-cache-remote: ${{ steps.plan.outputs.cache_save }}
           cache-key-pr: ${{ steps.plan.outputs.cache_key_pr }}
           ci-tests: true
           cache-key-suffix: linux
@@ -512,7 +512,7 @@ jobs:
           # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ needs.linux.outputs.cache_save }}
+          save-cache-remote: ${{ needs.linux.outputs.cache_save }}
           cache-key-pr: ${{ needs.linux.outputs.cache_key_pr }}
           ci-tests: true
           cache-key-suffix: build-${{ matrix.target }}
@@ -953,7 +953,7 @@ jobs:
           # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding
           # unreachable lock generations.
-          save-cache: ${{ steps.plan.outputs.cache_save }}
+          save-cache-remote: ${{ steps.plan.outputs.cache_save }}
           cache-key-pr: ${{ steps.plan.outputs.cache_key_pr }}
           toolchain: 1.95.0
           cache: true

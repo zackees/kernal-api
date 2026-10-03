@@ -3,18 +3,25 @@ description: >-
   The only `zackees/setup-soldr` call site in this repository (ci.toml
   [allow].setup-soldr.only-in; ci-lint CACHE-009/RUST-001). It fixes the
   inputs every job must share -- one Soldr runtime version and no cook-delta
-  layer -- and takes `save-cache` from the ci-lint plan, so a job cannot
+  layer -- and takes `save-cache-remote` from the ci-lint plan, so a job cannot
   write a durable cache outside the flows ci.toml [cache].write-on names.
   ci/test_cache_policy.py checks every caller.
 
 inputs:
   save-cache:
     description: >-
+      Global write policy. Explicit "false" disables every save, including
+      local execution; release and nightly guest lanes retain that disable.
+      Ordinary CI leaves "auto" so the shared action can save locally.
+    required: false
+    default: "auto"
+  save-cache-remote:
+    description: >-
       The ci-lint plan's cache_save output: "true" on a main push, "false"
-      on pull requests and dispatched runs. A job that never writes caches
-      (release, the nightly macOS guest) passes "false". Required, so no
-      caller falls back to setup-soldr's own "auto".
-    required: true
+      on pull requests and dispatched runs. Applies only to remote writes;
+      the shared action owns local automatic saves under act/act2.
+    required: false
+    default: "auto"
   cache-key-pr:
     description: >-
       The ci-lint plan's cache_key_pr output: "pr-N" on a pull request and
@@ -102,7 +109,8 @@ runs:
         version: 0.9.29
         cook-delta: false # per-commit delta layer off (setup-soldr#528)
         save-cache: ${{ inputs.save-cache }}
-        cache-key-suffix: ${{ inputs.save-cache == 'true' && inputs.cache-key-pr != '' && (inputs.cache-key-suffix != '' && format('{0}-{1}', inputs.cache-key-suffix, inputs.cache-key-pr) || inputs.cache-key-pr) || inputs.cache-key-suffix }}
+        save-cache-remote: ${{ inputs.save-cache-remote }}
+        cache-key-suffix: ${{ inputs.save-cache-remote == 'true' && inputs.cache-key-pr != '' && (inputs.cache-key-suffix != '' && format('{0}-{1}', inputs.cache-key-suffix, inputs.cache-key-pr) || inputs.cache-key-pr) || inputs.cache-key-suffix }}
         ci-tests: ${{ inputs.ci-tests }}
         cache: ${{ inputs.cache }}
         build-cache: ${{ inputs.build-cache }}

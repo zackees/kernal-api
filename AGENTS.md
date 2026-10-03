@@ -96,3 +96,12 @@
   and every standalone package denies it in its own `[lints.rust]` table;
   `ci/test_deny_warnings.py` fails if a package lacks one. Fix a warning, or
   `#[allow]` it at the narrowest item with a reason; never relax the table.
+
+- Before pushing, run the minimal Linux workflow through the local gate from
+  a clean committed tree:
+  `uvx --from git+https://github.com/zackees/ci.yml@9e44971219cd870a2263fa694debc94f57722405 ci-lint local-gate run`.
+  Its `linux-minimal` lane uses `bosn ci run` (the pinned act2 engine), checks
+  the completed run's workspace, SHA, clean snapshot and job verdict, and
+  reuses a recorded pass only for identical lane inputs. This first rollout
+  does not yet skip remote jobs; full-mode and native platform coverage must
+  still run as required above.

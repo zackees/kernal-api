@@ -1,6 +1,12 @@
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The symbol and snapshot APIs identify Linux ELF artifacts by their GNU
+    // build ID. Managed clang/lld does not add the distro GCC default, so make
+    // this artifact contract explicit for the requested target (not the host).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg=-Wl,--build-id=sha1");
+    }
     let cargo_manifest = Path::new(
         &std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("cargo always sets CARGO_MANIFEST_DIR for build.rs"),

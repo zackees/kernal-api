@@ -1,4 +1,4 @@
-"""Run the remote minimal Linux job through bosn's pinned act2 engine.
+"""Run remote minimal Linux checks through bosn's pinned act2 engine.
 
 The first migration lane covers minimal Linux only. Full and native platform
 jobs remain remote until their complete coverage has local evidence.
@@ -6,6 +6,7 @@ jobs remain remote until their complete coverage has local evidence.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import tempfile
@@ -20,6 +21,14 @@ else:
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ".github/workflows/ci.yml"
+
+
+def verify_pr_base(ref: str) -> None:
+    """A feature branch used as its own base can silently omit diff-gated tests."""
+    if ref != "refs/remotes/origin/main":
+        raise ValueError(
+            "origin/HEAD must name main; run git remote set-head origin -a"
+        )
 
 
 def verify_native_host(host: NativeHost) -> None:
@@ -92,7 +101,9 @@ class RunProof:
         )
 
 
-def verify_run(proof: RunProof, workspace: Path, sha: str) -> None:
+def verify_run(
+    proof: RunProof, workspace: Path, sha: str, *, job: str = "linux"
+) -> None:
     """Reject unrelated, dirty, partial, failed, or upstream-act runs."""
     if (
         proof.workspace != workspace.resolve()
@@ -101,7 +112,7 @@ def verify_run(proof: RunProof, workspace: Path, sha: str) -> None:
         or proof.engine != "act"
         or "-act2." not in proof.act_version
         or proof.workflow != WORKFLOW
-        or proof.job != "linux"
+        or proof.job != job
         or proof.mode != "minimal"
     ):
         raise ValueError("bosn run does not prove this clean minimal Linux lane")
@@ -132,6 +143,10 @@ def document(argv: list[str]) -> dict[str, JsonValue]:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--job", choices=("linux", "dylints"), default="linux")
+    args = parser.parse_args()
+    verify_pr_base(output(["git", "symbolic-ref", "refs/remotes/origin/HEAD"]).strip())
     verify_native_host(
         native_host(
             output(
@@ -152,7 +167,7 @@ def main() -> None:
             "--workflow",
             WORKFLOW,
             "--job",
-            "linux",
+            args.job,
             "--trigger",
             "pr",
             "--mode",
@@ -170,13 +185,13 @@ def main() -> None:
     print(f"bosn local gate run: {run_id}", flush=True)
     subprocess.run(["bosn", "ci", "wait", run_id], cwd=ROOT, check=True)
     proof = RunProof.from_json(document(["bosn", "ci", "show", run_id, "--json"]))
-    verify_run(proof, ROOT, sha)
+    verify_run(proof, ROOT, sha, job=args.job)
     if (
         output(["git", "rev-parse", "HEAD"]).strip() != sha
         or output(["git", "status", "--porcelain", "--untracked-files=normal"]).strip()
     ):
         raise ValueError("worktree changed while the local gate ran")
-    print(f"Passed minimal Linux on {proof.act_version}: {sha}", flush=True)
+    print(f"Passed minimal {args.job} on {proof.act_version}: {sha}", flush=True)
 
 
 if __name__ == "__main__":

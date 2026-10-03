@@ -114,6 +114,10 @@ verify = "ci.yml:verify"
 run = ["uv", "run", "--no-project", "--python", "3.12", "python", "ci/local_gate.py"]
 tools = ["bosn", "uv"]
 
+[local.gate.lanes.dylint-minimal]
+run = ["uv", "run", "--no-project", "--python", "3.12", "python", "ci/local_gate.py", "--job", "dylints"]
+tools = ["bosn", "uv"]
+
 [allow]
 workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "auto-release.yml" = ["workflow_dispatch"], "release.yml" = ["workflow_call"], "macos-x64-tests.yml" = ["schedule", "workflow_dispatch"] }
 actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]

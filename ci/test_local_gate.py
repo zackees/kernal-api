@@ -4,7 +4,23 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-from ci.local_gate import NativeHost, RunProof, verify_native_host, verify_run
+from ci.local_gate import (
+    NativeHost,
+    RunProof,
+    verify_native_host,
+    verify_pr_base,
+    verify_run,
+)
+
+
+class PrBaseTests(unittest.TestCase):
+    def test_main_base_passes(self):
+        verify_pr_base("refs/remotes/origin/main")
+
+    def test_feature_or_unknown_base_is_rejected(self):
+        for ref in ("refs/remotes/origin/feature", "", "refs/heads/main"):
+            with self.subTest(ref=ref), self.assertRaises(ValueError):
+                verify_pr_base(ref)
 
 
 class NativeHostTests(unittest.TestCase):
@@ -46,6 +62,12 @@ class RunProofTests(unittest.TestCase):
 
     def test_completed_matching_run_passes(self):
         verify_run(self.proof, self.workspace, self.sha)
+
+    def test_completed_dylint_run_proves_only_dylint(self):
+        proof = replace(self.proof, job="dylints")
+        verify_run(proof, self.workspace, self.sha, job="dylints")
+        with self.assertRaises(ValueError):
+            verify_run(proof, self.workspace, self.sha)
 
     def test_incomplete_wrong_tree_and_upstream_act_fail(self):
         for changes in (

@@ -52,6 +52,10 @@ pub mod config;
 #[cfg(feature = "json")]
 pub mod json;
 
+/// Actually Portable Executable launch support: detection, loader planning,
+/// and the recovery every spawn applies when a host refuses an APE image.
+pub mod ape;
+
 /// Kernel-owned BLAKE3 content hashing for bytes, readers, and files, plus
 /// an incremental hasher and key-derivation domain separation.
 pub mod hash;

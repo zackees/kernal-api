@@ -4494,9 +4494,9 @@ dependencies = [
 
 [[package]]
 name = "running-process"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02f0ff903e7b61396a074648fc6301668492de90aea4b5d09cc914eee9389e9b"
+checksum = "c040ca81d60235a6027ef3115629049829464758e1011500902c8a2355727812"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4522,15 +4522,16 @@ dependencies = [
 
 [[package]]
 name = "running-process-platform-internal"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6e5db04a966dfead09ff660b704c2461a05e8477249b8f10532b41a22219348"
+checksum = "0ef39418f8c71399ea811c5daba36f2325516cc02c3b2169473400411941ed5f"
 dependencies = [
  "blake3",
  "dirs 6.0.0",
  "getrandom 0.4.3",
  "interprocess",
  "libc",
+ "miniz_oxide",
  "prost",
  "running-process-protocol",
  "serde",
@@ -4546,9 +4547,9 @@ dependencies = [
 
 [[package]]
 name = "running-process-protocol"
-version = "4.10.14"
+version = "4.10.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c32daa00db0c79106d3181f1e306efe92a59bd1b0429440bdc5e6debf3cc4345"
+checksum = "c51894dfa970ac24213066f37b33656fd92c7053ef3e94f184b70000d8cf48f7"
 dependencies = [
  "prost",
  "prost-build",

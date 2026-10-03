@@ -118,6 +118,15 @@ tools = ["bosn", "uv"]
 run = ["uv", "run", "--no-project", "--python", "3.12", "python", "ci/local_gate.py", "--job", "dylints"]
 tools = ["bosn", "uv"]
 
+# Observe per-job trust first. Extended and full PRs always keep every remote
+# check; a minimal lane cannot prove their wider feature/artifact coverage.
+[local.gate.trust]
+mode = "shadow"
+skip = ["ci.yml:linux", "ci.yml:dylints"]
+covered-by = { "ci.yml:linux" = ["linux-minimal"], "ci.yml:dylints" = ["dylint-minimal"] }
+full-labels = ["ci-full", "ci-test"]
+audit-rate = 10
+
 [allow]
 workflows = { "ci.yml" = ["pull_request", "push:main", "workflow_dispatch"], "auto-release.yml" = ["workflow_dispatch"], "release.yml" = ["workflow_call"], "macos-x64-tests.yml" = ["schedule", "workflow_dispatch"] }
 actions   = ["actions/checkout", "actions/upload-artifact", "actions/download-artifact", "astral-sh/setup-uv", "zackees/setup-soldr", "zackees/docker-mac-x64", "rust-lang/crates-io-auth-action"]

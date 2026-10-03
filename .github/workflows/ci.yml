@@ -41,6 +41,9 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      skip_linux: ${{ steps.gate.outputs.skip_linux }}
+      skip_dylints: ${{ steps.gate.outputs.skip_dylints }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -55,9 +58,10 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
       - name: Verify local gate attestation (shadow)
+        id: gate
         env:
           PYTHONPATH: .ci-lint
-        run: uv run --no-project --python 3.12 python -m ci_lint local-gate verify --repo .
+        run: uv run --no-project --python 3.12 python -m ci_lint local-gate verify --repo . --trust --github-output
 
   # Four work jobs set up once and do everything that belongs on each runner.
   # Full mode adds one small coverage sentinel after those jobs finish.
@@ -83,6 +87,7 @@ jobs:
   # on one runner: the Linux-only checks first, then lint and the full suite.
   linux:
     needs: verify
+    if: needs.verify.outputs.skip_linux != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -889,6 +894,7 @@ jobs:
   # the PR critical path. It selects its own mode and SHA the same way.
   dylints:
     needs: verify
+    if: needs.verify.outputs.skip_dylints != 'true'
     name: Dylint workspace
     env:
       DYLINT_TOOLCHAIN: nightly-2026-05-28

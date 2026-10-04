@@ -1,6 +1,6 @@
 [package]
 name = "kernal-api"
-version = "0.1.26"
+version = "0.1.27"
 build = "build.rs"
 edition = "2021"
 rust-version = "1.95.0"
@@ -192,6 +192,8 @@ tauri-webview = [
 ]
 # Private acceptance-only observation for the process-main-thread smoke
 # executable. It exposes semantic counts only, never a Tauri/Wry/native type.
+system-tray = ["dep:ksni"]
+
 tauri-webview-test-support = ["tauri-webview", "dep:png"]
 hash-sha256 = ["dep:sha2"]
 archive = ["dep:zip", "dep:tar", "dep:zstd", "dep:flate2"]
@@ -394,6 +396,7 @@ tauri-utils = { version = "=2.9.3", optional = true }
 wry = { version = "=0.57.0", default-features = false, features = ["os-webview"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "=0.3.6", optional = true }
 gio = { version = "=0.18.4", optional = true }
 cairo-rs = { version = "=0.18.5", features = ["png"], optional = true }
 addr2line = { version = "=0.24.2", default-features = false, features = ["std", "loader"], optional = true }

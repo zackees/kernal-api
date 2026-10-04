@@ -38,6 +38,12 @@ pub use independent_spawn::{
 
 #[cfg(feature = "command-arguments")]
 pub mod arguments;
+/// Optional desktop status area, with explicit unsupported-host fallback.
+#[cfg(feature = "system-tray")]
+pub mod system_tray;
+#[cfg(feature = "system-tray")]
+use platform_imp::system_tray as native_system_tray;
+
 /// Bounded command-line schema parsing with facade-owned values and diagnostics.
 #[cfg(feature = "command-schema")]
 pub mod command;

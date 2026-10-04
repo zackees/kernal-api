@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import kernal_api
 
 
 def test_python_and_rust_versions_are_explicit() -> None:
-    assert kernal_api.__version__ == "0.1.26"
+    # Read the Rust package version without tomllib, which is unavailable on
+    # the supported Python 3.10 floor. The root package precedes dependencies.
+    manifest = Path(__file__).resolve().parents[2] / "Cargo.toml"
+    package = manifest.read_text().split("[dependencies]", 1)[0]
+    version = re.search(r'^version = "([^"\n]+)"$', package, re.MULTILINE)
+    assert version is not None
+    assert kernal_api.__version__ == version.group(1)
     assert kernal_api.RUST_MSRV == "1.95.0"
 
 

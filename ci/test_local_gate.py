@@ -2,7 +2,7 @@
 
 import subprocess
 import unittest
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -74,6 +74,7 @@ class RunProofTests(unittest.TestCase):
     def setUp(self):
         self.workspace = Path("/repo").resolve()
         self.sha = "a" * 40
+        self.git_tree = "b" * 40
         self.proof = RunProof(
             self.workspace,
             self.sha,
@@ -89,16 +90,21 @@ class RunProofTests(unittest.TestCase):
             1,
             1,
             0,
+            self.git_tree,
+            "pr",
+            "pull_request",
+            "removed",
+            "c" * 64,
         )
 
     def test_completed_matching_run_passes(self):
-        verify_run(self.proof, self.workspace, self.sha)
+        verify_run(self.proof, self.workspace, self.sha, self.git_tree)
 
     def test_completed_dylint_run_proves_only_dylint(self):
         proof = replace(self.proof, job="dylints")
-        verify_run(proof, self.workspace, self.sha, job="dylints")
+        verify_run(proof, self.workspace, self.sha, self.git_tree, job="dylints")
         with self.assertRaises(ValueError):
-            verify_run(proof, self.workspace, self.sha)
+            verify_run(proof, self.workspace, self.sha, self.git_tree)
 
     def test_incomplete_wrong_tree_and_upstream_act_fail(self):
         for changes in (
@@ -116,13 +122,44 @@ class RunProofTests(unittest.TestCase):
             {"total": 0},
             {"completed": 0},
             {"failed": 1},
+            {"git_tree": "d" * 40},
+            {"trigger": "workflow_dispatch"},
+            {"event": "push"},
+            {"cleanup": "failed"},
+            {"cleanup": "pending"},
+            {"payload_sha256": ""},
         ):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
-                verify_run(replace(self.proof, **changes), self.workspace, self.sha)
+                verify_run(replace(self.proof, **changes), self.workspace, self.sha, self.git_tree)
 
     def test_missing_boundary_fields_are_rejected(self):
         with self.assertRaises(ValueError):
             RunProof.from_json({})
+
+    def test_original_boundary_preserves_source_and_cleanup(self):
+        raw = asdict(self.proof)
+        raw.update(
+            workspace=str(self.workspace),
+            jobs={"total": 1, "completed": 1, "failed": 0},
+            schema_version=1,
+            provider="github",
+            repository="zackees/kernal-api",
+            act_exit_code=0,
+            tree_digest="d" * 64,
+        )
+        self.assertEqual(RunProof.from_json(raw), self.proof)
+        for field in ("git_tree", "trigger", "event", "cleanup", "payload_sha256"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RunProof.from_json({key: value for key, value in raw.items() if key != field})
+        for field, value in {
+            "schema_version": True,
+            "provider": "other",
+            "repository": "other/repo",
+            "act_exit_code": 1,
+            "tree_digest": "",
+        }.items():
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                RunProof.from_json({**raw, field: value})
 
 
 if __name__ == "__main__":

@@ -36,8 +36,8 @@ permissions:
   actions: read
 
 jobs:
-  # Shadow rollout: measure missing/stale local proof while preserving all
-  # existing remote checks. No job is skipped on the strength of this stamp.
+  # Require source-bound local proof before PR execution. Trust remains in
+  # shadow mode, so every selected remote check still runs for parity evidence.
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -45,19 +45,22 @@ jobs:
       skip_linux: ${{ steps.gate.outputs.skip_linux }}
       skip_dylints: ${{ steps.gate.outputs.skip_dylints }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout pinned ci-lint
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 9e44971219cd870a2263fa694debc94f57722405
+          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
           path: .ci-lint
           persist-credentials: false
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
-      - name: Verify local gate attestation (shadow)
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+      - name: Verify local gate attestation
         id: gate
         env:
           PYTHONPATH: .ci-lint
@@ -102,11 +105,13 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           lfs: true
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           # Before the plan exists: only a main push saves (ci.toml [cache].write-on).
           save-cache: ${{ github.event_name == 'push' }}
@@ -121,10 +126,11 @@ jobs:
       # prints this run's selection, and decides whether this run writes
       # caches (`cache_save`: main pushes only, ci.toml [cache].write-on) --
       # the remote write permission every setup-soldr and setup-uv step takes.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout pinned ci-lint
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 78506e7007650ddb11560a6d2289f51228cbf621
+          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint
@@ -151,7 +157,8 @@ jobs:
       # restore where the gate had restored 26,983. `dylints` guards against
       # the same thing with its own CARGO_HOME. Downloading sources costs a
       # minute; a poisoned registry costs the whole job.
-      - uses: ./.github/actions/soldr # the one setup-soldr call site
+      - name: Set up soldr
+        uses: ./.github/actions/soldr # the one setup-soldr call site
         id: setup_soldr
         with:
           # The plan saves only on main pushes; PRs and manually selected
@@ -167,15 +174,18 @@ jobs:
         run: |
           multiarch="$(dpkg-architecture -qDEB_HOST_MULTIARCH)"
           echo "PKG_CONFIG_LIBDIR_x86_64_unknown_linux_gnu=/usr/lib/${multiarch}/pkgconfig:/usr/share/pkgconfig" >> "${GITHUB_ENV}"
-      - run: soldr cargo fmt --all -- --check
+      - name: Check workspace formatting
+        run: soldr cargo fmt --all -- --check
       - name: Check Python function complexity
         run: uv run --no-project --with ruff==0.16.7 ruff check .
       - name: Check the CI guards and the guest build scripts
+        env:
+          PYTHONPATH: .ci-lint
         run: |
-          uv run --no-project -m unittest \
+          uv run --no-project --with pyyaml==6.0.2 -m unittest \
             ci.test_native_proof ci.test_native_proof_jobs ci.test_macos_x64_guest \
             ci.test_ci_modes ci.test_release_ci_gate \
-            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features ci.test_local_gate \
+            ci.test_nextest_config ci.test_deny_warnings ci.test_target_features ci.test_local_gate ci.test_replay_evidence \
             ci.test_cache_policy ci.test_prune_obsolete_cook_caches
           bash tests/screenshot-build-arguments.sh
           bash tests/screenshot-target-repair.sh
@@ -401,7 +411,8 @@ jobs:
       # and "Cancel the run" killed every attempt twice on #320. Every
       # fixed-name upload in this workflow overwrites so a rerun can
       # always refresh what its dependents need.
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - name: Upload target-independent Wasm guests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.mode.outputs.mode == 'full'
         with:
           name: native-proof-guests
@@ -933,10 +944,12 @@ jobs:
               libgtk-3-dev libwebkit2gtk-4.1-dev
             echo $? >"${RUNNER_TEMP}/webview-packages.status"
           ) >"${RUNNER_TEMP}/webview-packages.log" 2>&1 &
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout candidate source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
-      - uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff # v6
         with:
           # Before the plan exists: only a main push saves (ci.toml [cache].write-on).
           save-cache: ${{ github.event_name == 'push' }}
@@ -948,10 +961,11 @@ jobs:
         shell: bash
         run: test "$(git rev-parse HEAD)" = "${{ steps.mode.outputs.sha }}"
       # Runs beside `linux`, so it plans its own cache saves the same way.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout pinned ci-lint
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 78506e7007650ddb11560a6d2289f51228cbf621
+          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint
@@ -961,7 +975,8 @@ jobs:
         run: >-
           uv run --no-project python -m ci_lint plan --repo .
           --event-name "${GITHUB_EVENT_NAME}" --sha "${{ steps.mode.outputs.sha }}" --github-output
-      - uses: ./.github/actions/soldr # the one setup-soldr call site
+      - name: Set up soldr
+        uses: ./.github/actions/soldr # the one setup-soldr call site
         with:
           # The plan saves only on main pushes; PRs and manually selected
           # candidate SHAs restore without racing main retention or stranding

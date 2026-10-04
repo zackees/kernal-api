@@ -7,7 +7,8 @@ gates:
   general/all/ci-guards: {lane: linux-minimal, fidelity: native}
   rust/x86_64-unknown-linux-gnu/default-facade-clippy: {lane: linux-minimal, fidelity: native}
   rust/x86_64-unknown-linux-gnu/default-facade-test: {lane: linux-minimal, fidelity: native}
+  rust/x86_64-unknown-linux-gnu/desktop-status-test: {lane: linux-minimal, fidelity: native}
   rust/x86_64-unknown-linux-gnu/dylint-all-features-all-targets: {lane: dylint-minimal, fidelity: native}
 jobs:
-  ci.yml:linux: [general/all/ci-guards, rust/x86_64-unknown-linux-gnu/default-facade-clippy, rust/x86_64-unknown-linux-gnu/default-facade-test]
+  ci.yml:linux: [general/all/ci-guards, rust/x86_64-unknown-linux-gnu/default-facade-clippy, rust/x86_64-unknown-linux-gnu/default-facade-test, rust/x86_64-unknown-linux-gnu/desktop-status-test]
   ci.yml:dylints: [rust/x86_64-unknown-linux-gnu/dylint-all-features-all-targets]

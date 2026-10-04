@@ -32,10 +32,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github/workflows"
 WRAPPER = ROOT / ".github/actions/soldr/action.yml"
 DIRECT_SETUP_SOLDR = re.compile(
-    r"^(?P<indent> *)- uses: zackees/setup-soldr@(?P<ref>\S+)(?P<comment>.*)$"
+    r"^(?P<indent> *)(?P<marker>- )?uses: zackees/setup-soldr@(?P<ref>\S+)(?P<comment>.*)$"
 )
 SETUP_SOLDR = re.compile(
-    r"^(?P<indent> *)- uses: \./\.github/actions/soldr(?P<comment>.*)$"
+    r"^(?P<indent> *)(?P<marker>- )?uses: \./\.github/actions/soldr(?P<comment>.*)$"
 )
 
 # Pin the runtime independently of the action SHA. A floating `latest` Soldr
@@ -115,6 +115,11 @@ def step_inputs(lines, index, step_indent):
     return inputs
 
 
+def action_step_indent(match):
+    """Named steps put uses two spaces deeper than the list item."""
+    return len(match.group("indent")) - (0 if match.group("marker") else 2)
+
+
 def wrapper_call():
     """The wrapper's one setup-soldr step: its ref, pin comment and fixed inputs."""
     lines = WRAPPER.read_text(encoding="utf-8").splitlines()
@@ -127,7 +132,7 @@ def wrapper_call():
     index, match = calls[0]
     fixed = {
         name: value
-        for name, value in step_inputs(lines, index, len(match.group("indent"))).items()
+        for name, value in step_inputs(lines, index, action_step_indent(match)).items()
         if "inputs." not in value and name != "id"
     }
     return match.group("ref"), match.group("comment"), fixed
@@ -151,7 +156,7 @@ def setup_soldr_steps():
             match = SETUP_SOLDR.match(line)
             if not match:
                 continue
-            inputs = step_inputs(lines, index, len(match.group("indent")))
+            inputs = step_inputs(lines, index, action_step_indent(match))
             inputs.pop("id", None)
             overlap = set(inputs) & set(fixed)
             assert not overlap, f"the wrapper fixes {sorted(overlap)}"

@@ -30,16 +30,8 @@ slow-timeout = { period = "60s", terminate-after = 2, grace-period = "30s" }
 # `cargo test` lane never applied: there, tests were threads inside one
 # process and the harness ran a single binary at a time.
 #
-# A test that asserts work finishes inside a wall-clock window cannot tell that
-# load from a regression. `a_handful_of_threads_fills_a_small_ring_long_before
-# _the_window_ends` spawns four worker threads and expects them to fill a ring
-# before a deadline; on a four-core runner with three other test processes
-# resident it missed the window and failed the first replay.
-#
-# The fix is scheduling, not a weaker assertion: `threads-required` reserves
-# the whole test-thread budget, so nextest runs this test alone. Add a test
-# here when it measures elapsed time or saturates the CPU on purpose -- not
-# when it is merely slow.
+# This test spins four workers and samples them. Reserve the test-thread budget
+# so other tests do not compete for the same cores during the capture.
 [[profile.default.overrides]]
-filter = 'test(=profile::tests::a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends)'
+filter = 'test(=profile::tests::a_handful_of_threads_fills_a_small_ring)'
 threads-required = "num-test-threads"

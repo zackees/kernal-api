@@ -717,3 +717,49 @@ async fn sse_response_delivers_before_source_closure_and_encodes_multiline_data(
         .unwrap();
     drop(task);
 }
+
+#[cfg(feature = "event-stream")]
+#[tokio::test]
+async fn sse_response_emits_native_id_and_event_fields() {
+    use kernal_api::http_server::SseEvent;
+
+    let (sender, receiver) = async_engine::broadcast_channel::<SseEvent>(4).unwrap();
+    let receiver = std::sync::Arc::new(std::sync::Mutex::new(Some(receiver)));
+    let server = Server::bind(loopback(), Limits::default()).await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = async_engine::launch(server.serve(move |_| {
+        let receiver = receiver.lock().unwrap().take().unwrap();
+        async move {
+            Response::sse_stream(
+                receiver.into_stream_with(|result| result.ok().map(Ok)),
+                Duration::from_secs(1),
+            )
+            .unwrap()
+        }
+    }));
+    let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+    socket
+        .write_all(b"GET /events HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    sender
+        .send(SseEvent {
+            id: Some("1042".into()),
+            event: Some("stdout".into()),
+            data: "first\nsecond".into(),
+        })
+        .unwrap();
+    let mut received = String::new();
+    async_engine::timeout(Duration::from_secs(2), async {
+        while !received.contains("id: 1042\nevent: stdout\ndata: first\ndata: second\n\n") {
+            let mut buffer = [0; 1024];
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0);
+            received.push_str(std::str::from_utf8(&buffer[..count]).unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    drop(sender);
+    drop(task);
+}

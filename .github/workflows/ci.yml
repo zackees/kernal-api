@@ -36,8 +36,9 @@ permissions:
   actions: read
 
 jobs:
-  # Require source-bound local proof before PR execution. Trust remains in
-  # shadow mode, so every selected remote check still runs for parity evidence.
+  # Require source-bound local proof before PR execution. Eligible minimal
+  # PRs reuse their attested lanes; the base policy fails closed and keeps
+  # pushes, full/test labels, changed gate surfaces and audit samples remote.
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -55,7 +56,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
+          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
           path: .ci-lint
           persist-credentials: false
       - name: Set up uv
@@ -130,7 +131,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
+          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint
@@ -965,7 +966,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 4c39ed9c494a881cd8f4eb264f2487a7d1284a47
+          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint
@@ -1128,7 +1129,9 @@ jobs:
   # version in the key. After every producer job has completed its post-step,
   # retire old Soldr versions, superseded lock-scoped entries with an exact
   # same-shape replacement, and the five explicitly disabled cross-target
-  # cook shapes. Preserve the active native xlinux cook and all unique shapes.
+  # cook shapes. Preserve the active native xlinux cook. Under budget pressure,
+  # retire older-lock Dylint outputs in LRU order while preserving current-lock
+  # outputs and a nonempty current-lock anchor on the same architecture.
   cache-retention:
     name: Retire superseded and disabled cache generations
     needs: [linux, build, test, dylints, full-coverage]

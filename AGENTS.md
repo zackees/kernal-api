@@ -99,10 +99,13 @@
 
 - Before pushing, run the minimal Linux workflow through the local gate from
   a clean committed tree:
-  `uvx --from git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47 ci-lint local-gate run`.
+  `uvx --from git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150 ci-lint local-gate run`.
   Its `linux-minimal` lane uses `bosn ci run` (the pinned act2 engine), checks
   the completed run's source/tree, PR selection, executed checks and removed
   engine. The separate Dylint lane proves its selected checks too. Both lanes
   must pass before a stamp is cached. Local-gate enforcement rejects an
-  unstamped PR head; remote trust remains in shadow mode and skips no checks.
-  Full-mode and native platform coverage still run as required above.
+  unstamped PR head. Eligible attested minimal PRs skip the Linux and Dylint
+  remote repeats, using the PR base's trust policy. Changed gate surfaces,
+  ci-test/ci-full labels, forks, untrusted authors and the 1-in-10 audit run
+  remotely; pushes always run for real. Full-mode and native platform coverage
+  still run as required above.

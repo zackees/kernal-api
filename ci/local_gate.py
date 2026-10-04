@@ -1,6 +1,6 @@
-"""Run remote minimal Linux checks through bosn's pinned act2 engine.
+"""Run minimal Linux and Dylint checks through bosn's pinned act2 engine.
 
-The first migration lane covers minimal Linux only. Full and native platform
+Both required workflow lanes prove minimal checks. Full and other native platform
 jobs remain remote until their complete coverage has local evidence.
 """
 
@@ -23,7 +23,7 @@ else:
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ".github/workflows/ci.yml"
-CI_LINT = "ci-lint @ git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47"
+CI_LINT = "ci-lint @ git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150"
 
 
 def bosn_command(*arguments: str) -> list[str]:

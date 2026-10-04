@@ -1,6 +1,9 @@
 """Contract checks for autonomous release orchestration."""
 
 import unittest
+import subprocess
+import tempfile
+import tomllib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +13,29 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AutoReleaseTests(unittest.TestCase):
+    def test_tracked_consumer_versions_match_release(self):
+        version = tomllib.loads((ROOT / "Cargo.toml").read_text())["package"]["version"]
+        with tempfile.TemporaryFile(mode="w+") as output:
+            subprocess.run(
+                ["git", "ls-files", "**/Cargo.toml", "**/Cargo.lock", "Cargo.lock"],
+                cwd=ROOT, stdout=output, check=True,
+            )
+            output.seek(0)
+            tracked = output.read().splitlines()
+        for filename in tracked:
+            document = tomllib.loads((ROOT / filename).read_text())
+            with self.subTest(path=filename):
+                if filename.endswith("Cargo.lock"):
+                    for package in document.get("package", []):
+                        if package["name"] == "kernal-api":
+                            self.assertEqual(package["version"], version)
+                else:
+                    for section in ("dependencies", "build-dependencies", "dev-dependencies"):
+                        dependency = document.get(section, {}).get("kernal-api")
+                        if isinstance(dependency, dict) and "path" in dependency:
+                            if "version" in dependency:
+                                self.assertEqual(dependency["version"], f"={version}")
+
     def test_version_detection(self):
         self.assertEqual(release_tag('[package]\nversion = "0.1.0"'), "v0.1.0")
         for version in ["0.0.0", "bad", "0.1.0\nmalicious"]:

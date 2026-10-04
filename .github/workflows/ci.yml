@@ -43,8 +43,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      skip_linux: ${{ steps.gate.outputs.skip_linux }}
-      skip_dylints: ${{ steps.gate.outputs.skip_dylints }}
+      # Either mechanism may skip: a source-bound attestation on a PR
+      # (GATE-008/010), or a verified byte-identical merge on main
+      # (GEN-021). Both are fail-closed proofs, and neither is set unless
+      # its own check ran and passed.
+      skip_linux: ${{ steps.gate.outputs.skip_linux || steps.reuse.outputs.skip_linux }}
+      skip_dylints: ${{ steps.gate.outputs.skip_dylints || steps.reuse.outputs.skip_dylints }}
     steps:
       - name: Checkout candidate source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -56,7 +60,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
+          ref: 2adff46a75d6d9b4ad2ad67d0700037bb7225414
           path: .ci-lint
           persist-credentials: false
       - name: Set up uv
@@ -66,6 +70,26 @@ jobs:
         env:
           PYTHONPATH: .ci-lint
         run: uv run --no-project --python 3.12 python -m ci_lint local-gate verify --repo . --trust --github-output
+
+      # zackees/ci.yml#162 (GEN-021): a push to `main` whose one merged PR
+      # already validated a byte-identical tree may skip `linux` and
+      # `dylints`. Asserts nothing unless exactly one PR is merged into
+      # main with `merge_commit_sha` equal to the pushed SHA, the trees are
+      # equal, and every --required-job is `success` in a fresh proving run.
+      # A squash-merge batch or a drifted tree leaves both jobs running.
+      - name: Verified default-branch reuse
+        id: reuse
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          uv run --no-project --python 3.12
+          env PYTHONPATH=.ci-lint
+          python -m ci_lint reuse-check
+          --workflow ci.yml --mode enforce --github-output
+          --max-age-hours 24
+          --required-job "linux"
+          --required-job "Dylint workspace"
 
   # Four work jobs set up once and do everything that belongs on each runner.
   # Full mode adds one small coverage sentinel after those jobs finish.
@@ -131,7 +155,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
+          ref: 2adff46a75d6d9b4ad2ad67d0700037bb7225414
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint
@@ -966,7 +990,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: zackees/ci.yml
-          ref: 07438021fddadfc6ab1a8a1a36646ab6280da150
+          ref: 2adff46a75d6d9b4ad2ad67d0700037bb7225414
           path: .ci-lint
           persist-credentials: false
       - name: Plan this run with the pinned ci-lint

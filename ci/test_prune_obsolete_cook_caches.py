@@ -1,5 +1,6 @@
 import hashlib
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ci.prune_obsolete_cook_caches import (
@@ -14,6 +15,7 @@ from ci.prune_obsolete_cook_caches import (
     require_lock_generations_retired,
     require_single_current_generation,
     retired_cross_target_cook_bases,
+    retired_old_dylint_outputs,
     stale_cook_bases,
     superseded_lock_generation_caches,
     version_tuple,
@@ -22,6 +24,160 @@ from ci.prune_obsolete_cook_caches import (
 
 class CookCacheRetentionTests(unittest.TestCase):
     CURRENT_FIXTURE_LOCK_HASH = "5e524d4298978a25"
+
+    def test_old_dylint_outputs_retire_only_over_budget_with_current_anchor(self):
+        current = self.CURRENT_FIXTURE_LOCK_HASH
+        prefix = "setup-soldr-dylint-output-v2-linux-x64-"
+        now = datetime(2026, 10, 4, 15, tzinfo=timezone.utc)
+        entries = [
+            Cache(
+                1,
+                f"{prefix}aaaaaaaaaaaaaaaa-ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+            ),
+            Cache(
+                2,
+                f"{prefix}bbbbbbbbbbbbbbbb-{current}",
+                "refs/heads/main",
+                6,
+                "2026-09-02T00:00:00Z",
+                "2026-09-02T00:00:00Z",
+            ),
+        ]
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, set(), budget=12, now=now), []
+        )
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, set(), budget=10, now=now),
+            [entries[0]],
+        )
+        self.assertEqual(
+            retired_old_dylint_outputs(entries[:1], current, set(), budget=1, now=now),
+            [],
+        )
+
+    def test_dylint_retention_protects_unknown_young_pr_and_current_entries(self):
+        current = self.CURRENT_FIXTURE_LOCK_HASH
+        prefix = "setup-soldr-dylint-output-v2-linux-x64-aaaaaaaaaaaaaaaa-"
+        now = datetime(2026, 10, 4, 15, tzinfo=timezone.utc)
+        entries = [
+            Cache(1, prefix + current, "refs/heads/main", 6),
+            Cache(
+                2,
+                prefix + "ffffffffffffffff",
+                "refs/pull/1/merge",
+                6,
+                created_at="2026-09-01T00:00:00Z",
+            ),
+            Cache(
+                3,
+                prefix + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="2026-10-04T14:55:00Z",
+            ),
+            Cache(
+                4,
+                prefix + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="2026-10-05T00:00:00Z",
+            ),
+            Cache(
+                5,
+                prefix + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="invalid",
+            ),
+            Cache(
+                6,
+                prefix + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="2026-09-01T00:00:00",
+            ),
+            Cache(
+                7,
+                prefix.removesuffix("aaaaaaaaaaaaaaaa-") + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="2026-09-01T00:00:00Z",
+            ),
+        ]
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, set(), budget=1, now=now), []
+        )
+
+    def test_dylint_retention_accounts_for_exclusions_and_stops_in_lru_order(self):
+        current = self.CURRENT_FIXTURE_LOCK_HASH
+        prefix = "setup-soldr-dylint-output-v2-linux-arm64-aaaaaaaaaaaaaaaa-"
+        now = datetime(2026, 10, 4, 15, tzinfo=timezone.utc)
+        entries = [
+            Cache(1, prefix + current, "refs/heads/main", 6),
+            Cache(
+                2,
+                prefix + "ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                "2026-09-02T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+            ),
+            Cache(
+                3,
+                prefix + "eeeeeeeeeeeeeeee",
+                "refs/heads/main",
+                6,
+                "2026-09-01T00:00:00Z",
+                "2026-09-01T00:00:00Z",
+            ),
+        ]
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, set(), budget=12, now=now),
+            [entries[2]],
+        )
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, {2}, budget=12, now=now), []
+        )
+        self.assertEqual(
+            retired_old_dylint_outputs(entries, current, {1}, budget=1, now=now), []
+        )
+        empty_anchor = [Cache(1, prefix + current, "refs/heads/main", 0), entries[1]]
+        self.assertEqual(
+            retired_old_dylint_outputs(empty_anchor, current, set(), budget=1, now=now),
+            [],
+        )
+
+    def test_dylint_retention_requires_current_anchor_for_same_architecture(self):
+        prefix = "setup-soldr-dylint-output-v2-linux-"
+        entries = [
+            Cache(
+                1,
+                prefix + "arm64-aaaaaaaaaaaaaaaa-" + self.CURRENT_FIXTURE_LOCK_HASH,
+                "refs/heads/main",
+                6,
+            ),
+            Cache(
+                2,
+                prefix + "x64-bbbbbbbbbbbbbbbb-ffffffffffffffff",
+                "refs/heads/main",
+                6,
+                created_at="2026-09-01T00:00:00Z",
+            ),
+        ]
+        self.assertEqual(
+            retired_old_dylint_outputs(
+                entries,
+                self.CURRENT_FIXTURE_LOCK_HASH,
+                set(),
+                budget=1,
+                now=datetime(2026, 10, 4, 15, tzinfo=timezone.utc),
+            ),
+            [],
+        )
 
     def test_lock_generation_shape_removes_only_the_lock_dimension(self):
         cook_old = Cache(
@@ -835,30 +991,74 @@ class CookCacheRetentionTests(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", workflow)
         self.assertIn('--version "${SOLDR_VERSION}" --apply', workflow)
 
-
     def test_orphaned_lock_generations_retire_only_over_budget_lru_first(self):
         """Over budget, retire what GitHub's own LRU eviction would, never current."""
         current = self.CURRENT_FIXTURE_LOCK_HASH
         old = "f594fff1c7c78900"
         prefix = "setup-soldr-buildcache-v2-linux-x64-"
         caches = [
-            Cache(1, f"{prefix}aa-build-x86_64-apple-darwin-{old}", "refs/heads/main", 4, "2026-09-28T15:03"),
-            Cache(2, f"{prefix}bb-build-aarch64-apple-darwin-{old}", "refs/heads/main", 4, "2026-09-27T04:56"),
-            Cache(3, f"{prefix}cc-linux-{current}", "refs/heads/main", 4, "2026-09-01T00:00"),
-            Cache(4, f"{prefix}dd-build-x-{old}", "refs/pull/9/merge", 4, "2026-09-01T00:00"),
-            Cache(5, "setup-soldr-dylint-output-v2-linux-x64-75fcd49156e5685e", "refs/heads/main", 4, "2026-09-01T00:00"),
+            Cache(
+                1,
+                f"{prefix}aa-build-x86_64-apple-darwin-{old}",
+                "refs/heads/main",
+                4,
+                "2026-09-28T15:03",
+            ),
+            Cache(
+                2,
+                f"{prefix}bb-build-aarch64-apple-darwin-{old}",
+                "refs/heads/main",
+                4,
+                "2026-09-27T04:56",
+            ),
+            Cache(
+                3,
+                f"{prefix}cc-linux-{current}",
+                "refs/heads/main",
+                4,
+                "2026-09-01T00:00",
+            ),
+            Cache(
+                4,
+                f"{prefix}dd-build-x-{old}",
+                "refs/pull/9/merge",
+                4,
+                "2026-09-01T00:00",
+            ),
+            Cache(
+                5,
+                "setup-soldr-dylint-output-v2-linux-x64-75fcd49156e5685e",
+                "refs/heads/main",
+                4,
+                "2026-09-01T00:00",
+            ),
         ]
-        self.assertEqual(over_budget_orphaned_lock_caches(caches, current, set(), budget=20), [])
         self.assertEqual(
-            [c.cache_id for c in over_budget_orphaned_lock_caches(caches, current, set(), budget=16)],
+            over_budget_orphaned_lock_caches(caches, current, set(), budget=20), []
+        )
+        self.assertEqual(
+            [
+                c.cache_id
+                for c in over_budget_orphaned_lock_caches(
+                    caches, current, set(), budget=16
+                )
+            ],
             [2],
         )
         self.assertEqual(
-            [c.cache_id for c in over_budget_orphaned_lock_caches(caches, current, set(), budget=1)],
+            [
+                c.cache_id
+                for c in over_budget_orphaned_lock_caches(
+                    caches, current, set(), budget=1
+                )
+            ],
             [2, 1],
         )
         # Entries already chosen by another rule count as reclaimed.
-        self.assertEqual(over_budget_orphaned_lock_caches(caches, current, {2}, budget=16), [])
+        self.assertEqual(
+            over_budget_orphaned_lock_caches(caches, current, {2}, budget=16), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

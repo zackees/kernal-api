@@ -9,7 +9,12 @@ their producer opts out of cook; the native `xlinux` cook remains a required
 current-generation sentinel. For lock-scoped families, only an older cache is
 retired when a newer main cache exists for the identical non-lock shape. This
 keeps one reusable generation per producer shape without deleting unique
-platform, target, feature, or job caches.
+platform, target, feature, or job caches. When still over budget, understood
+old-lock Dylint outputs may be evicted in LRU order if a nonempty current-lock
+output of the same architecture remains. This budget-pressure eviction can
+retire a unique old compiler/manifest identity; it does not assert an equivalent
+replacement for that identity. Current-lock outputs, unknown keys, PR refs, and outputs with
+unknown creation time or younger than ten minutes are preserved.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -53,6 +59,7 @@ class Cache:
     ref: str
     size: int
     last_accessed: str = ""
+    created_at: str = ""
 
 
 def lock_generation_shape(cache: Cache) -> tuple[str, str, str] | None:
@@ -178,6 +185,59 @@ def over_budget_orphaned_lock_caches(
             orphans.append(cache)
     retired = []
     for cache in sorted(orphans, key=lambda c: (c.last_accessed, c.cache_id)):
+        if usage <= budget:
+            break
+        retired.append(cache)
+        usage -= cache.size
+    return retired
+
+
+def retired_old_dylint_outputs(
+    caches: list[Cache],
+    current_lock_hash: str,
+    excluded: set[int],
+    budget: int = BUDGET_BYTES,
+    now: datetime | None = None,
+) -> list[Cache]:
+    """Reclaim old-lock outputs over budget, preserving a current usable anchor."""
+    pattern = re.compile(
+        r"setup-soldr-dylint-output-v2-linux-(?P<arch>x64|arm64)-"
+        r"[0-9a-f]{16}-(?P<lock>[0-9a-f]{16})"
+    )
+    remaining = [cache for cache in caches if cache.cache_id not in excluded]
+    usage = sum(cache.size for cache in remaining)
+    if usage <= budget:
+        return []
+    anchored_arches = {
+        match.group("arch")
+        for cache in remaining
+        if cache.ref == MAIN_REF
+        and cache.size > 0
+        and (match := pattern.fullmatch(cache.key)) is not None
+        and match.group("lock") == current_lock_hash
+    }
+    if not anchored_arches:
+        return []
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(minutes=10)
+    eligible: list[Cache] = []
+    for cache in remaining:
+        match = pattern.fullmatch(cache.key)
+        if cache.ref != MAIN_REF or match is None:
+            continue
+        if (
+            match.group("lock") == current_lock_hash
+            or match.group("arch") not in anchored_arches
+        ):
+            continue
+        try:
+            created = datetime.fromisoformat(cache.created_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if created.tzinfo is None or created > cutoff:
+            continue
+        eligible.append(cache)
+    retired: list[Cache] = []
+    for cache in sorted(eligible, key=lambda item: (item.last_accessed, item.cache_id)):
         if usage <= budget:
             break
         retired.append(cache)
@@ -402,6 +462,7 @@ class GitHub:
                         ref=str(entry["ref"]),
                         size=int(entry["size_in_bytes"]),
                         last_accessed=str(entry.get("last_accessed_at", "")),
+                        created_at=str(entry.get("created_at", "")),
                     )
                 )
             if len(entries) < 100:
@@ -469,6 +530,10 @@ def prune(
         )
     }
     for cache in over_budget_orphaned_lock_caches(
+        before, current_lock_hash, set(candidates_by_id)
+    ):
+        candidates_by_id[cache.cache_id] = cache
+    for cache in retired_old_dylint_outputs(
         before, current_lock_hash, set(candidates_by_id)
     ):
         candidates_by_id[cache.cache_id] = cache

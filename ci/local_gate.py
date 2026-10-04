@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -21,6 +23,16 @@ else:
 JsonValue = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = ".github/workflows/ci.yml"
+CI_LINT = "ci-lint @ git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47"
+
+
+def bosn_command(*arguments: str) -> list[str]:
+    """Use the published report-capable runner and an optional owned state dir."""
+    argv = ["uvx", "--from", "bosn==0.1.13", "bosn", *arguments]
+    state = os.environ.get("BOSN_GATE_STATE_DIR")
+    if state:
+        argv.extend(["--state-dir", str(Path(state).resolve())])
+    return argv
 
 
 def verify_pr_base(ref: str) -> None:
@@ -59,10 +71,26 @@ class RunProof:
     total: int
     completed: int
     failed: int
+    git_tree: str
+    trigger: str
+    event: str
+    cleanup: str
+    payload_sha256: str
 
     @classmethod
     def from_json(cls, raw: dict[str, JsonValue]) -> RunProof:
         """Validate the wire document before treating it as evidence."""
+        if (
+            type(raw.get("schema_version")) is not int
+            or raw["schema_version"] != 1
+            or raw.get("provider") != "github"
+            or raw.get("repository") != "zackees/kernal-api"
+            or type(raw.get("act_exit_code")) is not int
+            or raw["act_exit_code"] != 0
+            or not isinstance(raw.get("tree_digest"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", str(raw["tree_digest"])) is None
+        ):
+            raise ValueError("bosn record lacks a successful source snapshot identity")
         strings = (
             "workspace",
             "sha",
@@ -73,6 +101,11 @@ class RunProof:
             "mode",
             "state",
             "conclusion",
+            "git_tree",
+            "trigger",
+            "event",
+            "cleanup",
+            "payload_sha256",
         )
         if any(not isinstance(raw.get(key), str) for key in strings):
             raise ValueError("bosn record is missing identity or completion fields")
@@ -98,11 +131,16 @@ class RunProof:
             int(jobs["total"]),
             int(jobs["completed"]),
             int(jobs["failed"]),
+            str(raw["git_tree"]),
+            str(raw["trigger"]),
+            str(raw["event"]),
+            str(raw["cleanup"]),
+            str(raw["payload_sha256"]),
         )
 
 
 def verify_run(
-    proof: RunProof, workspace: Path, sha: str, *, job: str = "linux"
+    proof: RunProof, workspace: Path, sha: str, git_tree: str, *, job: str = "linux"
 ) -> None:
     """Reject unrelated, dirty, partial, failed, or upstream-act runs."""
     if (
@@ -114,6 +152,11 @@ def verify_run(
         or proof.workflow != WORKFLOW
         or proof.job != job
         or proof.mode != "minimal"
+        or proof.git_tree != git_tree
+        or re.fullmatch(r"[0-9a-f]{40}", git_tree) is None
+        or proof.trigger != "pr"
+        or proof.event != "pull_request"
+        or re.fullmatch(r"[0-9a-f]{64}", proof.payload_sha256) is None
     ):
         raise ValueError("bosn run does not prove this clean minimal Linux lane")
     if (
@@ -123,6 +166,7 @@ def verify_run(
         or proof.total < 1
         or proof.completed != proof.total
         or proof.failed != 0
+        or proof.cleanup != "removed"
     ):
         raise ValueError("bosn run did not complete every selected job successfully")
 
@@ -149,6 +193,10 @@ def run_fast_guards() -> None:
             "uv",
             "run",
             "--no-project",
+            "--with",
+            CI_LINT,
+            "--with",
+            "pyyaml==6.0.2",
             "--python",
             "3.12",
             "python",
@@ -181,9 +229,9 @@ def main() -> None:
         )
     )
     sha = output(["git", "rev-parse", "HEAD"]).strip()
+    git_tree = output(["git", "rev-parse", "HEAD^{tree}"]).strip()
     submitted = document(
-        [
-            "bosn",
+        bosn_command(
             "ci",
             "run",
             "--workspace",
@@ -201,20 +249,32 @@ def main() -> None:
             "--timeout-secs",
             "7200",
             "--json",
-        ]
+        )
     )
     run_id = submitted.get("run")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("bosn did not return a run ID")
     print(f"bosn local gate run: {run_id}", flush=True)
-    subprocess.run(["bosn", "ci", "wait", run_id], cwd=ROOT, check=True)
-    proof = RunProof.from_json(document(["bosn", "ci", "show", run_id, "--json"]))
-    verify_run(proof, ROOT, sha, job=args.job)
+    subprocess.run(bosn_command("ci", "wait", run_id), cwd=ROOT, check=True)
+    report = output(bosn_command("ci", "show", run_id, "--json"))
+    raw = json.loads(report)
+    if not isinstance(raw, dict):
+        raise TypeError("expected the original bosn JSON object")
+    proof = RunProof.from_json(raw)
+    verify_run(proof, ROOT, sha, git_tree, job=args.job)
+    if __package__:
+        from .replay_evidence import verify_checks
+    else:
+        from replay_evidence import verify_checks
+    verify_checks(raw, ROOT, sha, git_tree, args.job)
     if (
         output(["git", "rev-parse", "HEAD"]).strip() != sha
         or output(["git", "status", "--porcelain", "--untracked-files=normal"]).strip()
     ):
         raise ValueError("worktree changed while the local gate ran")
+    report_path = os.environ.get("CI_LINT_GATE_REPLAY_REPORT")
+    if report_path:
+        Path(report_path).write_text(report, encoding="utf-8")
     print(f"Passed minimal {args.job} on {proof.act_version}: {sha}", flush=True)
 
 

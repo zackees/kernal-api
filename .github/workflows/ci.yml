@@ -77,9 +77,14 @@ jobs:
       # main with `merge_commit_sha` equal to the pushed SHA, the trees are
       # equal, and every --required-job is `success` in a fresh proving run.
       # A squash-merge batch or a drifted tree leaves both jobs running.
+      # Unconditional on purpose. `reuse-check` refuses anything that is not
+      # a push to the default branch at its first precondition, with no API
+      # call, so a PR run costs a python start-up and proves nothing.
+      # Guarding it with an `if:` instead would make it a step the replay
+      # proof has to exclude, and kernal-api's own drift test asserts that
+      # `verify`'s replayed steps are exactly the declared list.
       - name: Verified default-branch reuse
         id: reuse
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-

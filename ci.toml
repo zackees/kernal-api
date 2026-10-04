@@ -5,7 +5,7 @@
 # yet meet this contract are tracked in zackees/ci.yml, not silenced here.
 schema  = 3
 profile = "rust-library"                          # a Rust facade crate + a hatchling Python package; not a native-CLI PyPI app
-linter  = "zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47"
+linter  = "zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150"
 
 # -- Platforms: the six hosts `linux` + `test` (x5) run on --------------------
 [platforms]
@@ -108,22 +108,22 @@ cache  = "machine"
 # First rollout lane: the exact remote minimal Linux job in bosn/act2.
 # Remote jobs keep running until verifier wiring and coverage are validated.
 [local.gate]
-run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47", "--python", "3.12", "python", "ci/local_gate.py"]
+run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150", "--python", "3.12", "python", "ci/local_gate.py"]
 mode = "enforce"
 verify = "ci.yml:verify"
 
 [local.gate.lanes.linux-minimal]
-run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47", "--python", "3.12", "python", "ci/local_gate.py"]
+run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150", "--python", "3.12", "python", "ci/local_gate.py"]
 tools = ["bosn", "uv"]
 
 [local.gate.lanes.dylint-minimal]
-run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@4c39ed9c494a881cd8f4eb264f2487a7d1284a47", "--python", "3.12", "python", "ci/local_gate.py", "--job", "dylints"]
+run = ["uv", "run", "--no-project", "--with", "ci-lint @ git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8a1a36646ab6280da150", "--python", "3.12", "python", "ci/local_gate.py", "--job", "dylints"]
 tools = ["bosn", "uv"]
 
-# Observe per-job trust first. Extended and full PRs always keep every remote
-# check; a minimal lane cannot prove their wider feature/artifact coverage.
+# Eligible attested minimal PRs reuse both source-bound workflow lanes.
+# Extended/full PRs, changed gate surfaces, pushes and audit samples run remotely.
 [local.gate.trust]
-mode = "shadow"
+mode = "enforce"
 skip = ["ci.yml:linux", "ci.yml:dylints"]
 covered-by = { "ci.yml:linux" = ["linux-minimal"], "ci.yml:dylints" = ["dylint-minimal"] }
 full-labels = ["ci-full", "ci-test"]

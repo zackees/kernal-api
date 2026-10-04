@@ -1,7 +1,8 @@
 # The minimal Linux and Dylint workflow lanes prove these checks. Extended/full
 # mode and other native platforms still need their own successful local lanes.
 # Jobs are mapped only for minimal mode: the base's trust policy forces remote
-# execution for ci-test/ci-full. Shadow mode still runs every remote check.
+# execution for ci-test/ci-full, changed gate surfaces and the audit sample.
+# Pushes always execute; only eligible attested minimal PRs reuse these gates.
 version: 1
 gates:
   general/all/ci-guards: {lane: linux-minimal, fidelity: native}

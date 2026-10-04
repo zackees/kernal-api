@@ -69,11 +69,7 @@ EXCLUDE_CAP_PRIMITIVES='commit_error_cleans_staging_after_destination_parent_is_
 # supports both; all three tests pass on hosted Intel and Apple Silicon runners.
 EXCLUDE_MACOS_RENAME='failed_marker_write_is_cleaned_up_and_existing_marker_is_preserved marker_is_invisible_until_payload_is_complete install_directory_replaces_an_existing_tree_and_removes_the_old_one'
 
-# Two cores in a VM are not representative for wall-clock assertions: a
-# suspension window elapsed before the work did.
-EXCLUDE_VM_TIMING='a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends'
-
-EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME $EXCLUDE_VM_TIMING"
+EXCLUDED_TESTS="$EXCLUDE_CAP_PRIMITIVES $EXCLUDE_MACOS_RENAME"
 
 GUEST_EXCLUDE=''
 for name in $EXCLUDED_TESTS; do

@@ -27,6 +27,14 @@ use diagnostics::increment;
 pub use diagnostics::{Diagnostics, Snapshot};
 pub use target::QueryPairs;
 
+/// One server-sent event. `id` is the reconnect cursor and `event` is its type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SseEvent {
+    pub id: Option<String>,
+    pub event: Option<String>,
+    pub data: String,
+}
+
 #[cfg(feature = "websocket")]
 type UpgradeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -373,6 +381,23 @@ impl Response {
             .with_header("content-type", "text/event-stream")?
             .with_header("cache-control", "no-cache")?;
         response.body = ServerBody::events(events, keepalive)?;
+        Ok(response)
+    }
+
+    /// Encode SSE events with optional native `id:` and `event:` fields.
+    /// The source remains pull-driven, and dropping the response drops it.
+    /// Invalid field values cause a stream error before that event is sent.
+    ///
+    /// # Errors
+    /// Rejects invalid keepalive periods or missing runtime context.
+    pub fn sse_stream<S>(events: S, keepalive: Duration) -> io::Result<Self>
+    where
+        S: futures_core::Stream<Item = io::Result<SseEvent>> + Send + 'static,
+    {
+        let mut response = Self::new(200, Vec::new())?
+            .with_header("content-type", "text/event-stream")?
+            .with_header("cache-control", "no-cache")?;
+        response.body = ServerBody::sse_events(events, keepalive)?;
         Ok(response)
     }
 

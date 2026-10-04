@@ -1,4 +1,4 @@
-use super::Limits;
+use super::{Limits, SseEvent};
 use bytes::Bytes;
 use futures_core::Stream;
 use hyper::body::{Body, Frame, SizeHint};
@@ -57,11 +57,73 @@ struct FileSource {
 }
 
 struct EventSource {
-    stream: Pin<Box<dyn Stream<Item = io::Result<String>> + Send>>,
+    stream: EventStream,
     keepalive: Duration,
     timer: Pin<Box<tokio::time::Sleep>>,
     pending: Bytes,
     max_event: usize,
+}
+
+enum EventStream {
+    Data(Pin<Box<dyn Stream<Item = io::Result<String>> + Send>>),
+    Rich(Pin<Box<dyn Stream<Item = io::Result<SseEvent>> + Send>>),
+}
+
+impl EventStream {
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<SseEvent>>> {
+        match self {
+            Self::Data(stream) => stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map(|data| SseEvent {
+                        id: None,
+                        event: None,
+                        data,
+                    })
+                })
+            }),
+            Self::Rich(stream) => stream.as_mut().poll_next(cx),
+        }
+    }
+}
+
+fn encode_event(event: SseEvent, max_event: usize) -> io::Result<Bytes> {
+    if event.data.len()
+        + event.id.as_ref().map_or(0, String::len)
+        + event.event.as_ref().map_or(0, String::len)
+        > max_event
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SSE event exceeds configured limit",
+        ));
+    }
+    if event.id.as_ref().is_some_and(|id| id.contains(['\r', '\n', '\0']))
+        || event
+            .event
+            .as_ref()
+            .is_some_and(|kind| kind.contains(['\r', '\n', '\0']))
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SSE field"));
+    }
+    let normalized = event.data.replace("\r\n", "\n").replace('\r', "\n");
+    let mut encoded = String::new();
+    if let Some(id) = event.id {
+        encoded.push_str("id: ");
+        encoded.push_str(&id);
+        encoded.push('\n');
+    }
+    if let Some(kind) = event.event {
+        encoded.push_str("event: ");
+        encoded.push_str(&kind);
+        encoded.push('\n');
+    }
+    for line in normalized.split('\n') {
+        encoded.push_str("data: ");
+        encoded.push_str(line);
+        encoded.push('\n');
+    }
+    encoded.push('\n');
+    Ok(encoded.into())
 }
 
 pub(super) struct ServerBody {
@@ -113,6 +175,17 @@ impl ServerBody {
     where
         S: Stream<Item = io::Result<String>> + Send + 'static,
     {
+        Self::event_source(EventStream::Data(Box::pin(events)), keepalive)
+    }
+
+    pub(super) fn sse_events<S>(events: S, keepalive: Duration) -> io::Result<Self>
+    where
+        S: Stream<Item = io::Result<SseEvent>> + Send + 'static,
+    {
+        Self::event_source(EventStream::Rich(Box::pin(events)), keepalive)
+    }
+
+    fn event_source(stream: EventStream, keepalive: Duration) -> io::Result<Self> {
         if keepalive.is_zero() || keepalive > Duration::from_secs(365 * 24 * 3600) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -122,7 +195,7 @@ impl ServerBody {
         crate::async_engine::RuntimeHandle::current().map_err(io::Error::other)?;
         Ok(Self {
             source: Source::Events(EventSource {
-                stream: Box::pin(events),
+                stream,
                 keepalive,
                 timer: Box::pin(tokio::time::sleep(keepalive)),
                 pending: Bytes::new(),
@@ -222,25 +295,14 @@ impl ServerBody {
             }
             Source::Events(events) => {
                 if events.pending.is_empty() {
-                    match events.stream.as_mut().poll_next(cx) {
+                    match events.stream.poll_next(cx) {
                         Poll::Ready(None) => return Poll::Ready(None),
                         Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
-                        Poll::Ready(Some(Ok(data))) => {
-                            if data.len() > events.max_event {
-                                return Poll::Ready(Some(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "SSE event exceeds configured limit",
-                                ))));
-                            }
-                            let normalized = data.replace("\r\n", "\n").replace('\r', "\n");
-                            let mut encoded = String::new();
-                            for line in normalized.split('\n') {
-                                encoded.push_str("data: ");
-                                encoded.push_str(line);
-                                encoded.push('\n');
-                            }
-                            encoded.push('\n');
-                            events.pending = encoded.into();
+                        Poll::Ready(Some(Ok(event))) => {
+                            events.pending = match encode_event(event, events.max_event) {
+                                Ok(encoded) => encoded,
+                                Err(error) => return Poll::Ready(Some(Err(error))),
+                            };
                         }
                         Poll::Pending => {
                             std::task::ready!(events.timer.as_mut().poll(cx));
@@ -311,6 +373,24 @@ impl Body for ServerBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sse_metadata_cannot_inject_another_field() {
+        for value in ["x\nevent: hacked", "x\rid: hacked", "x\0y"] {
+            let event = SseEvent {
+                id: Some(value.into()),
+                event: None,
+                data: "safe".into(),
+            };
+            assert!(encode_event(event, 65536).is_err());
+            let event = SseEvent {
+                id: None,
+                event: Some(value.into()),
+                data: "safe".into(),
+            };
+            assert!(encode_event(event, 65536).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_read_keeps_shared_admission_until_native_work_finishes() {

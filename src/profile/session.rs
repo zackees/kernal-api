@@ -301,6 +301,13 @@ impl ProfileSession {
                 }
             }
 
+            // A capture can fill the ring on the final tick. Record that
+            // terminal condition before the duration check ends the loop.
+            if self.ring.is_full() {
+                buffer_full = true;
+                break;
+            }
+
             let now = Instant::now();
             if next > now {
                 std::thread::sleep(next - now);

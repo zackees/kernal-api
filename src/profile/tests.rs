@@ -216,6 +216,32 @@ fn a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends() {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
 
+    const CHILD: &str = "KERNAL_SMALL_RING_TEST_PARENT";
+    if let Some(parent) = std::env::var_os(CHILD) {
+        assert_ne!(parent, std::ffi::OsString::from(std::process::id().to_string()));
+    } else {
+        // A profile samples every sibling in its process. Parallel libtest
+        // cases add unrelated threads and mapping changes, so their unwind
+        // cost can consume this fixture's entire five-second window (#408).
+        // Isolate this one real four-worker proof; the suite stays parallel.
+        let output = crate::run_bounded_command(
+            crate::SpawnSpec::new(std::env::current_exe().expect("test executable"))
+                .args([
+                    "--exact",
+                    "profile::tests::a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends",
+                ])
+                .env(CHILD, std::process::id().to_string()),
+            Duration::from_secs(10),
+            65536,
+        )
+        .expect("isolated four-worker fixture must finish");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.exit.is_success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+        return;
+    }
+
     const WORKERS: usize = 4;
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -254,7 +280,7 @@ fn a_handful_of_threads_fills_a_small_ring_long_before_the_window_ends() {
 
     assert!(
         metrics.buffer_full,
-        "four threads must fill a ring of eight"
+        "four threads must fill a ring of eight: {metrics:?}"
     );
     assert_eq!(metrics.samples_captured, 8);
     // Five seconds were asked for. Ending well inside them is the whole

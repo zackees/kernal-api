@@ -92,11 +92,18 @@ never    = ["linked-tests", "nextest-archives", "target-dir"]
 pr       = { mode = "none", families = [], max-per-pr = "0MB", budget = "0MB", trim = "on-close" }   # PRs never save
 
 [cache.family]
+# `dylint` and `dylint-out` carry `evict = "lru"` (CACHE-029): their keys
+# embed a per-run hash, so without it every run appends an entry nothing
+# retires. Measured 2026-10-04: 13 live `dylint` entries (7.6 GB) and 11
+# `dylint-out` (7.0 GB), 87% of this repository's cache superseded, at
+# 98.8% of the 10 GB budget -- new saves were being refused and pull
+# requests ran cold. `max` sizes ONE entry and cannot bound the family;
+# `per` declares the writer shape, not the entry count.
 deps         = { via = "setup-soldr:cook",           max = "150MB",  lockfile = true, per = "none" }             # linux cook base, 127,235,799 B
 compile      = { via = "setup-soldr:build-cache",    max = "150MB",  lockfile = true, per = "none", min = "1MB" } # linux thin (ci-tests) build cache, 89,412,879 B
 toolchain    = { via = "setup-soldr:solo-toolchain", max = "210MB",  per = "none" }                              # linux-x64 tnone, 179,728,890 B
-dylint       = { via = "setup-soldr:dylint",         max = "600MB",  per = "none", min = "1MB" }                 # 544,405,988 B
-dylint-out   = { via = "setup-soldr:dylint-output",  max = "700MB",  lockfile = true, per = "none", min = "1MB" } # 619,590,808 B
+dylint       = { via = "setup-soldr:dylint",         max = "600MB",  per = "none", min = "1MB", evict = "lru" }   # 544,405,988 B
+dylint-out   = { via = "setup-soldr:dylint-output",  max = "700MB",  lockfile = true, per = "none", min = "1MB", evict = "lru" } # 619,590,808 B
 soldr-mini   = { via = "setup-soldr:soldr-mini",     max = "15MB",   per = "none", min = "1MB" }                 # linux-x64, 10,727,008 B
 uv           = { via = "setup-uv",                   max = "5MB",    per = "none" }                              # linux-x64, <= 1,474,015 B
 

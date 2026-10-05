@@ -206,6 +206,44 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     std::fs::set_permissions(path, permissions)
 }
 
+/// Deny in-place writes while keeping `Permissions::readonly()` false; the
+/// contract lives on [`crate::platform::fs::deny_in_place_writes`].
+///
+/// The Unix shape clears the owner-write bit and guarantees at least the
+/// group-write bit: the kernel applies only the owner bits to the owner, so
+/// owner-write clear refuses the owner's in-place writes, while the
+/// remaining write bit keeps `readonly()` (any write bit) false for
+/// `check_file_is_writeable` callers. Idempotent, and a legacy all-bits-cleared
+/// file upgrades to the sealed shape on the next sealing.
+pub fn deny_in_place_writes(path: &Path) -> io::Result<()> {
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    let sealed = (mode & !0o200) | 0o020;
+    if mode == sealed {
+        return Ok(());
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(sealed))
+}
+
+/// Remove a seal this module applied; see
+/// [`crate::platform::fs::allow_in_place_writes`]. A file whose owner-write
+/// bit is already set was never sealed by this module and is left alone.
+pub fn allow_in_place_writes(path: &Path) -> io::Result<()> {
+    let mode = std::fs::metadata(path)?.permissions().mode();
+    if mode & 0o200 != 0 {
+        return Ok(());
+    }
+    std::fs::set_permissions(
+        path,
+        std::fs::Permissions::from_mode((mode | 0o200) & !0o020),
+    )
+}
+
+/// Whether in-place writes are denied — the owner-write bit is clear; see
+/// [`crate::platform::fs::in_place_writes_denied`].
+pub fn in_place_writes_denied(path: &Path) -> io::Result<bool> {
+    Ok(std::fs::metadata(path)?.permissions().mode() & 0o200 == 0)
+}
+
 pub fn make_owner_executable(path: &Path) -> io::Result<()> {
     let mut permissions = std::fs::metadata(path)?.permissions();
     permissions.set_mode(permissions.mode() | 0o100);

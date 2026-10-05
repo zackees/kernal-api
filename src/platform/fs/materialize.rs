@@ -175,6 +175,62 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     native::set_readonly(path, readonly)
 }
 
+/// Deny in-place writes to `path` for every trustee — including the owner —
+/// while keeping `Permissions::readonly()` **false** and
+/// rename-over-replace intact.
+///
+/// The two guarantees together are what a compiler that pre-checks its
+/// outputs needs: rustc's `check_file_is_writeable` fails fatally when
+/// `readonly()` is true even though rustc only ever writes a temp file and
+/// renames it over the output (zccache#1791). A caller that wants "cannot be
+/// overwritten at all" wants `set_readonly(path, true)` instead.
+///
+/// The two hosts reach the guarantee by different mechanics: Unix clears the
+/// owner-write bit and keeps at least the group-write bit (the kernel
+/// applies only the owner bits to the owner), Windows installs a deny ACE
+/// for `FILE_WRITE_DATA | FILE_APPEND_DATA` on the file's DACL — the DACL
+/// rides the file record, so every hardlink carries the seal, and a legacy
+/// `READONLY` attribute is cleared so an older blob upgrades on its next
+/// sealing. Idempotent on both hosts; a file this seal never touched is
+/// left alone by the matching [`allow_in_place_writes`].
+///
+/// Follows symbolic links. Not a secure-open primitive: callers control the
+/// path, as everywhere else in this module.
+///
+/// # Errors
+///
+/// Returns the metadata or permission-change error for a missing path; on
+/// Windows, also when the filesystem cannot retain the deny ACE (no ACL
+/// support), rather than reporting a seal that was silently dropped.
+pub fn deny_in_place_writes(path: &Path) -> io::Result<()> {
+    native::deny_in_place_writes(path)
+}
+
+/// Remove a seal applied by [`deny_in_place_writes`], restoring in-place
+/// writes. A file without the seal is a no-op on both hosts.
+///
+/// Follows symbolic links.
+///
+/// # Errors
+///
+/// Returns the metadata or permission-change error for a missing path.
+pub fn allow_in_place_writes(path: &Path) -> io::Result<()> {
+    native::allow_in_place_writes(path)
+}
+
+/// Whether [`deny_in_place_writes`] currently applies to `path` — by deny
+/// mechanism or by a legacy seal the host treats as equivalent (a
+/// `READONLY` attribute on Windows).
+///
+/// Follows symbolic links.
+///
+/// # Errors
+///
+/// Returns the metadata error for a missing path.
+pub fn in_place_writes_denied(path: &Path) -> io::Result<bool> {
+    native::in_place_writes_denied(path)
+}
+
 /// Add every Unix execute bit, retaining the other mode bits. Windows has no
 /// per-file execute bit and performs no filesystem operation.
 ///

@@ -30,6 +30,9 @@ pub use replacement::{
     rename_generation, replace_with_delete_fallback,
 };
 
+#[path = "fs/write_seal.rs"]
+mod write_seal;
+
 /// Every share mode, so an observation never evicts or blocks a writer,
 /// renamer, or deleter that already holds the file.
 const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -335,6 +338,38 @@ pub fn set_readonly(path: &Path, readonly: bool) -> io::Result<()> {
     }
     permissions.set_readonly(readonly);
     std::fs::set_permissions(path, permissions)
+}
+
+/// Deny in-place writes for every trustee while keeping
+/// `Permissions::readonly()` false and rename-over-replace working; the
+/// contract lives on [`crate::platform::fs::deny_in_place_writes`].
+///
+/// A legacy seal that set the `READONLY` attribute is cleared first, so a
+/// blob staged by an older build upgrades to the ACE seal the next time it
+/// is sealed instead of staying unreadable to a `check_file_is_writeable`
+/// caller.
+pub fn deny_in_place_writes(path: &Path) -> io::Result<()> {
+    set_readonly(path, false)?;
+    write_seal::deny_in_place_writes(path)
+}
+
+/// Remove a seal this module applied; see
+/// [`crate::platform::fs::allow_in_place_writes`]. Clears a legacy
+/// `READONLY` attribute alongside the deny ACE, so either generation of
+/// seal restores in-place writes.
+pub fn allow_in_place_writes(path: &Path) -> io::Result<()> {
+    write_seal::allow_in_place_writes(path)?;
+    set_readonly(path, false)
+}
+
+/// Whether in-place writes are denied — by deny ACE **or** a legacy
+/// `READONLY` attribute; see
+/// [`crate::platform::fs::in_place_writes_denied`].
+pub fn in_place_writes_denied(path: &Path) -> io::Result<bool> {
+    if write_seal::in_place_writes_denied(path)? {
+        return Ok(true);
+    }
+    Ok(std::fs::metadata(path)?.permissions().readonly())
 }
 
 /// Windows has no per-file executable bit.

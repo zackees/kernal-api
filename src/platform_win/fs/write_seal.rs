@@ -29,8 +29,10 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Security::Authorization::{
-    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
+    SetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     AddAccessAllowedAce, AddAccessDeniedAce, AddAce, GetSecurityDescriptorDacl, InitializeAcl,
@@ -92,12 +94,77 @@ pub fn deny_in_place_writes(path: &Path) -> io::Result<()> {
     // some network mounts), which would leave the seal absent while every
     // caller believes the file is protected.
     if !in_place_writes_denied(path)? {
+        // Carry the observed DACL: a silent SetNamedSecurityInfoW success
+        // with a non-matching read-back is otherwise un-diagnosable from a
+        // CI log alone.
+        let observed = dacl_sddl(path).unwrap_or_else(|| "<sddl unavailable>".into());
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "the filesystem did not retain the in-place write seal (no ACL support?)",
+            format!(
+                "the filesystem did not retain the in-place write seal (no ACL support?); \
+                 observed DACL after write: {observed}"
+            ),
         ));
     }
     Ok(())
+}
+
+/// Best-effort SDDL rendering of `path`'s DACL, for error diagnostics only.
+fn dacl_sddl(path: &Path) -> Option<String> {
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated for the call; on success Windows
+    // allocates `descriptor`, freed below exactly once.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if rc != ERROR_SUCCESS || descriptor.is_null() {
+        return None;
+    }
+    let mut text: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `descriptor` is live; the string output is freed below.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION,
+            &mut text,
+            std::ptr::null_mut(),
+        )
+    };
+    let sddl = if ok != 0 && !text.is_null() {
+        // SAFETY: NUL-terminated wide string owned by LocalAlloc.
+        let mut chars = Vec::new();
+        let mut p = text;
+        // SAFETY: `p` walks a NUL-terminated wide string owned by LocalAlloc;
+        // the loop stops at the terminator before any out-of-bounds step.
+        unsafe {
+            while *p != 0 {
+                chars.push(*p);
+                p = p.add(1);
+            }
+        }
+        Some(String::from_utf16_lossy(&chars))
+    } else {
+        None
+    };
+    // SAFETY: each allocation is freed exactly once here.
+    unsafe {
+        if !text.is_null() {
+            LocalFree(text as HLOCAL);
+        }
+        LocalFree(descriptor as HLOCAL);
+    }
+    sddl
 }
 
 /// Remove a seal this module applied, restoring in-place writes. A file
@@ -393,17 +460,21 @@ mod tests {
 
     #[test]
     fn seal_ace_is_recognized_and_rejected_structurally() {
+        // `ACE_HEADER` is four bytes (type, flags, u16 size) — lay the ACE out
+        // from `size_of`, exactly as the matcher does, never from a hard-coded
+        // offset (a 20-byte seal ACE has its mask at [4..8], SID at [8..20]).
+        let header_len = std::mem::size_of::<ACE_HEADER>();
         let mut ace = vec![0_u8; seal_ace_size()];
         // A deny ACE header: type, flags, size; then mask; then World SID.
         ace[0] = DENY_ACE_TYPE;
         ace[1] = 0;
         ace[2..4].copy_from_slice(&(seal_ace_size() as u16).to_ne_bytes());
-        ace[8..12].copy_from_slice(&SEAL_RIGHTS.to_ne_bytes());
-        ace[12..].copy_from_slice(world_sid());
+        ace[header_len..header_len + 4].copy_from_slice(&SEAL_RIGHTS.to_ne_bytes());
+        ace[header_len + 4..].copy_from_slice(world_sid());
         assert!(is_seal_ace(&ace), "the constructed seal must match");
 
         let mut wrong_mask = ace.clone();
-        wrong_mask[8..12].copy_from_slice(&0x1u32.to_ne_bytes());
+        wrong_mask[header_len..header_len + 4].copy_from_slice(&0x1u32.to_ne_bytes());
         assert!(!is_seal_ace(&wrong_mask), "mask must match exactly");
 
         let mut wrong_type = ace.clone();

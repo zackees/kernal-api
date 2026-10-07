@@ -47,7 +47,7 @@ use windows_sys::Win32::Security::{
 const SEAL_RIGHTS: u32 = 0x2 | 0x4;
 
 /// `ACCESS_DENIED_ACE_TYPE`.
-const DENY_ACE_TYPE: u8 = 0;
+const DENY_ACE_TYPE: u8 = 1;
 
 /// `ACCESS_ALLOWED_ACE_TYPE`. Test-only: it is what a non-seal ACE looks
 /// like in the structural matcher's negative cases.
@@ -457,6 +457,19 @@ fn wide(path: &Path) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_the_deny_ace_written_by_windows() {
+        // Build through the native API rather than the matcher's constants:
+        // Windows emits type 1 for deny and type 0 for allow (#1791).
+        let rebuilt = rebuild_with_seal(empty_acl(), true, true).expect("build sealed ACL");
+        let entries: Vec<_> = aces(&rebuilt).collect();
+        assert_eq!(entries.len(), 2, "deny followed by the null DACL's grant");
+        let (start, end) = entries[0];
+        assert!(is_seal_ace(&rebuilt[start..end]), "the native deny ACE must match");
+        let (start, end) = entries[1];
+        assert!(!is_seal_ace(&rebuilt[start..end]), "the native allow ACE must not match");
+    }
 
     #[test]
     fn seal_ace_is_recognized_and_rejected_structurally() {

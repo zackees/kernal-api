@@ -28,7 +28,7 @@ CI_LINT = "ci-lint @ git+https://github.com/zackees/ci.yml@07438021fddadfc6ab1a8
 
 def bosn_command(*arguments: str) -> list[str]:
     """Use the published report-capable runner and an optional owned state dir."""
-    argv = ["uvx", "--from", "bosn==0.1.13", "bosn", *arguments]
+    argv = ["uvx", "--refresh-package", "bosn", "--from", "bosn", "bosn", *arguments]
     state = os.environ.get("BOSN_GATE_STATE_DIR")
     if state:
         argv.extend(["--state-dir", str(Path(state).resolve())])
